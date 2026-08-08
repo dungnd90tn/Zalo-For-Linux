@@ -1,0 +1,39 @@
+name: Build AppImage
+
+on:
+  release:
+    types: [published]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Actions are pinned to commit SHAs, not floating tags: a mutable tag like @v4 can be
+      # repointed at new code by whoever controls the action repo, which would run in this
+      # release job. The trailing comment records which release each SHA is.
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: latest
+
+      # No libfuse2 here on purpose: the runner image is Ubuntu 24.04+, where that package is
+      # gone, and build-appimage.sh now uses the static appimagetool with APPIMAGE_EXTRACT_AND_RUN.
+      - name: Install dependencies
+        run: sudo apt-get update -y && sudo apt-get install -y wget unzip
+
+      - name: Build AppImage
+        run: |
+          chmod +x build-appimage.sh
+          ./build-appimage.sh
+
+      - name: Upload AppImage to release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: dist/*.AppImage

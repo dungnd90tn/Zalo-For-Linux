@@ -1,0 +1,154 @@
+(this.webpackJsonp = this.webpackJsonp || []).push([
+    [54], {
+        "/Z2m": function(a, e, t) {
+            "use strict";
+            t.r(e), t.d(e, "default", (function() {
+                return I
+            }));
+            var n = t("+pQO"),
+                r = t("au82"),
+                s = t("bUXd"),
+                i = t("xn9U"),
+                o = t("/KpI"),
+                c = t("1Bg4"),
+                d = t("EYoW"),
+                l = t("XaxS"),
+                u = t("Cbzp"),
+                g = t("rgLe"),
+                f = t("8/ir"),
+                E = t("AyM1"),
+                N = t("r+zH"),
+                h = t("Uzj0"),
+                p = t("Z+rT");
+            const A = [d.a.DISPLAYNAME, d.a.AVATAR, d.a.GENDER, d.a.PHONENUMBER, d.a.AVATAR_GROUP, d.a.DISPLAYNAME_GROUP],
+                R = [d.a.AVATAR_GROUP, d.a.DISPLAYNAME_GROUP],
+                U = () => {};
+            class I extends u.ZNSHandleCMD {
+                handle(a) {
+                    A.includes(a.type) ? f.a.convertId(a.data, R.includes(a.type), l.a.ZNS_QUERY).then((e => {
+                        a.data = e, this.doHandle(a)
+                    })).catch((e => {
+                        N.default.getInstance().logError("Convert globalId -> noiseId Fail", a.data, e), null == a || a.error("not found")
+                    })) : this.doHandle(a)
+                }
+                doHandle(a) {
+                    if (!(a && a.type && a.data && a.success)) return;
+                    const e = a.success,
+                        u = a.error || U,
+                        A = a.data;
+                    switch (N.default.getInstance().logInfo("ZQueryHandler doHandle", `type: ${a.type}, key: ${a.key}, data: ${a.data}`), a.type) {
+                        case d.a.DISPLAYNAME:
+                            f.a.getDName(A, !1, e, u, l.a.ZNS_QUERY);
+                            break;
+                        case d.a.AVATAR:
+                            f.a.getProfileFriend(A, l.a.ZNS_QUERY).then((a => {
+                                let t, n, s;
+                                if (a ? (t = a.avatar, n = A, s = a.displayName) : (t = "", n = 123, s = "U K"), t) e(t);
+                                else {
+                                    let a = r.a.getAvatarWithInitials(s, 72, 72, n);
+                                    a && e(a.toDataURL())
+                                }
+                            })).catch((a => {
+                                u(a)
+                            }));
+                            break;
+                        case d.a.GENDER:
+                            f.a.getProfileFriend(A, l.a.ZNS_QUERY).then((a => {
+                                if (a && void 0 !== a.gender && null !== a.gender) return e(a.gender);
+                                u("Not found")
+                            })).catch((a => {
+                                u(a)
+                            }));
+                            break;
+                        case d.a.PHONENUMBER:
+                            f.a.getProfileFriend(A, l.a.ZNS_QUERY).then((a => {
+                                if (a && a.phoneNumber) return e(a.phoneNumber);
+                                u("not found")
+                            })).catch((a => {
+                                u(a)
+                            }));
+                            break;
+                        case d.a.TIME_LOCAL: {
+                            if (!A) return void u("data invalid");
+                            let t = A;
+                            "string" == typeof A && ([, t] = h.g.safeParseJson(A));
+                            let n = "vi";
+                            a && a.extraData && a.extraData.lang && (n = a.extraData.lang || "vi");
+                            const r = E.a.getLocalTimeStr(t, n);
+                            r ? e(r) : u("get time fail");
+                            break
+                        }
+                        case d.a.AVATAR_GROUP:
+                            f.a.getGroupInfo(A, l.a.ZNS_QUERY).then((a => {
+                                if (a) {
+                                    if (a.avatar) return e(a.avatar);
+                                    {
+                                        const a = t("fEM4");
+                                        return e(a.default)
+                                    }
+                                }
+                                u("Not found")
+                            })).catch((a => {
+                                u(a)
+                            }));
+                            break;
+                        case d.a.DISPLAYNAME_GROUP:
+                            f.a.getGroupInfo(A, l.a.ZNS_QUERY).then((a => {
+                                if (a && a.displayName) return e(a.displayName);
+                                u("Not found")
+                            })).catch((a => {
+                                u(a)
+                            }));
+                            break;
+                        case d.a.SEVER_TIME:
+                            e(s.default.getTimeNow());
+                            break;
+                        case d.a.TEXT_DECRYPT: {
+                            const t = n.a.getMessageInfo(a.key);
+                            if (!t) {
+                                u("invalid params cache");
+                                break
+                            }
+                            const [r, s] = h.g.safeParseJson(A);
+                            if (r) {
+                                u("data invalid");
+                                break
+                            }
+                            const {
+                                message: i
+                            } = t;
+                            (new p.a).decrypt(i).then((a => {
+                                const t = a[s.value];
+                                t ? e(t) : u("Decryption failed, cannot find decrypted value")
+                            })).catch((a => a(a)));
+                            break
+                        }
+                        case d.a.BIZ_INFO_CHAT:
+                            E.a.safeRun((() => {
+                                var t, r;
+                                const s = g.c.getBusinessInfoChat(null === (t = n.a.getMessageInfo(a.key)) || void 0 === t || null === (r = t.message) || void 0 === r ? void 0 : r.toUid, A);
+                                e(s.value)
+                            }), (a => u(a)));
+                            break;
+                        case d.a.ZCLOUD_EXPIRED_TIME:
+                            i.a.getInstance().getExpireTime().then((a => {
+                                if (a < 0 || !a) return void u("no data");
+                                if ("timestamp" === A) return void e(a);
+                                const t = new Date(a),
+                                    n = String(t.getDate()).padStart(2, "0"),
+                                    r = String(t.getMonth() + 1).padStart(2, "0"),
+                                    s = t.getFullYear();
+                                e(`${n}/${r}/${s}`)
+                            })).catch((a => u(a)));
+                            break;
+                        case d.a.ZCLOUD_UNDOWNLOADED_RESOURCE:
+                            o.a.getRemainingUsage().then((a => {
+                                e(Object(c.c)(a))
+                            })).catch((a => u(a)))
+                    }
+                }
+            }
+        }
+    }
+]);
+//# sourceMappingURL=../sourcemaps/lazy/54.4a76c54666711559b8d0.js.map

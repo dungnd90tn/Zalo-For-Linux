@@ -1,0 +1,7 @@
+dist
+.claw
+.clawd-todos.json
+unnamed_addrs.txt
+ghidrecomp
+reverse-engineering
+*run_zcall_re.sh
