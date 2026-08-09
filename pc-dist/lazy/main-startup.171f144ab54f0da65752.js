@@ -20077,7 +20077,13 @@
                                 startDecodeTs: performance.now()
                             });
                             const a = await $zFileManager.getFileArrayBuffer(v),
-                                i = new Blob([a]),
+                                i = await (async b => {
+                                    const u = new Uint8Array(b);
+                                    const isJxl = 255 === u[0] && 10 === u[1] || 0 === u[0] && 0 === u[1] && 0 === u[2] && 12 === u[3] && 74 === u[4] && 88 === u[5] && 76 === u[6] && 32 === u[7];
+                                    if (!isJxl) return new Blob([b]);
+                                    const j = await $zFeatures.libjxl.decodeToJpeg(u, 90, {});
+                                    return new Blob([j.data], { type: "image/jpeg" })
+                                })(a),
                                 n = await createImageBitmap(i);
                             f = document.createElement("canvas"), f.width = e.output.width, f.height = e.output.height;
                             const r = f.getContext("2d");

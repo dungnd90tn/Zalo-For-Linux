@@ -6,6 +6,15 @@ function getLib() {
     } else if (process.platform === 'darwin') {
         if (process.arch === 'arm64') nodeAddon = require('./build/darwin_arm64/jxl.node');
         else nodeAddon = require('./build/darwin_x64/jxl.node');
+    } else if (process.platform === 'linux' && process.arch === 'x64') {
+        // Built by generate-jxl-addon.py. Without it every JPEG XL chat photo is
+        // undecodable on Electron 43 (Chromium dropped its JXL decoder in 110),
+        // so the app falls back to a download placeholder that can never resolve.
+        try {
+            nodeAddon = require('./build/linux_x64/jxl.node');
+        } catch (error) {
+            return { error: 'not support' };
+        }
     } else {
         return {
             error: 'not support'
