@@ -41,6 +41,7 @@ Main branch is `latest` (not `main`); CI checks out `latest` explicitly.
 ./build-appimage.sh       # → dist/Zalo-<version>-x86_64.AppImage  (needs wget, unzip, sha256sum)
 ./build-deb.sh            # → dist/zalo_<version>_amd64.deb        (needs dpkg-deb, fakeroot, python3+PIL)
 python3 generate-addon.py # Rebuild the Linux db-cross-v4 addon (needs liblzma-dev, libssl-dev, node + npx)
+python3 generate-jxl-addon.py # Rebuild the Linux zjxl (JPEG XL) addon (needs libjxl-dev, libjpeg-turbo8-dev)
 ```
 
 `build-appimage.sh` caches its downloads in `${XDG_CACHE_HOME:-~/.cache}/zalo-linux-build` and verifies both against pinned SHA-256 values before use. It uses the maintained `AppImage/appimagetool` (a static binary, run with `APPIMAGE_EXTRACT_AND_RUN=1`), so **no libfuse2 is needed to build or to run the result** — the retired AppImageKit build required it, which broke on Ubuntu 24.04+. When upstream rotates its rolling `continuous` asset the pinned digest stops matching; verify the new binary, then re-pin `APPIMAGETOOL_SHA256` or override once with `ZALO_APPIMAGETOOL_SHA256=<sha>`.
@@ -65,7 +66,8 @@ Renderer entry points are HTML files in `pc-dist/`: `index.html` (main), `login.
 
 | Working on Linux | Stubbed / unsupported |
 |---|---|
-| `sqlite3` (`binding/napi-v6-linux-x64/node_sqlite3.node`) | `zcall` (calls), `zimage`, `zjxl`, `mp4thumb`, `file-utils`, `file-utilities`, `zwalker`, `zfile`, `v8-profiles` |
+| `sqlite3` (`binding/napi-v6-linux-x64/node_sqlite3.node`) | `zcall` (calls), `zimage`, `mp4thumb`, `file-utils`, `file-utilities`, `zwalker`, `zfile`, `v8-profiles` |
+| `zjxl` (`build/linux_x64/`, built by `generate-jxl-addon.py`) | |
 | `db-cross-v4` (`prebuilt/linux/electron/x64/`, built by `generate-addon.py`) | |
 | `logger` (pure JS) | |
 
@@ -80,6 +82,19 @@ Exports: `decompressAndDecryptDb_V2` (implemented), `parseBinNet` (implemented T
 **Security invariant:** entry names in the container are attacker-controllable, so every join of an entry name onto the output directory must go through `safe_join_under()` (rejects absolute paths, `..`, and symlinked components; returns error code `-16`). Joining with `fs::path::operator/` directly reintroduces arbitrary file write — an absolute name silently discards the base path. Bounds-check the container header before reading the file count at offset 14; the magic check only guarantees 6 bytes.
 
 Key algorithm details that are easy to get wrong: the AES-256 key is the **first 32 ASCII characters of the uppercased private key used verbatim** (not hex-decoded); CBC with a NULL IV that is **reset to zeros every 65536-byte chunk**; payload is LZMA2/XZ; `ZDB4.0` magic follows decryption.
+
+### zjxl — why chat photos need a JPEG XL decoder
+
+Zalo negotiates **JPEG XL** for message photos: it appends `?jxlstatus=1` and the CDN answers `content-type: image/jxl`, so what lands in `media/<uid>/ZaloDownloads/picture/<conv>/` is `.jxl`, not `.jpg`. Upstream relies on Chromium for the decode — [main.js:142210](main-dist/main.js#L142210) unconditionally calls `appendSwitch("enable-features", "JXL")` — with the native `zjxl` addon as the fallback when Chromium cannot help.
+
+**Chromium removed JPEG XL in 110.** On Electron 22 (Chromium 108) the switch worked; on Electron 43 (Chromium 150) it is a no-op, verified both with and without the flag. Since upstream ships `zjxl` only as Mach-O/PE, Linux had neither decoder and every chat photo collapsed to a download placeholder that re-downloading could never fix.
+
+`generate-jxl-addon.py` builds the missing addon (same embedded-C++ pattern as `generate-addon.py`) exposing the seven entry points the bundles call, with `(error, data, status_code)` callbacks and `SUCCESS_STATUS = 1`. Notes:
+
+- libjxl, its transitive deps and libjpeg-turbo are **copied next to `jxl.node`** and linked with **`DT_RPATH` (`--disable-new-dtags`), not `DT_RUNPATH`** — only the old tag is inherited when resolving a dependency's own dependencies, and `libjxl.so` pulls in `libjxl_cms`/`libhwy`/brotli. With `DT_RUNPATH` those fall back to system copies and the addon breaks on any distro without a matching libjxl. Check with `ldd`: all nine must resolve inside the addon directory.
+- libjpeg is linked **dynamically**; Ubuntu's `libjpeg.a` is built without `-fPIC` and cannot go into a shared object.
+- Fixing the URL layer instead (forcing `jxl.enable_convertible = false` so the client asks for `/gr/jpg/…`) **does not work** and was tried and reverted: the `?jxlstatus=1` URLs are already persisted in the message store, and instrumenting the function that appends `jxlstatus` shows it is never called at runtime.
+- One bundle patch is still needed. `regenImageFromUrlUsingNativeElectron` (around [main-startup:20080](pc-dist/lazy/main-startup.171f144ab54f0da65752.js#L20080)) feeds the raw source bytes to `createImageBitmap`, which throws `DOMException` on JXL; it now sniffs the JXL signature (`ff 0a`, or the `JXL ` ISOBMFF box) and routes those through `$zFeatures.libjxl.decodeToJpeg` first. Without it that path still failed 8 times per conversation.
 
 ## Patching the upstream bundles
 
@@ -152,7 +167,8 @@ Every external artifact this repo fetches is pinned to an exact version **and** 
 | Electron | `start.sh` (`ELECTRON_VERSION` + `ELECTRON_SHA256`) | v43.3.0 | Current supported line; see the upgrade notes above |
 | appimagetool | `build-appimage.sh` | 1.9.1 | Tagged release, not the `continuous` tag whose asset is replaced in place |
 | AppImage runtime | `build-appimage.sh` | 20251108 | appimagetool otherwise downloads it from `continuous` unverified and embeds it |
-| node-addon-api | `generate-addon.py` | 8.9.1 | Current line; fine now that Electron 43 embeds Node 24.18.1 |
+| node-addon-api | `generate-addon.py`, `generate-jxl-addon.py` | 8.9.1 | Current line; fine now that Electron 43 embeds Node 24.18.1 |
+| libjxl / libjpeg-turbo | build host, copied into `zjxl/build/linux_x64/` | whatever the builder has | Vendored into the addon dir, so the shipped bytes are fixed at build time rather than resolved on the user's machine |
 | node-gyp | `generate-addon.py` | 12.4.0 | Build-host only, no ABI effect; 13.x requires Node ^22.22.2 |
 | GitHub Actions | `.github/workflows/build-appimage.yml` | commit SHAs | A mutable `@v4` tag can be repointed at new code by the action's owner |
 
