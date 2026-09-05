@@ -31,6 +31,12 @@ Verified on v43 with an isolated `HOME`: zero unhandled rejections, and all four
 
 Main branch is `latest` (not `main`); CI checks out `latest` explicitly.
 
+### app.relaunch() on Linux (why restarts used to crash)
+
+Every "restart the app" path in the bundles — post-update relaunch, database reset, backup restore, compact-app switch, renderer-crash recovery (`vn()`) — ends in `app.relaunch()`. On Linux, Electron starts the successor through a relauncher helper forked via the zygote, so it inherits **`no_new_privs`**. The successor therefore cannot use the setuid `chrome-sandbox`, falls back to the user-namespace sandbox, and on Ubuntu 24.04+ (`kernel.apparmor_restrict_unprivileged_userns=1`) that is denied — it dies in `ZygoteHostImpl::Init` with **SIGTRAP** (`zygote_host_impl_linux.cc:207 Check failed ... Invalid argument (22)`) before any JS runs, and its stderr is `/dev/null`, so the journal shows nothing but the kernel `traps:` line and an apport report in `/var/crash/`. Launching from a VS Code terminal hides the bug: the `vscode` AppArmor profile grants `userns`.
+
+[bootstrap.js](bootstrap.js) replaces `app.relaunch` on Linux with a spawn **from the browser process** (where `no_new_privs` is clear) through a `/bin/sh` relauncher that waits for the current pid to exit (single-instance lock) and then `exec`s Electron. Two details: upstream's `relaunch({args})` assumes a packaged app whose executable *is* the app, so `args` replaces argv wholesale — the shim keeps the launcher's switches and re-inserts the app directory; and the successor's stdio goes to `~/.config/ZaloData/relaunch.log` (0600, truncated each relaunch) so a failed restart leaves a trace. Test it from the desktop context, not a terminal: `systemd-run --user <electron> --ozone-platform=x11 <appdir>`.
+
 ## Commands
 
 ```bash

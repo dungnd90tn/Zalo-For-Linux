@@ -250,6 +250,8 @@ Note that the ~300k lines of minified vendor bundles in `main-dist/` and `pc-dis
 
 **"It asks me to log in every time."** Zalo encrypts its session with Electron `safeStorage`, which on Linux means Chromium OSCrypt backed by your keyring. If the keyring is not reachable — a bare TTY, an SSH session, a desktop where gnome-keyring never unlocked — Chromium falls back to a hardcoded key and the stored session can no longer be decrypted. Make sure `gnome-keyring` or `kwallet` is running; the `.deb` depends on `libsecret-1-0` for this reason.
 
+**Zalo restarts itself and dies immediately** (an apport report in `/var/crash/` with `SIGTRAP`, and `traps: electron ... trap int3` in the journal). Fixed in v1.3.3. Electron's own `app.relaunch()` starts the new instance with `no_new_privs` set, which disables the setuid sandbox helper; on Ubuntu 24.04+ the user-namespace fallback is blocked by AppArmor, so the relaunched instance had no usable sandbox and aborted. The launcher now relaunches from the browser process instead, and the successor's output is kept in `~/.config/ZaloData/relaunch.log`.
+
 **The screenshot permission prompt keeps appearing.** The first capture asks through the desktop portal; grant it and the answer is remembered. `xdg-desktop-portal` and its backend for your desktop need to be installed.
 
 ## Contributing
