@@ -1,0 +1,56 @@
+// Independent offline oracle: evaluates exact request methods from our own bundle.
+// No network, credentials, private profiles or random production key material.
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+const assert = require('assert/strict');
+const source = fs.readFileSync(path.resolve(__dirname, '../../../../pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js'), 'utf8');
+const unique = marker => { const first=source.indexOf(marker); assert(first>=0 && first===source.lastIndexOf(marker), 'ambiguous source anchor'); return first; };
+const start=unique('var C = class {\n                    constructor(e, t) {\n                        this._reqId');
+const end=unique('},\n                b = a("Qtro"),');
+const init={SUBMIT_BUNDLE:540,GET_BUNDLE:541,SUBMIT_PREKEYS:542,INIT_SESSION:543,ACK_INIT_SESSION:544,DELETE_KEY:547,CHECK_COMPATIBLE:560,INIT_SESSION_GROUP:561,CHECK_COMPATIBLE_GROUP:562,GET_LIST_USER_E2EE:563,GET_KEY_ID:564};
+const context={o:{i:{DeviceIds:{MOBILE:0,WEB:1,PC:2},SignalCommands:{INIT:init}}},s:{a:Object.assign},E:{a:class {}},p:{p(){}},l:{default:{e2ee:{debug:{}}}}};
+const Manager=vm.runInNewContext('('+source.slice(start+'var C = '.length,end+1)+')',context,{timeout:1000});
+const manager=new Manager({}, '11');
+manager._Logger={zsymb(){}};
+const requests=[];
+manager._requestSocketAsync=async(reqId,request)=>{requests.push(JSON.parse(JSON.stringify(request)));return {error_code:0,data:{reqId,data:{err:0,keys:[],keyId:1234,submitTs:1700000000000,hasMore:false,threads:[],uids:[],waitUids:[],pendingUids:[]}}};};
+const pubkey=n=>Buffer.from([5,...Array.from({length:32},(_,i)=>(i+n)%256)]).toString('base64');
+const signature=Buffer.from(Array.from({length:64},(_,i)=>i+1)).toString('base64');
+const personal=type=>Buffer.from([type,0x33,...Array.from({length:72},(_,i)=>i+1)]).toString('base64');
+const group=Buffer.from([4,0x33,...Array.from({length:96},(_,i)=>i+1)]).toString('base64');
+const bundle={registrationId:1234,identityKey:pubkey(1),signedPreKey:{keyId:1235,publicKey:pubkey(2),signature},preKeys:[{keyId:1237,publicKey:pubkey(3)}]};
+(async()=>{
+ await manager._submitBundle(bundle,true);
+ await manager.getBundle('22',-1,{isReinit:true,msgInfoNoti:false,isAutoUpgrade:true});
+ await manager.submitOpKeys(bundle.preKeys,1234,2);
+ await manager.sendInitSession('22',[{deviceId:0,data:personal(3)}],true);
+ await manager.sendAckSession('22',0,{data:personal(1)},1,1700000000000);
+ await manager.sendInitSessionGroup('22',0,'33',personal(1),2,1700000000000);
+ await manager.getMyKeyId();
+ await manager.checkCompatible('22');
+ await manager.checkCompatibleGroup('33',['22','44'],true);
+ await manager.getListUserE2eeWithPagination();
+ await manager.getListUserE2eeWithPagination({lastId:'100',pageNo:1});
+ await manager.deleteKey(1234,['22'],1700000000000);
+ await manager.deleteGroupKeys(1234,['33'],1700000000000);
+ // Exact original SMS outer formatter. AES is replaced by an observation hook;
+ // this fixture checks its pre-encryption JSON shape, not cryptographic safety.
+ const smsStart=unique('static sendMsgE2ee(e, t, n, s, o, r, l, c = null, d = 3, A = 0) {');
+ const smsEnd=source.indexOf('                static buildParams(',smsStart);assert(smsEnd>smsStart);
+ const method=source.slice(smsStart,smsEnd).trim().replace(/^static /,'');
+ const api=vm.runInNewContext('({'+method+'})',{a:{a:Object.assign},i:{default:{encodeAES:x=>x}},_:{a:{CHAT_E2EE:'chat_e2e',CHAT_E2EE_GROUP:'group_e2e'}}},{timeout:1000});
+ api._getCommonParams=()=> 'zpw_ver=681&zpw_type=24';
+ const sms=[];
+ api._postSendMsg=(route,body,retry,metric)=>{sms.push({route,parameters:JSON.parse(decodeURIComponent(body.slice(7))),metric});};
+ const ext={version:0,compat_version:0,iid:2345,sender_iid:1234};
+ const personalRecords=[{message:personal(1),toId:'22',platform:0,e2eeExt:JSON.stringify(ext)}];
+ const groupRecords=[{message:group,grid:'33',clientId:1700000000001,visibility:0,e2eeExt:JSON.stringify({version:0,compat_version:0})}];
+ api.sendMsgE2ee('sms',personalRecords,false,'22',1700000000001,0,16000);
+ api.sendMsgE2ee('sms',groupRecords,true,'33',1700000000001,0,16100);
+ const output={provenance:'exact own-bundle methods; public synthetic bytes; NOT cryptographically valid keys/signatures/ciphertexts',bundle,personal:personal(1),prekey:personal(3),group,requests,sms};
+ const text=JSON.stringify(output,null,2)+'\n';
+ if(process.argv.includes('--write'))fs.writeFileSync(path.join(__dirname,'wire.json'),text);
+ else assert.equal(fs.readFileSync(path.join(__dirname,'wire.json'),'utf8'),text,'fixture differs from independently executed original methods');
+ console.log('Original Signal request/SMS fixtures match: '+requests.length+' requests, '+sms.length+' SMS envelopes');
+})().catch(error=>{console.error(error.message);process.exitCode=1;});

@@ -2,6 +2,7 @@
 //! bundle evidence. No network transport or trusted-device authentication is
 //! enabled here. See PROTOCOL_QR.md for evidence and explicit gaps.
 
+use super::client::ClientType;
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -58,6 +59,7 @@ impl ResponseCipher {
 /// Frozen bundle API facts, not a claim about today's server configuration.
 /// Caller supplies a fresh device ID and nonce; neither is read from Electron.
 pub struct QrRequestInput<'a> {
+    pub client_type: ClientType,
     pub imei: &'a str,
     pub computer_name: &'a str,
     pub language: &'a str,
@@ -107,9 +109,14 @@ fn create_request_mode(
         self_g: u8::from(trusted),
         qr_form: u8::from(trusted),
     })?;
-    let (mut params, key) =
-        encrypt_parameters(input.imei, input.first_launch_ms, input.nonce_hex, &payload)?;
-    params.insert("type".into(), "30".into());
+    let (mut params, key) = encrypt_parameters(
+        input.client_type,
+        input.imei,
+        input.first_launch_ms,
+        input.nonce_hex,
+        &payload,
+    )?;
+    params.insert("type".into(), input.client_type.api_type().into());
     params.insert("client_version".into(), "681".into());
     let signature = sign_parameters("reqqr", &params);
     params.insert("signkey".into(), signature);
@@ -128,6 +135,7 @@ fn create_request_mode(
 }
 
 pub(super) fn encrypt_parameters(
+    client_type: ClientType,
     imei: &str,
     milliseconds: u64,
     nonce: &str,
@@ -136,7 +144,7 @@ pub(super) fn encrypt_parameters(
     if !(6..=12).contains(&nonce.len()) || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("QR nonce must contain 6–12 hexadecimal characters");
     }
-    let device = format!("30,{imei},{milliseconds}");
+    let device = format!("{},{imei},{milliseconds}", client_type.api_type());
     let zcid = hex_upper(
         &cbc::Encryptor::<aes::Aes256>::new(PUBLIC_PARAMETER_KEY.into(), (&ZERO_IV).into())
             .encrypt_padded_vec_mut::<Pkcs7>(device.as_bytes()),
@@ -669,6 +677,7 @@ mod driver_tests {
     }
     fn request_input() -> QrRequestInput<'static> {
         QrRequestInput {
+            client_type: ClientType::Legacy30,
             imei: "fixture-imei",
             computer_name: "Fixture Linux",
             language: "vi",
@@ -798,6 +807,7 @@ mod tests {
         // Independently generated with Node's node:crypto AES-CBC implementation;
         // constants and recipe are recorded in PROTOCOL_QR.md.
         let (mut params, cipher) = encrypt_parameters(
+            ClientType::Legacy30,
             "fixture-imei",
             1700000000123,
             "abcdef123456",
@@ -847,6 +857,7 @@ mod tests {
     #[test]
     fn request_is_bounded_cookie_aware_and_encrypted() {
         let (request, _) = create_request(&QrRequestInput {
+            client_type: ClientType::Legacy30,
             imei: "fixture-imei",
             computer_name: "Fixture Linux",
             language: "vi",

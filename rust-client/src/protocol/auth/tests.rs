@@ -33,6 +33,7 @@ fn saved() -> StoredSession {
     ))
     .unwrap();
     StoredSession {
+        client_type: ClientType::PcLinux24,
         account_id: "11".into(),
         display_name: "Synthetic account".into(),
         imei: "native-fixture".into(),
@@ -458,9 +459,10 @@ async fn real_trust_worker_completes_primary_linking_and_independently_signed_co
     )
     .unwrap();
     let (mut http, server) = bootstrap_tls_fixture("11");
-    let info = bootstrap_authenticated(&mut http, "native-fixture", &pending)
-        .await
-        .unwrap();
+    let info =
+        bootstrap_authenticated(&mut http, "native-fixture", &pending, ClientType::PcLinux24)
+            .await
+            .unwrap();
     server.join().unwrap();
     let mut saved = saved();
     saved.proof.trusted_mut().signed_list = list.encoded.clone();
@@ -542,7 +544,7 @@ async fn real_trust_worker_completes_primary_linking_and_independently_signed_co
     .is_err());
     let (mut http, server) = bootstrap_tls_fixture("12");
     assert_eq!(
-        bootstrap_authenticated(&mut http, "native-fixture", &pending)
+        bootstrap_authenticated(&mut http, "native-fixture", &pending, ClientType::PcLinux24)
             .await
             .err(),
         Some(LoginFailure::AccountMismatch)
@@ -692,6 +694,7 @@ async fn public_unauthenticated_startup_probe() {
         .data_dir
         .join(session::AUTH_STATE_FILE)
         .exists());
+    assert!(!profile.paths.data_dir.join(".account-owner.json").exists());
     drop(profile);
     let deadline = Instant::now() + Duration::from_secs(2);
     while weak.upgrade().is_some() && Instant::now() < deadline {
@@ -706,6 +709,19 @@ async fn public_unauthenticated_startup_probe() {
 }
 
 fn bootstrap_tls_fixture(uid: &'static str) -> (HttpAdapter, thread::JoinHandle<()>) {
+    bootstrap_tls_fixture_reply(uid, None)
+}
+fn bootstrap_tls_fixture_reply(
+    uid: &'static str,
+    response: Option<Value>,
+) -> (HttpAdapter, thread::JoinHandle<()>) {
+    let (address, server) = bootstrap_tls_server_reply(uid, response);
+    (HttpAdapter::local_test_adapter(address), server)
+}
+fn bootstrap_tls_server_reply(
+    uid: &'static str,
+    response: Option<Value>,
+) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
     use rustls::{
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
         ServerConfig, ServerConnection, StreamOwned,
@@ -757,6 +773,12 @@ fn bootstrap_tls_fixture(uid: &'static str) -> (HttpAdapter, thread::JoinHandle<
             .unwrap();
         let query = path.split_once('?').unwrap().1;
         assert!(path.starts_with("/api/login/getLoginInfo?"));
+        assert!(request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("user-agent: ZaloPC-linux-24v681")));
+        let params: std::collections::BTreeMap<_, _> =
+            url::form_urlencoded::parse(query.as_bytes()).collect();
+        assert_eq!(params["type"], "24");
         let mut child = Command::new("node")
             .arg(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -771,7 +793,12 @@ fn bootstrap_tls_fixture(uid: &'static str) -> (HttpAdapter, thread::JoinHandle<
             .stdin
             .take()
             .unwrap()
-            .write_all(&serde_json::to_vec(&serde_json::json!({"query":query,"uid":uid})).unwrap())
+            .write_all(
+                &serde_json::to_vec(
+                    &serde_json::json!({"query":query,"uid":uid,"response":response}),
+                )
+                .unwrap(),
+            )
             .unwrap();
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
@@ -784,7 +811,7 @@ fn bootstrap_tls_fixture(uid: &'static str) -> (HttpAdapter, thread::JoinHandle<
         tls.write_all(&output.stdout).unwrap();
         tls.flush().unwrap();
     });
-    (HttpAdapter::local_test_adapter(address), server)
+    (address, server)
 }
 
 #[test]
@@ -845,6 +872,13 @@ async fn phone_approved_actual_tls_flow_commits_exact_assurance_without_loading_
     assert!(qr);
     assert_eq!(ready.account_id(), "11");
     assert_eq!(ready.assurance(), session::AuthAssurance::PhoneApproved);
+    assert!(ready.config().services.contains_key("chat"));
+    assert!(ready.config().services.contains_key("group"));
+    assert_eq!(ready.config().services.len(), 3);
+    assert_eq!(
+        ready.config().services["profile"][0].host_str(),
+        Some("profile-wpa.zaloapp.com")
+    );
     let record = AuthRecord::load(&profile).unwrap().unwrap();
     assert!(record.replay.is_empty());
     assert!(matches!(
@@ -934,6 +968,10 @@ async fn advertised_trusted_mode_never_downgrades_after_missing_primary_proof() 
     .is_err());
 }
 fn phone_tls_fixture(trusted: bool) -> (HttpAdapter, thread::JoinHandle<()>) {
+    let (address, server) = phone_tls_server(trusted);
+    (HttpAdapter::local_test_adapter(address), server)
+}
+fn phone_tls_server(trusted: bool) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
     use rustls::{
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
         ServerConfig, ServerConnection, StreamOwned,
@@ -1009,6 +1047,20 @@ fn phone_tls_fixture(trusted: bool) -> (HttpAdapter, thread::JoinHandle<()>) {
                 .nth(1)
                 .unwrap();
             assert_eq!(path.split('?').next().unwrap(), route);
+            assert!(request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("user-agent: ZaloPC-linux-24v681")));
+            if route.starts_with("/api/login/") {
+                let parsed = Url::parse(&format!("https://wpa.zaloapp.com{path}")).unwrap();
+                assert_eq!(
+                    parsed
+                        .query_pairs()
+                        .find(|(key, _)| key == "type")
+                        .unwrap()
+                        .1,
+                    "24"
+                );
+            }
             let data = match route {
                 "/api/login/getServerInfo" => {
                     serde_json::json!({"server_time":now_ms().unwrap()/1000,"setttings":{"authen":{"encryption":{"enable":1},"trusted_device":{"self_g":u8::from(trusted),"qr_format_trust_device":u8::from(trusted)}}}})
@@ -1066,7 +1118,7 @@ fn phone_tls_fixture(trusted: bool) -> (HttpAdapter, thread::JoinHandle<()>) {
             tls.flush().unwrap();
         }
     });
-    (HttpAdapter::local_test_adapter(address), server)
+    (address, server)
 }
 
 #[test]
@@ -1108,4 +1160,272 @@ fn polling_policy_is_exact_and_does_not_expand_authentication_origins() {
     ] {
         assert!(qr::validate_poll_url(text).is_err());
     }
+}
+
+#[tokio::test]
+async fn bootstrap_failures_preserve_sanitized_stage_and_code_without_false_server_rejection() {
+    use bootstrap::{BootstrapError as E, BootstrapFailure as F, BootstrapStage as S};
+    let pending = PendingCookies::from_confirmation(
+        &serde_json::json!({"uid":"11","dkey":"synthetic-storage","zpw_sek":"synthetic-cookie"}),
+    )
+    .unwrap();
+    let unsafe_config = serde_json::json!({"error_code":0,"data":{"uid":"11","dkey":"synthetic-storage","zpw_enk":"AAECAwQFBgcICQoLDA0ODw==","zpw_service_map_v3":{"chat":["http://chat-wpa.zaloapp.com/private-fixture-token"]}}});
+    let (mut http, server) = bootstrap_tls_fixture_reply("11", Some(unsafe_config));
+    let failure =
+        bootstrap_authenticated(&mut http, "native-fixture", &pending, ClientType::PcLinux24)
+            .await
+            .err()
+            .unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        failure,
+        LoginFailure::Bootstrap(F {
+            stage: S::ServiceConfiguration,
+            category: E::UnsafeEndpoint
+        })
+    );
+    let text = failure.to_string();
+    assert!(text.contains("bootstrap/service-config/unsafe-endpoint"));
+    assert!(!text.contains("Máy chủ từ chối"));
+    assert!(!text.contains("zaloapp"));
+    assert!(!text.contains("private-fixture-token"));
+    let (mut http, server) = bootstrap_tls_fixture_reply(
+        "11",
+        Some(serde_json::json!({"error_code":600,"error_message":"secret-fixture-cookie-and-url"})),
+    );
+    let failure =
+        bootstrap_authenticated(&mut http, "native-fixture", &pending, ClientType::PcLinux24)
+            .await
+            .err()
+            .unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        failure,
+        LoginFailure::Bootstrap(F {
+            stage: S::InnerEnvelope,
+            category: E::AuthenticationRejected(600)
+        })
+    );
+    assert!(failure
+        .to_string()
+        .contains("authentication-rejected code=600"));
+    assert!(!format!("{failure:?} {failure}").contains("secret-fixture"));
+    let (mut http, server) = bootstrap_tls_fixture_reply(
+        "11",
+        Some(
+            serde_json::json!({"error_code":0,"data":{"uid":"11","dkey":"synthetic-storage","zpw_enk":"invalid-fixture-secret"}}),
+        ),
+    );
+    let failure =
+        bootstrap_authenticated(&mut http, "native-fixture", &pending, ClientType::PcLinux24)
+            .await
+            .err()
+            .unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        failure,
+        LoginFailure::Bootstrap(F {
+            stage: S::SessionKey,
+            category: E::Malformed
+        })
+    );
+    assert!(!failure.to_string().contains("invalid-fixture"));
+}
+
+#[tokio::test]
+async fn actual_controller_new_linux_identity_survives_atomic_commit_and_verified_resume() {
+    let scratch = Scratch::new();
+    let profile = Arc::new(Profile::at_root(&scratch.0, "controller-linux24").unwrap());
+    let (address, server) = phone_tls_server(false);
+    let mut controller = LoginController::with_transport(
+        profile.clone(),
+        None,
+        repaint(),
+        AuthTransport::Local(address),
+    )
+    .unwrap();
+    let generation = controller.begin().unwrap();
+    let mut saw_qr = false;
+    let session = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match controller.events.recv().await.unwrap() {
+                LoginEvent::Qr {
+                    generation: g,
+                    pixels,
+                } if g == generation => {
+                    saw_qr = true;
+                    assert_eq!(pixels.rgba.len(), 16);
+                }
+                LoginEvent::Ready {
+                    generation: g,
+                    session,
+                } if g == generation => break session,
+                LoginEvent::Failed { error, .. } => panic!("synthetic controller failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    server.join().unwrap();
+    assert!(saw_qr);
+    assert_eq!(session.client_type(), ClientType::PcLinux24);
+    let path = profile.paths.data_dir.join(session::AUTH_STATE_FILE);
+    let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(value["version"], 2);
+    assert_eq!(value["active"]["client_type"], 24);
+    drop(session);
+    drop(controller);
+    let (address, server) = bootstrap_tls_server_reply("11", None);
+    let mut controller = LoginController::with_transport(
+        profile.clone(),
+        None,
+        repaint(),
+        AuthTransport::Local(address),
+    )
+    .unwrap();
+    let generation = controller.resume().unwrap();
+    let session = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match controller.events.recv().await.unwrap() {
+                LoginEvent::Ready {
+                    generation: g,
+                    session,
+                } if g == generation => break session,
+                LoginEvent::Failed { error, .. } => {
+                    panic!("synthetic desktop resume failed: {error}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(session.client_type(), ClientType::PcLinux24);
+    assert_eq!(session.account_id(), "11");
+    assert_eq!(
+        AuthRecord::load(&profile)
+            .unwrap()
+            .unwrap()
+            .active
+            .unwrap()
+            .client_type,
+        ClientType::PcLinux24
+    );
+}
+#[tokio::test]
+async fn legacy_missing_client_type_requires_approval_without_network_or_any_disk_mutation() {
+    use std::net::TcpListener;
+    let scratch = Scratch::new();
+    let profile = Arc::new(Profile::at_root(&scratch.0, "legacy30").unwrap());
+    let mut record = AuthRecord::empty("11");
+    let mut active = saved();
+    active.proof = SessionProof::PhoneApproved;
+    record.active = Some(active);
+    record
+        .replay
+        .insert("synthetic-master".into(), 1700000000000);
+    let mut value = serde_json::to_value(&record).unwrap();
+    value["version"] = Value::from(1);
+    value["active"]
+        .as_object_mut()
+        .unwrap()
+        .remove("client_type");
+    let path = profile.paths.data_dir.join(session::AUTH_STATE_FILE);
+    crate::profile::atomic_write_secret(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+    let before = fs::read(&path).unwrap();
+    let db_path = profile.paths.data_dir.join("messages.sqlite");
+    {
+        let mut store = crate::store::MessageStore::open(&db_path).unwrap();
+        store
+            .insert_batch(&[crate::domain::Message {
+                account_id: "11".into(),
+                thread_id: "d:12".into(),
+                id: "kept".into(),
+                sender: "12".into(),
+                text: "Preserved history".into(),
+                sent_at_ms: 1,
+            }])
+            .unwrap();
+    }
+    let history_before = fs::read(&db_path).unwrap();
+    let loaded = AuthRecord::load(&profile).unwrap().unwrap();
+    assert_eq!(
+        loaded.active.as_ref().unwrap().client_type,
+        ClientType::Legacy30
+    );
+    assert!(VerifiedSession::from_committed(
+        loaded.active.as_ref().unwrap(),
+        config(),
+        profile.clone()
+    )
+    .is_err());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut controller = LoginController::with_transport(
+        profile.clone(),
+        None,
+        repaint(),
+        AuthTransport::Local(listener.local_addr().unwrap()),
+    )
+    .unwrap();
+    let generation = controller.resume().unwrap();
+    let failure = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(LoginEvent::Failed {
+                generation: g,
+                error,
+            }) = controller.events.recv().await
+            {
+                if g == generation {
+                    break error;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failure, LoginFailure::FreshApprovalRequired);
+    assert_eq!(
+        listener.accept().err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(&db_path).unwrap(), history_before);
+    assert_eq!(
+        AuthRecord::load(&profile).unwrap().unwrap().replay,
+        record.replay
+    );
+    assert!(profile.check_account("12").is_err());
+    assert!(failure.to_string().contains("Lịch sử đã lưu vẫn được giữ"));
+}
+#[test]
+fn new_record_requires_explicit_supported_type_but_v1_defaults_only_to_legacy() {
+    let scratch = Scratch::new();
+    let profile = Profile::at_root(&scratch.0, "record-types").unwrap();
+    let mut record = AuthRecord::empty("11");
+    record.active = Some(saved());
+    let path = profile.paths.data_dir.join(session::AUTH_STATE_FILE);
+    let mut value = serde_json::to_value(&record).unwrap();
+    value["active"]
+        .as_object_mut()
+        .unwrap()
+        .remove("client_type");
+    crate::profile::atomic_write_secret(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(AuthRecord::load(&profile).is_err());
+    value["active"]["client_type"] = Value::from(25);
+    crate::profile::atomic_write_secret(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(AuthRecord::load(&profile).is_err());
+    value["active"]["client_type"] = Value::from(24);
+    crate::profile::atomic_write_secret(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(
+        AuthRecord::load(&profile)
+            .unwrap()
+            .unwrap()
+            .active
+            .unwrap()
+            .client_type,
+        ClientType::PcLinux24
+    );
 }

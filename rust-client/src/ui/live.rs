@@ -31,9 +31,17 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub worker: Option<LiveWorker>,
     #[cfg(feature = "messaging")]
+    session: Option<Arc<crate::protocol::session::VerifiedSession>>,
+    #[cfg(feature = "messaging")]
+    context: egui::Context,
+    #[cfg(feature = "messaging")]
+    reason: Option<String>,
+    #[cfg(feature = "messaging")]
     pub connection: LiveConnection,
     #[cfg(feature = "messaging")]
     pub delivery: super::delivery::DeliveryBook,
+    #[cfg(feature = "messaging")]
+    pub directory: super::directory::DirectoryView,
     #[cfg(feature = "messaging")]
     pub review_dialog: bool,
     #[cfg(feature = "messaging")]
@@ -63,9 +71,17 @@ impl LiveState {
             #[cfg(feature = "messaging")]
             worker: None,
             #[cfg(feature = "messaging")]
+            session: None,
+            #[cfg(feature = "messaging")]
+            context: ctx.clone(),
+            #[cfg(feature = "messaging")]
+            reason: None,
+            #[cfg(feature = "messaging")]
             connection: LiveConnection::Offline,
             #[cfg(feature = "messaging")]
             delivery: Default::default(),
+            #[cfg(feature = "messaging")]
+            directory: Default::default(),
             #[cfg(feature = "messaging")]
             review_dialog: false,
             #[cfg(feature = "messaging")]
@@ -101,6 +117,83 @@ impl LiveState {
         }
     }
 
+    #[cfg(feature = "messaging")]
+    pub(super) fn ensure_worker(&mut self, profile: Arc<Profile>) -> bool {
+        if self.worker.is_some() {
+            return true;
+        }
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        let repaint = self.context.clone();
+        match LiveWorker::start(
+            profile,
+            session.clone(),
+            Arc::new(move || repaint.request_repaint()),
+        ) {
+            Ok(worker) => {
+                self.worker = Some(worker);
+                self.connection = LiveConnection::Connecting;
+                self.reason = None;
+                true
+            }
+            Err(_) => {
+                self.connection = LiveConnection::Offline;
+                self.reason = Some(
+                    "Chưa khởi tạo được gửi nhận. Hãy thử kết nối lại; bản nháp được giữ nguyên."
+                        .into(),
+                );
+                false
+            }
+        }
+    }
+
+    #[cfg(feature = "messaging")]
+    fn observe_status(&mut self, event: &LiveEvent) {
+        match event {
+            LiveEvent::Connection { state, .. } => {
+                self.connection = *state;
+                if *state == LiveConnection::Online {
+                    self.reason = None;
+                }
+            }
+            LiveEvent::Diagnostic { diagnostic, .. } => self.reason = Some(diagnostic.to_string()),
+            LiveEvent::Fault { error, .. } => {
+                if self.connection != LiveConnection::Expired {
+                    self.connection = LiveConnection::Offline;
+                }
+                // A terminal generic fault must not hide the preceding typed diagnostic.
+                self.reason.get_or_insert_with(|| error.clone());
+                self.delivery.interrupted();
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "messaging")]
+    fn worker_closed(&mut self, model: &mut Model, drafts: &mut DraftBook, latest_page: bool) {
+        let reason = self
+            .reason
+            .get_or_insert_with(|| {
+                "Tiến trình gửi nhận đã dừng. Chọn Kết nối lại; bản nháp được giữ nguyên.".into()
+            })
+            .clone();
+        if let Some(account) = &self.account {
+            let event = LiveEvent::Fault {
+                account_id: account.id.clone(),
+                error: reason,
+            };
+            drafts.apply_live(&event, &account.id);
+            model.apply_live(event, &account.id, latest_page);
+        }
+        self.delivery.interrupted();
+        self.directory.worker_closed();
+        if self.connection != LiveConnection::Expired {
+            self.connection = LiveConnection::Offline;
+        }
+        self.worker = None;
+    }
+
     pub fn connection_label(&self) -> &'static str {
         #[cfg(feature = "messaging")]
         return match self.connection {
@@ -129,6 +222,53 @@ impl LiveState {
 }
 
 impl NativeApp {
+    #[cfg(feature = "messaging")]
+    pub(super) fn live_connection_notice(&mut self, ctx: &egui::Context) {
+        let Some(state) = &mut self.live else {
+            return;
+        };
+        if state.account.is_none() || state.connection == LiveConnection::Online {
+            return;
+        }
+        let mut action = None;
+        egui::TopBottomPanel::top("live_connection_notice")
+            .min_height(90.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(super::visuals::PALE_BLUE)
+                    .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
+            )
+            .show(ctx, |ui| {
+                action = recovery_controls(
+                    ui,
+                    state.connection,
+                    state.worker.is_some(),
+                    state.reason.as_deref(),
+                );
+            });
+        match action {
+            Some(RecoveryAction::Retry) => {
+                if let Some(worker) = &state.worker {
+                    match worker.submit(LiveCommand::Reconnect) {
+                        Ok(()) => {
+                            state.connection = LiveConnection::Reconnecting;
+                            state.reason = None;
+                        }
+                        Err(error) => self.model.status = error.to_string(),
+                    }
+                } else {
+                    state.ensure_worker(self._profile.clone());
+                }
+            }
+            Some(RecoveryAction::Open) => {
+                state.ensure_worker(self._profile.clone());
+                state.open_dialog = true;
+            }
+            Some(RecoveryAction::Logout) => state.logout_dialog = true,
+            None => {}
+        }
+    }
+
     pub(super) fn live_information(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(state) = self.live.as_mut() else {
             return false;
@@ -285,21 +425,9 @@ impl NativeApp {
                     });
                     #[cfg(feature = "messaging")]
                     {
-                        let repaint = ctx.clone();
-                        match LiveWorker::start(
-                            self._profile.clone(),
-                            session,
-                            Arc::new(move || repaint.request_repaint()),
-                        ) {
-                            Ok(worker) => {
-                                state.worker = Some(worker);
-                                state.connection = LiveConnection::Connecting;
-                            }
-                            Err(_) => {
-                                state.connection = LiveConnection::Offline;
-                                self.model.status = "Đã đăng nhập nhưng chưa khởi tạo được gửi nhận. Hãy đăng xuất và thử lại.".into();
-                            }
-                        }
+                        state.directory = Default::default();
+                        state.session = Some(session);
+                        state.ensure_worker(self._profile.clone());
                     }
                 }
                 LoginEvent::SignedOut { generation } => {
@@ -311,8 +439,11 @@ impl NativeApp {
                     #[cfg(feature = "messaging")]
                     {
                         state.worker = None;
+                        state.session = None;
+                        state.reason = None;
                         state.connection = LiveConnection::Offline;
                         state.delivery = Default::default();
+                        state.directory = Default::default();
                         state.review_dialog = false;
                     }
                     self.model = Model::default();
@@ -324,6 +455,8 @@ impl NativeApp {
             }
         }
         #[cfg(feature = "messaging")]
+        state.directory.poll_request(state.worker.as_ref(), ctx);
+        #[cfg(feature = "messaging")]
         while remaining > 0 && Instant::now() < deadline {
             let event = state
                 .worker
@@ -333,18 +466,14 @@ impl NativeApp {
                 break;
             };
             remaining -= 1;
-            let Some(account) = &state.account else {
+            let Some(account_id) = state.account.as_ref().map(|account| account.id.clone()) else {
                 continue;
             };
-            if event.account_id() != account.id {
+            if event.account_id() != account_id {
                 continue;
             }
-            if let LiveEvent::Connection {
-                state: connection, ..
-            } = &event
-            {
-                state.connection = *connection;
-            }
+            state.directory.apply(&event, &account_id, ctx);
+            state.observe_status(&event);
             match &event {
                 LiveEvent::SendFailed {
                     thread,
@@ -362,7 +491,6 @@ impl NativeApp {
                 LiveEvent::Sent {
                     thread, request_id, ..
                 } => state.delivery.sent(thread, *request_id),
-                LiveEvent::Fault { .. } => state.connection = LiveConnection::Offline,
                 _ => {}
             }
             let opened = match &event {
@@ -373,8 +501,8 @@ impl NativeApp {
                 } if *generation == self.model.generation => Some(conversation.id.clone()),
                 _ => None,
             };
-            self.drafts.apply_live(&event, &account.id);
-            self.model.apply_live(event, &account.id, self.latest_page);
+            self.drafts.apply_live(&event, &account_id);
+            self.model.apply_live(event, &account_id, self.latest_page);
             if let Some(thread) = opened {
                 let _ = self.drafts.select(&thread);
                 if let Some(worker) = &state.worker {
@@ -410,17 +538,7 @@ impl NativeApp {
             .as_ref()
             .is_some_and(|worker| worker.events.is_closed() && worker.events.is_empty())
         {
-            if let Some(account) = &state.account {
-                let event = LiveEvent::Fault {
-                    account_id: account.id.clone(),
-                    error: "Tiến trình gửi nhận đã dừng. Bản nháp được giữ lại; hãy đăng nhập lại."
-                        .into(),
-                };
-                self.drafts.apply_live(&event, &account.id);
-                self.model.apply_live(event, &account.id, self.latest_page);
-            }
-            state.connection = LiveConnection::Offline;
-            state.worker = None;
+            state.worker_closed(&mut self.model, &mut self.drafts, self.latest_page);
         }
         if !state.controller.events.is_empty() {
             ctx.request_repaint();
@@ -458,8 +576,11 @@ impl NativeApp {
                         #[cfg(feature = "messaging")]
                         {
                             state.worker = None;
+                            state.session = None;
+                            state.reason = None;
                             state.connection = LiveConnection::Offline;
                             state.delivery = Default::default();
+                            state.directory = Default::default();
                             state.review_dialog = false;
                         }
                         self.model = Model::default();
@@ -472,14 +593,16 @@ impl NativeApp {
             state.logout_dialog = open;
         }
         #[cfg(feature = "messaging")]
-        if state.open_dialog {
-            show_target_dialog(
+        if state.open_dialog
+            && show_target_dialog(
                 state,
                 &mut self.model,
                 &mut self.drafts,
                 &mut self.latest_page,
                 ctx,
-            );
+            )
+        {
+            self.compact_list = false;
         }
         #[cfg(feature = "messaging")]
         if state.review_dialog {
@@ -521,7 +644,8 @@ fn show_target_dialog(
     drafts: &mut DraftBook,
     latest: &mut bool,
     ctx: &egui::Context,
-) {
+) -> bool {
+    let mut accepted = false;
     let mut open = state.open_dialog;
     let mut requested = false;
     egui::Window::new("Mở hội thoại")
@@ -556,6 +680,13 @@ fn show_target_dialog(
                 state.target.trim(),
             )
             .is_ok();
+            if !state.target.trim().is_empty() && !valid {
+                ui.label(
+                    egui::RichText::new("ID chỉ gồm chữ số và không bắt đầu bằng 0.")
+                        .size(11.0)
+                        .color(super::visuals::MUTED),
+                );
+            }
             if ui
                 .add_enabled(
                     valid && state.worker.is_some(),
@@ -592,6 +723,7 @@ fn show_target_dialog(
                         state.delivery.edited(&thread, &drafts.active.text);
                         model.pending = true;
                         *latest = true;
+                        accepted = true;
                         open = false;
                     }
                     Err(error) => model.status = error.to_string(),
@@ -600,4 +732,587 @@ fn show_target_dialog(
         }
     }
     state.open_dialog = open;
+    accepted
+}
+
+#[cfg(feature = "messaging")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryAction {
+    Retry,
+    Open,
+    Logout,
+}
+
+/// The same recovery controls remain reachable when the compact sidebar is hidden.
+#[cfg(feature = "messaging")]
+fn recovery_controls(
+    ui: &mut egui::Ui,
+    connection: LiveConnection,
+    worker_alive: bool,
+    reason: Option<&str>,
+) -> Option<RecoveryAction> {
+    use super::visuals::{INK, MUTED};
+    let mut action = None;
+    let active = matches!(
+        connection,
+        LiveConnection::Connecting | LiveConnection::Reconnecting
+    );
+    let expired = connection == LiveConnection::Expired;
+    ui.spacing_mut().item_spacing.y = 5.0;
+    ui.label(
+        egui::RichText::new(if expired {
+            "Phiên đăng nhập đã hết hạn"
+        } else if !worker_alive {
+            "Gửi nhận đã dừng · vẫn giữ bản nháp"
+        } else if active {
+            "Đang kết nối tới Zalo…"
+        } else {
+            "Ngoại tuyến · vẫn có thể đọc tin đã lưu và soạn bản nháp"
+        })
+        .size(12.0)
+        .strong()
+        .color(INK),
+    );
+    if let Some(reason) = reason {
+        ui.add(egui::Label::new(egui::RichText::new(reason).size(11.0).color(MUTED)).wrap());
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(
+                !active && !expired,
+                egui::Button::new("Kết nối lại").small(),
+            )
+            .clicked()
+        {
+            action = Some(RecoveryAction::Retry);
+        }
+        if ui.small_button("Mở hội thoại").clicked() {
+            action = Some(RecoveryAction::Open);
+        }
+        if ui
+            .small_button(if expired {
+                "Đăng nhập lại"
+            } else {
+                "Đăng xuất"
+            })
+            .clicked()
+        {
+            action = Some(RecoveryAction::Logout);
+        }
+    });
+    action
+}
+
+#[cfg(all(test, feature = "messaging"))]
+mod tests {
+    use super::*;
+    use crate::{
+        domain::Conversation,
+        protocol::{bootstrap::ServerConfig, session::synthetic_session},
+    };
+
+    fn fixture(ctx: &egui::Context) -> (NativeApp, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "zalo-offline-ui-{}",
+            crate::domain::local_message_id().unwrap()
+        ));
+        let profile = Arc::new(Profile::at_root(&root, "fixture").unwrap());
+        super::super::visuals::install(ctx);
+        let mut state = LiveState::new(profile.clone(), None, ctx).unwrap();
+        // No endpoint, cookie or real account can escape this test-only capability.
+        let session = Arc::new(synthetic_session(
+            profile.clone(),
+            ServerConfig {
+                trusted_qr: false,
+                server_time_seconds: None,
+                parameter_encryption: None,
+                services: Default::default(),
+                chat_poll: vec![],
+                control_poll: vec![],
+                websocket: vec![],
+            },
+        ));
+        state.account = Some(Account {
+            id: session.account_id().into(),
+            name: session.display_name().into(),
+        });
+        state.session = Some(session);
+        state.reason = Some("Kết nối TLS chưa hoàn tất.".into());
+        (
+            NativeApp {
+                worker: None,
+                model: Model::default(),
+                drafts: DraftBook::default(),
+                demo: false,
+                search: String::new(),
+                search_folded: String::new(),
+                compact_list: false,
+                details: false,
+                focus_composer: false,
+                latest_page: true,
+                ime_composing: false,
+                live: Some(state),
+                _profile: profile,
+            },
+            root,
+        )
+    }
+
+    fn render(app: &mut NativeApp, ctx: &egui::Context, width: f32) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 480.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.workspace(ctx),
+        )
+    }
+
+    fn text_rect(output: &egui::FullOutput, expected: &str) -> Option<egui::Rect> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text == expected => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn signed_in_empty_offline_and_stopped_worker_have_visible_recovery_at_both_widths() {
+        for width in [640.0, 1200.0] {
+            let ctx = egui::Context::default();
+            let (mut app, root) = fixture(&ctx);
+            for worker_alive in [false, true] {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 480.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            recovery_controls(
+                                ui,
+                                LiveConnection::Offline,
+                                worker_alive,
+                                Some("Kết nối TLS chưa hoàn tất."),
+                            );
+                        });
+                    },
+                );
+                for label in [
+                    "Kết nối lại",
+                    "Mở hội thoại",
+                    "Đăng xuất",
+                    "Kết nối TLS chưa hoàn tất.",
+                ] {
+                    let rect = text_rect(&output, label)
+                        .unwrap_or_else(|| panic!("missing {label} at {width}"));
+                    assert!(rect.bottom() <= 480.0 && rect.right() <= width);
+                }
+            }
+            let output = render(&mut app, &ctx, width);
+            for label in [
+                "Kết nối lại",
+                "Mở hội thoại",
+                "Đăng xuất",
+                "Mở hội thoại bằng ID",
+            ] {
+                let rect = text_rect(&output, label).unwrap_or_else(|| {
+                    panic!(
+                        "workspace missing {label} at {width}; texts={:?}",
+                        output
+                            .shapes
+                            .iter()
+                            .filter_map(|s| match &s.shape {
+                                egui::epaint::Shape::Text(t) => Some(t.galley.job.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    )
+                });
+                assert!(rect.bottom() <= 480.0 && rect.right() <= width);
+            }
+            assert!(app.is_signed_in());
+            assert!(!app.live_can_send());
+            assert!(app.model.conversations.is_empty());
+            assert!(
+                app.live.as_ref().unwrap().worker.is_none(),
+                "rendering must not start network"
+            );
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn offline_editor_keeps_cached_thread_and_draft_without_enabling_send() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        let thread = "d:22";
+        app.model.conversations.push(Conversation {
+            id: thread.into(),
+            title: "Hội thoại kiểm thử".into(),
+            last_message_at_ms: 0,
+            last_text: String::new(),
+            last_sender: String::new(),
+        });
+        app.model.selected = Some(thread.into());
+        app.drafts.select(thread).unwrap();
+        app.drafts.active.text = "Bản nháp riêng".into();
+        for width in [640.0, 1200.0] {
+            let output = render(&mut app, &ctx, width);
+            assert!(
+                text_rect(&output, "Bản nháp riêng").is_some(),
+                "offline draft must remain in actual editor at {width}"
+            );
+            assert_eq!(app.model.selected.as_deref(), Some(thread));
+            assert_eq!(app.drafts.active.text, "Bản nháp riêng");
+            assert!(!app.live_can_send());
+        }
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_recovery_buttons_respond_to_pointer_clicks() {
+        let ctx = egui::Context::default();
+        for (label, expected) in [
+            ("Kết nối lại", RecoveryAction::Retry),
+            ("Mở hội thoại", RecoveryAction::Open),
+            ("Đăng xuất", RecoveryAction::Logout),
+        ] {
+            let mut action = None;
+            let mut draw = |events| {
+                ctx.run(
+                    egui::RawInput {
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(640.0, 480.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            action = recovery_controls(ui, LiveConnection::Offline, false, None);
+                        });
+                    },
+                )
+            };
+            let output = draw(vec![]);
+            let pos = text_rect(&output, label).unwrap().center();
+            draw(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ]);
+            draw(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }]);
+            assert_eq!(action, Some(expected));
+        }
+    }
+    #[test]
+    fn terminal_worker_close_preserves_typed_reason_fault_and_expiration() {
+        use crate::app::live::{LiveCategory, LiveDiagnostic, LiveStage};
+        for expired in [false, true] {
+            let ctx = egui::Context::default();
+            let (mut app, root) = fixture(&ctx);
+            let state = app.live.as_mut().unwrap();
+            state.reason = None;
+            let diagnostic = LiveDiagnostic {
+                stage: LiveStage::Authentication,
+                category: LiveCategory::Http,
+                http_status: Some(403),
+                server_code: None,
+                parser_reason: None,
+            };
+            let typed = LiveEvent::Diagnostic {
+                account_id: "11".into(),
+                diagnostic,
+            };
+            state.observe_status(&typed);
+            app.model.apply_live(typed, "11", true);
+            if expired {
+                let event = LiveEvent::Connection {
+                    account_id: "11".into(),
+                    state: LiveConnection::Expired,
+                };
+                state.observe_status(&event);
+                app.model.apply_live(event, "11", true);
+            }
+            let fault = LiveEvent::Fault {
+                account_id: "11".into(),
+                error: "Tiến trình đã dừng".into(),
+            };
+            state.observe_status(&fault);
+            app.model.apply_live(fault, "11", true);
+            state.worker_closed(&mut app.model, &mut app.drafts, true);
+            assert_eq!(
+                state.reason.as_deref(),
+                Some(diagnostic.to_string().as_str())
+            );
+            assert_eq!(app.model.status, diagnostic.to_string());
+            assert_eq!(
+                state.connection,
+                if expired {
+                    LiveConnection::Expired
+                } else {
+                    LiveConnection::Offline
+                }
+            );
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
+        }
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        let state = app.live.as_mut().unwrap();
+        state.reason = None;
+        let fault = LiveEvent::Fault {
+            account_id: "11".into(),
+            error: "Không mở được kho tin nhắn trên thiết bị".into(),
+        };
+        state.observe_status(&fault);
+        app.model.apply_live(fault, "11", true);
+        state.worker_closed(&mut app.model, &mut app.drafts, true);
+        assert_eq!(app.model.status, "Không mở được kho tin nhắn trên thiết bị");
+        assert_eq!(state.reason.as_deref(), Some(app.model.status.as_str()));
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_directory_names_refresh_sidebar_without_replacing_selected_history_or_draft() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        let thread = "d:22";
+        let original = crate::domain::Message {
+            account_id: "11".into(),
+            thread_id: thread.into(),
+            id: "501".into(),
+            sender: "22".into(),
+            text: "Lịch sử đã lưu".into(),
+            sent_at_ms: 100,
+        };
+        app.model.selected = Some(thread.into());
+        app.model.messages = vec![original.clone()];
+        app.drafts.select(thread).unwrap();
+        app.drafts.active.text = "Bản nháp không đổi".into();
+        let event = LiveEvent::DirectoryChanged {
+            account_id: "11".into(),
+            conversations: vec![Conversation {
+                id: thread.into(),
+                title: "Đặng Minh".into(),
+                last_message_at_ms: 100,
+                last_text: original.text.clone(),
+                last_sender: "22".into(),
+            }],
+        };
+        app.live
+            .as_mut()
+            .unwrap()
+            .directory
+            .apply(&event, "11", &ctx);
+        app.model.apply_live(event, "11", true);
+        assert_eq!(app.model.conversations[0].title, "Đặng Minh");
+        assert_eq!(app.model.selected.as_deref(), Some(thread));
+        assert_eq!(app.model.messages, vec![original]);
+        assert_eq!(app.drafts.active.text, "Bản nháp không đổi");
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn named_directory_open_works_offline_and_restores_the_previous_draft() {
+        use crate::store::directory::{DirectoryBatch, DirectoryRecord};
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        let entry = DirectoryRecord {
+            remote_id: "33".into(),
+            is_group: false,
+            display_name: "Nguyễn Hà".into(),
+            avatar_url: None,
+            is_friend: Some(true),
+            is_blocked: None,
+            member_count: None,
+        };
+        let mut store =
+            crate::store::MessageStore::open(&app._profile.paths.data_dir.join("messages.sqlite"))
+                .unwrap();
+        store
+            .apply_directory_batch(&DirectoryBatch {
+                account_id: "11".into(),
+                entries: vec![entry.clone()],
+                messages: vec![],
+                observed_at_ms: 100,
+            })
+            .unwrap();
+        drop(store);
+        app.model.selected = Some("d:22".into());
+        app.drafts.select("d:22").unwrap();
+        app.drafts.active.text = "Bản nháp hội thoại trước".into();
+        app.live.as_mut().unwrap().directory.visible = true;
+        app.open_directory_entry(entry);
+        assert!(!app.directory_visible());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            app.poll_live(&ctx);
+            if !app.model.pending
+                && app
+                    .model
+                    .conversations
+                    .iter()
+                    .any(|c| c.id == "d:33" && c.title == "Nguyễn Hà")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.model.selected.as_deref(), Some("d:33"));
+        assert!(app
+            .model
+            .conversations
+            .iter()
+            .any(|c| c.id == "d:33" && c.title == "Nguyễn Hà"));
+        assert!(
+            app.model.messages.is_empty(),
+            "a named contact must not manufacture history"
+        );
+        assert!(
+            !app.live_can_send(),
+            "cache operations must not imply Online"
+        );
+        assert!(app.load_latest("d:22".into()));
+        assert_eq!(app.drafts.active.text, "Bản nháp hội thoại trước");
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Native-window fixture exists only in the test binary, with no external endpoints.
+    #[test]
+    #[ignore = "requires isolated X11 display; QA closes the window via WM_DELETE_WINDOW"]
+    fn signed_in_offline_native_window_fixture() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let width = std::env::var("ZALO_UI_FIXTURE_WIDTH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| (640.0..=1600.0).contains(v))
+            .unwrap_or(1200.0);
+        let directory = std::env::var_os("ZALO_UI_FIXTURE_DIRECTORY").is_some();
+        let cached = directory || std::env::var_os("ZALO_UI_FIXTURE_CACHED").is_some();
+        let root = Arc::new(std::sync::Mutex::new(None));
+        let cleanup = root.clone();
+        eframe::run_native(
+            "Zalo Native · Offline UI fixture",
+            eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_inner_size([width, if width < 940.0 { 480.0 } else { 780.0 }])
+                    .with_min_inner_size([640.0, 480.0]),
+                event_loop_builder: Some(Box::new(|builder| {
+                    builder.with_any_thread(true);
+                })),
+                ..Default::default()
+            },
+            Box::new(move |cc| {
+                let (mut app, path) = fixture(&cc.egui_ctx);
+                *root.lock().unwrap() = Some(path);
+                if cached {
+                    let messages: Vec<_> = [
+                        ("d:22", "22", "Tin nhắn kiểm thử đã lưu"),
+                        ("d:33", "33", "Hội thoại kiểm thử thứ hai"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (thread, sender, text))| crate::domain::Message {
+                        account_id: "11".into(),
+                        thread_id: thread.into(),
+                        id: format!("fixture-{}", i + 1),
+                        sender: sender.into(),
+                        text: text.into(),
+                        sent_at_ms: 1700000000000 + i as i64,
+                    })
+                    .collect();
+                    let mut store = crate::store::MessageStore::open(
+                        &app._profile.paths.data_dir.join("messages.sqlite"),
+                    )
+                    .unwrap();
+                    store.insert_batch(&messages).unwrap();
+                    app.model.conversations = messages
+                        .iter()
+                        .map(|m| Conversation {
+                            id: m.thread_id.clone(),
+                            title: m.sender.clone(),
+                            last_message_at_ms: m.sent_at_ms,
+                            last_text: m.text.clone(),
+                            last_sender: m.sender.clone(),
+                        })
+                        .collect();
+                    app.model.selected = Some("d:22".into());
+                    app.model.messages = vec![messages[0].clone()];
+                    app.drafts.select("d:22").unwrap();
+                    app.drafts.active.text = "Bản nháp ngoại tuyến".into();
+                }
+                if directory {
+                    use crate::store::directory::{DirectoryBatch, DirectoryRecord};
+                    let mut entries: Vec<_> = [
+                        ("22", "Đặng Minh", false),
+                        ("33", "Nguyễn Hà", false),
+                        ("22", "Nhóm dự án Việt", true),
+                    ]
+                    .into_iter()
+                    .map(|(id, name, is_group)| DirectoryRecord {
+                        remote_id: id.into(),
+                        is_group,
+                        display_name: name.into(),
+                        avatar_url: None,
+                        is_friend: if is_group { None } else { Some(true) },
+                        is_blocked: None,
+                        member_count: if is_group { Some(3) } else { None },
+                    })
+                    .collect();
+                    entries.extend((1001..=1105).map(|id| DirectoryRecord {
+                        remote_id: id.to_string(),
+                        is_group: false,
+                        display_name: format!("Liên hệ kiểm thử {id}"),
+                        avatar_url: None,
+                        is_friend: Some(true),
+                        is_blocked: None,
+                        member_count: None,
+                    }));
+                    let mut store = crate::store::MessageStore::open(
+                        &app._profile.paths.data_dir.join("messages.sqlite"),
+                    )
+                    .unwrap();
+                    store
+                        .apply_directory_batch(&DirectoryBatch {
+                            account_id: "11".into(),
+                            entries,
+                            messages: vec![],
+                            observed_at_ms: 1700000000100,
+                        })
+                        .unwrap();
+                    app.model.conversations = store.conversations("11", 200).unwrap();
+                    app.activate_directory(&cc.egui_ctx);
+                }
+                Ok(Box::new(app))
+            }),
+        )
+        .unwrap();
+        if let Some(path) = cleanup.lock().unwrap().take() {
+            let _ = std::fs::remove_dir_all(path);
+        };
+    }
 }

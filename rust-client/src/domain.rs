@@ -68,6 +68,35 @@ pub fn local_message_id() -> Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Literal Vietnamese accent/case-insensitive search. Persisted on metadata
+/// writes; querying never loads the directory onto the rendering thread.
+pub fn fold_search(text: &str) -> String {
+    const GROUPS: [(&str, char); 7] = [
+        ("àáảãạăằắẳẵặâầấẩẫậ", 'a'),
+        ("èéẻẽẹêềếểễệ", 'e'),
+        ("ìíỉĩị", 'i'),
+        ("òóỏõọôồốổỗộơờớởỡợ", 'o'),
+        ("ùúủũụưừứửữự", 'u'),
+        ("ỳýỷỹỵ", 'y'),
+        ("đ", 'd'),
+    ];
+    text.trim()
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter_map(|ch| {
+            if ('\u{0300}'..='\u{036f}').contains(&ch) {
+                return None;
+            }
+            Some(
+                GROUPS
+                    .iter()
+                    .find_map(|(letters, base)| letters.contains(ch).then_some(*base))
+                    .unwrap_or(ch),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

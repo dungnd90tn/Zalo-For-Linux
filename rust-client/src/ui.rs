@@ -1,6 +1,8 @@
 //! Original native desktop UI. File, database, and network work stays off the render thread.
 #[cfg(feature = "messaging")]
 mod delivery;
+#[cfg(feature = "messaging")]
+mod directory;
 #[cfg(feature = "live-login")]
 mod live;
 #[cfg(feature = "live-login")]
@@ -8,7 +10,7 @@ mod login;
 mod visuals;
 
 use crate::app::{Command, DraftBook, Event, Model, Worker, EVENTS_PER_FRAME};
-use crate::domain::{Conversation, Message};
+use crate::domain::{fold_search, Conversation, Message};
 use crate::profile::Profile;
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke,
@@ -139,6 +141,15 @@ impl NativeApp {
         if !self.drafts.can_select(&thread) {
             self.model.status = "Đã đạt giới hạn bản nháp hội thoại đang mở.".into();
             return false;
+        }
+        #[cfg(feature = "messaging")]
+        if let Some(state) = &mut self.live {
+            if state.account.is_some() && !state.ensure_worker(self._profile.clone()) {
+                self.model.status =
+                    "Chưa mở được hội thoại. Hãy chọn Kết nối lại; bản nháp được giữ nguyên."
+                        .into();
+                return false;
+            }
         }
         #[cfg(feature = "messaging")]
         if let Some(worker) = self.live.as_ref().and_then(|state| state.worker.as_ref()) {
@@ -337,21 +348,35 @@ impl NativeApp {
                     self.account_label(),
                 );
                 ui.add_space(27.0);
-                for (kind, title, selected) in [
-                    (Icon::Chat, "Tin nhắn", true),
+                #[cfg(feature = "messaging")]
+                let directory = self.directory_visible();
+                #[cfg(not(feature = "messaging"))]
+                let directory = false;
+                #[cfg(feature = "messaging")]
+                let contacts_enabled = self.is_signed_in();
+                #[cfg(not(feature = "messaging"))]
+                let contacts_enabled = false;
+                for (kind, title, selected, enabled) in [
+                    (Icon::Chat, "Tin nhắn", !directory, true),
                     (
                         Icon::Contacts,
-                        "Danh bạ · chưa hỗ trợ trong bản xem trước",
-                        false,
+                        if contacts_enabled {
+                            "Danh bạ"
+                        } else {
+                            "Danh bạ · cần đăng nhập với gửi nhận"
+                        },
+                        directory,
+                        contacts_enabled,
                     ),
                     (
                         Icon::Cloud,
                         "Lưu trữ đám mây · chưa hỗ trợ trong bản xem trước",
                         false,
+                        false,
                     ),
                 ] {
                     let (rect, response) = ui
-                        .add_enabled_ui(selected, |ui| {
+                        .add_enabled_ui(enabled, |ui| {
                             ui.allocate_exact_size(vec2(64.0, 56.0), Sense::click())
                         })
                         .inner;
@@ -368,8 +393,21 @@ impl NativeApp {
                             Color32::from_white_alpha(180)
                         },
                     );
-                    if selected && response.clicked() && compact {
-                        self.compact_list = true;
+                    if enabled && response.clicked() {
+                        match kind {
+                            Icon::Contacts => {
+                                #[cfg(feature = "messaging")]
+                                self.activate_directory(ctx);
+                            }
+                            Icon::Chat => {
+                                #[cfg(feature = "messaging")]
+                                if let Some(state) = &mut self.live {
+                                    state.directory.visible = false;
+                                }
+                                self.compact_list |= compact;
+                            }
+                            _ => {}
+                        }
                     }
                     response.on_hover_text(title).on_disabled_hover_text(title);
                 }
@@ -443,7 +481,7 @@ impl NativeApp {
                     let open_live = self
                         .live
                         .as_ref()
-                        .is_some_and(|state| state.account.is_some() && state.worker.is_some());
+                        .is_some_and(|state| state.account.is_some());
                     #[cfg(not(feature = "messaging"))]
                     let open_live = false;
                     if icon_button(
@@ -460,6 +498,7 @@ impl NativeApp {
                     {
                         #[cfg(feature = "messaging")]
                         if let Some(state) = &mut self.live {
+                            state.ensure_worker(self._profile.clone());
                             state.open_dialog = true;
                         }
                     }
@@ -870,7 +909,26 @@ impl NativeApp {
                                     message_bubble(ui, message, compact, self.account_id());
                                     ui.add_space(13.0);
                                 }
-                                if self.model.messages.is_empty() && !self.model.pending {
+                                #[cfg(feature = "messaging")]
+                                if self.is_signed_in() && self.model.selected.is_none() {
+                                    ui.add_space(18.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(RichText::new("Chưa có hội thoại trên thiết bị này").strong());
+                                        ui.add_space(8.0);
+                                        ui.label("Chọn Danh bạ để mở liên hệ hoặc nhóm đã đồng bộ. Lịch sử cũ có thể chưa được nhập.");
+                                        ui.add_space(10.0);
+                                        if ui.button("Mở danh bạ").clicked() {
+                                            self.activate_directory(ctx);
+                                        }
+                                        if ui.small_button("Mở hội thoại bằng ID").clicked() {
+                                            if let Some(state) = &mut self.live {
+                                                state.ensure_worker(self._profile.clone());
+                                                state.open_dialog = true;
+                                            }
+                                        }
+                                    });
+                                }
+                                if self.model.messages.is_empty() && !self.model.pending && self.model.selected.is_some() {
                                     ui.add_space(30.0);
                                     ui.vertical_centered(|ui| {
                                         ui.label(
@@ -919,6 +977,55 @@ impl NativeApp {
             },
         );
         self.composer(ui, ctx, composer_height);
+    }
+
+    fn workspace(&mut self, ctx: &egui::Context) {
+        let compact = ctx.screen_rect().width() < 940.0;
+        self.navigation(ctx, compact);
+        #[cfg(feature = "messaging")]
+        self.live_connection_notice(ctx);
+        #[cfg(feature = "messaging")]
+        let show_directory = self.directory_visible();
+        #[cfg(not(feature = "messaging"))]
+        let show_directory = false;
+        if compact && show_directory {
+            #[cfg(feature = "messaging")]
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(Color32::WHITE))
+                .show(ctx, |ui| self.directory_panel(ui));
+        } else if compact && self.compact_list {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(Color32::WHITE))
+                .show(ctx, |ui| self.conversations(ui, true));
+        } else {
+            if !compact {
+                egui::SidePanel::left("conversations")
+                    .default_width(344.0)
+                    .width_range(280.0..=420.0)
+                    .resizable(true)
+                    .frame(
+                        egui::Frame::none()
+                            .fill(Color32::WHITE)
+                            .stroke(Stroke::new(1.0_f32, LINE)),
+                    )
+                    .show(ctx, |ui| {
+                        #[cfg(feature = "messaging")]
+                        if show_directory {
+                            self.directory_panel(ui);
+                            return;
+                        }
+                        self.conversations(ui, false);
+                    });
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(CANVAS))
+                .show(ctx, |ui| self.chat(ui, ctx, compact));
+        }
+        if self.details {
+            self.information(ctx);
+        }
+        #[cfg(feature = "live-login")]
+        self.live_dialogs(ctx);
     }
 
     fn welcome(&self, ui: &mut egui::Ui) {
@@ -970,34 +1077,7 @@ impl eframe::App for NativeApp {
             }
         }
         ctx.input(|input| update_ime_state(&mut self.ime_composing, &input.events));
-        let compact = ctx.screen_rect().width() < 940.0;
-        self.navigation(ctx, compact);
-        if compact && self.compact_list {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(Color32::WHITE))
-                .show(ctx, |ui| self.conversations(ui, true));
-        } else {
-            if !compact {
-                egui::SidePanel::left("conversations")
-                    .default_width(344.0)
-                    .width_range(280.0..=420.0)
-                    .resizable(true)
-                    .frame(
-                        egui::Frame::none()
-                            .fill(Color32::WHITE)
-                            .stroke(Stroke::new(1.0_f32, LINE)),
-                    )
-                    .show(ctx, |ui| self.conversations(ui, false));
-            }
-            egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(CANVAS))
-                .show(ctx, |ui| self.chat(ui, ctx, compact));
-        }
-        if self.details {
-            self.information(ctx);
-        }
-        #[cfg(feature = "live-login")]
-        self.live_dialogs(ctx);
+        self.workspace(ctx);
     }
 }
 
@@ -1192,37 +1272,6 @@ fn message_bubble(ui: &mut egui::Ui, message: &Message, compact: bool, account: 
                 });
         },
     );
-}
-
-/// Vietnamese search is case- and tone-insensitive; arbitrary scripts remain searchable.
-fn fold_search(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(char::to_lowercase)
-        .filter_map(|ch| {
-            if ('\u{0300}'..='\u{036f}').contains(&ch) {
-                return None;
-            }
-            Some(match ch {
-                'à' | 'á' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ằ' | 'ắ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ầ'
-                | 'ấ' | 'ẩ' | 'ẫ' | 'ậ' => 'a',
-                'è' | 'é' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ề' | 'ế' | 'ể' | 'ễ' | 'ệ' => {
-                    'e'
-                }
-                'ì' | 'í' | 'ỉ' | 'ĩ' | 'ị' => 'i',
-                'ò' | 'ó' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ồ' | 'ố' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ờ'
-                | 'ớ' | 'ở' | 'ỡ' | 'ợ' => 'o',
-                'ù' | 'ú' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ừ' | 'ứ' | 'ử' | 'ữ' | 'ự' => {
-                    'u'
-                }
-                'ỳ' | 'ý' | 'ỷ' | 'ỹ' | 'ỵ' => 'y',
-                'đ' => 'd',
-                _ => ch,
-            })
-        })
-        .collect::<String>()
-        .trim()
-        .to_owned()
 }
 
 fn update_ime_state(composing: &mut bool, events: &[egui::Event]) {

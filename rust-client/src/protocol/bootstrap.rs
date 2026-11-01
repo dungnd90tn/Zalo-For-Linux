@@ -1,5 +1,6 @@
 //! Original bootstrap wire contracts recovered from the repository's local JS bundles.
 //! These primitives neither authenticate an account nor commit credentials to a profile.
+use super::client::ClientType;
 use super::qr::{
     encrypt_parameters, sign_parameters, RequestSpec, ResponseCipher, MAX_RESPONSE_BYTES,
 };
@@ -14,9 +15,8 @@ use url::Url;
 const ZERO_IV: [u8; 16] = [0; 16];
 const AUTH_ORIGIN: &str = "https://wpa.zaloapp.com";
 const MAX_ENDPOINTS_PER_SERVICE: usize = 16;
-const MAX_SERVICES: usize = 64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapError {
     Http(u16),
     Malformed,
@@ -66,7 +66,59 @@ impl BootstrapError {
     }
 }
 
+/// Sanitized post-confirmation diagnostics: only fixed stages/categories and
+/// explicit numeric service status are retained, never response data or URLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapStage {
+    Http,
+    OuterEnvelope,
+    ResponseDecryption,
+    InnerEnvelope,
+    Identity,
+    StorageKey,
+    SessionKey,
+    ServiceConfiguration,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapFailure {
+    pub stage: BootstrapStage,
+    pub category: BootstrapError,
+}
+impl std::fmt::Display for BootstrapFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stage = match self.stage {
+            BootstrapStage::Http => "http",
+            BootstrapStage::OuterEnvelope => "outer-envelope",
+            BootstrapStage::ResponseDecryption => "decrypt",
+            BootstrapStage::InnerEnvelope => "inner-envelope",
+            BootstrapStage::Identity => "identity",
+            BootstrapStage::StorageKey => "storage-key",
+            BootstrapStage::SessionKey => "session-key",
+            BootstrapStage::ServiceConfiguration => "service-config",
+        };
+        let (category, code) = match self.category {
+            BootstrapError::Http(code) => ("http-status", Some(i64::from(code))),
+            BootstrapError::Malformed => ("malformed", None),
+            BootstrapError::UnsafeEndpoint => ("unsafe-endpoint", None),
+            BootstrapError::UnsupportedSchema => ("unsupported-schema", None),
+            BootstrapError::AuthenticationRejected(code) => ("authentication-rejected", Some(code)),
+            BootstrapError::ServiceRejected(code) => ("service-rejected", Some(code)),
+            BootstrapError::EncryptionRejected(code) => ("encryption-rejected", Some(code)),
+        };
+        write!(f, "bootstrap/{stage}/{category}")?;
+        if let Some(code) = code {
+            write!(f, " code={code}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for BootstrapFailure {}
+fn at_stage(stage: BootstrapStage) -> impl FnOnce(BootstrapError) -> BootstrapFailure {
+    move |category| BootstrapFailure { stage, category }
+}
+
 pub struct ServerInfoInput<'a> {
+    pub client_type: ClientType,
     pub imei: &'a str,
     pub computer_name: &'a str,
     pub support_maintenance: Option<i64>,
@@ -78,7 +130,7 @@ pub fn server_info_request(input: &ServerInfoInput<'_>) -> Result<RequestSpec> {
     let mut params = BTreeMap::from([
         ("imei".into(), input.imei.to_owned()),
         ("computer_name".into(), input.computer_name.to_owned()),
-        ("type".into(), "30".into()),
+        ("type".into(), input.client_type.api_type().into()),
         ("client_version".into(), "681".into()),
         (
             "sp_mtn".into(),
@@ -91,6 +143,7 @@ pub fn server_info_request(input: &ServerInfoInput<'_>) -> Result<RequestSpec> {
 }
 
 pub struct LoginInfoInput<'a> {
+    pub client_type: ClientType,
     pub imei: &'a str,
     pub computer_name: &'a str,
     pub language: &'a str,
@@ -116,9 +169,14 @@ pub fn login_info_request(input: &LoginInfoInput<'_>) -> Result<(RequestSpec, Re
         language: input.language,
         ts: input.timestamp_ms,
     })?;
-    let (mut params, key) =
-        encrypt_parameters(input.imei, input.timestamp_ms, input.nonce_hex, &payload)?;
-    params.insert("type".into(), "30".into());
+    let (mut params, key) = encrypt_parameters(
+        input.client_type,
+        input.imei,
+        input.timestamp_ms,
+        input.nonce_hex,
+        &payload,
+    )?;
+    params.insert("type".into(), input.client_type.api_type().into());
     params.insert("client_version".into(), "681".into());
     params.insert("signkey".into(), sign_parameters("getlogininfo", &params));
     Ok((request("/api/login/getLoginInfo", &params)?, key))
@@ -177,15 +235,30 @@ pub fn decode_login_reply(
     body: &[u8],
     cipher: &ResponseCipher,
 ) -> std::result::Result<LoginInfo, BootstrapError> {
+    decode_login_reply_detailed(status, body, cipher).map_err(|failure| failure.category)
+}
+pub fn decode_login_reply_detailed(
+    status: u16,
+    body: &[u8],
+    cipher: &ResponseCipher,
+) -> std::result::Result<LoginInfo, BootstrapFailure> {
     if status != 200 {
-        return Err(BootstrapError::Http(status));
+        return Err(BootstrapFailure {
+            stage: BootstrapStage::Http,
+            category: BootstrapError::Http(status),
+        });
     }
-    let outer = envelope(body)?;
-    let encrypted = outer.as_str().ok_or(BootstrapError::Malformed)?;
-    let plaintext = cipher
-        .decrypt(encrypted)
-        .map_err(|_| BootstrapError::Malformed)?;
-    LoginInfo::parse(&envelope(&plaintext)?)
+    let outer = envelope(body).map_err(at_stage(BootstrapStage::OuterEnvelope))?;
+    let encrypted = outer.as_str().ok_or(BootstrapFailure {
+        stage: BootstrapStage::OuterEnvelope,
+        category: BootstrapError::Malformed,
+    })?;
+    let plaintext = cipher.decrypt(encrypted).map_err(|_| BootstrapFailure {
+        stage: BootstrapStage::ResponseDecryption,
+        category: BootstrapError::Malformed,
+    })?;
+    let data = envelope(&plaintext).map_err(at_stage(BootstrapStage::InnerEnvelope))?;
+    LoginInfo::parse_detailed(&data)
 }
 
 /// Pre-login settings cannot authorize message/service endpoints or session cookies.
@@ -296,19 +369,40 @@ impl ServerConfig {
             })
             .transpose()?;
         let mut services = BTreeMap::new();
-        if let Some(map) = object.get("zpw_service_map_v3") {
-            let map = map
-                .as_object()
-                .filter(|m| m.len() <= MAX_SERVICES)
-                .ok_or(BootstrapError::UnsupportedSchema)?;
-            for (name, urls) in map {
-                if name.is_empty()
-                    || name.len() > 64
-                    || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                {
-                    return Err(BootstrapError::UnsupportedSchema);
+        let modern = object
+            .get("zpw_service_map_v3")
+            .map(|map| map.as_object().ok_or(BootstrapError::UnsupportedSchema))
+            .transpose()?;
+        let legacy = object.get("zpw_service_map_new").and_then(Value::as_object);
+        // The bundle filters supported domain types before interpreting values.
+        // Required messaging capabilities remain strict. Unused services must
+        // neither reject authentication nor authorize credential destinations.
+        for name in ["chat", "group"] {
+            let urls = modern.and_then(|map| map.get(name));
+            let mut endpoints = endpoint_list(urls, false)?;
+            if endpoints.is_empty() {
+                if let Some(fallback) = legacy.and_then(|map| map.get(name)) {
+                    endpoints = endpoint_list(Some(&Value::Array(vec![fallback.clone()])), false)?;
                 }
-                services.insert(name.clone(), endpoint_list(Some(urls), false)?);
+            }
+            if !endpoints.is_empty() {
+                services.insert(name.into(), endpoints);
+            }
+        }
+        // Directory capabilities are optional. The bundle's merge ignores
+        // unsupported modern values and falls back to the legacy string. Each
+        // candidate is validated independently; discarded routes grant no cookies.
+        for name in ["profile", "conversation"] {
+            let mut endpoints =
+                endpoint_list(modern.and_then(|map| map.get(name)), false).unwrap_or_default();
+            if endpoints.is_empty() {
+                if let Some(fallback) = legacy.and_then(|map| map.get(name)) {
+                    endpoints = endpoint_list(Some(&Value::Array(vec![fallback.clone()])), false)
+                        .unwrap_or_default();
+                }
+            }
+            if !endpoints.is_empty() {
+                services.insert(name.into(), endpoints);
             }
         }
         let trusted = value
@@ -323,8 +417,10 @@ impl ServerConfig {
             server_time_seconds,
             parameter_encryption,
             services,
-            chat_poll: endpoint_list(object.get("zpw_chts_new"), false)?,
-            control_poll: endpoint_list(object.get("zpw_ctrs_new"), false)?,
+            // The native runtime uses WebSockets, not legacy chat/control LP.
+            // Unconsumed LP routes cannot reject login or authorize cookies.
+            chat_poll: Vec::new(),
+            control_poll: Vec::new(),
             websocket: endpoint_list(object.get("zpw_ws"), true)?,
         })
     }
@@ -353,7 +449,7 @@ fn endpoint_list(
                 || !url.username().is_empty()
                 || url.password().is_some()
                 || url.port_or_known_default() != Some(443)
-                || url.path() != "/"
+                || (!websocket && url.path() != "/")
                 || url.query().is_some()
                 || url.fragment().is_some()
             {
@@ -380,18 +476,30 @@ pub struct LoginInfo {
 }
 impl LoginInfo {
     pub fn parse(data: &Value) -> std::result::Result<Self, BootstrapError> {
-        let account_id = secret_field(data, "uid", 64)?;
+        Self::parse_detailed(data).map_err(|failure| failure.category)
+    }
+    fn parse_detailed(data: &Value) -> std::result::Result<Self, BootstrapFailure> {
+        let account_id =
+            secret_field(data, "uid", 64).map_err(at_stage(BootstrapStage::Identity))?;
         if !account_id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(BootstrapError::Malformed);
+            return Err(BootstrapFailure {
+                stage: BootstrapStage::Identity,
+                category: BootstrapError::Malformed,
+            });
         }
-        let storage_key = secret_field(data, "dkey", 1024)?;
-        let key = secret_field(data, "zpw_enk", 1024)?;
-        let session_cipher = SessionCipher::from_base64(&key)?;
+        let storage_key =
+            secret_field(data, "dkey", 1024).map_err(at_stage(BootstrapStage::StorageKey))?;
+        let key =
+            secret_field(data, "zpw_enk", 1024).map_err(at_stage(BootstrapStage::SessionKey))?;
+        let session_cipher =
+            SessionCipher::from_base64(&key).map_err(at_stage(BootstrapStage::SessionKey))?;
+        let config =
+            ServerConfig::parse(data).map_err(at_stage(BootstrapStage::ServiceConfiguration))?;
         Ok(Self {
             account_id,
-            config: ServerConfig::parse(data)?,
             storage_key,
             session_cipher,
+            config,
         })
     }
     pub fn has_storage_key(&self) -> bool {
@@ -433,7 +541,14 @@ impl SessionCipher {
         Ok(Self { key })
     }
     pub fn decrypt(&self, encoded: &str) -> std::result::Result<Vec<u8>, BootstrapError> {
-        if encoded.len() > MAX_RESPONSE_BYTES {
+        self.decrypt_bounded(encoded, MAX_RESPONSE_BYTES)
+    }
+    pub(super) fn decrypt_bounded(
+        &self,
+        encoded: &str,
+        limit: usize,
+    ) -> std::result::Result<Vec<u8>, BootstrapError> {
+        if limit > 16 * 1024 * 1024 || encoded.len() > limit {
             return Err(BootstrapError::Malformed);
         }
         let encoded = super::qr::percent_decode(encoded).map_err(|_| BootstrapError::Malformed)?;
@@ -532,6 +647,7 @@ mod tests {
     use serde_json::json;
     fn login_input() -> LoginInfoInput<'static> {
         LoginInfoInput {
+            client_type: ClientType::Legacy30,
             imei: "fixture-imei",
             computer_name: "fixture-pc",
             language: "vi",
@@ -567,7 +683,7 @@ mod tests {
         .unwrap();
         assert!(parsed.trusted_qr);
         assert_eq!(parsed.parameter_encryption, Some(true));
-        assert!(ServerConfig::parse(&value).is_err());
+        assert!(ServerConfig::parse(&value).unwrap().services.is_empty());
     }
     #[test]
     fn public_prelogin_integer_encryption_flag_is_strictly_supported() {
@@ -596,6 +712,7 @@ mod tests {
     #[test]
     fn server_request_matches_independent_node_signature_and_local_field_contract() {
         let request = server_info_request(&ServerInfoInput {
+            client_type: ClientType::Legacy30,
             imei: "fixture-imei",
             computer_name: "fixture-pc",
             support_maintenance: None,
@@ -646,8 +763,174 @@ mod tests {
         assert_eq!(
             parsed.config.services["profile"][0].host_str(),
             Some("profile-wpa.zaloapp.com")
-        );
+        ); // Directory profile capability is now consumed.
         assert_eq!(parsed.config.websocket[0].scheme(), "wss");
+    }
+    #[test]
+    fn websocket_routes_are_preserved_while_unused_long_poll_cannot_grant_credentials() {
+        let value = serde_json::json!({"zpw_service_map_v3":{"chat":["https://chat-wpa.zaloapp.com/"]},"zpw_ws":["wss://ws1.zalo.me/legacy/socket"],"zpw_chts_new":{"unsupported":"http://unconsumed.invalid/poll"},"zpw_ctrs_new":["https://unconsumed.invalid/control"]});
+        let parsed = ServerConfig::parse(&value).unwrap();
+        assert_eq!(parsed.websocket[0].path(), "/legacy/socket");
+        assert!(parsed.chat_poll.is_empty());
+        assert!(parsed.control_poll.is_empty());
+        for url in [
+            "ws://ws1.zalo.me/legacy/socket",
+            "wss://ws1.zalo.me/legacy/socket?token=unsafe",
+            "wss://ws1.zalo.me:444/socket",
+            "wss://ws1.zalo.me.attacker.invalid/socket",
+            "wss://user@ws1.zalo.me/socket",
+            "wss://127.0.0.1/socket",
+        ] {
+            assert!(ServerConfig::parse(&serde_json::json!({"zpw_ws":[url]})).is_err());
+        }
+    }
+    #[test]
+    fn service_capabilities_filter_unused_schemas_and_validate_consumed_origins() {
+        let mut map = serde_json::Map::new();
+        for index in 0..100 {
+            map.insert(
+                format!("unused-cdn-{index}"),
+                serde_json::json!({"future_schema":"http://unused.invalid/path"}),
+            );
+        }
+        map.insert(
+            "chat".into(),
+            serde_json::json!(["https://chat-wpa.zaloapp.com/"]),
+        );
+        map.insert(
+            "analytics".into(),
+            serde_json::json!(["https://metrics.invalid/collect"]),
+        );
+        let mut value = serde_json::json!({"zpw_service_map_v3":map,"zpw_service_map_new":{"group":"https://group-wpa.zaloapp.com/"}});
+        let parsed = ServerConfig::parse(&value).unwrap();
+        assert_eq!(parsed.services.len(), 2);
+        assert_eq!(
+            parsed.services["group"][0].host_str(),
+            Some("group-wpa.zaloapp.com")
+        );
+        for bad in [
+            "http://chat-wpa.zaloapp.com/",
+            "https://chat-wpa.zaloapp.com.attacker.invalid/",
+            "https://127.0.0.1/",
+            "https://chat-wpa.zaloapp.com/path",
+        ] {
+            value["zpw_service_map_v3"]["chat"] = serde_json::json!([bad]);
+            assert!(ServerConfig::parse(&value).is_err());
+        }
+    }
+    #[test]
+    fn optional_directory_routes_fail_locally_without_rejecting_verified_bootstrap_identity() {
+        let base = json!({"uid":"11","dkey":"synthetic-storage","zpw_enk":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","zpw_service_map_v3":{"chat":["https://chat-wpa.zaloapp.com"],"group":["https://group-wpa.zaloapp.com"]},"zpw_ws":["wss://ws1.zalo.me/socket"]});
+        let expected = LoginInfo::parse(&base)
+            .unwrap()
+            .session_cipher
+            .encrypt(b"same session key")
+            .unwrap();
+        for bad in [
+            json!(null),
+            json!({"future":"schema"}),
+            json!("https://discarded.zaloapp.com"),
+            json!(["https://attacker.invalid"]),
+            json!(["https://discarded.zaloapp.com", "https://attacker.invalid"]),
+            json!(["https://profile.zalo.me/path"]),
+        ] {
+            let mut value = base.clone();
+            value["zpw_service_map_v3"]["profile"] = bad.clone();
+            value["zpw_service_map_v3"]["conversation"] = bad;
+            let parsed = LoginInfo::parse(&value).unwrap();
+            assert_eq!(parsed.account_id, "11");
+            assert_eq!(
+                parsed.session_cipher.encrypt(b"same session key").unwrap(),
+                expected
+            );
+            assert_eq!(parsed.config.services.len(), 2);
+            assert_eq!(parsed.config.websocket[0].path(), "/socket");
+            value["zpw_service_map_new"] = json!({"profile":"https://safe-profile.zaloapp.com","conversation":"https://safe-conversation.zalo.me"});
+            let parsed = LoginInfo::parse(&value).unwrap();
+            assert_eq!(
+                parsed.config.services["profile"][0].host_str(),
+                Some("safe-profile.zaloapp.com")
+            );
+            assert_eq!(
+                parsed.config.services["conversation"][0].host_str(),
+                Some("safe-conversation.zalo.me")
+            );
+            value["zpw_service_map_new"] = json!({"profile":"http://unsafe.zalo.me","conversation":"https://attacker.invalid"});
+            assert_eq!(LoginInfo::parse(&value).unwrap().config.services.len(), 2);
+            value["zpw_service_map_v3"]["chat"] = json!(["https://attacker.invalid"]);
+            assert!(
+                LoginInfo::parse(&value).is_err(),
+                "required messaging origins stay strict"
+            );
+        }
+    }
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn discarded_optional_routes_never_receive_session_cookies() {
+        use std::sync::Arc;
+        let root = std::env::temp_dir().join(format!(
+            "native-optional-route-{}",
+            crate::domain::local_message_id().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let profile = Arc::new(crate::profile::Profile::at_root(&root, "fixture").unwrap());
+        let config=ServerConfig::parse(&json!({"zpw_service_map_v3":{"chat":["https://chat.zalo.me"],"profile":["https://discarded.zaloapp.com","https://attacker.invalid"],"conversation":{"future":"https://discarded-conversation.zalo.me"}},"zpw_service_map_new":{"profile":"https://safe-profile.zaloapp.com","conversation":"https://attacker.invalid"}})).unwrap();
+        let session = super::super::session::synthetic_session(profile.clone(), config);
+        for denied in [
+            "https://discarded.zaloapp.com/api/social/friend/getfriends",
+            "https://discarded-conversation.zalo.me/api/preloadconvers/get-last-msgs",
+            "https://attacker.invalid/",
+        ] {
+            assert!(session
+                .authorization_cookie(&Url::parse(denied).unwrap())
+                .is_none());
+        }
+        assert!(session
+            .authorization_cookie(
+                &Url::parse("https://safe-profile.zaloapp.com/api/social/friend/getfriends")
+                    .unwrap()
+            )
+            .is_some());
+        drop(session);
+        drop(profile);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn detailed_bootstrap_failures_do_not_mislabel_parsing_as_server_rejection() {
+        let (_, cipher) = login_info_request(&login_input()).unwrap();
+        for (status, body, stage, category) in [
+            (
+                503,
+                b"not returned".as_slice(),
+                BootstrapStage::Http,
+                BootstrapError::Http(503),
+            ),
+            (
+                200,
+                b"not json".as_slice(),
+                BootstrapStage::OuterEnvelope,
+                BootstrapError::Malformed,
+            ),
+            (
+                200,
+                br#"{"error_code":0,"data":"not-a-ciphertext-or-secret"}"#.as_slice(),
+                BootstrapStage::ResponseDecryption,
+                BootstrapError::Malformed,
+            ),
+            (
+                200,
+                br#"{"error_code":600,"error_message":"not-retained-secret"}"#.as_slice(),
+                BootstrapStage::OuterEnvelope,
+                BootstrapError::AuthenticationRejected(600),
+            ),
+        ] {
+            let failure = decode_login_reply_detailed(status, body, &cipher)
+                .err()
+                .unwrap();
+            assert_eq!(failure.stage, stage);
+            assert_eq!(failure.category, category);
+            assert!(!format!("{failure:?} {failure}").contains("secret"));
+        }
     }
     #[test]
     fn session_cipher_matches_node_known_answers_for_all_supported_aes_key_lengths() {
@@ -710,12 +993,12 @@ mod tests {
             "https://profile.zalo.me/?secret=x",
         ] {
             assert!(
-                ServerConfig::parse(&json!({"zpw_service_map_v3":{"profile":[host]}})).is_err(),
+                ServerConfig::parse(&json!({"zpw_service_map_v3":{"chat":[host]}})).is_err(),
                 "{host}"
             );
         }
         assert!(ServerConfig::parse(
-            &json!({"zpw_service_map_v3":{"profile":"https://profile.zalo.me"}})
+            &json!({"zpw_service_map_v3":{"chat":"https://chat.zalo.me"}})
         )
         .is_err());
         assert!(ServerConfig::parse(&json!({"zpw_ws":["https://ws1-msg.chat.zalo.me"]})).is_err());

@@ -1,5 +1,8 @@
 //! Durable account ownership and opaque, verified runtime session capability.
-use super::bootstrap::{ServerConfig, SessionCipher};
+use super::{
+    bootstrap::{ServerConfig, SessionCipher},
+    client::ClientType,
+};
 use crate::profile::{atomic_write_secret, Profile};
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -16,6 +19,8 @@ pub(super) const AUTH_STATE_FILE: &str = "auth-state.json";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StoredSession {
+    #[serde(default = "ClientType::legacy30")]
+    pub client_type: ClientType,
     pub account_id: String,
     pub display_name: String,
     pub imei: String,
@@ -81,7 +86,7 @@ pub(super) struct AuthRecord {
 impl AuthRecord {
     pub fn empty(owner: &str) -> Self {
         Self {
-            version: 1,
+            version: 2,
             owner_uid: owner.into(),
             replay: BTreeMap::new(),
             active: None,
@@ -114,9 +119,18 @@ impl AuthRecord {
         if bytes.len() as u64 > MAX_RECORD {
             bail!("session record exceeds limit");
         }
-        let record: Self = serde_json::from_slice(&bytes)
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("invalid session record"))?;
-        if record.version != 1
+        if value.get("version").and_then(serde_json::Value::as_u64) == Some(2)
+            && value
+                .get("active")
+                .is_some_and(|s| !s.is_null() && s.get("client_type").is_none())
+        {
+            bail!("session record requires an explicit client type");
+        }
+        let mut record: Self =
+            serde_json::from_value(value).map_err(|_| anyhow::anyhow!("invalid session record"))?;
+        if !matches!(record.version, 1 | 2)
             || !valid_account(&record.owner_uid)
             || record.replay.len() > 32
             || record
@@ -127,6 +141,7 @@ impl AuthRecord {
             bail!("inconsistent session ownership");
         }
         profile.check_account(&record.owner_uid)?;
+        record.version = 2; // In-memory schema upgrade; loading never rewrites credentials.
         Ok(Some(record))
     }
     pub fn write(&self, profile: &Profile) -> Result<()> {
@@ -152,6 +167,7 @@ pub(super) fn valid_account(account: &str) -> bool {
 /// Only the authentication coordinator can construct this runtime capability.
 /// No Debug, serialization or public constructor can manufacture verified login.
 pub struct VerifiedSession {
+    client_type: ClientType,
     account_id: String,
     assurance: AuthAssurance,
     display_name: String,
@@ -167,7 +183,11 @@ impl VerifiedSession {
         config: ServerConfig,
         profile: Arc<Profile>,
     ) -> Result<Self> {
+        if !saved.client_type.supports_native_session() {
+            bail!("Fresh phone approval is required for this client type");
+        }
         Ok(Self {
+            client_type: saved.client_type,
             account_id: saved.account_id.clone(),
             assurance: saved.proof.assurance(),
             display_name: saved.display_name.clone(),
@@ -180,6 +200,9 @@ impl VerifiedSession {
     }
     pub fn assurance(&self) -> AuthAssurance {
         self.assurance
+    }
+    pub fn client_type(&self) -> ClientType {
+        self.client_type
     }
     pub fn account_id(&self) -> &str {
         &self.account_id
@@ -198,6 +221,14 @@ impl VerifiedSession {
     }
     pub fn decrypt_payload(&self, text: &str) -> Result<Vec<u8>> {
         self.cipher.decrypt(text).map_err(anyhow::Error::new)
+    }
+    /// Directory metadata may contain 20,000 profiles. This separate, fixed
+    /// budget never enlarges authentication or messaging payload limits.
+    #[cfg(feature = "messaging")]
+    pub(crate) fn decrypt_directory_payload(&self, text: &str) -> Result<Vec<u8>> {
+        self.cipher
+            .decrypt_bounded(text, super::directory::MAX_DIRECTORY_BODY)
+            .map_err(anyhow::Error::new)
     }
     pub fn authorization_cookie(&self, url: &Url) -> Option<String> {
         if !matches!(url.scheme(), "https" | "wss")
@@ -231,6 +262,7 @@ pub(super) fn encode_key(cipher: &SessionCipher) -> String {
 #[cfg(all(test, feature = "messaging"))]
 pub(crate) fn synthetic_session(profile: Arc<Profile>, config: ServerConfig) -> VerifiedSession {
     VerifiedSession {
+        client_type: ClientType::PcLinux24,
         account_id: "11".into(),
         assurance: AuthAssurance::PhoneApproved,
         display_name: "Synthetic account".into(),

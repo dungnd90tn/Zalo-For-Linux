@@ -54,6 +54,14 @@ cancellation after it invalidates the accepted attempt through a durable tombsto
 Repeated cancellation retains the target attempt identity. UI calls perform only
 bounded channel/atomic operations; filesystem work runs on the auth worker.
 
+## Client identity and saved-session migration
+
+The Linux launcher returns client type 24 ([main.js:109415](../main-dist/main.js#L109415)). Both login and main pages receive it through `Wt` ([110055](../main-dist/main.js#L110055), [110085](../main-dist/main.js#L110085), [110223](../main-dist/main.js#L110223)); renderer startup overrides the fallback API type from that URL ([N:228138](../pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js#L228138)). The parameter-cipher device string and signed `type` query use this same runtime setting ([N:397986](../pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js#L397986), [N:398235](../pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js#L398235)). New native attempts therefore carry the closed typed capability `PcLinux24` through QR, bootstrap, persistence and messaging; the HTTP user agent is `ZaloPC-linux-24v681`.
+
+New private auth records are schema version 2 and include the numeric `client_type`. Existing version-1 records without it decode as `Legacy30`, preserving their actual historical protocol identity. Their resume fails with `FreshApprovalRequired` **before opening the HTTP transport**. No old cookie is silently retyped or given a guessed legacy user agent/origin. The UI asks for another QR scan and explicitly retains saved history. Reading/refusing that session leaves its bytes, owner, replay watermarks and message database unchanged. Fresh approval may replace credentials only after the existing UID, trust and atomic-commit checks. The separate immutable owner record remains version 1. Unknown record versions or client types fail closed.
+
+Actual `LoginController` loopback-TLS tests cover new type-24 QR creation through commit and fresh encrypted resume. An independent Node crypto fixture checks the query type, decrypted `zcid` prefix, request device identity and signature, then encrypts the responses. Historical type-30 known-answer vectors remain separate tests rather than a live fallback.
+
 ## Explicit assurance and verification
 
 Only explicit server flags `self_g=0, qr_format_trust_device=0` select
@@ -78,10 +86,12 @@ Synthetic actual-TLS tests cover the full classic create/scan/confirm/bootstrap/
 commit path, resume, UID mismatch and no downgrade; separate real-WASM fixtures
 continue through signed devices, bootstrap and commit. A bounded public probe
 verified actual controller Begin → QR → immediate Cancel and lock release for
-API version 681. It never scanned, approved, logged in or sent messages. Real
+API version 681, including one source-correct `PcLinux24` run after the client-type
+migration. It asserted no auth record or owner marker was persisted. It never
+scanned, approved, logged in or sent messages. Real
 phone approval, authenticated bootstrap and production messaging still require
 manual acceptance. Public polling is separately limited to the exact observed
-`qr-id.zaloapp.com` plus the two auth hosts; the dedicated pool receives no cookies.
+`qr-id.zaloapp.com` plus the two auth hosts; the poll-only `qr-id.zaloapp.com` origin receives no cookies.
 
 
 [L:596]: ../pc-dist/lazy/login-startup.cdc0ebe7d54dc91a9c23.js#L596
@@ -108,3 +118,8 @@ manual acceptance. Public polling is separately limited to the exact observed
 
 [L:854]: ../pc-dist/lazy/login-startup.cdc0ebe7d54dc91a9c23.js#L854
 [L:1354]: ../pc-dist/lazy/login-startup.cdc0ebe7d54dc91a9c23.js#L1354
+
+Post-confirmation failures carry sanitized bootstrap stage/category and explicit
+numeric server codes. Unused service-map and legacy polling fields neither reject
+valid authentication nor authorize cookie destinations; only consumed chat/group
+origins and validated WSS routes enter the runtime capability.

@@ -1,0 +1,114 @@
+{
+  "queueFailures": [
+    {
+      "name": "missing",
+      "frame": "AgEAAHsiZXJyb3JfY29kZSI6MCwia2V5IjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EeEFSRWhNVUZSWVhHQmthR3h3ZEhoOD0iLCJlbmNyeXB0IjoxLCJkYXRhIjoiSDRzSUFBQUFBQUFBQTZ0V1NpMHF5aStLVDg1UFNWV3lNdEJSU2trc1NWU3lxcTZ0QlFCWnFXa0lHZ0FBQUE9PSJ9"
+    },
+    {
+      "name": "empty",
+      "frame": "AgEAAHsiZXJyb3JfY29kZSI6MCwia2V5IjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EeEFSRWhNVUZSWVhHQmthR3h3ZEhoOD0iLCJlbmNyeXB0IjoxLCJkYXRhIjoiSDRzSUFBQUFBQUFBQTZ0V1NpMHF5aStLVDg1UFNWV3lNdEJSU2trc1NWU3lxbFlxZE01TktWYXlpbzZ0clFVQXlkWUthaVFBQUFBPSJ9"
+    },
+    {
+      "name": "wrong_type",
+      "frame": "AgEAAHsiZXJyb3JfY29kZSI6MCwia2V5IjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EeEFSRWhNVUZSWVhHQmthR3h3ZEhoOD0iLCJlbmNyeXB0IjoxLCJkYXRhIjoiSDRzSUFBQUFBQUFBQTZ0V1NpMHF5aStLVDg1UFNWV3lNdEJSU2trc1NWU3lxbFlxZE01TktRWXlhbXRyQVJjL2RmSWtBQUFBIn0="
+    }
+  ],
+  "provenance": "exact original _processEventBlob/_onRawData/_decrypt/_decompress/_processAuthData and bundled pako; synthetic key only",
+  "cases": [
+    {
+      "name": "zlib_v1",
+      "frame": "AQEAAHsiZXJyb3JfY29kZSI6MCwia2V5IjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EeEFSRWhNVUZSWVhHQmthR3h3ZEhoOD0iLCJlbmNyeXB0IjoxLCJkYXRhIjoiZUp5clZrb3RLc292aWsvT1QwbFZzakxRVVVwSkxFbFVzcXBXS25UT1RTbFdzb3F1VmtyT1RWR3lNalVFeWhXWEpqbURPQWExT25CaFEyVGgyTnBhQUNFVUdWST0ifQ==",
+      "expected": {
+        "error_code": 0,
+        "data": {
+          "qCmds": [
+            {
+              "cmd": 510,
+              "subCmd": 0
+            },
+            {
+              "cmd": 511,
+              "subCmd": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "gzip_v0",
+      "frame": "AAEAAHsiZXJyb3JfY29kZSI6MCwia2V5IjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EeEFSRWhNVUZSWVhHQmthR3h3ZEhoOD0iLCJlbmNyeXB0IjoxLCJkYXRhIjoiSDRzSUFBQUFBQUFBQTZ0V1NpMHF5aStLVDg1UFNWV3lNdEJSU2trc1NWU3lxbFlxZE01TktWYXlpcTVXU3M1TlViSXlOUVRLRlpjbU9ZTTRCclU2Y0dGRFpPSFkybG9BMGFOVHBWRUFBQUE9In0=",
+      "expected": {
+        "error_code": 0,
+        "data": {
+          "qCmds": [
+            {
+              "cmd": 510,
+              "subCmd": 0
+            },
+            {
+              "cmd": 511,
+              "subCmd": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "gzip_v2",
+      "frame": "AgEAAHsiZXJyb3JfY29kZSI6MCwia2V5IjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EeEFSRWhNVUZSWVhHQmthR3h3ZEhoOD0iLCJlbmNyeXB0IjoxLCJkYXRhIjoiSDRzSUFBQUFBQUFBQTZ0V1NpMHF5aStLVDg1UFNWV3lNdEJSU2trc1NWU3lxbFlxZE01TktWYXlpcTVXU3M1TlViSXlOUVRLRlpjbU9ZTTRCclU2Y0dGRFpPSFkybG9BMGFOVHBWRUFBQUE9In0=",
+      "expected": {
+        "error_code": 0,
+        "data": {
+          "qCmds": [
+            {
+              "cmd": 510,
+              "subCmd": 0
+            },
+            {
+              "cmd": 511,
+              "subCmd": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "gcm_gzip_v2",
+      "frame": "AgEAAHsiZXJyb3JfY29kZSI6MCwia2V5IjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EeEFSRWhNVUZSWVhHQmthR3h3ZEhoOD0iLCJlbmNyeXB0IjoyLCJkYXRhIjoiQVFJREJBVUdCd2dKQ2dzTURRNFBFQkVTRXhRVkZoY1lHUm9iSEIwZUh5RDREcHpXM1V4dXFwSFVsQkJYbVJiYURkVXloUU4ydDN4OE5aajBhemlnNG9oTnZsdWw4dVc0aHM2VSUyRjFmdmNzUlpCRUJjc25vT21LNXEzWFhRalN2elBJQTlUMHJQWVFnYmZic1poSTMlMkJFOVQ2Y3JCVmklMkI2aEJMVHlKbVQzNjNZJTNEIn0=",
+      "expected": {
+        "error_code": 0,
+        "data": {
+          "qCmds": [
+            {
+              "cmd": 510,
+              "subCmd": 0
+            },
+            {
+              "cmd": 511,
+              "subCmd": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "gcm_v3",
+      "frame": "AQEAAHsiZXJyb3JfY29kZSI6MCwia2V5IjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EeEFSRWhNVUZSWVhHQmthR3h3ZEhoOD0iLCJlbmNyeXB0IjozLCJkYXRhIjoiQVFJREJBVUdCd2dKQ2dzTURRNFBFQkVTRXhRVkZoY1lHUm9iSEIwZUh5Q2NwJTJGR2tyeU1jOWZLNFd5TSUyRmpndzhBRHNjUHkwZDJMVnNsSXJUUm1mTGpHR2N5aEs4V0lxcjVVMHVmU1BXeWV0TDJ4WkxqSUJtSSUyRk54UFNDeUdpdTJiUEoxak9GZ1dVdW51c3FHNWZDamJtb0FiUzFzWktSOHdZQjhyNWNLaTN3NSJ9",
+      "expected": {
+        "error_code": 0,
+        "data": {
+          "qCmds": [
+            {
+              "cmd": 510,
+              "subCmd": 0
+            },
+            {
+              "cmd": 511,
+              "subCmd": 0
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

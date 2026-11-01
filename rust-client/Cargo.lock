@@ -4226,6 +4226,17 @@ dependencies = [
  "tokio-tungstenite",
  "url",
  "wasmi",
+ "winit",
+ "zalo-signal-engine",
+]
+
+[[package]]
+name = "zalo-signal-engine"
+version = "0.1.0"
+dependencies = [
+ "futures-channel",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

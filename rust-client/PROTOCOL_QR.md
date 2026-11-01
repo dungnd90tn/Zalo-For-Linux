@@ -10,7 +10,8 @@ Line references below identify the committed Electron bundles, not live servers:
 
 | Fact | Local evidence |
 | --- | --- |
-| Default auth origin `https://wpa.zaloapp.com`, API version `681`, type `30` | `pc-dist/compact-app-pc.e08d0d44f38873747a6b.js:268324`, `:268390`, `:268407` |
+| Auth origin `https://wpa.zaloapp.com`, API version `681`; renderer fallback type `30` is overridden by the Linux launcher with desktop type `24` for both login and main pages | `main-dist/main.js:109415`, `:110055`, `:110085`, `:110223`; shared bundle `:228138` |
+| Parameter cipher uses the same runtime client type in `type,imei,time`; the signed query also uses that type | Shared bundle `:397986`, `:398235`, `:398253` |
 | QR creation is cookie-bearing GET `/api/login/reqqr` | Same bundle `:487560`, `:487619` |
 | Plaintext fields: `language`, rounded Unix-second `client_time`, `imei`, `computer_name`, comma-separated `logged_uids`, `self_g`, `qr_form` | Same bundle `:487621`; `pc-dist/lazy/login-startup.cdc0ebe7d54dc91a9c23.js:1171` |
 | Signature: lowercase MD5 of `zsecure` + command + parameter values ordered by key; `signkey` added last | Compact bundle `:487640` |
@@ -27,6 +28,9 @@ Line references below identify the committed Electron bundles, not live servers:
 The default preview remains offline. Opt-in `live-login` provides a real native
 `LoginController`; the `live` umbrella also enables messaging. Each user-started
 attempt owns a fresh random device ID, private HTTP jar and cancellation generation.
+New attempts explicitly use `ClientType::PcLinux24` throughout server-info, QR,
+parameter-key derivation, encrypted bootstrap and the committed runtime session.
+The authentication HTTP user agent is `ZaloPC-linux-24v681`.
 A 300-second deadline bounds the flow; stale callbacks never publish usable state.
 
 Explicit pre-login flags select classic `PhoneApproved` (`self_g=0, qr_form=0`)
@@ -52,7 +56,8 @@ bounded RGBA/typed progress and an opaque coordinator-created session capability
 
 ## Independent cryptographic fixture
 
-The known-answer vector was generated with Node's `node:crypto`, independently
+The historical type-30 known-answer vector is retained explicitly as `Legacy30`
+and was generated with Node's `node:crypto`, independently
 of the Rust code. Input device string is `30,fixture-imei,1700000000123`, nonce
 `abcdef123456`, and UTF-8 plaintext is
 `{"fixture":"Vietnamese: Tiếng Việt","value":42}`.
@@ -68,11 +73,19 @@ of the Rust code. Input device string is `30,fixture-imei,1700000000123`, nonce
 Expected key: `9E2FEF1536FB6489D9B1FEE6480D0186`.
 Expected signature: `a5124a84eb34d1757e00d7a6049c2aa1`.
 The unit test also pins the full ciphertext and `zcid` produced by Node.
+Production `Begin` does not use this historical identity. Actual local-TLS
+controller tests independently decode type-24 `zcid` and request payloads in Node,
+verify the signed query and encrypt both QR/bootstrap replies before durable
+commit and type-24 saved-session resume.
 
 ## Acceptance boundary
 
 Actual unauthenticated API681 startup and controller QR creation/cancellation have
-passed against the public server. Its flags selected classic PhoneApproved mode.
+passed against the public server. The source-correct type-24 controller was checked
+once after the migration: CreatingQr → QR generated → immediate Cancel, with no
+auth record or owner marker and prompt profile-lock release. No QR material,
+cookies, URLs or tokens were logged. The earlier type-30 probe selected classic
+PhoneApproved mode; neither probe performed phone approval or authenticated work.
 No real account was scanned/approved, no credentials imported, and no messages sent.
 Production phone approval, authenticated bootstrap, refresh renewal and messaging
 remain manual acceptance gates. Local TLS and independent cryptographic fixtures

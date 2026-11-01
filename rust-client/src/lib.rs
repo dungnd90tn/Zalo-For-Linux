@@ -1,6 +1,7 @@
 //! Independently authored native migration architecture. No remote implementation is vendored.
 pub mod app;
 pub mod cache;
+pub mod diagnostics;
 pub mod domain;
 pub mod migration;
 pub mod profile;

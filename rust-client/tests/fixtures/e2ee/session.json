@@ -1,0 +1,14 @@
+{
+  "description": "PUBLIC SYNTHETIC KEYS ONLY. Never use fixture RNG or keys in production.",
+  "library_sha256": "abbb3f578ede0d16c57b792a1c1793eb221dda07cf6f94919a3e76ee8a047966",
+  "alice_identity_private": "70076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c6a",
+  "alice_identity_public": "058520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+  "bob_identity_private": "58ab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e06b",
+  "bob_identity_public": "05de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+  "bob_signed_prekey_private": "d05ddf9f5caf60c8e504e449a97b62d68189ef368468e5b00344f9f221be9878",
+  "bob_signed_prekey_public": "05a51350168a47e43446e683a05e2581da19a9852bacf370f9b0ef209e04e01c24",
+  "bob_one_time_private": "b05a9b50c7eaa2d9e0b2a8fad2d08a04fc2d8fa78b5a216ab180425bddab2a55",
+  "bob_one_time_public": "05dbe4a5c11a582ddb2e7ce5473d3dd78a0c42f24b6077f116a62db1ae9869934b",
+  "initial_prekey_message": "3328e90708093007122105a1e06a0b7d1945d6a2c590cd57f1de1fb122b9547400e771797c0680cd50952a1a21058520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a2252330a2105290b1933ad26269c8a82712b7aceefa7a5b5c60e4f308bb5c21378e87072b27e1000180022209762cca0d4bb44d080a4c38f66f9d820bbbffab7fc8c407118ccee49299551dd381e4f7746b35b89",
+  "plaintext": "public synthetic hello"
+}

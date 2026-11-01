@@ -29,7 +29,7 @@ All compact-bundle references identify `pc-dist/compact-app-pc.e08d0d44f38873747
 
 - Minimal signed server-info and encrypted login-info request specifications reuse the independently authored QR module's parameter cipher and signer. No identity-submission extras are invented.
 - Bounded outer and decrypted inner envelope parsing distinguishes HTTP failures, malformed responses, service errors, encryption incompatibility and locally verified authentication rejection codes. HTTP failures, parse errors, unknown codes and negative `-102` never expire credentials. `19000` does not trigger plaintext fallback.
-- Configuration parsing validates service lists, separates chat/control polling from WebSockets, limits counts and URL lengths, and accepts only secure Zalo origins without userinfo, arbitrary ports, paths, queries or fragments. Unknown schemas are refused; no observed host is silently replaced by a hardcoded alternative.
+- Configuration authorizes only the consumed `chat`/`group` services, filtering unused map entries before interpreting their schemas, as the bundle does (shared worker `:470323–470337`; compact `:585143`). A bounded V3 list may use its scalar `zpw_service_map_new` fallback. Consumed HTTP roots remain HTTPS443 Zalo origins without paths, credentials, queries or fragments. WebSockets preserve their server-supplied queryless WSS path. Unused legacy chat/control polling remains disabled and cannot grant cookie destinations.
 - Session response decryption supports standard AES key lengths of 16, 24 and 32 bytes after base64 decoding. Independent Node crypto fixtures cover each key length and Unicode plaintext; the encrypted login-info fixture pins the nested envelope structure.
 - `PendingCookies` represents a staging plan only. It validates confirmation fields and cookie bytes, scopes a header to secure Zalo hosts, and keeps the refresh token separate. It does not install a cookie jar, persist a session, bind an account, or mark authentication successful. Secret-bearing structs have no `Debug`/`Serialize` implementation.
 
@@ -52,3 +52,20 @@ refresh tokens are retained but renewal exchange remains unimplemented. Current
 production account bootstrap and message interoperability require manual acceptance.
 The observed session AES format is compatibility code, not a design recommendation.
 Electron credentials and `safeStorage` are never read.
+
+## Post-confirmation compatibility regression
+
+Earlier parsing rejected every unsupported service-map entry, including unused
+CDN routes and extension schemas. That contradicted the original supported-domain
+filter and could turn an otherwise valid bootstrap into a generic login refusal.
+An independently encrypted Node fixture now includes over100 unused entries,
+valid chat/group origins and WebSockets; the complete local-TLS coordinator reaches
+durable Ready. Unsafe consumed origins still fail, and ignored entries never enter
+the session cookie authorization set.
+
+`decode_login_reply_detailed` retains only fixed stages/categories and explicit
+numeric service codes. The UI now distinguishes HTTP, outer/inner envelope,
+decryption, identity, session fields and service configuration failures from real
+server rejection. No URL, response body, cookie, UID or key value is retained in
+these diagnostics. This fixes demonstrated contract bugs; the user's production
+post-confirmation outcome still requires retry because no real session was read.

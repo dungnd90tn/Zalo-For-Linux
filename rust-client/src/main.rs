@@ -13,6 +13,7 @@ struct Cli {
     help: bool,
     version: bool,
     doctor: bool,
+    debug_log: bool,
     demo: bool,
     live: bool,
     trust_module: Option<PathBuf>,
@@ -31,6 +32,7 @@ impl Cli {
                 "--help" | "-h" => cli.help = true,
                 "--version" | "-V" => cli.version = true,
                 "--doctor" => cli.doctor = true,
+                "--debug-log" => cli.debug_log = true,
                 "--demo" => cli.demo = true,
                 "--live" => cli.live = true,
                 "--headless" => cli.headless = true,
@@ -103,7 +105,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse(std::env::args().skip(1))?;
     if cli.help {
         println!("Zalo Linux Rust preview\n");
-        println!("Usage: zalo-rust [--gui] [--profile NAME] [--profile-root DIR]\n       zalo-rust --live [--trust-module ABSOLUTE_PATH] [--profile NAME]\n       zalo-rust --demo [--headless] [--profile NAME] [--profile-root DIR]\n       zalo-rust --doctor\n       zalo-rust --inspect-electron-copy SNAPSHOT --source-account ID\n\n--live       Enable live login and messaging compiled with Cargo feature 'live'\n             Network access starts only after an explicit login/restore action\n--trust-module  Optional advanced override of the bundled, hash-verified trust module\n--demo       Offline GUI with synthetic messages and local-only storage\n--headless   Exercise demo worker/storage without opening a window\n--doctor     Print offline environment/capability JSON without creating profiles\n--help, -h   Show help\n--version    Print version\n\nCalls, updates, and history import are unavailable.\nDefault profiles: rust-live for live, rust-demo for demo, rust-pilot otherwise. Electron data is never opened automatically.");
+        println!("Usage: zalo-rust [--gui] [--profile NAME] [--profile-root DIR]\n       zalo-rust --live [--trust-module ABSOLUTE_PATH] [--profile NAME]\n       zalo-rust --demo [--headless] [--profile NAME] [--profile-root DIR]\n       zalo-rust --doctor\n       zalo-rust --inspect-electron-copy SNAPSHOT --source-account ID\n\n--live       Enable live login and messaging compiled with Cargo feature 'live'\n             Network access starts only after an explicit login/restore action\n--trust-module  Optional advanced override of the bundled, hash-verified trust module\n--demo       Offline GUI with synthetic messages and local-only storage\n--headless   Exercise demo worker/storage without opening a window\n--doctor     Print offline environment/capability JSON without creating profiles\n--debug-log  Include additional fixed structural diagnostics; logs are always enabled\n--help, -h   Show help\n--version    Print version\n\nCalls, updates, and history import are unavailable.\nDefault profiles: rust-live for live, rust-demo for demo, rust-pilot otherwise. Electron data is never opened automatically.");
         return Ok(());
     }
     if cli.version {
@@ -135,6 +137,7 @@ fn main() -> Result<()> {
             network_started: bool,
             history_import_available: bool,
             selected_profile: &'a str,
+            diagnostic_log_path: PathBuf,
             command_queue_capacity: usize,
             event_queue_capacity: usize,
             max_page_size: usize,
@@ -156,6 +159,9 @@ fn main() -> Result<()> {
                 network_started: false,
                 history_import_available: false,
                 selected_profile: cli.profile_name(),
+                diagnostic_log_path: zalo_rust::diagnostics::log_path(
+                    &Profile::planned_paths(cli.root.as_deref(), cli.profile_name())?.cache_dir
+                ),
                 command_queue_capacity: zalo_rust::app::COMMAND_CAPACITY,
                 event_queue_capacity: zalo_rust::app::EVENT_CAPACITY,
                 max_page_size: zalo_rust::domain::MAX_PAGE_SIZE
@@ -171,6 +177,20 @@ fn main() -> Result<()> {
     } else {
         Profile::open(cli.profile_name())?
     };
+    let _diagnostics =
+        match zalo_rust::diagnostics::Logger::start(&profile.paths.cache_dir, cli.debug_log) {
+            Ok(logger) => {
+                eprintln!("Diagnostic log: {}", logger.path().display());
+                Some(logger)
+            }
+            Err(_) => {
+                eprintln!(
+                    "Diagnostic log unavailable: private path or I/O failure. Intended log: {}",
+                    zalo_rust::diagnostics::log_path(&profile.paths.cache_dir).display()
+                );
+                None
+            }
+        };
     // Demo data must never become another account's cached history.
     if cli.demo {
         profile.bind_account(DEMO_ACCOUNT)?;

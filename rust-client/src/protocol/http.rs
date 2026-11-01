@@ -240,10 +240,7 @@ fn client_builder(cookies: Arc<AttemptCookies>) -> reqwest::ClientBuilder {
         .timeout(Duration::from_millis(MAX_TIMEOUT_MS))
         .pool_max_idle_per_host(1)
         .pool_idle_timeout(Duration::from_secs(30))
-        .user_agent(concat!(
-            "zalo-linux-native-preview/",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .user_agent(super::client::PC_LINUX_USER_AGENT)
 }
 
 impl QrTransport for HttpAdapter {

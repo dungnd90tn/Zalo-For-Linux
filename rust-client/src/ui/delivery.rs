@@ -55,6 +55,17 @@ impl DeliveryBook {
             self.overflow = true;
         }
     }
+    /// Worker loss cannot prove whether outstanding HTTP sends reached Zalo.
+    pub fn interrupted(&mut self) {
+        let pending: Vec<_> = self
+            .pending
+            .iter()
+            .map(|(thread, item)| (thread.clone(), item.request))
+            .collect();
+        for (thread, request) in pending {
+            self.failed(&thread, request, false);
+        }
+    }
     pub fn sent(&mut self, thread: &str, request: u64) {
         if self
             .pending
@@ -96,6 +107,21 @@ fn digest(text: &str) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stopped_worker_preserves_unacknowledged_send_guard_across_reconnect() {
+        let mut book = DeliveryBook::default();
+        book.submitted("d:22", 7, "Giữ nguyên bản nháp");
+        book.interrupted();
+        assert!(!book.can_send("d:22"));
+        assert!(!book.review("d:22").unwrap().accepted);
+        book.sent("d:22", 8);
+        assert!(
+            !book.can_send("d:22"),
+            "unrelated ACK cannot release original send"
+        );
+        book.sent("d:22", 7);
+        assert!(book.can_send("d:22"));
+    }
     #[test]
     fn unknown_send_preserves_new_drafts_but_blocks_original_body_even_after_undo() {
         let mut book = DeliveryBook::default();

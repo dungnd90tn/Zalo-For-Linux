@@ -1,0 +1,14 @@
+{
+  "electron": "43.3.0",
+  "chromium": "150.0.7871.212",
+  "transport": "wss",
+  "observer": true,
+  "method": "GET",
+  "httpVersion": "1.1",
+  "path": "/socket?zpw_ver=681&zpw_type=24&t=1700000000000",
+  "origin": "file://",
+  "userAgent": "ZaloPC-linux-24v681",
+  "extensions": "permessage-deflate; client_max_window_bits",
+  "protocol": null,
+  "version": "13"
+}

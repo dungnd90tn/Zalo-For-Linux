@@ -1,6 +1,8 @@
 use super::*;
 use crate::{
+    app::directory::{DirectoryCategory, DirectoryFetcher, DirectorySink, DirectoryStage},
     protocol::messaging::{self as wire, DecodedFrame, FrameDecoder, Target, WireError},
+    store::directory::DirectoryBatch,
     store::MessageStore,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -17,19 +19,209 @@ use url::Url;
 mod integration_tests;
 
 #[derive(Debug)]
-struct NetworkFailure;
+struct NetworkFailure(LiveDiagnostic);
 impl std::fmt::Display for NetworkFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Messaging connection interrupted")
+        self.0.fmt(f)
     }
 }
 impl std::error::Error for NetworkFailure {}
+impl NetworkFailure {
+    fn new(stage: LiveStage, category: LiveCategory) -> Self {
+        Self(LiveDiagnostic {
+            stage,
+            category,
+            http_status: None,
+            server_code: None,
+            parser_reason: None,
+        })
+    }
+    fn socket(stage: LiveStage, error: tungstenite::Error) -> Self {
+        let category = match &error {
+            tungstenite::Error::Http(_) => LiveCategory::Http,
+            tungstenite::Error::Tls(_) => LiveCategory::Tls,
+            tungstenite::Error::Io(e)
+                if stage == LiveStage::Connect
+                    && matches!(e.kind(), std::io::ErrorKind::InvalidData) =>
+            {
+                LiveCategory::Tls
+            }
+            tungstenite::Error::Io(_) => LiveCategory::Network,
+            tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
+                LiveCategory::Closed
+            }
+            tungstenite::Error::Capacity(_) | tungstenite::Error::WriteBufferFull(_) => {
+                LiveCategory::Resource
+            }
+            _ => LiveCategory::Protocol,
+        };
+        let mut result = Self::new(stage, category);
+        if let tungstenite::Error::Http(reply) = error {
+            result.0.http_status = Some(reply.status().as_u16());
+        }
+        result
+    }
+}
+fn wire_error(error: &anyhow::Error) -> Option<&WireError> {
+    error
+        .downcast_ref::<wire::FrameFailure>()
+        .map(|failure| &failure.error)
+        .or_else(|| error.downcast_ref::<WireError>())
+}
+fn diagnostic(error: &anyhow::Error, stage: LiveStage) -> LiveDiagnostic {
+    if let Some(network) = error.downcast_ref::<NetworkFailure>() {
+        record_failure(network.0, None);
+        return network.0;
+    }
+    let frame_failure = error.downcast_ref::<wire::FrameFailure>();
+    let wire_error = wire_error(error);
+    let category = match wire_error {
+        Some(WireError::Invalid) => LiveCategory::Protocol,
+        Some(WireError::Oversize) => LiveCategory::Resource,
+        Some(WireError::Crypto) => LiveCategory::Crypto,
+        Some(WireError::Unsupported) => LiveCategory::Unsupported,
+        Some(WireError::Authentication) => LiveCategory::Authentication,
+        Some(WireError::Service(_)) => LiveCategory::Server,
+        None => LiveCategory::Storage,
+    };
+    let result = LiveDiagnostic {
+        stage,
+        category,
+        http_status: None,
+        parser_reason: frame_failure.map(|failure| failure.reason),
+        server_code: match wire_error {
+            Some(WireError::Service(code)) => Some(*code),
+            _ => None,
+        },
+    };
+    record_failure(result, frame_failure.map(|failure| failure.context));
+    result
+}
+fn record_failure(detail: LiveDiagnostic, context: Option<wire::FrameContext>) {
+    use crate::diagnostics::{record, Event, Kind, Reason, Stage, ValueType};
+    let stage = match detail.stage {
+        LiveStage::Configuration | LiveStage::Connect => Stage::Connection,
+        LiveStage::Authentication => Stage::Authentication,
+        LiveStage::Send => Stage::Send,
+        LiveStage::Receive => Stage::Receive,
+        LiveStage::Synchronization => Stage::Synchronization,
+        LiveStage::Heartbeat => Stage::Heartbeat,
+        LiveStage::Storage => Stage::Storage,
+    };
+    let reason = match detail.parser_reason {
+        Some(reason) => match reason {
+            wire::FrameReason::MessageType => Reason::MessageType,
+            wire::FrameReason::FrameLength => Reason::FrameLength,
+            wire::FrameReason::OuterJson => Reason::OuterJson,
+            wire::FrameReason::OuterEnvelope => Reason::OuterEnvelope,
+            wire::FrameReason::AuthKey => Reason::AuthKey,
+            wire::FrameReason::EncryptionMode => Reason::EncryptionMode,
+            wire::FrameReason::OuterData => Reason::OuterData,
+            wire::FrameReason::Base64 => Reason::Base64,
+            wire::FrameReason::CipherIntegrity => Reason::CipherIntegrity,
+            wire::FrameReason::Compression => Reason::Compression,
+            wire::FrameReason::InnerJson => Reason::InnerJson,
+            wire::FrameReason::InnerEnvelope => Reason::InnerEnvelope,
+            wire::FrameReason::PlaintextAuth => Reason::PlaintextAuth,
+            wire::FrameReason::QueueCommands => Reason::QueueCommands,
+        },
+        None => match detail.category {
+            LiveCategory::Timeout => Reason::Timeout,
+            LiveCategory::Http => Reason::HttpStatus,
+            LiveCategory::Authentication | LiveCategory::Server => Reason::ServerCode,
+            LiveCategory::Unsupported => Reason::Unsupported,
+            LiveCategory::Protocol | LiveCategory::Crypto => Reason::Invalid,
+            LiveCategory::Storage => Reason::Io,
+            _ => Reason::Transport,
+        },
+    };
+    let mut event = Event::new(Kind::Failure, stage, reason)
+        .http_status(detail.http_status)
+        .server_code(detail.server_code);
+    if let Some(context) = context {
+        let kind = |value| match value {
+            wire::FrameValueType::Absent => ValueType::Absent,
+            wire::FrameValueType::Null => ValueType::Null,
+            wire::FrameValueType::Integer => ValueType::Integer,
+            wire::FrameValueType::Number => ValueType::Number,
+            wire::FrameValueType::String => ValueType::String,
+            wire::FrameValueType::Boolean => ValueType::Boolean,
+            wire::FrameValueType::Object => ValueType::Object,
+            wire::FrameValueType::Array => ValueType::Array,
+        };
+        event = event
+            .bytes(context.bytes)
+            .envelope_types(kind(context.status_type), kind(context.data_type));
+        if let (Some(command), Some(subcommand)) = (context.command, context.subcommand) {
+            event = event.frame(command, subcommand, context.encryption)
+        }
+    }
+    record(event);
+}
+fn trace(stage: crate::diagnostics::Stage, reason: crate::diagnostics::Reason) {
+    crate::diagnostics::record(crate::diagnostics::Event::new(
+        crate::diagnostics::Kind::Transition,
+        stage,
+        reason,
+    ));
+}
+fn record_directory_failure(failure: &DirectoryFailure) {
+    use crate::diagnostics::{record, Event, Kind, Reason, Stage};
+    let reason = match failure.category {
+        DirectoryCategory::Unavailable => Reason::Unsupported,
+        DirectoryCategory::Network => Reason::Transport,
+        DirectoryCategory::Timeout => Reason::Timeout,
+        DirectoryCategory::Http => Reason::HttpStatus,
+        DirectoryCategory::Server => Reason::ServerCode,
+        DirectoryCategory::Crypto | DirectoryCategory::Schema => Reason::Invalid,
+        DirectoryCategory::Resource => Reason::FrameLength,
+        DirectoryCategory::Cancelled => Reason::Cancelled,
+        DirectoryCategory::Storage => Reason::Io,
+    };
+    record(
+        Event::new(Kind::Failure, Stage::Synchronization, reason)
+            .http_status(failure.http_status)
+            .server_code(failure.server_code),
+    );
+}
+/// Deterministic transport failures require an explicit retry, while the local
+/// account database and command receiver remain available.
+fn terminal_transport_state(error: &anyhow::Error) -> Option<LiveConnection> {
+    if let Some(wire) = wire_error(error) {
+        return Some(if *wire == WireError::Authentication {
+            LiveConnection::Expired
+        } else {
+            LiveConnection::Offline
+        });
+    }
+    let failure = error.downcast_ref::<NetworkFailure>()?;
+    match failure.0.category {
+        LiveCategory::Http => match failure.0.http_status {
+            Some(401) => Some(LiveConnection::Expired),
+            Some(300..=499) if failure.0.http_status != Some(429) => Some(LiveConnection::Offline),
+            _ => None,
+        },
+        LiveCategory::Tls | LiveCategory::Protocol | LiveCategory::Resource => {
+            Some(LiveConnection::Offline)
+        }
+        LiveCategory::Closed => match failure.0.server_code {
+            Some(3000) => Some(LiveConnection::Expired),
+            Some(3001..=3003) => Some(LiveConnection::Offline),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type Job = Box<dyn FnOnce(&mut MessageStore) + Send>;
 struct Database {
     jobs: Option<mpsc::Sender<Job>>,
     thread: Option<JoinHandle<()>>,
+}
+#[derive(Clone)]
+struct DatabaseHandle {
+    jobs: mpsc::Sender<Job>,
 }
 impl Database {
     async fn open(profile: Arc<Profile>, account: String) -> Result<Self> {
@@ -74,16 +266,236 @@ impl Database {
         &self,
         job: impl FnOnce(&mut MessageStore) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.handle()?.call(job).await
+    }
+    fn handle(&self) -> Result<DatabaseHandle> {
+        Ok(DatabaseHandle {
+            jobs: self
+                .jobs
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Storage stopped"))?
+                .clone(),
+        })
+    }
+}
+impl DatabaseHandle {
+    async fn call<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut MessageStore) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let (tx, rx) = oneshot::channel();
         self.jobs
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Storage stopped"))?
             .send(Box::new(move |store| {
                 let _ = tx.send(job(store));
             }))
             .await
             .map_err(|_| anyhow::anyhow!("Storage stopped"))?;
         rx.await.map_err(|_| anyhow::anyhow!("Storage stopped"))?
+    }
+}
+
+fn directory_failure(category: DirectoryCategory) -> DirectoryFailure {
+    DirectoryFailure {
+        stage: DirectoryStage::Storage,
+        category,
+        http_status: None,
+        server_code: None,
+    }
+}
+struct RuntimeDirectorySink {
+    account: String,
+    db: DatabaseHandle,
+    updates: watch::Sender<u64>,
+}
+impl DirectorySink for RuntimeDirectorySink {
+    async fn apply(&mut self, batch: DirectoryBatch) -> std::result::Result<(), DirectoryFailure> {
+        if batch.account_id != self.account {
+            return Err(directory_failure(DirectoryCategory::Storage));
+        }
+        self.db
+            .call(move |store| {
+                store.apply_directory_batch(&batch)?;
+                Ok(())
+            })
+            .await
+            .map_err(|_| directory_failure(DirectoryCategory::Storage))?;
+        // Coalesce durable changes while the UI is slow. The directory task
+        // never reserves critical WebSocket event capacity.
+        self.updates
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        Ok(())
+    }
+}
+struct DirectoryRun {
+    generation: u64,
+    task: tokio::task::JoinHandle<std::result::Result<DirectoryReport, DirectoryFailure>>,
+    cancel: watch::Sender<bool>,
+}
+impl Drop for DirectoryRun {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+        self.task.abort();
+    }
+}
+struct DirectorySync {
+    running: Option<DirectoryRun>,
+    pending: Option<u64>,
+    updates_tx: watch::Sender<u64>,
+    updates_rx: watch::Receiver<u64>,
+    status: Option<(u64, bool, DirectoryReport)>,
+    conversations_changed: bool,
+}
+impl DirectorySync {
+    fn new() -> Self {
+        let (updates_tx, updates_rx) = watch::channel(0);
+        Self {
+            running: None,
+            pending: None,
+            updates_tx,
+            updates_rx,
+            status: None,
+            conversations_changed: false,
+        }
+    }
+    fn request(
+        &mut self,
+        generation: u64,
+        session: Arc<VerifiedSession>,
+        db: DatabaseHandle,
+        transports: &Transports,
+    ) {
+        if self.running.is_some() {
+            self.pending = Some(generation);
+            self.status = Some((generation, true, DirectoryReport::default()));
+            return;
+        }
+        self.start(generation, session, db, transports);
+    }
+    fn start(
+        &mut self,
+        generation: u64,
+        session: Arc<VerifiedSession>,
+        db: DatabaseHandle,
+        transports: &Transports,
+    ) {
+        let fetcher = {
+            #[cfg(test)]
+            {
+                if transports.local.is_some() {
+                    Ok(DirectoryFetcher::with_client(transports.http.clone()))
+                } else {
+                    DirectoryFetcher::new()
+                }
+            }
+            #[cfg(not(test))]
+            {
+                let _ = transports;
+                DirectoryFetcher::new()
+            }
+        };
+        let fetcher = match fetcher {
+            Ok(fetcher) => fetcher,
+            Err(error) => {
+                self.status = Some((
+                    generation,
+                    false,
+                    DirectoryReport {
+                        failures: vec![error],
+                        ..Default::default()
+                    },
+                ));
+                return;
+            }
+        };
+        let (cancel, rx) = watch::channel(false);
+        let mut sink = RuntimeDirectorySink {
+            account: session.account_id().into(),
+            db,
+            updates: self.updates_tx.clone(),
+        };
+        let task = tokio::spawn(async move { fetcher.synchronize(&session, &mut sink, rx).await });
+        self.running = Some(DirectoryRun {
+            generation,
+            task,
+            cancel,
+        });
+        self.status = Some((generation, true, DirectoryReport::default()));
+    }
+    fn completed(
+        &mut self,
+        result: std::result::Result<
+            std::result::Result<DirectoryReport, DirectoryFailure>,
+            tokio::task::JoinError,
+        >,
+        session: Arc<VerifiedSession>,
+        db: DatabaseHandle,
+        transports: &Transports,
+    ) {
+        let generation = self
+            .running
+            .take()
+            .expect("completed directory sync")
+            .generation;
+        let report = match result {
+            Ok(Ok(report)) => report,
+            Ok(Err(error)) => DirectoryReport {
+                failures: vec![error],
+                ..Default::default()
+            },
+            Err(_) => DirectoryReport {
+                failures: vec![DirectoryFailure {
+                    stage: DirectoryStage::Synchronization,
+                    category: DirectoryCategory::Cancelled,
+                    http_status: None,
+                    server_code: None,
+                }],
+                ..Default::default()
+            },
+        };
+        if let Some(generation) = self.pending.take() {
+            self.start(generation, session, db, transports);
+        } else {
+            self.status = Some((generation, false, report));
+        }
+    }
+    fn notifications_pending(&self) -> bool {
+        self.status.is_some() || self.conversations_changed
+    }
+    async fn publish_notification(
+        &mut self,
+        permit: mpsc::Permit<'_, LiveEvent>,
+        db: &Database,
+        events: &Events,
+    ) -> Result<()> {
+        if let Some((generation, syncing, report)) = self.status.take() {
+            for failure in &report.failures {
+                record_directory_failure(failure);
+            }
+            permit.send(LiveEvent::DirectoryStatus {
+                account_id: events.account.clone(),
+                generation,
+                syncing,
+                report,
+            });
+        } else {
+            let account = events.account.clone();
+            // Read after obtaining UI capacity: earlier Received/Sent commits
+            // are included, and later socket events cannot overtake this read.
+            let conversations = db
+                .call(move |store| store.conversations(&account, crate::domain::MAX_PAGE_SIZE))
+                .await?;
+            self.conversations_changed = false;
+            permit.send(LiveEvent::DirectoryChanged {
+                account_id: events.account.clone(),
+                conversations,
+            });
+        }
+        (events.repaint)();
+        Ok(())
+    }
+    fn changed(&mut self) {
+        self.updates_rx.borrow_and_update();
+        self.conversations_changed = true;
     }
 }
 impl Drop for Database {
@@ -108,9 +520,25 @@ impl Events {
         Ok(())
     }
     async fn connection(&self, state: LiveConnection) -> Result<()> {
+        use crate::diagnostics::{Reason, Stage};
+        trace(
+            Stage::Connection,
+            match state {
+                LiveConnection::Connecting | LiveConnection::Reconnecting => Reason::Requested,
+                LiveConnection::Online => Reason::Online,
+                LiveConnection::Offline | LiveConnection::Expired => Reason::Offline,
+            },
+        );
         self.emit(LiveEvent::Connection {
             account_id: self.account.clone(),
             state,
+        })
+        .await
+    }
+    async fn diagnostic(&self, diagnostic: LiveDiagnostic) -> Result<()> {
+        self.emit(LiveEvent::Diagnostic {
+            account_id: self.account.clone(),
+            diagnostic,
         })
         .await
     }
@@ -127,7 +555,7 @@ impl Transports {
             let request = Connection::handshake_request(session, index)?;
             let tcp = tokio::net::TcpStream::connect(address)
                 .await
-                .map_err(|_| NetworkFailure)?;
+                .map_err(|_| NetworkFailure::new(LiveStage::Connect, LiveCategory::Network))?;
             let (socket, _) = tokio_tungstenite::client_async_tls_with_config(
                 request,
                 tcp,
@@ -135,7 +563,7 @@ impl Transports {
                 Some(tokio_tungstenite::Connector::Rustls(tls.clone())),
             )
             .await
-            .map_err(|_| NetworkFailure)?;
+            .map_err(|e| NetworkFailure::socket(LiveStage::Connect, e))?;
             return Ok(Connection::connected(socket));
         }
         Connection::connect(session, index).await
@@ -149,7 +577,7 @@ pub(super) async fn run(
     repaint: Arc<dyn Fn() + Send + Sync>,
     cancel: watch::Receiver<bool>,
 ) {
-    let http = match client() {
+    let http = match client(session.client_type()) {
         Ok(client) => client,
         Err(_) => {
             let _ = events.try_send(LiveEvent::Fault {
@@ -188,7 +616,9 @@ async fn run_with_transports(
     if *cancel.borrow() {
         return;
     }
-    tokio::select! {biased; _=cancel.changed()=>{},result=run_inner(profile,session,commands,&event,&transports)=>{if result.is_err(){
+    tokio::select! {biased; _=cancel.changed()=>{trace(crate::diagnostics::Stage::Shutdown,crate::diagnostics::Reason::Cancelled)},result=run_inner(profile,session,commands,&event,&transports)=>{if let Err(error)=result{
+        let detail=diagnostic(&error,LiveStage::Storage);
+        tokio::select!{biased;_=cancel.changed()=>{},_=event.diagnostic(detail)=>{}}
         tokio::select!{biased;_=cancel.changed()=>{},_=event.emit(LiveEvent::Fault{account_id:event.account.clone(),error:"Messaging stopped. Your local history and drafts are preserved.".into()})=>{}}
     }}}
 }
@@ -199,7 +629,7 @@ fn now_ms() -> i64 {
         .as_millis()
         .min(i64::MAX as u128) as i64
 }
-fn client() -> Result<reqwest::Client> {
+fn client(client_type: crate::protocol::client::ClientType) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .no_proxy()
         .http1_only()
@@ -207,7 +637,7 @@ fn client() -> Result<reqwest::Client> {
         .https_only(true)
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(15))
-        .user_agent("Mozilla/5.0 ZaloPC NativeLinux")
+        .user_agent(client_type.user_agent().ok_or(WireError::Unsupported)?)
         .build()?)
 }
 fn root_for(session: &VerifiedSession, name: &str) -> Result<Url> {
@@ -250,27 +680,38 @@ impl Connection {
             self.socket.send(tungstenite::Message::Binary(frame)),
         )
         .await
-        .map_err(|_| NetworkFailure)?
-        .map_err(|_| NetworkFailure)?;
+        .map_err(|_| NetworkFailure::new(LiveStage::Receive, LiveCategory::Timeout))?
+        .map_err(|e| NetworkFailure::socket(LiveStage::Receive, e))?;
         Ok(())
     }
     async fn next(&mut self) -> Result<Option<DecodedFrame>> {
         match self.socket.next().await {
-            Some(Ok(tungstenite::Message::Binary(bytes))) => Ok(Some(self.decoder.decode(&bytes)?)),
+            Some(Ok(tungstenite::Message::Binary(bytes))) => {
+                Ok(Some(self.decoder.decode_detailed(&bytes)?))
+            }
             Some(Ok(tungstenite::Message::Ping(bytes))) => {
                 tokio::time::timeout(
                     Duration::from_secs(5),
                     self.socket.send(tungstenite::Message::Pong(bytes)),
                 )
                 .await
-                .map_err(|_| NetworkFailure)?
-                .map_err(|_| NetworkFailure)?;
+                .map_err(|_| NetworkFailure::new(LiveStage::Heartbeat, LiveCategory::Timeout))?
+                .map_err(|e| NetworkFailure::socket(LiveStage::Heartbeat, e))?;
                 Ok(None)
             }
             Some(Ok(tungstenite::Message::Pong(_))) => Ok(None),
-            Some(Ok(tungstenite::Message::Close(_))) | None => Err(NetworkFailure.into()),
-            Some(Ok(_)) => Err(WireError::Invalid.into()),
-            Some(Err(_)) => Err(NetworkFailure.into()),
+            Some(Ok(tungstenite::Message::Close(frame))) => {
+                let mut failure = NetworkFailure::new(LiveStage::Receive, LiveCategory::Closed);
+                failure.0.server_code = frame.map(|frame| i64::from(u16::from(frame.code)));
+                Err(failure.into())
+            }
+            None => Err(NetworkFailure::new(LiveStage::Receive, LiveCategory::Closed).into()),
+            Some(Ok(_)) => Err(wire::FrameFailure::new(
+                WireError::Invalid,
+                wire::FrameReason::MessageType,
+            )
+            .into()),
+            Some(Err(error)) => Err(NetworkFailure::socket(LiveStage::Receive, error).into()),
         }
     }
     fn handshake_request(
@@ -281,7 +722,7 @@ impl Connection {
         let root = roots
             .get(index % roots.len().max(1))
             .ok_or(WireError::Unsupported)?;
-        let url = wire::socket_url(root, now_ms())?;
+        let url = wire::socket_url(root, now_ms(), session.client_type())?;
         let mut request = url
             .as_str()
             .into_client_request()
@@ -295,9 +736,15 @@ impl Connection {
                 .headers_mut()
                 .insert("Cookie", cookie.parse().map_err(|_| WireError::Invalid)?);
         }
-        request
-            .headers_mut()
-            .insert("Origin", "https://chat.zalo.me".parse()?);
+        request.headers_mut().insert("Origin", "file://".parse()?);
+        request.headers_mut().insert(
+            "User-Agent",
+            session
+                .client_type()
+                .user_agent()
+                .ok_or(WireError::Unsupported)?
+                .parse()?,
+        );
         Ok(request)
     }
     fn socket_config() -> WebSocketConfig {
@@ -318,8 +765,8 @@ impl Connection {
             tokio_tungstenite::connect_async_with_config(request, Some(config), false),
         )
         .await
-        .map_err(|_| NetworkFailure)?
-        .map_err(|_| NetworkFailure)?;
+        .map_err(|_| NetworkFailure::new(LiveStage::Connect, LiveCategory::Timeout))?
+        .map_err(|e| NetworkFailure::socket(LiveStage::Connect, e))?;
         Ok(Self::connected(socket))
     }
     fn connected(socket: Socket) -> Self {
@@ -376,22 +823,38 @@ impl Connection {
     async fn process(&mut self, frame: DecodedFrame, db: &Database, events: &Events) -> Result<()> {
         match frame.cmd {
             1 => {
+                trace(
+                    crate::diagnostics::Stage::Authentication,
+                    crate::diagnostics::Reason::Ready,
+                );
                 self.authenticated_at = Some(tokio::time::Instant::now());
                 let commands = frame
                     .payload
                     .pointer("/data/qCmds")
                     .and_then(Value::as_array)
-                    .filter(|v| v.len() <= 64)
-                    .ok_or(WireError::Invalid)?;
+                    .filter(|v| !v.is_empty() && v.len() <= 64)
+                    .ok_or_else(|| {
+                        wire::FrameFailure::new(
+                            WireError::Invalid,
+                            wire::FrameReason::QueueCommands,
+                        )
+                    })?;
                 for command in commands {
-                    let cmd = command
-                        .get("cmd")
-                        .and_then(Value::as_u64)
-                        .ok_or(WireError::Invalid)?;
+                    let cmd = command.get("cmd").and_then(Value::as_u64).ok_or_else(|| {
+                        wire::FrameFailure::new(
+                            WireError::Invalid,
+                            wire::FrameReason::QueueCommands,
+                        )
+                    })?;
                     let sub = command
                         .get("subCmd")
                         .and_then(Value::as_u64)
-                        .ok_or(WireError::Invalid)?;
+                        .ok_or_else(|| {
+                            wire::FrameFailure::new(
+                                WireError::Invalid,
+                                wire::FrameReason::QueueCommands,
+                            )
+                        })?;
                     if [510, 511].contains(&cmd) && sub <= 1 {
                         self.queues.insert((cmd as u16, sub as u8));
                     }
@@ -406,10 +869,29 @@ impl Connection {
                 }
             }
             2 => {
-                if frame.payload.get("eventId").and_then(Value::as_i64) == self.last_ping {
+                if frame
+                    .payload
+                    .get("eventId")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|id| self.last_ping == Some(id))
+                {
                     self.last_ping = None;
                     self.last_pong = tokio::time::Instant::now();
+                    trace(
+                        crate::diagnostics::Stage::Heartbeat,
+                        crate::diagnostics::Reason::Ready,
+                    );
                 }
+            }
+            4 => {
+                crate::diagnostics::record(
+                    crate::diagnostics::Event::new(
+                        crate::diagnostics::Kind::Debug,
+                        crate::diagnostics::Stage::Heartbeat,
+                        crate::diagnostics::Reason::Ready,
+                    )
+                    .frame(4, frame.sub_cmd, None),
+                );
             }
             501 | 521 | 510 | 511 | 534 | 570 => {
                 let parsed = wire::incoming_messages(&events.account, &frame.payload)?;
@@ -426,8 +908,8 @@ impl Connection {
                         .ok_or(WireError::Invalid)?;
                     for (queue, value) in map {
                         let (cmd, sub) = queue.split_once('_').ok_or(WireError::Invalid)?;
-                        let cmd = cmd.parse::<u16>()?;
-                        let sub = sub.parse::<u8>()?;
+                        let cmd = cmd.parse::<u16>().map_err(|_| WireError::Invalid)?;
+                        let sub = sub.parse::<u8>().map_err(|_| WireError::Invalid)?;
                         if ![510, 511].contains(&cmd) || sub > 1 {
                             continue;
                         }
@@ -499,6 +981,10 @@ impl Connection {
                         .await?;
                 }
                 for (message, conversation) in stored {
+                    trace(
+                        crate::diagnostics::Stage::Receive,
+                        crate::diagnostics::Reason::Ready,
+                    );
                     events
                         .emit(LiveEvent::Received {
                             account_id: events.account.clone(),
@@ -633,6 +1119,13 @@ async fn authenticated_request(
         client.get(url)
     };
     let response = request
+        .header(
+            "User-Agent",
+            session
+                .client_type()
+                .user_agent()
+                .ok_or(WireError::Unsupported)?,
+        )
         .header("Cookie", cookie)
         .send()
         .await
@@ -650,7 +1143,7 @@ async fn verify_group(
     let params=session.encrypt_payload(&serde_json::to_vec(&json!({"grid":target.remote_id,"avatar_size":120,"member_avatar_size":120,"mpage":1,"mcount":100,"imei":session.imei()}))?)?;
     url.query_pairs_mut()
         .append_pair("zpw_ver", wire::API_VERSION)
-        .append_pair("zpw_type", wire::API_TYPE)
+        .append_pair("zpw_type", session.client_type().api_type())
         .append_pair("params", &params);
     let payload = tokio::time::timeout(
         Duration::from_secs(15),
@@ -674,7 +1167,7 @@ async fn send_text(
             ThreadKind::Group => "group",
         },
     )?;
-    let url = wire::send_url(&root, target.kind)?;
+    let url = wire::send_url(&root, target.kind, session.client_type())?;
     let mut parameters = wire::text_parameters(target, text, client_id, session.imei())?;
     if target.kind == ThreadKind::Group {
         parameters["visibility"] = json!(visibility.ok_or(WireError::Invalid)?);
@@ -709,13 +1202,21 @@ async fn persist_ack(
             .await;
         match result {
             Ok(value) => return Ok(value),
-            Err(error) => last = Some(error),
+            Err(error) => {
+                let _ = diagnostic(&error, LiveStage::Storage);
+                last = Some(error)
+            }
         }
         if attempt < 2 {
             tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("Cannot store acknowledgement")))
+}
+enum CommandOutcome {
+    Continue,
+    PauseTransport,
+    Shutdown,
 }
 async fn handle_command(
     command: LiveCommand,
@@ -724,9 +1225,51 @@ async fn handle_command(
     events: &Events,
     session: &VerifiedSession,
     client: &reqwest::Client,
-) -> Result<bool> {
+) -> Result<CommandOutcome> {
     match command {
-        LiveCommand::Shutdown => return Ok(false),
+        LiveCommand::Reconnect | LiveCommand::RefreshDirectory { .. } => {
+            return Ok(CommandOutcome::Continue)
+        }
+        LiveCommand::Shutdown => return Ok(CommandOutcome::Shutdown),
+        LiveCommand::Directory {
+            generation,
+            is_group,
+            query,
+            after,
+        } => {
+            const PAGE_SIZE: usize = 100;
+            let account = events.account.clone();
+            let search = query.clone();
+            let result = db
+                .call(move |store| {
+                    store.directory_page(&account, is_group, &search, after.as_ref(), PAGE_SIZE + 1)
+                })
+                .await;
+            let event = match result {
+                Ok(mut entries) => {
+                    let next = if entries.len() > PAGE_SIZE {
+                        entries.pop();
+                        entries.last().map(DirectoryCursor::from_record)
+                    } else {
+                        None
+                    };
+                    LiveEvent::DirectoryPage {
+                        account_id: events.account.clone(),
+                        generation,
+                        is_group,
+                        query,
+                        entries,
+                        next,
+                    }
+                }
+                Err(_) => LiveEvent::DirectoryFailed {
+                    account_id: events.account.clone(),
+                    generation,
+                    error: directory_failure(DirectoryCategory::Storage),
+                },
+            };
+            events.emit(event).await?;
+        }
         LiveCommand::Open {
             generation,
             kind,
@@ -740,7 +1283,13 @@ async fn handle_command(
                 ThreadKind::Group => format!("Nhóm {remote_id}"),
             };
             let result = db
-                .call(move |s| s.open_conversation(&account, &thread, &title))
+                .call(move |s| {
+                    let title = s
+                        .directory_record(&account, &thread)?
+                        .map(|entry| entry.display_name)
+                        .unwrap_or(title);
+                    s.open_conversation(&account, &thread, &title)
+                })
                 .await;
             match result {
                 Ok(conversation) => {
@@ -808,6 +1357,10 @@ async fn handle_command(
             text,
             request_id,
         } => {
+            trace(
+                crate::diagnostics::Stage::Send,
+                crate::diagnostics::Reason::Requested,
+            );
             let target = Target::from_thread(&thread)?;
             let eligible = match connection.as_mut() {
                 Some(c) if c.decoder.authenticated() => match target.kind {
@@ -819,8 +1372,8 @@ async fn handle_command(
             let visibility = match eligible {
                 Ok(visibility) => visibility,
                 Err(error) => {
-                    let message = if error
-                        .downcast_ref::<WireError>()
+                    let _ = diagnostic(&error, LiveStage::Send);
+                    let message = if wire_error(&error)
                         .is_some_and(|e| matches!(e, WireError::Unsupported))
                     {
                         "Hội thoại mã hóa đầu cuối hoặc chưa xác minh được trạng thái mã hóa. Bản nháp được giữ lại."
@@ -838,7 +1391,14 @@ async fn handle_command(
                             server_accepted: false,
                         })
                         .await?;
-                    return Ok(true);
+                    if wire_error(&error) == Some(&WireError::Authentication) {
+                        events
+                            .diagnostic(diagnostic(&error, LiveStage::Authentication))
+                            .await?;
+                        events.connection(LiveConnection::Expired).await?;
+                        return Ok(CommandOutcome::PauseTransport);
+                    }
+                    return Ok(CommandOutcome::Continue);
                 }
             };
             let account = events.account.clone();
@@ -849,23 +1409,28 @@ async fn handle_command(
                 .await;
             let id = match prepared {
                 Ok(id) => id,
-                Err(_) => {
+                Err(error) => {
+                    let _ = diagnostic(&error, LiveStage::Storage);
                     events.emit(LiveEvent::SendFailed{account_id:events.account.clone(),generation,thread,request_id,error:"Bản nháp đã có lượt gửi chưa xác định, hoặc không thể lưu khóa gửi an toàn. Không tự gửi lại.".into(),unknown_delivery:true,server_accepted:false}).await?;
-                    return Ok(true);
+                    return Ok(CommandOutcome::Continue);
                 }
             };
             match send_text(client, session, &target, &text, id, visibility).await {
                 Ok(ack) => {
+                    trace(
+                        crate::diagnostics::Stage::Send,
+                        crate::diagnostics::Reason::Ready,
+                    );
                     let account = events.account.clone();
                     let result = persist_ack(db, &account, id, ack).await;
                     match result{Ok((message,conversation))=>events.emit(LiveEvent::Sent{account_id:events.account.clone(),generation,thread,request_id,message,conversation}).await?,Err(_)=>events.emit(LiveEvent::SendFailed{account_id:events.account.clone(),generation,thread,request_id,error:"Zalo đã nhận nhưng chưa lưu được xác nhận trên thiết bị. Không gửi lại.".into(),unknown_delivery:true,server_accepted:true}).await?,}
                 }
                 Err(error) => {
-                    let known = error.downcast_ref::<WireError>().is_some_and(|e| {
+                    let _ = diagnostic(&error, LiveStage::Send);
+                    let known = wire_error(&error).is_some_and(|e| {
                         matches!(e, WireError::Service(_) | WireError::Authentication)
                     });
-                    let expired =
-                        error.downcast_ref::<WireError>() == Some(&WireError::Authentication);
+                    let expired = wire_error(&error) == Some(&WireError::Authentication);
                     let account = events.account.clone();
                     db.call(move |s| s.fail_outgoing(&account, id, !known))
                         .await?;
@@ -886,14 +1451,17 @@ async fn handle_command(
                         })
                         .await?;
                     if expired {
+                        events
+                            .diagnostic(diagnostic(&error, LiveStage::Authentication))
+                            .await?;
                         events.connection(LiveConnection::Expired).await?;
-                        return Ok(false);
+                        return Ok(CommandOutcome::PauseTransport);
                     }
                 }
             }
         }
     }
-    Ok(true)
+    Ok(CommandOutcome::Continue)
 }
 fn retry_delay(
     connection: Option<&Connection>,
@@ -926,37 +1494,99 @@ async fn run_inner(
         })
         .await?;
     let client = transports.http.clone();
+    let mut directory = DirectorySync::new();
+    directory.request(0, session.clone(), db.handle()?, transports);
     let mut connection: Option<Connection> = None;
+    let mut network_paused = false;
     let mut retries = 0_usize;
     let mut backoff = crate::reconnect::Backoff::default();
     let mut next_connect = tokio::time::Instant::now();
     let mut next_ping = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         tokio::select! {
+            result = async { (&mut directory.running.as_mut().expect("guarded directory sync").task).await }, if directory.running.is_some() => {
+                directory.completed(result,session.clone(),db.handle()?,transports);
+            },
+            changed = directory.updates_rx.changed() => {
+                changed.map_err(|_|anyhow::anyhow!("Directory stopped"))?;
+                directory.changed();
+            },
+            permit = events.tx.reserve(), if directory.notifications_pending() => {
+                directory.publish_notification(permit.map_err(|_|anyhow::anyhow!("UI stopped"))?,&db,events).await?;
+            },
             command = commands.recv() => {
                 let Some(command) = command else { return Ok(()) };
-                if !handle_command(command, &mut connection, &db, events, &session, &client).await? {
-                    return Ok(());
+                if let LiveCommand::RefreshDirectory{generation}=command {
+                    directory.request(generation,session.clone(),db.handle()?,transports);
+                    continue;
+                }
+                if matches!(command, LiveCommand::Reconnect) {
+                    trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
+                    connection = None;
+                    network_paused = false;
+                    retries = 0;
+                    backoff = crate::reconnect::Backoff::default();
+                    next_connect = tokio::time::Instant::now();
+                    continue;
+                }
+                match handle_command(command, &mut connection, &db, events, &session, &client).await? {
+                    CommandOutcome::Shutdown => return Ok(()),
+                    CommandOutcome::PauseTransport => { connection=None;network_paused=true; },
+                    CommandOutcome::Continue => {},
                 }
             },
-            _ = tokio::time::sleep_until(next_connect), if connection.is_none() => {
+            _ = tokio::time::sleep_until(next_connect), if connection.is_none() && !network_paused => {
                 events.connection(if retries == 0 { LiveConnection::Connecting } else { LiveConnection::Reconnecting }).await?;
-                match transports.connect(&session, retries).await {
+                let connecting = transports.connect(&session, retries);
+                tokio::pin!(connecting);
+                let result = loop {
+                    tokio::select! {
+                        result = async { (&mut directory.running.as_mut().expect("guarded directory sync").task).await }, if directory.running.is_some() => {
+                            directory.completed(result,session.clone(),db.handle()?,transports);
+                        },
+                        changed = directory.updates_rx.changed() => {
+                            changed.map_err(|_|anyhow::anyhow!("Directory stopped"))?;
+                            directory.changed();
+                        },
+                        permit = events.tx.reserve(), if directory.notifications_pending() => {
+                            directory.publish_notification(permit.map_err(|_|anyhow::anyhow!("UI stopped"))?,&db,events).await?;
+                        },
+                        result = &mut connecting => break Some(result),
+                        command = commands.recv() => {
+                            let Some(command) = command else { return Ok(()) };
+                            if let LiveCommand::RefreshDirectory{generation}=command {
+                                directory.request(generation,session.clone(),db.handle()?,transports);
+                                continue;
+                            }
+                            if matches!(command, LiveCommand::Reconnect) {
+                                trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
+                                break None;
+                            }
+                            match handle_command(command, &mut connection, &db, events, &session, &client).await? {
+                                CommandOutcome::Shutdown => return Ok(()),
+                                CommandOutcome::PauseTransport => { network_paused=true;break None; },
+                                CommandOutcome::Continue => {},
+                            }
+                        }
+                    }
+                };
+                let Some(result) = result else {
+                    retries = 0;
+                    backoff = crate::reconnect::Backoff::default();
+                    next_connect = tokio::time::Instant::now();
+                    continue;
+                };
+                match result {
                     Ok(c) => {
                         connection = Some(c);
                         next_ping = tokio::time::Instant::now() + Duration::from_secs(15);
                     },
                     Err(error) => {
-                        if let Some(wire) = error.downcast_ref::<WireError>() {
-                            if *wire == WireError::Authentication {
-                                events.connection(LiveConnection::Expired).await?;
-                            } else {
-                                events.emit(LiveEvent::Fault {
-                                    account_id: events.account.clone(),
-                                    error: "Máy chủ chưa cung cấp cấu hình nhắn tin được hỗ trợ.".into(),
-                                }).await?;
-                            }
-                            return Ok(());
+                        events.diagnostic(diagnostic(&error, LiveStage::Configuration)).await?;
+                        if let Some(state) = terminal_transport_state(&error) {
+                            network_paused = true;
+                            events.connection(state).await?;
+                            continue;
                         }
                         retries = retries.saturating_add(1);
                         next_connect = tokio::time::Instant::now() + retry_delay(None, &mut backoff);
@@ -965,23 +1595,23 @@ async fn run_inner(
                 }
             },
             frame = async { connection.as_mut().expect("guarded connection").next().await }, if connection.is_some() => {
-                let refresh_ping = frame.as_ref().ok().and_then(Option::as_ref).is_some_and(|frame| frame.cmd == 1 || frame.cmd == 2);
+                let stage = if frame.as_ref().ok().and_then(Option::as_ref).is_some_and(|frame| frame.cmd == 1) || !connection.as_ref().is_some_and(|c| c.decoder.authenticated()) {LiveStage::Authentication} else {LiveStage::Synchronization};
+                let refresh_ping = frame.as_ref().ok().and_then(Option::as_ref).is_some_and(|frame| frame.cmd == 1 || (frame.cmd == 2 && frame.payload.get("eventId").and_then(Value::as_i64).is_some_and(|id| connection.as_ref().is_some_and(|c| c.last_ping == Some(id)))));
                 let result = match frame {
                     Ok(Some(frame)) => connection.as_mut().unwrap().process(frame, &db, events).await,
                     Ok(None) => Ok(()),
                     Err(error) => Err(error),
                 };
                 if let Err(error) = result {
-                    if error.downcast_ref::<WireError>() == Some(&WireError::Authentication) {
-                        events.connection(LiveConnection::Expired).await?;
-                        return Ok(());
+                    events.diagnostic(diagnostic(&error, stage)).await?;
+                    if let Some(state) = terminal_transport_state(&error) {
+                        connection = None;
+                        network_paused = true;
+                        events.connection(state).await?;
+                        continue;
                     }
                     if error.downcast_ref::<NetworkFailure>().is_none() {
-                        events.emit(LiveEvent::Fault {
-                            account_id: events.account.clone(),
-                            error: "Định dạng hoặc hàng đợi tin nhắn chưa được hỗ trợ. Đã dừng kết nối để giữ nguyên lịch sử.".into(),
-                        }).await?;
-                        return Ok(());
+                        return Err(error);
                     }
                     next_connect = tokio::time::Instant::now() + retry_delay(connection.as_ref(), &mut backoff);
                     connection = None;
@@ -992,8 +1622,11 @@ async fn run_inner(
                 }
             },
             _ = tokio::time::sleep_until(next_ping), if connection.is_some() => {
+                trace(crate::diagnostics::Stage::Heartbeat,crate::diagnostics::Reason::Requested);
                 let c = connection.as_mut().unwrap();
                 if !c.decoder.authenticated() || c.last_ping.is_some() {
+                    let stage=if c.decoder.authenticated(){LiveStage::Heartbeat}else{LiveStage::Authentication};
+                    events.diagnostic(NetworkFailure::new(stage,LiveCategory::Timeout).0).await?;
                     next_connect = tokio::time::Instant::now() + retry_delay(connection.as_ref(), &mut backoff);
                     connection = None;
                     retries = retries.saturating_add(1);
@@ -1002,7 +1635,8 @@ async fn run_inner(
                 }
                 let now = now_ms();
                 c.last_ping = Some(now);
-                if c.send(2, 1, json!({"eventId": now})).await.is_err() {
+                if let Err(error)=c.send(2, 1, json!({"eventId": now})).await {
+                    events.diagnostic(diagnostic(&error,LiveStage::Heartbeat)).await?;
                     next_connect = tokio::time::Instant::now() + retry_delay(connection.as_ref(), &mut backoff);
                     connection = None;
                     retries = retries.saturating_add(1);

@@ -1,5 +1,6 @@
 //! Independently derived legacy text and socket wire formats from the local PC bundles.
 //! Signal/E2EE commands are never downgraded to these legacy endpoints.
+use super::client::ClientType;
 use crate::domain::{Message, MAX_TEXT_BYTES};
 use aes::cipher::consts::U16;
 use aes_gcm::{
@@ -7,7 +8,7 @@ use aes_gcm::{
     AesGcm, KeyInit,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use flate2::read::ZlibDecoder;
+use flate2::bufread::{GzDecoder, ZlibDecoder};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -17,7 +18,6 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 pub const MAX_INFLATED: usize = 4 * 1024 * 1024;
 pub const MAX_BATCH: usize = 200;
 pub const API_VERSION: &str = "681";
-pub const API_TYPE: &str = "30";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThreadKind {
@@ -119,7 +119,7 @@ pub fn text_parameters(
     }
     Ok(v)
 }
-pub fn send_url(root: &Url, kind: ThreadKind) -> Result<Url, WireError> {
+pub fn send_url(root: &Url, kind: ThreadKind, client_type: ClientType) -> Result<Url, WireError> {
     validate_origin(root, "https")?;
     let mut url = root.clone();
     url.set_path(match kind {
@@ -128,15 +128,15 @@ pub fn send_url(root: &Url, kind: ThreadKind) -> Result<Url, WireError> {
     });
     url.query_pairs_mut()
         .append_pair("zpw_ver", API_VERSION)
-        .append_pair("zpw_type", API_TYPE);
+        .append_pair("zpw_type", client_type.api_type());
     Ok(url)
 }
-pub fn socket_url(root: &Url, now_ms: i64) -> Result<Url, WireError> {
+pub fn socket_url(root: &Url, now_ms: i64, client_type: ClientType) -> Result<Url, WireError> {
     validate_origin(root, "wss")?;
     let mut url = root.clone();
     url.query_pairs_mut()
         .append_pair("zpw_ver", API_VERSION)
-        .append_pair("zpw_type", API_TYPE)
+        .append_pair("zpw_type", client_type.api_type())
         .append_pair("t", &now_ms.to_string());
     Ok(url)
 }
@@ -148,7 +148,9 @@ pub fn validate_origin(url: &Url, scheme: &str) -> Result<(), WireError> {
         || url.password().is_some()
         || url.fragment().is_some()
         || url.query().is_some()
-        || url.path() != "/"
+        // The bundle preserves the advertised WebSocket path when adding its
+        // common query parameters. HTTP message services remain origin roots.
+        || (scheme != "wss" && url.path() != "/")
         || !(host == "zalo.me"
             || host.ends_with(".zalo.me")
             || host == "zaloapp.com"
@@ -174,6 +176,81 @@ pub struct DecodedFrame {
     pub sub_cmd: u8,
     pub payload: Value,
 }
+/// Fixed, secret-free parser locations; no peer-controlled values are retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameReason {
+    MessageType,
+    FrameLength,
+    OuterJson,
+    OuterEnvelope,
+    AuthKey,
+    EncryptionMode,
+    OuterData,
+    Base64,
+    CipherIntegrity,
+    Compression,
+    InnerJson,
+    InnerEnvelope,
+    PlaintextAuth,
+    QueueCommands,
+}
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum FrameValueType {
+    #[default]
+    Absent,
+    Null,
+    Integer,
+    Number,
+    String,
+    Boolean,
+    Object,
+    Array,
+}
+impl FrameValueType {
+    fn of(value: Option<&Value>) -> Self {
+        match value {
+            None => Self::Absent,
+            Some(Value::Null) => Self::Null,
+            Some(Value::Number(n)) if n.is_i64() || n.is_u64() => Self::Integer,
+            Some(Value::Number(_)) => Self::Number,
+            Some(Value::String(_)) => Self::String,
+            Some(Value::Bool(_)) => Self::Boolean,
+            Some(Value::Object(_)) => Self::Object,
+            Some(Value::Array(_)) => Self::Array,
+        }
+    }
+}
+/// Structural data only. Never retains arbitrary JSON, URLs, keys or messages.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FrameContext {
+    pub command: Option<u16>,
+    pub subcommand: Option<u8>,
+    pub encryption: Option<u8>,
+    pub bytes: usize,
+    pub status_type: FrameValueType,
+    pub data_type: FrameValueType,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameFailure {
+    pub error: WireError,
+    pub reason: FrameReason,
+    pub context: FrameContext,
+}
+impl FrameFailure {
+    pub fn new(error: WireError, reason: FrameReason) -> Self {
+        Self {
+            error,
+            reason,
+            context: FrameContext::default(),
+        }
+    }
+}
+impl std::fmt::Display for FrameFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({:?})", self.error, self.reason)
+    }
+}
+impl std::error::Error for FrameFailure {}
 #[derive(Default)]
 pub struct FrameDecoder {
     key: Vec<u8>,
@@ -184,26 +261,63 @@ impl FrameDecoder {
         self.authenticated
     }
     pub fn decode(&mut self, bytes: &[u8]) -> Result<DecodedFrame, WireError> {
+        self.decode_detailed(bytes).map_err(|failure| failure.error)
+    }
+    pub fn decode_detailed(&mut self, bytes: &[u8]) -> Result<DecodedFrame, FrameFailure> {
+        let mut reason = FrameReason::FrameLength;
+        let mut context = FrameContext {
+            bytes: bytes.len().min(MAX_FRAME + 1),
+            ..Default::default()
+        };
+        if bytes.len() >= 4 {
+            context.command = Some(u16::from_le_bytes([bytes[1], bytes[2]]));
+            context.subcommand = Some(bytes[3]);
+        }
+        self.decode_with_reason(bytes, &mut reason, &mut context)
+            .map_err(|error| FrameFailure {
+                error,
+                reason,
+                context,
+            })
+    }
+    fn decode_with_reason(
+        &mut self,
+        bytes: &[u8],
+        reason: &mut FrameReason,
+        context: &mut FrameContext,
+    ) -> Result<DecodedFrame, WireError> {
         if bytes.len() > MAX_FRAME {
             return Err(WireError::Oversize);
         }
-        if bytes.len() < 6 || bytes[0] != 1 {
+        if bytes.len() < 6 {
             return Err(WireError::Invalid);
         }
         let cmd = u16::from_le_bytes([bytes[1], bytes[2]]);
         let sub_cmd = bytes[3];
+        // The original accepts the first header byte as opaque metadata. Only
+        // command/subcommand select processing; it does not gate server version 1.
+        *reason = FrameReason::OuterJson;
         let outer: Value = serde_json::from_slice(&bytes[4..]).map_err(|_| WireError::Invalid)?;
-        service_code(&outer)?;
-        if cmd == 2 {
-            return Ok(DecodedFrame {
-                cmd,
-                sub_cmd,
-                payload: outer,
-            });
+        context.status_type = FrameValueType::of(outer.get("error_code"));
+        context.data_type = FrameValueType::of(outer.get("data"));
+        context.encryption = outer
+            .get("encrypt")
+            .and_then(Value::as_u64)
+            .and_then(|v| u8::try_from(v).ok())
+            .filter(|v| *v <= 3);
+        *reason = FrameReason::OuterEnvelope;
+        if !outer.is_object() {
+            return Err(WireError::Invalid);
         }
-        if cmd == 563 {
-            if !self.authenticated {
-                return Err(WireError::Authentication);
+        // Source _onRawData routes PONG and lightweight PING_ACTIVE before the
+        // ordinary outer-success/encryption gates. Missing/null status is legal
+        // ONLY for these control commands and cannot authenticate a session.
+        if cmd == 2 || cmd == 4 {
+            if outer
+                .get("error_code")
+                .is_some_and(|value| !value.is_null())
+            {
+                service_code(&outer)?;
             }
             return Ok(DecodedFrame {
                 cmd,
@@ -211,8 +325,10 @@ impl FrameDecoder {
                 payload: outer,
             });
         }
+        service_code(&outer)?;
         if cmd == 1 {
             self.authenticated = false;
+            *reason = FrameReason::AuthKey;
             let key = STANDARD
                 .decode(
                     outer
@@ -228,14 +344,18 @@ impl FrameDecoder {
         } else if !self.authenticated {
             return Err(WireError::Authentication);
         }
+        *reason = FrameReason::EncryptionMode;
         let encryption = outer
             .get("encrypt")
             .and_then(Value::as_u64)
             .ok_or(WireError::Invalid)?;
+        *reason = FrameReason::OuterData;
         let raw = outer.get("data").ok_or(WireError::Invalid)?;
         if cmd == 1 && encryption == 0 {
+            *reason = FrameReason::PlaintextAuth;
             return Err(WireError::Invalid);
         }
+        *reason = FrameReason::InnerJson;
         let payload = match encryption {
             0 => match raw {
                 Value::String(s) => parse_inner(s.as_bytes())?,
@@ -243,32 +363,31 @@ impl FrameDecoder {
                 _ => return Err(WireError::Invalid),
             },
             1..=3 => {
+                *reason = FrameReason::OuterData;
                 let s = raw.as_str().ok_or(WireError::Invalid)?;
                 let decoded = if encryption == 1 {
+                    *reason = FrameReason::Base64;
                     STANDARD.decode(s).map_err(|_| WireError::Crypto)?
                 } else {
+                    *reason = FrameReason::CipherIntegrity;
                     self.decrypt_gcm(s)?
                 };
                 if encryption == 3 {
+                    *reason = FrameReason::InnerJson;
                     parse_inner(&decoded)?
                 } else {
-                    let mut z = ZlibDecoder::new(decoded.as_slice());
-                    let mut result = Vec::new();
-                    z.by_ref()
-                        .take((MAX_INFLATED + 1) as u64)
-                        .read_to_end(&mut result)
-                        .map_err(|_| WireError::Invalid)?;
-                    if result.len() > MAX_INFLATED {
-                        return Err(WireError::Oversize);
-                    }
-                    if z.total_in() as usize != decoded.len() {
-                        return Err(WireError::Invalid);
-                    }
+                    *reason = FrameReason::Compression;
+                    let result = inflate_payload(&decoded)?;
+                    *reason = FrameReason::InnerJson;
                     parse_inner(&result)?
                 }
             }
-            _ => return Err(WireError::Unsupported),
+            _ => {
+                *reason = FrameReason::EncryptionMode;
+                return Err(WireError::Unsupported);
+            }
         };
+        *reason = FrameReason::InnerEnvelope;
         service_code(&payload)?;
         if cmd == 1 {
             self.authenticated = true
@@ -308,6 +427,30 @@ impl FrameDecoder {
         };
         result.map_err(|_| WireError::Crypto)
     }
+}
+/// Pako's default inflate accepts gzip and zlib. Keep strict checksum validation,
+/// one complete member, no trailing bytes, and the same inflated-size ceiling.
+fn inflate_payload(bytes: &[u8]) -> Result<Vec<u8>, WireError> {
+    let mut input = bytes;
+    let mut result = Vec::new();
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        GzDecoder::new(&mut input)
+            .take((MAX_INFLATED + 1) as u64)
+            .read_to_end(&mut result)
+            .map_err(|_| WireError::Invalid)?;
+    } else {
+        ZlibDecoder::new(&mut input)
+            .take((MAX_INFLATED + 1) as u64)
+            .read_to_end(&mut result)
+            .map_err(|_| WireError::Invalid)?;
+    }
+    if result.len() > MAX_INFLATED {
+        return Err(WireError::Oversize);
+    }
+    if !input.is_empty() {
+        return Err(WireError::Invalid);
+    }
+    Ok(result)
 }
 fn parse_inner(bytes: &[u8]) -> Result<Value, WireError> {
     if bytes.len() > MAX_INFLATED {
@@ -570,6 +713,106 @@ mod tests {
         }
     }
     #[test]
+    fn original_post_auth_oracle_routes_only_control_status_exceptions_and_decodes_api_layers() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/messaging/post_auth_frames.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let bytes = STANDARD.decode(case["frame"].as_str().unwrap()).unwrap();
+            let result = authenticated().decode_detailed(&bytes);
+            if case["route"] == "rejected" {
+                assert!(result.is_err(), "invalid message cannot cross status gates");
+                continue;
+            }
+            let decoded = result.unwrap();
+            if case["route"] == "pong" {
+                assert_eq!(decoded.cmd, 2);
+                assert_eq!(decoded.payload["eventId"], 1700000000000_i64)
+            } else {
+                assert_eq!(decoded.payload, case["payload"])
+            }
+        }
+        let mut decoder = FrameDecoder::default();
+        assert!(decoder
+            .decode_detailed(&frame(2, json!({"eventId":123})))
+            .is_ok());
+        assert!(decoder
+            .decode_detailed(&frame(4, json!({"data":{"reqId":"cmd_4"}})))
+            .is_ok());
+        assert!(!decoder.authenticated());
+        let error = authenticated()
+            .decode_detailed(&frame(
+                501,
+                json!({"encrypt":0,"data":"private-synthetic-message"}),
+            ))
+            .unwrap_err();
+        assert_eq!(error.reason, FrameReason::OuterEnvelope);
+        assert_eq!(error.context.command, Some(501));
+        assert_eq!(error.context.status_type, FrameValueType::Absent);
+        assert_eq!(error.context.data_type, FrameValueType::String);
+        assert!(!format!("{error:?}").contains("private-synthetic-message"));
+    }
+    #[test]
+    fn original_auth_oracle_accepts_server_header_metadata_gzip_and_encrypted_gzip() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/messaging/auth_frames.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let bytes = STANDARD.decode(case["frame"].as_str().unwrap()).unwrap();
+            let mut decoder = FrameDecoder::default();
+            let frame = decoder.decode_detailed(&bytes).unwrap();
+            assert_eq!(frame.cmd, 1);
+            assert_eq!(frame.payload, case["expected"]);
+            assert!(decoder.authenticated());
+        }
+    }
+    #[test]
+    fn parser_reasons_are_fixed_and_gzip_crc_trailing_bytes_and_bombs_fail_closed() {
+        use std::io::Write;
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/messaging/auth_frames.json"
+        ))
+        .unwrap();
+        let original = STANDARD
+            .decode(fixture["cases"][1]["frame"].as_str().unwrap())
+            .unwrap();
+        let outer: Value = serde_json::from_slice(&original[4..]).unwrap();
+        let compressed = STANDARD.decode(outer["data"].as_str().unwrap()).unwrap();
+        let mut corrupted = compressed.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        let mut trailing = compressed;
+        trailing.extend(b"private-synthetic-suffix");
+        let mut bomb = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        bomb.write_all(&vec![b' '; MAX_INFLATED + 1]).unwrap();
+        for (bytes, expected) in [
+            (corrupted, WireError::Invalid),
+            (trailing, WireError::Invalid),
+            (bomb.finish().unwrap(), WireError::Oversize),
+        ] {
+            let mut outer = outer.clone();
+            outer["data"] = json!(STANDARD.encode(bytes));
+            let mut decoder = FrameDecoder::default();
+            let error = decoder.decode_detailed(&frame(1, outer)).unwrap_err();
+            assert_eq!(error.reason, FrameReason::Compression);
+            assert_eq!(error.error, expected);
+            assert!(!decoder.authenticated());
+            assert!(!format!("{error:?}").contains("private-synthetic-suffix"));
+        }
+        let mut decoder = FrameDecoder::default();
+        let failure=decoder.decode_detailed(&frame(1,json!({"error_code":0,"key":STANDARD.encode([7;32]),"encrypt":0,"data":{"error_code":0}}))).unwrap_err();
+        assert_eq!(failure.reason, FrameReason::PlaintextAuth);
+        assert!(!decoder.authenticated());
+        assert_eq!(
+            decoder
+                .decode_detailed(&[1, 1, 0, 0, b'{', b'?'])
+                .unwrap_err()
+                .reason,
+            FrameReason::OuterJson
+        );
+    }
+    #[test]
     fn auth_is_only_established_after_valid_key_and_successful_inner_envelope() {
         let mut decoder = FrameDecoder::default();
         use std::io::Write;
@@ -732,7 +975,8 @@ mod tests {
         assert!(Target::new(ThreadKind::Direct, "22\n").is_err());
         assert!(send_url(
             &Url::parse("https://chat.zalo.me").unwrap(),
-            ThreadKind::Direct
+            ThreadKind::Direct,
+            ClientType::Legacy30
         )
         .unwrap()
         .as_str()
@@ -743,8 +987,14 @@ mod tests {
             "http://chat.zalo.me",
             "https://chat.zalo.me:444",
             "https://chat.zalo.me/?token=secret",
+            "https://chat.zalo.me/socket",
         ] {
-            assert!(send_url(&Url::parse(bad).unwrap(), ThreadKind::Direct).is_err());
+            assert!(send_url(
+                &Url::parse(bad).unwrap(),
+                ThreadKind::Direct,
+                ClientType::Legacy30
+            )
+            .is_err());
         }
         assert_eq!(
             send_ack(
@@ -755,5 +1005,44 @@ mod tests {
             "9007199254740993"
         );
         assert!(send_ack(&json!({"error_code":0,"data":{}})).is_err());
+    }
+
+    #[test]
+    fn socket_preserves_advertised_path_without_relaxing_endpoint_policy() {
+        let advertised = Url::parse("wss://ws1.chat.zalo.me/socket/v1%2Fmessages").unwrap();
+        let url = socket_url(&advertised, 1760000000000, ClientType::Legacy30).unwrap();
+        assert_eq!(url.path(), advertised.path());
+        assert_eq!(
+            url.as_str(),
+            "wss://ws1.chat.zalo.me/socket/v1%2Fmessages?zpw_ver=681&zpw_type=30&t=1760000000000"
+        );
+        assert!(socket_url(
+            &Url::parse("wss://chat.zalo.me/").unwrap(),
+            1,
+            ClientType::Legacy30
+        )
+        .is_ok());
+        for bad in [
+            "ws://chat.zalo.me/socket",
+            "https://chat.zalo.me/socket",
+            "wss://chat.zalo.me.example.org/socket",
+            "wss://127.0.0.1/socket",
+            "wss://user@chat.zalo.me/socket",
+            "wss://user:password@chat.zalo.me/socket",
+            "wss://chat.zalo.me:444/socket",
+            "wss://chat.zalo.me/socket?token=secret",
+            "wss://chat.zalo.me/socket?",
+            "wss://chat.zalo.me/socket#fragment",
+        ] {
+            assert!(socket_url(&Url::parse(bad).unwrap(), 1, ClientType::Legacy30).is_err());
+        }
+        for kind in [ThreadKind::Direct, ThreadKind::Group] {
+            assert!(send_url(
+                &Url::parse("https://chat.zalo.me/socket").unwrap(),
+                kind,
+                ClientType::Legacy30
+            )
+            .is_err());
+        }
     }
 }

@@ -2,6 +2,9 @@
 #[cfg(feature = "live-login")]
 pub mod auth;
 pub mod bootstrap;
+pub mod client;
+#[cfg(feature = "messaging")]
+pub mod directory;
 #[cfg(feature = "network")]
 pub mod http;
 #[cfg(feature = "messaging")]

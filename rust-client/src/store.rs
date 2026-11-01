@@ -3,6 +3,8 @@ use crate::domain::{validate_id, Conversation, Cursor, Message, MAX_PAGE_SIZE, M
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
+pub mod directory;
+pub mod e2ee;
 
 const CURSOR_PAGE_SQL: &str =
     "SELECT account_id,thread_id,message_id,sender,body,sent_at_ms FROM messages
@@ -34,7 +36,7 @@ fn insert_validated(conn: &Connection, messages: &[Message]) -> Result<usize> {
     {
         let mut thread = conn.prepare_cached(
             "INSERT INTO conversations(account_id,thread_id,title,last_message_at_ms)
-                VALUES (?1,?2,?2,?3) ON CONFLICT(account_id,thread_id) DO UPDATE SET
+                VALUES (?1,?2,COALESCE((SELECT display_name FROM directory_entries WHERE account_id=?1 AND thread_id=?2),?2),?3) ON CONFLICT(account_id,thread_id) DO UPDATE SET
                 last_message_at_ms=MAX(last_message_at_ms,excluded.last_message_at_ms)",
         )?;
         let mut existing = conn.prepare_cached(
@@ -86,7 +88,7 @@ impl MessageStore {
     fn initialize(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 2 {
+        if version > 4 {
             bail!("Database was created by a newer client");
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
@@ -111,7 +113,10 @@ impl MessageStore {
             CREATE TABLE IF NOT EXISTS outgoing_counters(account_id TEXT PRIMARY KEY,last_id INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS receive_cursors(account_id TEXT NOT NULL,queue TEXT NOT NULL,last_id TEXT NOT NULL,
                 PRIMARY KEY(account_id,queue));
-            PRAGMA user_version=2; COMMIT;")?;
+            ")?;
+        directory::initialize(&conn)?;
+        e2ee::initialize(&conn)?;
+        conn.execute_batch("PRAGMA user_version=4; COMMIT;")?;
         Ok(Self { conn })
     }
 
@@ -360,7 +365,7 @@ impl MessageStore {
     ) -> Result<Conversation> {
         validate_id(account)?;
         validate_id(thread)?;
-        if title.is_empty() || title.len() > 256 {
+        if title.is_empty() || title.len() > 512 {
             bail!("Invalid conversation title");
         }
         self.conn.execute("INSERT INTO conversations(account_id,thread_id,title,last_message_at_ms) VALUES(?1,?2,?3,0) ON CONFLICT(account_id,thread_id) DO NOTHING",params![account,thread,title])?;
@@ -373,7 +378,7 @@ impl MessageStore {
     pub fn set_title(&self, account: &str, thread: &str, title: &str) -> Result<()> {
         validate_id(account)?;
         validate_id(thread)?;
-        if title.is_empty() || title.len() > 256 {
+        if title.is_empty() || title.len() > 512 {
             bail!("Invalid conversation title");
         }
         self.conn.execute("INSERT INTO conversations(account_id,thread_id,title,last_message_at_ms) VALUES (?1,?2,?3,0)

@@ -31,6 +31,15 @@ pub struct Profile {
     _lock: File,
 }
 
+impl Drop for Profile {
+    fn drop(&mut self) {
+        // End ownership explicitly: fork/dup can retain the same open-file
+        // description after this File closes, even with close-on-exec enabled.
+        // The lock file stays in place, so a new owner's inode cannot diverge.
+        let _ = FileExt::unlock(&self._lock);
+    }
+}
+
 impl Profile {
     /// Check all durable owner authorities without creating or changing them.
     pub fn check_account(&self, account: &str) -> Result<()> {
@@ -41,43 +50,39 @@ impl Profile {
         bind_account_at(&self.paths.data_dir, account)
     }
 
-    pub fn open(name: &str) -> Result<Self> {
+    /// Resolve paths only. No directories, lock files, or account state are read/written.
+    pub fn planned_paths(base: Option<&Path>, name: &str) -> Result<ProfilePaths> {
         validate_profile_name(name)?;
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let data_root = xdg_root("XDG_DATA_HOME", home.as_deref(), ".local/share")?;
-        let config_root = xdg_root("XDG_CONFIG_HOME", home.as_deref(), ".config")?;
-        let cache_root = xdg_root("XDG_CACHE_HOME", home.as_deref(), ".cache")?;
-        Self::from_paths(
-            name,
-            ProfilePaths {
-                data_dir: data_root.join(NAMESPACE).join("profiles").join(name),
-                config_dir: config_root.join(NAMESPACE).join("profiles").join(name),
-                cache_dir: cache_root.join(NAMESPACE).join("profiles").join(name),
-                session_file: data_root
-                    .join(NAMESPACE)
-                    .join("profiles")
-                    .join(name)
-                    .join("session.json"),
-            },
-        )
-    }
-
-    /// Explicit isolated root for testing or portable installations.
-    pub fn at_root(base: &Path, name: &str) -> Result<Self> {
-        validate_profile_name(name)?;
-        if !base.is_absolute() {
-            bail!("profile root must be an absolute path");
-        }
-        let root = base.join(name);
-        Self::from_paths(
-            name,
-            ProfilePaths {
+        if let Some(base) = base {
+            if !base.is_absolute() {
+                bail!("profile root must be an absolute path");
+            }
+            let root = base.join(name);
+            return Ok(ProfilePaths {
                 data_dir: root.join("data"),
                 config_dir: root.join("config"),
                 cache_dir: root.join("cache"),
                 session_file: root.join("data/session.json"),
-            },
-        )
+            });
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let data_root = xdg_root("XDG_DATA_HOME", home.as_deref(), ".local/share")?;
+        let config_root = xdg_root("XDG_CONFIG_HOME", home.as_deref(), ".config")?;
+        let cache_root = xdg_root("XDG_CACHE_HOME", home.as_deref(), ".cache")?;
+        let data_dir = data_root.join(NAMESPACE).join("profiles").join(name);
+        Ok(ProfilePaths {
+            session_file: data_dir.join("session.json"),
+            data_dir,
+            config_dir: config_root.join(NAMESPACE).join("profiles").join(name),
+            cache_dir: cache_root.join(NAMESPACE).join("profiles").join(name),
+        })
+    }
+    pub fn open(name: &str) -> Result<Self> {
+        Self::from_paths(name, Self::planned_paths(None, name)?)
+    }
+    /// Explicit isolated root for testing or portable installations.
+    pub fn at_root(base: &Path, name: &str) -> Result<Self> {
+        Self::from_paths(name, Self::planned_paths(Some(base), name)?)
     }
 
     fn from_paths(name: &str, paths: ProfilePaths) -> Result<Self> {
@@ -139,9 +144,13 @@ fn check_account_at(data_dir: &Path, account: &str) -> Result<()> {
         }
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).context("invalid account ownership record")?;
-        if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
-            || value.get(field).and_then(serde_json::Value::as_str) != Some(account)
-        {
+        let version = value.get("version").and_then(serde_json::Value::as_u64);
+        let supported = if name == "auth-state.json" {
+            matches!(version, Some(1 | 2))
+        } else {
+            version == Some(1)
+        };
+        if !supported || value.get(field).and_then(serde_json::Value::as_str) != Some(account) {
             bail!("this profile belongs to another account; choose a different --profile NAME");
         }
     }
@@ -233,7 +242,7 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_private_dir(path: &Path) -> Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> Result<()> {
     reject_symlink_components(path)?;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -262,7 +271,7 @@ fn check_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn check_private_file(file: &File) -> Result<()> {
+pub(crate) fn check_private_file(file: &File) -> Result<()> {
     let meta = file.metadata()?;
     if !meta.is_file() {
         bail!("private path is not a regular file");
@@ -428,6 +437,24 @@ mod tests {
     }
 
     #[test]
+    fn dropping_profile_unlocks_while_an_inherited_open_file_description_remains() {
+        let base = TestDir::new();
+        let profile = Profile::at_root(&base.0, "inherited").unwrap();
+        // dup and fork inheritance retain the same flock open-file description.
+        // Keep that description alive deterministically, without timing or fork.
+        let inherited = profile._lock.try_clone().unwrap();
+        assert!(Profile::at_root(&base.0, "inherited").is_err());
+        drop(profile);
+        let replacement = Profile::at_root(&base.0, "inherited")
+            .expect("Profile ownership must end its lock even while an inherited FD remains");
+        // Closing the old duplicate must not release the replacement's new lock.
+        drop(inherited);
+        assert!(Profile::at_root(&base.0, "inherited").is_err());
+        drop(replacement);
+        Profile::at_root(&base.0, "inherited").unwrap();
+    }
+
+    #[test]
     fn account_binding_is_permanent_and_separate_profiles_can_use_other_accounts() {
         let base = TestDir::new();
         let one = Profile::at_root(&base.0, "one").unwrap();
@@ -531,5 +558,30 @@ mod tests {
             fs::metadata(&data).unwrap().permissions().mode() & 0o777,
             0o755
         );
+    }
+    #[test]
+    fn ownership_accepts_auth_schema_two_without_relaxing_owner_or_future_versions() {
+        let base = TestDir::new();
+        let profile = Profile::at_root(&base.0, "auth-version").unwrap();
+        let path = profile.paths.data_dir.join("auth-state.json");
+        for version in [1, 2] {
+            atomic_write_secret(
+                &path,
+                &serde_json::to_vec(&serde_json::json!({"version":version,"owner_uid":"11"}))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(profile.check_account("11").is_ok());
+            assert!(profile.check_account("12").is_err());
+        }
+        atomic_write_secret(&path, br#"{"version":3,"owner_uid":"11"}"#).unwrap();
+        assert!(profile.check_account("11").is_err());
+        fs::remove_file(path).unwrap();
+        atomic_write_secret(
+            &profile.paths.data_dir.join(".account-owner.json"),
+            br#"{"version":2,"account_id":"11"}"#,
+        )
+        .unwrap();
+        assert!(profile.check_account("11").is_err());
     }
 }

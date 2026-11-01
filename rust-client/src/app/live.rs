@@ -1,6 +1,8 @@
 //! Live account worker: bounded commands/events, no rendering-thread I/O.
 use super::SubmitError;
+pub use crate::app::directory::{DirectoryFailure, DirectoryReport};
 pub use crate::protocol::messaging::ThreadKind;
+pub use crate::store::directory::{DirectoryCursor, DirectoryRecord};
 use crate::{
     domain::{Conversation, Cursor, Message, MAX_TEXT_BYTES},
     profile::Profile,
@@ -19,8 +21,92 @@ pub enum LiveConnection {
     Offline,
     Expired,
 }
+/// Fixed diagnostic fields; transport URLs, headers and response bodies never enter UI events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveStage {
+    Configuration,
+    Connect,
+    Authentication,
+    Send,
+    Receive,
+    Synchronization,
+    Heartbeat,
+    Storage,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveCategory {
+    Timeout,
+    Network,
+    Tls,
+    Http,
+    Protocol,
+    Crypto,
+    Unsupported,
+    Authentication,
+    Server,
+    Closed,
+    Resource,
+    Storage,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveDiagnostic {
+    pub stage: LiveStage,
+    pub category: LiveCategory,
+    pub http_status: Option<u16>,
+    pub server_code: Option<i64>,
+    pub parser_reason: Option<crate::protocol::messaging::FrameReason>,
+}
+impl LiveDiagnostic {
+    pub fn safe_message(&self) -> &'static str {
+        match self.category {
+            LiveCategory::Timeout => "Quá thời gian chờ máy chủ nhắn tin.",
+            LiveCategory::Network => "Không kết nối được máy chủ nhắn tin.",
+            LiveCategory::Tls => "Không xác minh được kết nối TLS của máy chủ nhắn tin.",
+            LiveCategory::Http => "Máy chủ từ chối nâng cấp kết nối WebSocket.",
+            LiveCategory::Protocol => "Định dạng kết nối nhắn tin chưa được hỗ trợ.",
+            LiveCategory::Crypto => "Không xác minh được dữ liệu mã hóa của kết nối nhắn tin.",
+            LiveCategory::Unsupported => "Máy chủ yêu cầu tính năng nhắn tin chưa được hỗ trợ.",
+            LiveCategory::Authentication => "Máy chủ từ chối phiên nhắn tin. Cần đăng nhập lại.",
+            LiveCategory::Server => "Máy chủ trả về lỗi nhắn tin.",
+            LiveCategory::Closed => "Máy chủ đã đóng kết nối nhắn tin.",
+            LiveCategory::Resource => "Dữ liệu nhắn tin vượt giới hạn xử lý an toàn.",
+            LiveCategory::Storage => "Không lưu được lịch sử nhắn tin trên thiết bị.",
+        }
+    }
+}
+impl std::fmt::Display for LiveDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} [{:?}/{:?}",
+            self.safe_message(),
+            self.stage,
+            self.category
+        )?;
+        if let Some(status) = self.http_status {
+            write!(f, "; HTTP {status}")?;
+        }
+        if let Some(code) = self.server_code {
+            write!(f, "; code {code}")?;
+        }
+        if let Some(reason) = self.parser_reason {
+            write!(f, "; parser {reason:?}")?;
+        }
+        f.write_str("]")
+    }
+}
 #[derive(Debug)]
 pub enum LiveCommand {
+    Reconnect,
+    Directory {
+        generation: u64,
+        is_group: bool,
+        query: String,
+        after: Option<DirectoryCursor>,
+    },
+    RefreshDirectory {
+        generation: u64,
+    },
     Open {
         generation: u64,
         kind: ThreadKind,
@@ -41,6 +127,33 @@ pub enum LiveCommand {
 }
 #[derive(Debug)]
 pub enum LiveEvent {
+    DirectoryPage {
+        account_id: String,
+        generation: u64,
+        is_group: bool,
+        query: String,
+        entries: Vec<DirectoryRecord>,
+        next: Option<DirectoryCursor>,
+    },
+    DirectoryStatus {
+        account_id: String,
+        generation: u64,
+        syncing: bool,
+        report: DirectoryReport,
+    },
+    DirectoryChanged {
+        account_id: String,
+        conversations: Vec<Conversation>,
+    },
+    DirectoryFailed {
+        account_id: String,
+        generation: u64,
+        error: DirectoryFailure,
+    },
+    Diagnostic {
+        account_id: String,
+        diagnostic: LiveDiagnostic,
+    },
     Ready {
         account_id: String,
         conversations: Vec<Conversation>,
@@ -97,7 +210,12 @@ pub enum LiveEvent {
 impl LiveEvent {
     pub fn account_id(&self) -> &str {
         match self {
-            Self::Ready { account_id, .. }
+            Self::DirectoryPage { account_id, .. }
+            | Self::DirectoryStatus { account_id, .. }
+            | Self::DirectoryChanged { account_id, .. }
+            | Self::DirectoryFailed { account_id, .. }
+            | Self::Diagnostic { account_id, .. }
+            | Self::Ready { account_id, .. }
             | Self::Opened { account_id, .. }
             | Self::Page { account_id, .. }
             | Self::Connection { account_id, .. }
@@ -160,6 +278,21 @@ impl LiveWorker {
     pub fn submit(&self, command: LiveCommand) -> std::result::Result<(), SubmitError> {
         use crate::protocol::messaging::Target;
         let valid = match &command {
+            LiveCommand::Directory {
+                is_group,
+                query,
+                after,
+                ..
+            } => {
+                query.chars().count() <= 128
+                    && !query.chars().any(char::is_control)
+                    && after.as_ref().is_none_or(|cursor| {
+                        cursor.name.len() <= 512
+                            && !cursor.name.chars().any(char::is_control)
+                            && Target::from_thread(&cursor.thread_id)
+                                .is_ok_and(|target| (target.kind == ThreadKind::Group) == *is_group)
+                    })
+            }
             LiveCommand::Open {
                 kind, remote_id, ..
             } => Target::new(*kind, remote_id).is_ok(),
@@ -174,7 +307,9 @@ impl LiveWorker {
                     && !text.trim().is_empty()
                     && text.len() <= MAX_TEXT_BYTES
             }
-            LiveCommand::Shutdown => true,
+            LiveCommand::Reconnect
+            | LiveCommand::RefreshDirectory { .. }
+            | LiveCommand::Shutdown => true,
         };
         if !valid {
             return Err(SubmitError::Invalid);
@@ -298,7 +433,8 @@ impl super::Model {
             return false;
         }
         match event {
-            LiveEvent::Ready { conversations, .. } => {
+            LiveEvent::Ready { conversations, .. }
+            | LiveEvent::DirectoryChanged { conversations, .. } => {
                 self.conversations = conversations;
                 true
             }
@@ -403,6 +539,13 @@ impl super::Model {
                 self.status = error;
                 true
             }
+            LiveEvent::Diagnostic { diagnostic, .. } => {
+                self.status = diagnostic.to_string();
+                true
+            }
+            LiveEvent::DirectoryPage { .. }
+            | LiveEvent::DirectoryStatus { .. }
+            | LiveEvent::DirectoryFailed { .. } => false,
             LiveEvent::Fault { error, .. } => {
                 self.status = error;
                 self.pending = false;

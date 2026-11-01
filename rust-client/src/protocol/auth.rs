@@ -1,6 +1,7 @@
 //! Native QR authentication with isolated transport, bounded trust worker and durable commit.
 use super::{
     bootstrap::{self, LoginInfoInput, PendingCookies, ServerInfoInput},
+    client::ClientType,
     http::HttpAdapter,
     qr::{self, HttpReply, QrRequestInput, RequestSpec, MAX_RESPONSE_BYTES},
     session::{self, AuthRecord, SessionProof, StoredSession, StoredTrust, VerifiedSession},
@@ -45,7 +46,10 @@ pub enum LoginFailure {
     Expired,
     Network,
     Rejected,
+    Bootstrap(bootstrap::BootstrapFailure),
+    ServerRejected { stage: LoginStage, code: i64 },
     Unsupported,
+    FreshApprovalRequired,
     Malformed,
     Trust,
     AccountMismatch,
@@ -54,18 +58,28 @@ pub enum LoginFailure {
 }
 impl std::fmt::Display for LoginFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::Bootstrap(failure) = self {
+            return write!(f, "Không hoàn tất khởi tạo phiên ({failure}).");
+        }
+        if let Self::ServerRejected { stage, code } = self {
+            return write!(f, "Máy chủ từ chối yêu cầu (server/{stage:?} code={code}).");
+        }
         f.write_str(match self {
             Self::Busy => "Đang xử lý đăng nhập; vui lòng thử lại.",
             Self::Cancelled => "Đã hủy đăng nhập.",
             Self::Expired => "Mã QR đã hết hạn. Hãy tạo mã mới.",
             Self::Network => "Không thể kết nối máy chủ đăng nhập.",
-            Self::Rejected => "Máy chủ từ chối đăng nhập.",
+            Self::Rejected => "Không hoàn tất đăng nhập. Vui lòng tạo mã QR mới.",
             Self::Unsupported => "Máy chủ yêu cầu giao thức đăng nhập chưa được hỗ trợ.",
+            Self::FreshApprovalRequired => {
+                "Cần quét mã QR lại để hoàn tất cập nhật ứng dụng. Lịch sử đã lưu vẫn được giữ."
+            }
             Self::Malformed => "Phản hồi đăng nhập không hợp lệ.",
             Self::Trust => "Không xác minh được liên kết thiết bị.",
             Self::AccountMismatch => "Tài khoản không khớp hồ sơ. Hãy dùng hồ sơ khác.",
             Self::Storage => "Không lưu được phiên đăng nhập an toàn.",
             Self::Internal => "Không khởi tạo được đăng nhập.",
+            Self::Bootstrap(_) | Self::ServerRejected { .. } => unreachable!(),
         })
     }
 }
@@ -108,6 +122,21 @@ struct Cancellation {
     generation: u64,
     attempt: u64,
 }
+#[derive(Clone, Copy)]
+enum AuthTransport {
+    Production,
+    #[cfg(test)]
+    Local(std::net::SocketAddr),
+}
+impl AuthTransport {
+    fn open(self) -> Result<HttpAdapter> {
+        match self {
+            Self::Production => Ok(HttpAdapter::new()?),
+            #[cfg(test)]
+            Self::Local(address) => Ok(HttpAdapter::local_test_adapter(address)),
+        }
+    }
+}
 pub struct LoginController {
     controls: mpsc::Sender<Control>,
     epoch: Arc<AtomicU64>,
@@ -121,6 +150,14 @@ impl LoginController {
         profile: Arc<Profile>,
         trust_module: Option<PathBuf>,
         repaint: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self> {
+        Self::with_transport(profile, trust_module, repaint, AuthTransport::Production)
+    }
+    fn with_transport(
+        profile: Arc<Profile>,
+        trust_module: Option<PathBuf>,
+        repaint: Arc<dyn Fn() + Send + Sync>,
+        transport: AuthTransport,
     ) -> Result<Self> {
         if trust_module.as_ref().is_some_and(|p| !p.is_absolute()) {
             bail!("trust module override must be absolute");
@@ -151,6 +188,7 @@ impl LoginController {
                             notice,
                             cancel_notice,
                             repaint,
+                            transport,
                         },
                     ));
                 }
@@ -188,6 +226,11 @@ impl LoginController {
         let generation = self.advance();
         self.attempt.fetch_max(generation, Ordering::AcqRel);
         permit.send(Control::Begin(generation));
+        crate::diagnostics::record(crate::diagnostics::Event::new(
+            crate::diagnostics::Kind::Transition,
+            crate::diagnostics::Stage::Login,
+            crate::diagnostics::Reason::Requested,
+        ));
         Ok(generation)
     }
     pub fn resume(&self) -> Result<u64> {
@@ -198,9 +241,19 @@ impl LoginController {
         let generation = self.advance();
         self.attempt.fetch_max(generation, Ordering::AcqRel);
         permit.send(Control::Resume(generation));
+        crate::diagnostics::record(crate::diagnostics::Event::new(
+            crate::diagnostics::Kind::Transition,
+            crate::diagnostics::Stage::Resume,
+            crate::diagnostics::Reason::Requested,
+        ));
         Ok(generation)
     }
     pub fn cancel(&self) -> u64 {
+        crate::diagnostics::record(crate::diagnostics::Event::new(
+            crate::diagnostics::Kind::Transition,
+            crate::diagnostics::Stage::Login,
+            crate::diagnostics::Reason::Cancelled,
+        ));
         let generation = self.advance();
         // Repeated cancellation retains the attempt identity even when watch coalesces.
         // A later Begin/Resume replaces that identity; stale starts cannot overwrite it.
@@ -227,7 +280,76 @@ impl Drop for LoginController {
         let _ = self.controls.try_send(Control::Stop);
     }
 }
+fn login_stage(stage: LoginStage) -> (crate::diagnostics::Stage, crate::diagnostics::Reason) {
+    use crate::diagnostics::{Reason as R, Stage as S};
+    match stage {
+        LoginStage::CreatingQr => (S::Qr, R::CreatingQr),
+        LoginStage::WaitingForScan => (S::Qr, R::WaitingForScan),
+        LoginStage::WaitingForPhone => (S::Qr, R::WaitingForPhone),
+        LoginStage::VerifyingTrust => (S::Trust, R::VerifyingTrust),
+        LoginStage::Bootstrapping => (S::Bootstrap, R::Bootstrapping),
+        LoginStage::Restoring => (S::Resume, R::Restoring),
+    }
+}
+fn login_diagnostic(event: &LoginEvent) -> crate::diagnostics::Event {
+    use crate::diagnostics::{Event, Kind as K, Reason as R, Stage as S};
+    match event {
+        LoginEvent::Progress { stage, .. } => {
+            let (stage, reason) = login_stage(*stage);
+            Event::new(K::Transition, stage, reason)
+        }
+        LoginEvent::Qr { .. } => Event::new(K::Transition, S::Qr, R::Ready),
+        LoginEvent::Ready { .. } => Event::new(K::Transition, S::Login, R::Ready),
+        LoginEvent::SignedOut { .. } => Event::new(K::Transition, S::Login, R::Offline),
+        LoginEvent::Failed { error, .. } => match error {
+            LoginFailure::Busy => Event::new(K::Failure, S::Login, R::QueueFull),
+            LoginFailure::Cancelled => Event::new(K::Failure, S::Login, R::Cancelled),
+            LoginFailure::Expired => Event::new(K::Failure, S::Qr, R::Timeout),
+            LoginFailure::Network => Event::new(K::Failure, S::Login, R::Transport),
+            LoginFailure::Rejected => Event::new(K::Failure, S::Login, R::ServerCode),
+            LoginFailure::Unsupported => Event::new(K::Failure, S::Login, R::Unsupported),
+            LoginFailure::FreshApprovalRequired => {
+                Event::new(K::Failure, S::Resume, R::FreshApprovalRequired)
+            }
+            LoginFailure::Malformed | LoginFailure::Internal => {
+                Event::new(K::Failure, S::Login, R::Invalid)
+            }
+            LoginFailure::Trust => Event::new(K::Failure, S::Trust, R::CipherIntegrity),
+            LoginFailure::AccountMismatch => Event::new(K::Failure, S::Profile, R::Invalid),
+            LoginFailure::Storage => Event::new(K::Failure, S::Storage, R::Io),
+            LoginFailure::ServerRejected { stage, code } => {
+                Event::new(K::Failure, login_stage(*stage).0, R::ServerCode)
+                    .server_code(Some(*code))
+            }
+            LoginFailure::Bootstrap(failure) => match failure.category {
+                bootstrap::BootstrapError::Http(code) => {
+                    Event::new(K::Failure, S::Bootstrap, R::HttpStatus).http_status(Some(code))
+                }
+                bootstrap::BootstrapError::AuthenticationRejected(code)
+                | bootstrap::BootstrapError::ServiceRejected(code)
+                | bootstrap::BootstrapError::EncryptionRejected(code) => {
+                    Event::new(K::Failure, S::Bootstrap, R::ServerCode).server_code(Some(code))
+                }
+                bootstrap::BootstrapError::Malformed => Event::new(
+                    K::Failure,
+                    S::Bootstrap,
+                    match failure.stage {
+                        bootstrap::BootstrapStage::OuterEnvelope => R::OuterEnvelope,
+                        bootstrap::BootstrapStage::ResponseDecryption => R::CipherIntegrity,
+                        bootstrap::BootstrapStage::InnerEnvelope => R::InnerEnvelope,
+                        _ => R::Invalid,
+                    },
+                ),
+                bootstrap::BootstrapError::UnsafeEndpoint
+                | bootstrap::BootstrapError::UnsupportedSchema => {
+                    Event::new(K::Failure, S::Bootstrap, R::Unsupported)
+                }
+            },
+        },
+    }
+}
 fn emit(tx: &mpsc::Sender<LoginEvent>, event: LoginEvent, repaint: &Arc<dyn Fn() + Send + Sync>) {
+    crate::diagnostics::record(login_diagnostic(&event));
     let _ = tx.try_send(event);
     repaint();
 }
@@ -244,9 +366,11 @@ async fn deliver(
     if epoch.load(Ordering::Acquire) & GENERATION_MASK != generation {
         return;
     }
-    tokio::select! {biased;_=cancellation.changed()=>{},result=tx.send(event)=>{if result.is_ok(){repaint();}}}
+    let diagnostic = login_diagnostic(&event);
+    tokio::select! {biased;_=cancellation.changed()=>{},result=tx.send(event)=>{if result.is_ok(){crate::diagnostics::record(diagnostic);repaint();}}}
 }
 struct ControllerChannels {
+    transport: AuthTransport,
     rx: mpsc::Receiver<Control>,
     tx: mpsc::Sender<LoginEvent>,
     epoch: Arc<AtomicU64>,
@@ -260,6 +384,7 @@ async fn controller_loop(
     channels: ControllerChannels,
 ) {
     let ControllerChannels {
+        transport,
         mut rx,
         tx,
         epoch,
@@ -318,7 +443,7 @@ async fn controller_loop(
             last_commit: &last_commit,
             repaint: &repaint,
         };
-        let work = authenticate(profile.clone(), module.clone(), resume, &context);
+        let work = authenticate(profile.clone(), module.clone(), resume, &context, transport);
         let result = tokio::select! {biased;_ = notice.changed()=>Err(LoginFailure::Cancelled),result=tokio::time::timeout(Duration::from_secs(OVERALL_SECONDS),work)=>result.unwrap_or(Err(LoginFailure::Expired))};
         if epoch.load(Ordering::Acquire) & GENERATION_MASK == generation {
             if let Err(error) = result {
@@ -779,7 +904,7 @@ async fn poll<T: qr::QrTransport>(
     descriptor: &QrDescriptor,
     confirm: bool,
 ) -> std::result::Result<(i64, Value), LoginFailure> {
-    let mut last_timeout = false;
+    let mut last_code = None;
     for attempt in 0..descriptor.retries {
         match http.get(&descriptor.request(confirm)).await {
             Ok(reply) => {
@@ -787,7 +912,7 @@ async fn poll<T: qr::QrTransport>(
                 if matches!(code, 0 | -20 | -21 | 18010) {
                     return Ok((code, data));
                 }
-                last_timeout = code == 408;
+                last_code = Some(code);
             }
             Err(_) if attempt + 1 == descriptor.retries => return Err(LoginFailure::Network),
             Err(_) => {}
@@ -796,10 +921,17 @@ async fn poll<T: qr::QrTransport>(
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
-    Err(if last_timeout {
-        LoginFailure::Expired
-    } else {
-        LoginFailure::Rejected
+    Err(match last_code {
+        Some(408) => LoginFailure::Expired,
+        Some(code) => LoginFailure::ServerRejected {
+            stage: if confirm {
+                LoginStage::WaitingForPhone
+            } else {
+                LoginStage::WaitingForScan
+            },
+            code,
+        },
+        None => LoginFailure::Network,
     })
 }
 
@@ -807,12 +939,14 @@ async fn bootstrap_authenticated(
     http: &mut HttpAdapter,
     imei: &str,
     pending: &PendingCookies,
+    client_type: ClientType,
 ) -> std::result::Result<bootstrap::LoginInfo, LoginFailure> {
     http.stage_verified_confirmation(pending)
         .map_err(|_| LoginFailure::Network)?;
     let time = now_ms()?;
     let random = nonce();
     let (request, cipher) = bootstrap::login_info_request(&LoginInfoInput {
+        client_type,
         imei,
         computer_name: "Zalo Linux",
         language: "vi",
@@ -821,8 +955,8 @@ async fn bootstrap_authenticated(
     })
     .map_err(|_| LoginFailure::Internal)?;
     let reply = fetch(http, &request).await?;
-    let result = bootstrap::decode_login_reply(reply.status, &reply.body, &cipher)
-        .map_err(|_| LoginFailure::Rejected)?;
+    let result = bootstrap::decode_login_reply_detailed(reply.status, &reply.body, &cipher)
+        .map_err(LoginFailure::Bootstrap)?;
     if result.account_id != pending.account_id {
         return Err(LoginFailure::AccountMismatch);
     }
@@ -895,8 +1029,17 @@ async fn authenticate(
     module: Option<PathBuf>,
     resume: bool,
     context: &Attempt<'_>,
+    transport: AuthTransport,
 ) -> std::result::Result<(), LoginFailure> {
-    let http = HttpAdapter::new().map_err(|_| LoginFailure::Network)?;
+    if resume
+        && AuthRecord::load(&profile)
+            .map_err(|_| LoginFailure::Storage)?
+            .and_then(|r| r.active)
+            .is_some_and(|s| !s.client_type.supports_native_session())
+    {
+        return Err(LoginFailure::FreshApprovalRequired);
+    }
+    let http = transport.open().map_err(|_| LoginFailure::Network)?;
     authenticate_with_http(profile, module, resume, context, http).await
 }
 async fn authenticate_with_http(
@@ -926,6 +1069,9 @@ async fn authenticate_with_http(
             .as_mut()
             .and_then(|record| record.active.take())
             .ok_or(LoginFailure::Rejected)?;
+        if !saved.client_type.supports_native_session() {
+            return Err(LoginFailure::FreshApprovalRequired);
+        }
         profile
             .check_account(&saved.account_id)
             .map_err(|_| LoginFailure::AccountMismatch)?;
@@ -958,7 +1104,8 @@ async fn authenticate_with_http(
         }
         let pending =
             PendingCookies::from_confirmation(&pending_value).map_err(|_| LoginFailure::Storage)?;
-        let info = bootstrap_authenticated(&mut http, &saved.imei, &pending).await?;
+        let info =
+            bootstrap_authenticated(&mut http, &saved.imei, &pending, saved.client_type).await?;
         let mut saved = saved;
         saved.session_key = session::encode_key(&info.session_cipher);
         (saved, info.config)
@@ -971,9 +1118,11 @@ async fn authenticate_with_http(
             },
             repaint,
         );
+        let client_type = ClientType::PcLinux24;
         let imei = device_id();
         let local_time = now_ms()?;
         let request = bootstrap::server_info_request(&ServerInfoInput {
+            client_type,
             imei: &imei,
             computer_name: "Zalo Linux",
             support_maintenance: None,
@@ -1005,6 +1154,7 @@ async fn authenticate_with_http(
         } else {
             qr::create_request
         })(&QrRequestInput {
+            client_type,
             imei: &imei,
             computer_name: "Zalo Linux",
             language: "vi",
@@ -1014,7 +1164,10 @@ async fn authenticate_with_http(
         .map_err(|_| LoginFailure::Internal)?;
         let (code, value) = envelope(fetch(&mut http, &request).await?)?;
         if code != 0 {
-            return Err(LoginFailure::Rejected);
+            return Err(LoginFailure::ServerRejected {
+                stage: LoginStage::CreatingQr,
+                code,
+            });
         }
         let encrypted = value.as_str().ok_or(LoginFailure::Malformed)?;
         let inner = cipher
@@ -1025,7 +1178,10 @@ async fn authenticate_with_http(
             body: inner,
         })?;
         if code != 0 {
-            return Err(LoginFailure::Rejected);
+            return Err(LoginFailure::ServerRejected {
+                stage: LoginStage::CreatingQr,
+                code,
+            });
         }
         let mut qr_data = value;
         let mut descriptor = QrDescriptor::parse_mode(&qr_data, false, trusted)?;
@@ -1045,6 +1201,11 @@ async fn authenticate_with_http(
             tx.send(LoginEvent::Qr { generation, pixels })
                 .await
                 .map_err(|_| LoginFailure::Cancelled)?;
+            crate::diagnostics::record(crate::diagnostics::Event::new(
+                crate::diagnostics::Kind::Transition,
+                crate::diagnostics::Stage::Qr,
+                crate::diagnostics::Reason::Ready,
+            ));
             repaint();
             emit(
                 tx,
@@ -1061,7 +1222,10 @@ async fn authenticate_with_http(
                 continue;
             }
             if code != 0 {
-                return Err(LoginFailure::Expired);
+                return Err(LoginFailure::ServerRejected {
+                    stage: LoginStage::WaitingForScan,
+                    code,
+                });
             }
             emit(
                 tx,
@@ -1119,7 +1283,10 @@ async fn authenticate_with_http(
                 continue;
             }
             if code != 0 {
-                return Err(LoginFailure::Rejected);
+                return Err(LoginFailure::ServerRejected {
+                    stage: LoginStage::WaitingForPhone,
+                    code,
+                });
             }
             let pending = PendingCookies::from_confirmation(&confirmed)
                 .map_err(|_| LoginFailure::Malformed)?;
@@ -1173,7 +1340,7 @@ async fn authenticate_with_http(
                 },
                 repaint,
             );
-            let info = bootstrap_authenticated(&mut http, &imei, &pending).await?;
+            let info = bootstrap_authenticated(&mut http, &imei, &pending, client_type).await?;
             let display_name = confirmed
                 .pointer("/profile/displayName")
                 .or_else(|| confirmed.pointer("/profile/display_name"))
@@ -1182,6 +1349,7 @@ async fn authenticate_with_http(
                 .unwrap_or("Tài khoản Zalo")
                 .to_owned();
             let saved = StoredSession {
+                client_type,
                 account_id: pending.account_id,
                 display_name,
                 imei: imei.clone(),
@@ -1264,13 +1432,61 @@ async fn publish_session(
         logout_record(&profile).map_err(|_| LoginFailure::Storage)?;
         return Err(LoginFailure::Cancelled);
     }
-    permit.send(LoginEvent::Ready {
+    let event = LoginEvent::Ready {
         generation,
         session: runtime,
-    });
+    };
+    crate::diagnostics::record(login_diagnostic(&event));
+    permit.send(event);
     repaint();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn login_progress_and_typed_failures_have_fixed_structural_diagnostics() {
+        for (stage, expected_stage, expected_reason) in [
+            (LoginStage::CreatingQr, "qr", "creating_qr"),
+            (LoginStage::WaitingForScan, "qr", "waiting_for_scan"),
+            (LoginStage::WaitingForPhone, "qr", "waiting_for_phone"),
+            (LoginStage::VerifyingTrust, "trust", "verifying_trust"),
+            (LoginStage::Bootstrapping, "bootstrap", "bootstrapping"),
+            (LoginStage::Restoring, "resume", "restoring"),
+        ] {
+            let value = serde_json::to_value(login_diagnostic(&LoginEvent::Progress {
+                generation: 123,
+                stage,
+            }))
+            .unwrap();
+            assert_eq!(value["stage"], expected_stage);
+            assert_eq!(value["reason"], expected_reason);
+            assert!(value.get("generation").is_none());
+        }
+        let failure = LoginEvent::Failed {
+            generation: 123,
+            error: LoginFailure::ServerRejected {
+                stage: LoginStage::Bootstrapping,
+                code: 102,
+            },
+        };
+        let value = serde_json::to_value(login_diagnostic(&failure)).unwrap();
+        assert_eq!(value["kind"], "failure");
+        assert_eq!(value["stage"], "bootstrap");
+        assert_eq!(value["server_code"], 102);
+        let failure = LoginEvent::Failed {
+            generation: 123,
+            error: LoginFailure::Bootstrap(bootstrap::BootstrapFailure {
+                stage: bootstrap::BootstrapStage::OuterEnvelope,
+                category: bootstrap::BootstrapError::Malformed,
+            }),
+        };
+        let value = serde_json::to_value(login_diagnostic(&failure)).unwrap();
+        assert_eq!(value["reason"], "outer_envelope");
+        assert!(value.get("server_code").is_none());
+    }
+}

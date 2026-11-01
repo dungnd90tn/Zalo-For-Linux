@@ -9,7 +9,8 @@ for script in "$REPO_ROOT"/scripts/rust/*.sh; do
 done
 python3 -m unittest discover -s "$REPO_ROOT/scripts/rust/tests" -v
 cargo fmt --manifest-path "$MANIFEST" --all -- --check
-cargo tree --locked --offline --manifest-path "$MANIFEST" -e normal --prefix none | python3 -c 'import sys; lines=sys.stdin.read().splitlines(); assert not any(line.startswith(("wasmi ", "reqwest ", "tokio-tungstenite ")) for line in lines), "optional protocol engines entered the default dependency graph"; print("Default dependencies exclude optional HTTP/WebSocket/WASM engines.")'
+cargo tree --locked --offline --manifest-path "$MANIFEST" -e normal --prefix none | python3 -c 'import sys; lines=sys.stdin.read().splitlines(); assert not any(line.startswith(("wasmi ", "reqwest ", "tokio-tungstenite ", "rquickjs", "libsignal-core ")) for line in lines), "optional protocol engines entered the default dependency graph"; print("Default dependencies exclude optional HTTP/WebSocket/WASM/Signal engines.")'
+cargo tree --locked --offline --manifest-path "$MANIFEST" --features signal-store -e normal --prefix none | python3 -c 'import sys; lines=sys.stdin.read().splitlines(); assert not any(line.startswith(("wasmi ", "reqwest ", "tokio-tungstenite ", "rquickjs", "libsignal-core ")) for line in lines), "signal-store DTOs enabled a protocol or cryptographic runtime"; print("Signal storage DTOs exclude embedded cryptography and network engines.")'
 cargo test --locked --manifest-path "$MANIFEST" --offline
 cargo clippy --locked --manifest-path "$MANIFEST" --offline --all-targets -- -D warnings
 SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/zalo-rust-smoke.XXXXXXXX")"

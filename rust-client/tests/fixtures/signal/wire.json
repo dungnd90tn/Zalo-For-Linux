@@ -1,0 +1,261 @@
+{
+  "provenance": "exact own-bundle methods; public synthetic bytes; NOT cryptographically valid keys/signatures/ciphertexts",
+  "bundle": {
+    "registrationId": 1234,
+    "identityKey": "BQECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g",
+    "signedPreKey": {
+      "keyId": 1235,
+      "publicKey": "BQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAh",
+      "signature": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QA=="
+    },
+    "preKeys": [
+      {
+        "keyId": 1237,
+        "publicKey": "BQMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEi"
+      }
+    ]
+  },
+  "personal": "ATMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g=",
+  "prekey": "AzMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g=",
+  "group": "BDMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A=",
+  "requests": [
+    {
+      "cmd": 540,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_0",
+        "data": {
+          "delSS": 1,
+          "key": {
+            "deviceId": 2,
+            "preKey": {
+              "iKey": {
+                "id": 1234,
+                "key": "BQECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g"
+              },
+              "signature": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QA==",
+              "spKey": {
+                "id": 1235,
+                "key": "BQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAh"
+              }
+            },
+            "opKeys": [
+              {
+                "id": 1237,
+                "key": "BQMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEi"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "cmd": 541,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_1",
+        "data": {
+          "uids": [
+            {
+              "uid": "22",
+              "deviceId": -1
+            }
+          ],
+          "isReInit": 1,
+          "msgInfoNoti": 0,
+          "isAutoUpgrade": 1
+        }
+      }
+    },
+    {
+      "cmd": 542,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_2",
+        "data": {
+          "deviceId": 2,
+          "id": 1234,
+          "opKeys": [
+            {
+              "id": 1237,
+              "key": "BQMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEi"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "cmd": 543,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_3",
+        "data": {
+          "type": 1,
+          "uidTo": "22",
+          "data": [
+            {
+              "deviceId": 0,
+              "data": "AzMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g="
+            }
+          ]
+        }
+      }
+    },
+    {
+      "cmd": 544,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_4",
+        "data": {
+          "type": 1,
+          "uidTo": "22",
+          "data": [
+            {
+              "deviceId": 0,
+              "ts": 1700000000000,
+              "data": "ATMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g="
+            }
+          ]
+        }
+      }
+    },
+    {
+      "cmd": 561,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_5",
+        "data": {
+          "type": 2,
+          "uidTo": "22",
+          "data": [
+            {
+              "deviceId": 0,
+              "data": "ATMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g=",
+              "ts": 1700000000000
+            }
+          ],
+          "tId": "33"
+        }
+      }
+    },
+    {
+      "cmd": 564,
+      "subCmd": 0,
+      "data": {
+        "data": {
+          "platformType": 2
+        },
+        "reqId": "signal_req_6"
+      }
+    },
+    {
+      "cmd": 560,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_7",
+        "data": {
+          "uids": [
+            "22"
+          ]
+        }
+      }
+    },
+    {
+      "cmd": 562,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_8",
+        "data": {
+          "uids": [
+            "22",
+            "44"
+          ],
+          "groupId": "33",
+          "enableEE": 1
+        }
+      }
+    },
+    {
+      "cmd": 563,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_9",
+        "data": {
+          "reqIid": 1,
+          "first": true
+        }
+      }
+    },
+    {
+      "cmd": 563,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_10",
+        "data": {
+          "reqIid": 1,
+          "lastId": "100",
+          "first": false
+        }
+      }
+    },
+    {
+      "cmd": 547,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_11",
+        "data": {
+          "keyId": 1234,
+          "uids": [
+            "22"
+          ],
+          "ts": 1700000000000
+        }
+      }
+    },
+    {
+      "cmd": 547,
+      "subCmd": 0,
+      "data": {
+        "reqId": "signal_req_12",
+        "data": {
+          "keyId": 1234,
+          "groupIds": [
+            "33"
+          ],
+          "ts": 1700000000000
+        }
+      }
+    }
+  ],
+  "sms": [
+    {
+      "route": {
+        "domainType": "chat_e2e",
+        "path": "/api/e2ee/pc/message/sms",
+        "query": "zpw_ver=681&zpw_type=24"
+      },
+      "parameters": {
+        "listParams": "[{\"message\":\"ATMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g=\",\"toId\":\"22\",\"platform\":0,\"e2eeExt\":\"{\\\"version\\\":0,\\\"compat_version\\\":0,\\\"iid\\\":2345,\\\"sender_iid\\\":1234}\"}]",
+        "destType": 3,
+        "threadId": "22",
+        "clientId": 1700000000001
+      },
+      "metric": 16000
+    },
+    {
+      "route": {
+        "domainType": "group_e2e",
+        "path": "/api/e2ee/pc/group/sms",
+        "query": "zpw_ver=681&zpw_type=24"
+      },
+      "parameters": {
+        "message": "BDMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A=",
+        "grid": "33",
+        "clientId": 1700000000001,
+        "visibility": 0,
+        "e2eeExt": "{\"version\":0,\"compat_version\":0}"
+      },
+      "metric": 16100
+    }
+  ]
+}

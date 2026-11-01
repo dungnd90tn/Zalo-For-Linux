@@ -1,5 +1,7 @@
 //! Bounded UI/storage boundary. SQLite and filesystem work never run on the render thread.
 #[cfg(feature = "messaging")]
+pub mod directory;
+#[cfg(feature = "messaging")]
 pub mod live;
 
 use crate::domain::{
