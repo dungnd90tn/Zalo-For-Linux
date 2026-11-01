@@ -1,0 +1,36 @@
+name: Rust client preview
+
+on:
+  push:
+    paths: ['rust-client/**', 'scripts/rust/**', '.github/workflows/rust-client.yml']
+  pull_request:
+    paths: ['rust-client/**', 'scripts/rust/**', '.github/workflows/rust-client.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  offline-checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the repository's pinned Rust toolchain
+        working-directory: rust-client
+        run: rustup show active-toolchain
+      - name: Install Linux build libraries
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev openssl
+      - name: Fetch pinned dependencies
+        working-directory: rust-client
+        run: cargo fetch --locked --manifest-path Cargo.toml
+      - name: Test, lint, and check informational CLI without a display or account
+        run: ./scripts/rust/check.sh
+      - name: Test optional protocol adapters and the bounded trust interpreter
+        working-directory: rust-client
+        run: |
+          cargo test --locked --offline --manifest-path Cargo.toml --all-features
+          cargo clippy --locked --offline --manifest-path Cargo.toml --all-targets --all-features -- -D warnings
+          cargo test --release --locked --offline --manifest-path Cargo.toml --features trust-wasm protocol::trust
+      - name: Build release preview
+        run: ./scripts/rust/build.sh --offline
+      - name: Validate the release binary with disposable profiles
+        run: python3 scripts/rust/smoke-release.py

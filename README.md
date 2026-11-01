@@ -87,6 +87,24 @@ cd zalo-linux-2026
 
 ## Building from source
 
+### Rust client preview
+
+An independently written native Rust client is being developed alongside the Electron port. It keeps a native UI using this repository's existing Zalo theme, fonts and icons, without a WebView or copied reference-project implementation. Electron remains the current supported application while the Rust domain, storage, background runtime, and protocol integration are validated.
+
+With the pinned Rust toolchain (`rust-client/rust-toolchain.toml`) and the Linux build prerequisites listed in [the validation guide](rust-client/VALIDATION.md):
+
+```bash
+./scripts/rust/build.sh                 # locked release build
+./scripts/rust/run.sh --demo            # offline GUI with synthetic messages
+./scripts/rust/run.sh --demo --headless # offline worker/database smoke check
+(cd rust-client && cargo fetch --locked --manifest-path Cargo.toml)
+./scripts/rust/check.sh                 # offline tests, lint, CLI smoke checks
+```
+
+The launcher and direct binary share the CLI's XDG paths: data under `${XDG_DATA_HOME:-$HOME/.local/share}/zalo-rust/profiles/<name>`, with configuration/cache under their respective XDG roots. The default name is `rust-demo` with `--demo`, otherwise `rust-pilot`. Optional `ZALO_RUST_PROFILE_ROOT` and `ZALO_RUST_PROFILE` overrides select a disposable location; explicit CLI flags take precedence. Demo data is synthetic. Live Zalo authentication and messaging are not yet implemented; no real-account compatibility or performance improvement is claimed. See [architecture](rust-client/ARCHITECTURE.md), [validation](rust-client/VALIDATION.md), and [migration status](rust-client/MIGRATION_STATUS.md).
+
+### Electron packaging
+
 ```bash
 ./build-deb.sh                 # → dist/zalo_<version>_amd64.deb
 ./build-appimage.sh            # → dist/Zalo-<version>-x86_64.AppImage

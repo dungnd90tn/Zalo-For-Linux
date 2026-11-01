@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository actually is
 
-This is **not** an application source tree. It is the extracted contents of the macOS Zalo desktop client's `app.asar` (VNG's proprietary Electron app), plus a thin layer of Linux porting work on top:
+The Electron portion consists of extracted macOS Zalo `app.asar` contents (VNG's proprietary app) plus Linux porting work. An independently authored native Rust preview lives alongside it:
 
 - `main-dist/`, `pc-dist/` — prebuilt, minified webpack bundles shipped by VNG. There is no build step that regenerates them, and no `node_modules` (the `dependencies` in `package.json` are the upstream manifest, informational only). Changes here are made by **patching minified code in place**.
 - `native/nativelibs/` — the upstream native addon loaders. Most `.node` binaries are Mach-O (macOS) and unusable on Linux; only `sqlite3` and `db-cross-v4` have Linux binaries.
 - `generate-addon.py`, `reverse-engineering/` — the port's own work: a clean-room C++ reimplementation of the `db-cross-v4` backup-decryption addon, derived from disassembly of the macOS binary.
 - `install.sh`, `start.sh`, `update.sh`, `build-appimage.sh`, `toggle-devtools.sh`, `version.txt` — the port's packaging/launcher layer.
+- `rust-client/` — independent domain, SQLite, bounded worker, native UI and protocol modules; inline Rust tests and synthetic benchmarks. `scripts/rust/` contains build/run/verification helpers and Python tests. Live authentication and messaging are unavailable; preserve explicit offline demo labeling.
 
 Electron is pinned to **v43.3.0** by version *and* SHA-256 in `start.sh` (`ELECTRON_VERSION`, `ELECTRON_SHA256`), and that is the ABI target for the native addon build. The port previously shipped v22.3.27 (Chromium 108, EOL since 2023); the upgrade is what removed that exposure.
 
@@ -52,7 +53,7 @@ python3 generate-jxl-addon.py # Rebuild the Linux zjxl (JPEG XL) addon (needs li
 
 `build-appimage.sh` caches its downloads in `${XDG_CACHE_HOME:-~/.cache}/zalo-linux-build` and verifies both against pinned SHA-256 values before use. It uses the maintained `AppImage/appimagetool` (a static binary, run with `APPIMAGE_EXTRACT_AND_RUN=1`), so **no libfuse2 is needed to build or to run the result** — the retired AppImageKit build required it, which broke on Ubuntu 24.04+. When upstream rotates its rolling `continuous` asset the pinned digest stops matching; verify the new binary, then re-pin `APPIMAGETOOL_SHA256` or override once with `ZALO_APPIMAGETOOL_SHA256=<sha>`.
 
-There is no test suite, linter, or package manager step. Verification is manual: launch with `./start.sh` and watch stdout (`ELECTRON_ENABLE_LOGGING=1` is set by `start.sh`).
+Electron bundle verification remains manual: launch with `./start.sh` and watch stdout (`ELECTRON_ENABLE_LOGGING=1` is set by `start.sh`); there is no npm workflow. For Rust, use `./scripts/rust/check.sh` (formatting, tests, strict Clippy, offline smoke), `./scripts/rust/build.sh --offline`, and `python3 scripts/rust/smoke-release.py`. Fetch locked dependencies first as described in `rust-client/VALIDATION.md`. Keep synthetic checks distinct from real-account integration evidence; optional `trust-wasm` has a separate test/lint gate.
 
 Ad-hoc RE helpers live in [reverse-engineering/tools/](reverse-engineering/tools/) (`check_decrypted_db.py`, `offline_decrypt_check.py`, `debug_parse_binnet.js`) — see [reverse-engineering/README.md](reverse-engineering/README.md).
 
