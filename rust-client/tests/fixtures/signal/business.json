@@ -1,0 +1,26 @@
+{
+  "provenance": "Exact original sendZText/encrypt/encryptMessageAsync/getTextFromContent plus bundled SessionCipher roundtrip; fixture-only Node ByteBuffer UTF8 bridge and synthetic RNG",
+  "cases": [
+    {
+      "bytes": 18,
+      "sha256": "86cf5f0043ad6e4e73355c1aebcc27637b1c0ce5a86d799cd64b99e036cd2a4a",
+      "preview": "Xin chào 🦀 \"\\\n",
+      "encrypted_fields": 1,
+      "properties": null
+    },
+    {
+      "bytes": 6,
+      "sha256": "d9975a8c3cbfa08b5296dd72d9f9815d87ecaa1db526dcf4b4203fb540af15d6",
+      "preview": "Đậm",
+      "encrypted_fields": 2,
+      "properties": "{\"styles\":[{\"start\":0,\"len\":3,\"st\":\"b\"}],\"ver\":0}"
+    },
+    {
+      "bytes": 65536,
+      "sha256": "1f8745f0d2d1387ec1af2211a3cf417b2e9e885e853472649c1d979d0e9370e3",
+      "preview": null,
+      "encrypted_fields": 1,
+      "properties": null
+    }
+  ]
+}

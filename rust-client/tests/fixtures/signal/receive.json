@@ -1,0 +1,224 @@
+{
+  "provenance": "Original onReceiveSessionOffline dispatch for synthetic envelopes; message/group/delivery field shapes from N404551-404625/N162568/N163012/N167752",
+  "first": {
+    "error_code": 0,
+    "data": {
+      "more": true,
+      "lastActionId": "100",
+      "eesession": [
+        {
+          "msgId": "100",
+          "cmd": 543,
+          "sessionData": {
+            "uidFrom": "22",
+            "uidTo": "11",
+            "deviceId": 0,
+            "ts": 1700000000000,
+            "data": "AzMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g="
+          }
+        }
+      ]
+    }
+  },
+  "last": {
+    "error_code": 0,
+    "data": {
+      "more": false,
+      "lastActionId": "104",
+      "eesession": [
+        {
+          "msgId": "101",
+          "cmd": 544,
+          "sessionData": {
+            "uidFrom": "22",
+            "uidTo": "11",
+            "deviceId": 0,
+            "ts": 1700000000000,
+            "type": 1,
+            "data": "ATMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g="
+          }
+        },
+        {
+          "msgId": "102",
+          "cmd": 549,
+          "sessionData": {
+            "uidFrom": "22",
+            "uidTo": "11",
+            "deviceId": 0,
+            "ts": 1700000000000,
+            "type": 1
+          }
+        },
+        {
+          "msgId": "103",
+          "cmd": 548,
+          "sessionData": {
+            "uidFrom": "22",
+            "uidTo": "11",
+            "deviceId": 0,
+            "ts": 1700000000000,
+            "deleteType": 0
+          }
+        },
+        {
+          "msgId": "104",
+          "cmd": 549,
+          "sessionData": {
+            "uidFrom": "22",
+            "uidTo": "11",
+            "deviceId": 0,
+            "ts": 1700000000000,
+            "type": 2
+          }
+        }
+      ]
+    }
+  },
+  "group": {
+    "error_code": 0,
+    "data": {
+      "more": false,
+      "lastActionId": "105",
+      "eesession": [
+        {
+          "msgId": "105",
+          "cmd": 561,
+          "sessionData": {
+            "uidFrom": "22",
+            "uidTo": "11",
+            "deviceId": 0,
+            "ts": 1700000000000,
+            "threadId": "33",
+            "type": 2,
+            "data": "ATMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g="
+          }
+        }
+      ]
+    }
+  },
+  "messages": {
+    "error_code": 0,
+    "data": {
+      "msgs": [
+        {
+          "msgId": "106",
+          "uidFrom": "22",
+          "idTo": "11",
+          "ts": "1700000000000",
+          "msgType": "webchat",
+          "content": "ATMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g=",
+          "paramsExt": {
+            "platformType": 0
+          }
+        }
+      ],
+      "pageMsgs": []
+    }
+  },
+  "groupMessages": {
+    "error_code": 0,
+    "data": {
+      "groupMsgs": [
+        {
+          "msgId": "107",
+          "uidFrom": "22",
+          "idTo": "33",
+          "ts": "1700000000000",
+          "msgType": "webchat",
+          "content": "BDMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A=",
+          "paramsExt": {
+            "platformType": 0
+          }
+        }
+      ]
+    }
+  },
+  "deliveries": {
+    "error_code": 0,
+    "data": {
+      "delivereds": [
+        {
+          "msgId": "106",
+          "uid": "22",
+          "deviceId": 0,
+          "err": 0
+        }
+      ]
+    }
+  },
+  "dispatch": [
+    {
+      "kind": "init",
+      "event": {
+        "msgId": "100",
+        "cmd": 543,
+        "sessionData": {
+          "uidFrom": "22",
+          "uidTo": "11",
+          "deviceId": 0,
+          "ts": 1700000000000,
+          "data": "AzMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g="
+        }
+      }
+    },
+    {
+      "kind": "ack",
+      "event": {
+        "msgId": "101",
+        "cmd": 544,
+        "sessionData": {
+          "uidFrom": "22",
+          "uidTo": "11",
+          "deviceId": 0,
+          "ts": 1700000000000,
+          "type": 1,
+          "data": "ATMBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0g="
+        }
+      }
+    },
+    {
+      "kind": "prekeys",
+      "offline": true,
+      "event": {
+        "msgId": "102",
+        "cmd": 549,
+        "sessionData": {
+          "uidFrom": "22",
+          "uidTo": "11",
+          "deviceId": 0,
+          "ts": 1700000000000,
+          "type": 1
+        }
+      }
+    },
+    {
+      "kind": "delete",
+      "event": {
+        "msgId": "103",
+        "cmd": 548,
+        "sessionData": {
+          "uidFrom": "22",
+          "uidTo": "11",
+          "deviceId": 0,
+          "ts": 1700000000000,
+          "deleteType": 0
+        }
+      }
+    },
+    {
+      "kind": "prekeys",
+      "offline": true,
+      "event": {
+        "msgId": "104",
+        "cmd": 549,
+        "sessionData": {
+          "uidFrom": "22",
+          "uidTo": "11",
+          "deviceId": 0,
+          "ts": 1700000000000,
+          "type": 2
+        }
+      }
+    }
+  ]
+}

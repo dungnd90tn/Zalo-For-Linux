@@ -17,6 +17,8 @@ use std::{
 
 #[cfg(feature = "signal-store")]
 pub mod engine_adapter;
+#[cfg(feature = "signal-crypto")]
+pub mod provisioning;
 
 pub const MAX_RECORDS: usize = 512;
 pub const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
@@ -267,18 +269,77 @@ impl Drop for CommitLease<'_> {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetKind {
+    Personal,
+    Group,
+}
+/// Authenticated delivery identity; queue is deliberately not part of it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputContext {
+    pub kind: TargetKind,
+    pub thread: String,
+    pub server_id: String,
+    pub sender: PeerNamespace,
+    pub registration_id: u16,
+}
+impl InputContext {
+    fn encoded(&self) -> Result<String> {
+        validate_id(&self.thread)?;
+        validate_id(&self.server_id)?;
+        ensure!(
+            self.registration_id <= 16383,
+            "Invalid input registration ID"
+        );
+        account(&self.sender.uid)?;
+        epoch(&self.sender.epoch)?;
+        ensure!(
+            match self.kind {
+                TargetKind::Personal => self.thread.starts_with("d:"),
+                TargetKind::Group => self.thread.starts_with("g:"),
+            },
+            "Input target kind mismatch"
+        );
+        Ok(serde_json::to_string(self)?)
+    }
+}
 pub struct Receive<'a> {
     pub delta: &'a Delta,
     pub messages: &'a [Message],
     pub queue: &'a str,
     pub cursor: u64,
-    pub server_message_id: String,
+    pub context: InputContext,
     pub ciphertext_digest: [u8; 32],
 }
 pub struct EncryptedInput<'a> {
     pub queue: &'a str,
-    pub server_id: &'a str,
+    pub context: &'a InputContext,
     pub ciphertext_digest: &'a [u8; 32],
+}
+/// Durable logical work identity, separate from a transient engine job sequence.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperationIdentity<'a> {
+    Receive { context: &'a InputContext },
+    Send { client_id: u64 },
+}
+pub struct ReplayDelivery<'a> {
+    pub operation_id: u64,
+    pub input: EncryptedInput<'a>,
+    pub cursor: u64,
+    pub generation: u64,
+}
+/// Wire-visible identity used before resolving today's peer epoch. A committed
+/// duplicate must recover its original verified epoch, not a replacement device.
+pub struct InputLocator<'a> {
+    pub kind: TargetKind,
+    pub thread: &'a str,
+    pub server_id: &'a str,
+    pub sender_uid: &'a str,
+    pub sender_platform: Platform,
+    pub registration_id: u16,
 }
 /// Constructed only after SQL COMMIT. Fields are private; it cannot be forged or
 /// deserialized by protocol callers. Only this receipt may authorize publication/ACK.
@@ -370,6 +431,7 @@ pub struct DispatchReceipt {
     ciphertext: Vec<u8>,
     metadata: Vec<u8>,
     payload_hash: [u8; 32],
+    verified_codec: Option<u32>,
 }
 impl DispatchReceipt {
     pub fn can_dispatch(&self, gate: &GenerationGate) -> bool {
@@ -404,6 +466,9 @@ impl DispatchReceipt {
     }
     pub fn metadata(&self) -> &[u8] {
         &self.metadata
+    }
+    pub fn verified_codec(&self) -> Option<u32> {
+        self.verified_codec
     }
     pub fn payload_hash(&self) -> &[u8; 32] {
         &self.payload_hash
@@ -480,21 +545,22 @@ fn digest_part(hash: &mut Sha256, bytes: &[u8]) {
     hash.update(bytes);
 }
 
-/// Stable input identity includes account, queue, server-message identity and
-/// encrypted bytes, not ciphertext alone. Use it before invoking the engine.
+/// Stable input binds account, canonical server-message identity and encrypted
+/// bytes. Queue is validated but excluded: online/offline are delivery routes,
+/// never different cryptographic operations. Canonical server identity must
+/// include its thread/sender scope when server message IDs are not global.
 pub fn receive_input_digest(
     owner: &str,
     queue: &str,
-    server_id: &str,
+    context: &InputContext,
     ciphertext_digest: &[u8; 32],
 ) -> Result<[u8; 32]> {
     account(owner)?;
     validate_id(queue)?;
-    validate_id(server_id)?;
+    let identity = context.encoded()?;
     let mut hash = Sha256::new();
     digest_part(&mut hash, owner.as_bytes());
-    digest_part(&mut hash, queue.as_bytes());
-    digest_part(&mut hash, server_id.as_bytes());
+    digest_part(&mut hash, identity.as_bytes());
     hash.update(ciphertext_digest);
     Ok(hash.finalize().into())
 }
@@ -507,8 +573,17 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
     CREATE UNIQUE INDEX IF NOT EXISTS e2ee_active_peer ON e2ee_peer_epochs(account,local_epoch,uid,platform) WHERE active=1;
     CREATE TABLE IF NOT EXISTS e2ee_records(account TEXT NOT NULL,key TEXT NOT NULL,value BLOB NOT NULL,PRIMARY KEY(account,key));
     CREATE TABLE IF NOT EXISTS e2ee_inputs(account TEXT NOT NULL,queue TEXT NOT NULL,server_id TEXT NOT NULL,cipher_digest BLOB NOT NULL,operation_id INTEGER NOT NULL,PRIMARY KEY(account,queue,server_id),UNIQUE(account,cipher_digest));
+    CREATE INDEX IF NOT EXISTS e2ee_input_identity ON e2ee_inputs(account,server_id);
+    CREATE TABLE IF NOT EXISTS e2ee_deliveries(account TEXT NOT NULL,queue TEXT NOT NULL,server_id TEXT NOT NULL,operation_id INTEGER NOT NULL,cursor INTEGER NOT NULL,PRIMARY KEY(account,queue,server_id));
+    CREATE TABLE IF NOT EXISTS e2ee_operation_counters(account TEXT PRIMARY KEY,last_id INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS e2ee_operation_reservations(account TEXT NOT NULL,stable_key TEXT NOT NULL,operation_id INTEGER NOT NULL,input_digest BLOB NOT NULL,PRIMARY KEY(account,stable_key),UNIQUE(account,operation_id));
     CREATE TABLE IF NOT EXISTS e2ee_operations(account TEXT NOT NULL,operation_id INTEGER NOT NULL,digest BLOB NOT NULL,input_digest BLOB NOT NULL,revision INTEGER NOT NULL,queue TEXT,cursor INTEGER,PRIMARY KEY(account,operation_id));
     CREATE TABLE IF NOT EXISTS e2ee_outbox(account TEXT NOT NULL,client_id INTEGER NOT NULL,thread TEXT NOT NULL,local_epoch INTEGER NOT NULL,platform INTEGER NOT NULL,body TEXT NOT NULL,created_ms INTEGER NOT NULL,state TEXT NOT NULL,ciphertext BLOB,metadata BLOB,server_id TEXT,operation_id INTEGER,crypto_revision INTEGER,peer_bindings TEXT,payload_hash BLOB,PRIMARY KEY(account,client_id));
+    CREATE TABLE IF NOT EXISTS e2ee_verified_outbox(account TEXT NOT NULL,client_id INTEGER NOT NULL,codec INTEGER NOT NULL,operation_id INTEGER NOT NULL,crypto_revision INTEGER NOT NULL,payload_hash BLOB NOT NULL,PRIMARY KEY(account,client_id));
+    CREATE TABLE IF NOT EXISTS e2ee_local_candidates(account TEXT NOT NULL,epoch INTEGER NOT NULL,platform INTEGER NOT NULL,intent TEXT NOT NULL,operation_id INTEGER NOT NULL,expected_current INTEGER,prekey_count INTEGER NOT NULL,state TEXT NOT NULL,base_revision INTEGER NOT NULL,plan_digest BLOB NOT NULL,stage_digest BLOB,registration_id INTEGER,PRIMARY KEY(account,epoch),UNIQUE(account,intent),UNIQUE(account,operation_id));
+    CREATE TABLE IF NOT EXISTS e2ee_pending_records(account TEXT NOT NULL,epoch INTEGER NOT NULL,key TEXT NOT NULL,value BLOB NOT NULL,PRIMARY KEY(account,epoch,key));
+    CREATE TABLE IF NOT EXISTS e2ee_public_outbox(account TEXT NOT NULL,operation_id INTEGER NOT NULL,epoch INTEGER NOT NULL,codec INTEGER NOT NULL,command INTEGER NOT NULL,payload BLOB NOT NULL,payload_hash BLOB NOT NULL,bundle_hash BLOB NOT NULL,state TEXT NOT NULL,attempt_counter INTEGER NOT NULL DEFAULT 0,attempt_generation INTEGER,socket_epoch INTEGER,request_id TEXT,attempt_hash BLOB,PRIMARY KEY(account,operation_id));
+    CREATE UNIQUE INDEX IF NOT EXISTS e2ee_public_request_id ON e2ee_public_outbox(account,request_id) WHERE request_id IS NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS e2ee_server_message ON e2ee_outbox(account,thread,server_id) WHERE server_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS e2ee_outbox_state ON e2ee_outbox(account,state,client_id);")?;
     Ok(())
@@ -552,6 +627,13 @@ fn validate_address(
         );
     }
     if let Some(peer) = key.peer() {
+        if matches!(key, RecordKey::GroupSender { .. }) && peer.uid == owner {
+            ensure!(
+                peer.platform == local.platform && peer.epoch == local.epoch,
+                "Own group sender must match the local registration epoch"
+            );
+            return Ok(encoded);
+        }
         ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM e2ee_peer_epochs WHERE account=?1 AND local_epoch=?2 AND peer_epoch=?3 AND uid=?4 AND platform=?5 AND (?6=0 OR active=1))",params![owner,epoch(&local.epoch)?,epoch(&peer.epoch)?,peer.uid,peer.platform.wire(),i64::from(active)],|r|r.get::<_,bool>(0))?,"Unknown or retired peer crypto namespace");
     }
     Ok(encoded)
@@ -560,6 +642,11 @@ fn delta_digest(conn: &Connection, delta: &Delta) -> Result<Vec<u8>> {
     account(&delta.account)?;
     integer(delta.operation_id)?;
     integer(delta.generation)?;
+    let reserved:Option<Vec<u8>>=conn.query_row("SELECT input_digest FROM e2ee_operation_reservations WHERE account=?1 AND operation_id=?2",params![delta.account,integer(delta.operation_id)?],|r|r.get(0)).optional()?;
+    ensure!(
+        reserved.is_none_or(|digest| digest == delta.input_digest),
+        "Crypto delta differs from its reserved input"
+    );
     ensure!(
         delta.expected_revision < i64::MAX as u64
             && delta.allowed_keys.len() <= MAX_RECORDS
@@ -707,7 +794,146 @@ fn remember(
     Ok(())
 }
 
+fn canonical_input(
+    conn: &Connection,
+    owner: &str,
+    input: &EncryptedInput<'_>,
+) -> Result<Option<(u64, u64)>> {
+    let digest = receive_input_digest(owner, input.queue, input.context, input.ciphertext_digest)?;
+    let identity = input.context.encoded()?;
+    let by_cipher: Option<String> = conn
+        .query_row(
+            "SELECT server_id FROM e2ee_inputs WHERE account=?1 AND cipher_digest=?2",
+            params![owner, input.ciphertext_digest.as_slice()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(previous) = by_cipher {
+        ensure!(
+            previous == identity,
+            "Ciphertext replay has a different server identity"
+        );
+    }
+    let row:Option<(Vec<u8>,i64,i64,Vec<u8>)>=conn.query_row("SELECT i.cipher_digest,i.operation_id,o.revision,o.input_digest FROM e2ee_inputs i JOIN e2ee_operations o ON o.account=i.account AND o.operation_id=i.operation_id WHERE i.account=?1 AND i.server_id=?2",params![owner,identity],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    row.map(|(cipher, id, rev, previous)| {
+        ensure!(
+            cipher == input.ciphertext_digest && previous == digest,
+            "Conflicting committed encrypted input"
+        );
+        Ok((id as u64, rev as u64))
+    })
+    .transpose()
+}
+fn reserve_operation_id(
+    conn: &Connection,
+    owner: &str,
+    stable_key: &str,
+    input_digest: &[u8; 32],
+) -> Result<u64> {
+    let existing:Option<(i64,Vec<u8>)>=conn.query_row("SELECT operation_id,input_digest FROM e2ee_operation_reservations WHERE account=?1 AND stable_key=?2",params![owner,stable_key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((id, digest)) = existing {
+        ensure!(digest == input_digest, "Conflicting reserved crypto input");
+        return Ok(id as u64);
+    }
+    let last:i64=conn.query_row("SELECT MAX(n) FROM (SELECT COALESCE(MAX(operation_id),0) n FROM e2ee_operations WHERE account=?1 UNION ALL SELECT COALESCE(MAX(operation_id),0) FROM e2ee_operation_reservations WHERE account=?1 UNION ALL SELECT COALESCE(MAX(last_id),0) FROM e2ee_operation_counters WHERE account=?1)",[owner],|r|r.get(0))?;
+    let next = integer(
+        (last as u64)
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Crypto operation IDs exhausted"))?,
+    )?;
+    conn.execute("INSERT INTO e2ee_operation_counters(account,last_id) VALUES(?1,?2) ON CONFLICT(account) DO UPDATE SET last_id=excluded.last_id",params![owner,next])?;
+    conn.execute("INSERT INTO e2ee_operation_reservations(account,stable_key,operation_id,input_digest) VALUES(?1,?2,?3,?4)",params![owner,stable_key,next,input_digest.as_slice()])?;
+    Ok(next as u64)
+}
+fn dispatch_peers(delta: &Delta) -> Result<Vec<PeerNamespace>> {
+    let mut peers = BTreeSet::new();
+    for key in &delta.allowed_keys {
+        if let Some(peer) = key.peer() {
+            if matches!(key,RecordKey::GroupSender{local,sender,..} if sender.uid==delta.account&&sender.platform==local.platform&&sender.epoch==local.epoch)
+            {
+                continue;
+            }
+            peers.insert(peer.clone());
+            ensure!(
+                peers.len() <= MAX_DISPATCH_PEERS,
+                "Encrypted dispatch fanout exceeds budget"
+            );
+        }
+    }
+    Ok(peers.into_iter().collect())
+}
+fn advance_cursor(conn: &Connection, owner: &str, queue: &str, cursor: u64) -> Result<()> {
+    let cursor = cursor.to_string();
+    conn.execute("INSERT INTO receive_cursors(account_id,queue,last_id) VALUES(?1,?2,?3) ON CONFLICT(account_id,queue) DO UPDATE SET last_id=CASE WHEN length(excluded.last_id)>length(last_id) OR (length(excluded.last_id)=length(last_id) AND excluded.last_id>last_id) THEN excluded.last_id ELSE last_id END",params![owner,queue,cursor])?;
+    Ok(())
+}
 impl MessageStore {
+    /// Check the immutable verified DB binding before trusting opaque engine
+    /// identity bytes. This performs no transition or implicit first-use trust.
+    pub fn e2ee_validate_local_identity(
+        &self,
+        owner: &str,
+        local: &LocalNamespace,
+        registration_id: u16,
+        identity_key: &[u8; 33],
+    ) -> Result<()> {
+        account(owner)?;
+        validate_address(
+            &self.conn,
+            owner,
+            &RecordKey::LocalIdentity {
+                local: local.clone(),
+            },
+            true,
+        )?;
+        ensure!(
+            registration_id <= 16383
+                && identity_key[0] == 5
+                && identity_key[1..].iter().any(|byte| *byte != 0),
+            "Invalid local identity binding"
+        );
+        let(id,fingerprint):(u16,Vec<u8>)=self.conn.query_row("SELECT registration_id,fingerprint FROM e2ee_local_epochs WHERE account=?1 AND epoch=?2 AND platform=?3",params![owner,epoch(&local.epoch)?,local.platform.wire()],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        ensure!(
+            id == registration_id && fingerprint == Sha256::digest(identity_key).as_slice(),
+            "Local identity differs from its verified namespace"
+        );
+        Ok(())
+    }
+    pub fn e2ee_validate_peer_identity(
+        &self,
+        owner: &str,
+        local: &LocalNamespace,
+        peer: &PeerNamespace,
+        registration_id: u16,
+        identity_key: &[u8; 33],
+        session_timestamp: u64,
+    ) -> Result<()> {
+        account(owner)?;
+        validate_address(
+            &self.conn,
+            owner,
+            &RecordKey::PeerIdentity {
+                local: local.clone(),
+                peer: peer.clone(),
+            },
+            true,
+        )?;
+        ensure!(
+            registration_id <= 16383
+                && identity_key[0] == 5
+                && identity_key[1..].iter().any(|byte| *byte != 0),
+            "Invalid peer identity binding"
+        );
+        integer(session_timestamp)?;
+        let(id,fingerprint,ts):(u16,Vec<u8>,i64)=self.conn.query_row("SELECT registration_id,fingerprint,session_ts FROM e2ee_peer_epochs WHERE account=?1 AND local_epoch=?2 AND peer_epoch=?3 AND uid=?4 AND platform=?5 AND active=1",params![owner,epoch(&local.epoch)?,epoch(&peer.epoch)?,peer.uid,peer.platform.wire()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        ensure!(
+            id == registration_id
+                && fingerprint == Sha256::digest(identity_key).as_slice()
+                && ts == session_timestamp as i64,
+            "Peer identity differs from its verified namespace"
+        );
+        Ok(())
+    }
     /// Allocate only after an explicit verified local registration transition.
     /// Previous epochs/records remain available; reconnect alone never calls this.
     pub fn e2ee_register_local(
@@ -971,6 +1197,46 @@ impl MessageStore {
         })
         .transpose()
     }
+    pub fn e2ee_lookup_committed_input(
+        &self,
+        owner: &str,
+        locator: InputLocator<'_>,
+        ciphertext_digest: &[u8; 32],
+    ) -> Result<Option<InputContext>> {
+        account(owner)?;
+        account(locator.sender_uid)?;
+        validate_id(locator.thread)?;
+        validate_id(locator.server_id)?;
+        ensure!(
+            locator.registration_id <= 16383,
+            "Invalid input registration ID"
+        );
+        let row: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT server_id FROM e2ee_inputs WHERE account=?1 AND cipher_digest=?2",
+                params![owner, ciphertext_digest.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        row.map(|encoded| {
+            let context: InputContext = serde_json::from_str(&encoded)?;
+            context.encoded()?;
+            ensure!(
+                context.kind == locator.kind
+                    && context.thread == locator.thread
+                    && context.server_id == locator.server_id
+                    && context.sender.uid == locator.sender_uid
+                    && context.sender.platform == locator.sender_platform
+                    && context.registration_id == locator.registration_id,
+                "Ciphertext replay has a different authenticated input context"
+            );
+            Ok(context)
+        })
+        .transpose()
+    }
+    /// Read-only lookup never authorizes a new queue/cursor. Use replay_receive
+    /// to durably acknowledge a duplicate arriving by a different delivery route.
     pub fn e2ee_committed_receive(
         &self,
         owner: &str,
@@ -979,20 +1245,85 @@ impl MessageStore {
         generation: u64,
         gate: &GenerationGate,
     ) -> Result<Option<CommitReceipt>> {
-        let EncryptedInput {
-            queue,
-            server_id,
-            ciphertext_digest,
-        } = input;
-        let input = receive_input_digest(owner, queue, server_id, ciphertext_digest)?;
-        let previous:Option<(String,String,i64)>=self.conn.query_row("SELECT queue,server_id,operation_id FROM e2ee_inputs WHERE account=?1 AND cipher_digest=?2",params![owner,ciphertext_digest.as_slice()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-        if let Some((old_queue, old_server, old_op)) = previous {
-            ensure!(
-                old_queue == queue && old_server == server_id && old_op == integer(operation_id)?,
-                "Ciphertext replay has a different server identity"
-            );
+        gate.check(generation)?;
+        let Some((id, rev)) = canonical_input(&self.conn, owner, &input)? else {
+            return Ok(None);
+        };
+        ensure!(id == operation_id, "Conflicting durable operation identity");
+        let cursor:Option<i64>=self.conn.query_row("SELECT cursor FROM e2ee_deliveries WHERE account=?1 AND queue=?2 AND server_id=?3 AND operation_id=?4",params![owner,input.queue,input.context.encoded()?,integer(id)?],|r|r.get(0)).optional()?;
+        Ok(cursor.map(|cursor| CommitReceipt {
+            account: owner.into(),
+            operation_id: id,
+            revision: rev,
+            replay: true,
+            generation,
+            cursor: Some((input.queue.into(), cursor as u64)),
+            published: vec![],
+        }))
+    }
+    /// Reuse committed plaintext/ratchets, committing only the new queue cursor.
+    /// No engine overlay is needed and nothing is republished.
+    pub fn e2ee_replay_receive(
+        &mut self,
+        owner: &str,
+        delivery: ReplayDelivery<'_>,
+        gate: &GenerationGate,
+    ) -> Result<Option<CommitReceipt>> {
+        gate.check(delivery.generation)?;
+        integer(delivery.cursor)?;
+        let tx = self.conn.transaction()?;
+        let Some((id, rev)) = canonical_input(&tx, owner, &delivery.input)? else {
+            tx.rollback()?;
+            return Ok(None);
+        };
+        ensure!(
+            id == delivery.operation_id,
+            "Conflicting durable operation identity"
+        );
+        tx.execute("INSERT INTO e2ee_deliveries(account,queue,server_id,operation_id,cursor) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(account,queue,server_id) DO UPDATE SET cursor=MAX(cursor,excluded.cursor) WHERE operation_id=excluded.operation_id",params![owner,delivery.input.queue,delivery.input.context.encoded()?,integer(id)?,integer(delivery.cursor)?])?;
+        advance_cursor(&tx, owner, delivery.input.queue, delivery.cursor)?;
+        let lease = gate.linearize(delivery.generation)?;
+        tx.commit()?;
+        drop(lease);
+        Ok(Some(CommitReceipt {
+            account: owner.into(),
+            operation_id: id,
+            revision: rev,
+            replay: true,
+            generation: delivery.generation,
+            cursor: Some((delivery.input.queue.into(), delivery.cursor)),
+            published: vec![],
+        }))
+    }
+    /// Stable logical operation IDs survive retries/restart; engine jobs have
+    /// their own monotonic, ephemeral sequence and must not replace this ID.
+    pub fn e2ee_reserve_operation(
+        &mut self,
+        owner: &str,
+        identity: OperationIdentity<'_>,
+        input_digest: &[u8; 32],
+    ) -> Result<u64> {
+        account(owner)?;
+        match &identity {
+            OperationIdentity::Receive { context } => {
+                context.encoded()?;
+            }
+            OperationIdentity::Send { client_id } => {
+                integer(*client_id)?;
+                let _ = self.e2ee_reserved_plaintext(owner, *client_id)?;
+            }
         }
-        self.e2ee_committed_operation(owner, operation_id, &input, generation, gate)
+        let key = serde_json::to_string(&identity)?;
+        let tx = self.conn.transaction()?;
+        ensure_owner(&tx, owner)?;
+        let id = reserve_operation_id(&tx, owner, &key, input_digest)?;
+        tx.commit()?;
+        Ok(id)
+    }
+    pub fn e2ee_reserved_plaintext(&self, owner: &str, client_id: u64) -> Result<String> {
+        account(owner)?;
+        integer(client_id)?;
+        Ok(self.conn.query_row("SELECT body FROM e2ee_outbox WHERE account=?1 AND client_id=?2 AND state='reserved' AND length(CAST(body AS BLOB))<=?3",params![owner,client_id as i64,MAX_TEXT_BYTES as i64],|r|r.get(0))?)
     }
     /// Monotonic allocation survives prekey consumption/deletion and crashes.
     pub fn e2ee_reserve_prekey_ids(
@@ -1057,7 +1388,7 @@ impl MessageStore {
                 == receive_input_digest(
                     &delta.account,
                     receive.queue,
-                    &receive.server_message_id,
+                    &receive.context,
                     &receive.ciphertext_digest
                 )?,
             "Receive operation input identity mismatch"
@@ -1075,7 +1406,7 @@ impl MessageStore {
         for message in receive.messages {
             message.validate()?;
             ensure!(
-                message.account_id == delta.account,
+                message.account_id == delta.account && message.thread_id == receive.context.thread,
                 "Crypto receive account mismatch"
             );
             message_bytes += message.text.len();
@@ -1100,7 +1431,17 @@ impl MessageStore {
                 published: vec![],
             });
         }
-        tx.execute("INSERT INTO e2ee_inputs(account,queue,server_id,cipher_digest,operation_id) VALUES(?1,?2,?3,?4,?5)",params![delta.account,receive.queue,receive.server_message_id,receive.ciphertext_digest.as_slice(),integer(delta.operation_id)?])?;
+        let identity = receive.context.encoded()?;
+        let existing_identity: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM e2ee_inputs WHERE account=?1 AND server_id=?2)",
+            params![delta.account, identity],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            !existing_identity,
+            "Server message identity is already committed; use replay receipt"
+        );
+        tx.execute("INSERT INTO e2ee_inputs(account,queue,server_id,cipher_digest,operation_id) VALUES(?1,?2,?3,?4,?5)",params![delta.account,receive.queue,identity,receive.ciphertext_digest.as_slice(),integer(delta.operation_id)?])?;
         let next = apply_delta(&tx, delta)?;
         let mut published = Vec::new();
         for message in receive.messages {
@@ -1113,8 +1454,8 @@ impl MessageStore {
                 published.push((message.clone(), conversation));
             }
         }
-        let cursor = receive.cursor.to_string();
-        tx.execute("INSERT INTO receive_cursors(account_id,queue,last_id) VALUES(?1,?2,?3) ON CONFLICT(account_id,queue) DO UPDATE SET last_id=CASE WHEN length(excluded.last_id)>length(last_id) OR (length(excluded.last_id)=length(last_id) AND excluded.last_id>last_id) THEN excluded.last_id ELSE last_id END",params![delta.account,receive.queue,cursor])?;
+        advance_cursor(&tx, &delta.account, receive.queue, receive.cursor)?;
+        tx.execute("INSERT INTO e2ee_deliveries(account,queue,server_id,operation_id,cursor) VALUES(?1,?2,?3,?4,?5)",params![delta.account,receive.queue,identity,integer(delta.operation_id)?,integer(receive.cursor)?])?;
         remember(
             &tx,
             delta,
@@ -1197,6 +1538,46 @@ impl MessageStore {
         send: PreparedSend<'_>,
         gate: &GenerationGate,
     ) -> Result<CommitReceipt> {
+        self.commit_send_inner(send, gate, None, || Ok(()))
+    }
+    #[cfg(feature = "signal-crypto")]
+    pub fn e2ee_commit_verified_send(
+        &mut self,
+        send: &crate::app::live::signal_crypto::VerifiedPreparedSend,
+        gate: &GenerationGate,
+    ) -> Result<CommitReceipt> {
+        send.check_current(gate)?;
+        let peers = dispatch_peers(send.delta())?;
+        ensure!(
+            peers == send.peers(),
+            "Verified dispatch peer scope mismatch"
+        );
+        ensure!(
+            send.delta()
+                .allowed_keys
+                .iter()
+                .all(|key| key.local() == send.local()),
+            "Verified dispatch local scope mismatch"
+        );
+        self.commit_send_inner(
+            PreparedSend {
+                delta: send.delta(),
+                client_id: send.client_id(),
+                ciphertext: send.exact_sms(),
+                metadata: send.metadata(),
+            },
+            gate,
+            Some(1),
+            || send.check_preparation(),
+        )
+    }
+    fn commit_send_inner(
+        &mut self,
+        send: PreparedSend<'_>,
+        gate: &GenerationGate,
+        verified_codec: Option<u32>,
+        check_preparation: impl Fn() -> Result<()>,
+    ) -> Result<CommitReceipt> {
         let delta = send.delta;
         gate.check(delta.generation)?;
         integer(send.client_id)?;
@@ -1206,9 +1587,21 @@ impl MessageStore {
                 && send.metadata.len() <= 16 * 1024,
             "Encrypted send exceeds budget"
         );
+        let peers = dispatch_peers(delta)?;
+        let peers_json = serde_json::to_string(&peers)?;
+        let total = send
+            .ciphertext
+            .len()
+            .checked_add(send.metadata.len())
+            .and_then(|n| n.checked_add(peers_json.len()));
+        ensure!(
+            total.is_some_and(|n| n <= MAX_DISPATCH_PAYLOAD),
+            "Aggregate encrypted dispatch exceeds budget"
+        );
         let mut hash = Sha256::new();
         digest_part(&mut hash, &delta_digest(&self.conn, delta)?);
         digest_part(&mut hash, b"send");
+        hash.update(verified_codec.unwrap_or(0).to_be_bytes());
         hash.update(send.client_id.to_be_bytes());
         digest_part(&mut hash, send.ciphertext);
         digest_part(&mut hash, send.metadata);
@@ -1237,21 +1630,6 @@ impl MessageStore {
             "Send namespace mismatch"
         );
         let next = apply_delta(&tx, delta)?;
-        let peers: Vec<_> = delta
-            .allowed_keys
-            .iter()
-            .filter_map(RecordKey::peer)
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let peers_json = serde_json::to_string(&peers)?;
-        ensure!(
-            peers.len() <= MAX_DISPATCH_PEERS
-                && send.ciphertext.len() + send.metadata.len() + peers_json.len()
-                    <= MAX_DISPATCH_PAYLOAD,
-            "Aggregate encrypted dispatch exceeds budget"
-        );
         let thread: String = tx.query_row(
             "SELECT thread FROM e2ee_outbox WHERE account=?1 AND client_id=?2",
             params![delta.account, send.client_id as i64],
@@ -1272,8 +1650,15 @@ impl MessageStore {
             &peers_json,
         )?;
         tx.execute("UPDATE e2ee_outbox SET state='ready',ciphertext=?3,metadata=?4,operation_id=?5,crypto_revision=?6,peer_bindings=?7,payload_hash=?8 WHERE account=?1 AND client_id=?2 AND state='reserved'",params![delta.account,send.client_id as i64,send.ciphertext,send.metadata,integer(delta.operation_id)?,next as i64,peers_json,hash.as_slice()])?;
+        if let Some(codec) = verified_codec {
+            tx.execute("INSERT INTO e2ee_verified_outbox(account,client_id,codec,operation_id,crypto_revision,payload_hash) VALUES(?1,?2,?3,?4,?5,?6)",params![delta.account,send.client_id as i64,codec,integer(delta.operation_id)?,next as i64,hash.as_slice()])?;
+        }
         remember(&tx, delta, &digest, next, None)?;
         let lease = gate.linearize(delta.generation)?;
+        // Preparation-only checkpoint: failure rolls back; cancellation after
+        // this check may durably prepare Ready. It never revokes an existing
+        // outbox entry. Auth/logout cancellation still uses GenerationGate.
+        check_preparation()?;
         tx.commit()?;
         drop(lease);
         Ok(CommitReceipt {
@@ -1351,6 +1736,16 @@ impl MessageStore {
             actual.as_slice() == expected,
             "Committed ciphertext binding mismatch"
         );
+        let marker:Option<(u32,i64,i64,Vec<u8>)>=tx.query_row("SELECT codec,operation_id,crypto_revision,payload_hash FROM e2ee_verified_outbox WHERE account=?1 AND client_id=?2",params![owner,client_id as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let verified_codec = marker
+            .map(|(codec, op, rev, hash)| {
+                ensure!(
+                    codec == 1 && op == operation_id && rev == crypto_revision && hash == actual,
+                    "Verified dispatch marker mismatch"
+                );
+                Ok(codec)
+            })
+            .transpose()?;
         let lease = gate.linearize(generation)?;
         tx.commit()?;
         drop(lease);
@@ -1366,6 +1761,7 @@ impl MessageStore {
             ciphertext,
             metadata,
             payload_hash: actual,
+            verified_codec,
         })
     }
     pub fn e2ee_outgoing(&self, owner: &str, client_id: u64) -> Result<Outgoing> {
@@ -1496,6 +1892,19 @@ mod tests {
             id,
         }
     }
+    fn input_context(id: u64) -> InputContext {
+        InputContext {
+            kind: TargetKind::Personal,
+            thread: "d:456".into(),
+            server_id: format!("op-{id}"),
+            sender: PeerNamespace {
+                uid: "456".into(),
+                platform: Platform::Mobile,
+                epoch: "1".into(),
+            },
+            registration_id: 0,
+        }
+    }
     fn delta(
         store: &MessageStore,
         _local: &LocalNamespace,
@@ -1517,7 +1926,7 @@ mod tests {
             input_digest: receive_input_digest(
                 "123",
                 "signal-personal",
-                &format!("op-{id}"),
+                &input_context(id),
                 &Sha256::digest(id.to_be_bytes()).into(),
             )
             .unwrap(),
@@ -1548,9 +1957,641 @@ mod tests {
             messages,
             queue: "signal-personal",
             cursor: 100,
-            server_message_id: format!("op-{}", delta.operation_id),
+            context: input_context(delta.operation_id),
             ciphertext_digest: Sha256::digest(delta.operation_id.to_be_bytes()).into(),
         }
+    }
+    #[test]
+    fn planned_identity_bytes_must_match_active_verified_sqlite_bindings() {
+        let (mut store, local, peer) = setup();
+        let local_binding = binding(Platform::Pc, 1);
+        let peer_binding = binding(Platform::Mobile, 2);
+        store
+            .e2ee_validate_local_identity("123", &local, 0, &local_binding.identity_key)
+            .unwrap();
+        store
+            .e2ee_validate_peer_identity("123", &local, &peer, 0, &peer_binding.identity_key, 100)
+            .unwrap();
+        assert!(store
+            .e2ee_validate_local_identity("123", &local, 1, &local_binding.identity_key)
+            .is_err());
+        assert!(store
+            .e2ee_validate_local_identity("123", &local, 0, &peer_binding.identity_key)
+            .is_err());
+        assert!(store
+            .e2ee_validate_local_identity("999", &local, 0, &local_binding.identity_key)
+            .is_err());
+        assert!(store
+            .e2ee_validate_peer_identity("123", &local, &peer, 1, &peer_binding.identity_key, 100)
+            .is_err());
+        assert!(store
+            .e2ee_validate_peer_identity("123", &local, &peer, 0, &local_binding.identity_key, 100)
+            .is_err());
+        assert!(store
+            .e2ee_validate_peer_identity("123", &local, &peer, 0, &peer_binding.identity_key, 101)
+            .is_err());
+        let next = store
+            .e2ee_register_peer(
+                "123",
+                &local,
+                "456",
+                Some(peer.epoch.parse().unwrap()),
+                &binding(Platform::Mobile, 9),
+            )
+            .unwrap();
+        assert!(store
+            .e2ee_validate_peer_identity("123", &local, &peer, 0, &peer_binding.identity_key, 100)
+            .is_err());
+        store
+            .e2ee_validate_peer_identity(
+                "123",
+                &local,
+                &next,
+                0,
+                &binding(Platform::Mobile, 9).identity_key,
+                100,
+            )
+            .unwrap();
+        store
+            .e2ee_register_local(
+                "123",
+                Some(local.epoch.parse().unwrap()),
+                &binding(Platform::Pc, 8),
+            )
+            .unwrap();
+        assert!(store
+            .e2ee_validate_local_identity("123", &local, 0, &local_binding.identity_key)
+            .is_err());
+        assert!(store
+            .e2ee_validate_peer_identity(
+                "123",
+                &local,
+                &next,
+                0,
+                &binding(Platform::Mobile, 9).identity_key,
+                100
+            )
+            .is_err());
+    }
+    #[test]
+    fn verified_marker_is_atomic_restart_recoverable_and_never_minted_by_raw_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "zalo-e2ee-marker-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let gate = GenerationGate::new(1).unwrap();
+        let local;
+        let trusted;
+        {
+            let mut store = MessageStore::open(&path).unwrap();
+            local = store
+                .e2ee_register_local("123", None, &binding(Platform::Pc, 1))
+                .unwrap();
+            let client = store
+                .e2ee_reserve_send("123", &local, "d:456", "raw", 1000)
+                .unwrap();
+            let d = delta(&store, &local, 1, vec![put(key(&local, 1), b"raw")]);
+            let metadata=br#"{"codec":1,"kind":"personal","path":"/api/e2ee/pc/message/sms","metric_command":16000}"#;
+            store
+                .e2ee_commit_send(
+                    PreparedSend {
+                        delta: &d,
+                        client_id: client,
+                        ciphertext: b"raw ciphertext",
+                        metadata,
+                    },
+                    &gate,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .e2ee_begin_dispatch("123", client, 1, &gate)
+                    .unwrap()
+                    .verified_codec(),
+                None
+            );
+            trusted = store
+                .e2ee_reserve_send("123", &local, "d:456", "trusted", 1001)
+                .unwrap();
+            let d = delta(
+                &store,
+                &local,
+                2,
+                vec![put(key(&local, 2), b"verified overlay")],
+            );
+            let before = revision(&store.conn, "123").unwrap();
+            store.conn.execute_batch("CREATE TRIGGER marker_fault BEFORE INSERT ON e2ee_verified_outbox BEGIN SELECT RAISE(ABORT,'fixture marker write failure'); END;").unwrap();
+            // Exercise the private transaction branch; production can reach this
+            // only with a sealed coordinator candidate, never a public boolean.
+            assert!(store
+                .commit_send_inner(
+                    PreparedSend {
+                        delta: &d,
+                        client_id: trusted,
+                        ciphertext: b"exact verified bytes",
+                        metadata
+                    },
+                    &gate,
+                    Some(1),
+                    || Ok(()),
+                )
+                .is_err());
+            assert_eq!(revision(&store.conn, "123").unwrap(), before);
+            assert!(store.e2ee_outgoing("123", trusted).unwrap().state == SendState::Reserved);
+            assert!(store
+                .e2ee_snapshot("123", &[key(&local, 2)])
+                .unwrap()
+                .records
+                .is_empty());
+            store
+                .conn
+                .execute_batch("DROP TRIGGER marker_fault")
+                .unwrap();
+            assert!(store
+                .commit_send_inner(
+                    PreparedSend {
+                        delta: &d,
+                        client_id: trusted,
+                        ciphertext: b"exact verified bytes",
+                        metadata
+                    },
+                    &gate,
+                    Some(1),
+                    || bail!("fixture preparation expired")
+                )
+                .is_err());
+            assert!(gate.is_current(1));
+            assert_eq!(revision(&store.conn, "123").unwrap(), before);
+            assert_eq!(store.conn.query_row("SELECT count(*) FROM e2ee_verified_outbox WHERE account='123' AND client_id=?1",[trusted as i64],|r|r.get::<_,i64>(0)).unwrap(),0);
+            assert!(store.e2ee_outgoing("123", trusted).unwrap().state == SendState::Reserved);
+            store
+                .commit_send_inner(
+                    PreparedSend {
+                        delta: &d,
+                        client_id: trusted,
+                        ciphertext: b"exact verified bytes",
+                        metadata,
+                    },
+                    &gate,
+                    Some(1),
+                    || Ok(()),
+                )
+                .unwrap();
+        }
+        {
+            let mut store = MessageStore::open(&path).unwrap();
+            store.conn.execute("UPDATE e2ee_verified_outbox SET operation_id=99 WHERE account='123' AND client_id=?1",[trusted as i64]).unwrap();
+            assert!(store.e2ee_begin_dispatch("123", trusted, 1, &gate).is_err());
+            assert!(store.e2ee_outgoing("123", trusted).unwrap().state == SendState::Ready);
+            store.conn.execute("UPDATE e2ee_verified_outbox SET operation_id=2 WHERE account='123' AND client_id=?1",[trusted as i64]).unwrap();
+            let receipt = store.e2ee_begin_dispatch("123", trusted, 1, &gate).unwrap();
+            assert_eq!(receipt.verified_codec(), Some(1));
+            assert_eq!(receipt.ciphertext(), b"exact verified bytes");
+            assert!(receipt.local() == &local);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn own_group_sender_uses_local_identity_and_remote_namespaces_stay_strict() {
+        let (mut store, local, peer) = setup();
+        let gate = GenerationGate::new(1).unwrap();
+        let own = RecordKey::GroupSender {
+            local: local.clone(),
+            group: "789".into(),
+            sender: PeerNamespace {
+                uid: "123".into(),
+                platform: local.platform,
+                epoch: local.epoch.clone(),
+            },
+        };
+        let d = delta(
+            &store,
+            &local,
+            1,
+            vec![put(own.clone(), b"own sender chain")],
+        );
+        store.e2ee_commit_receive(receive(&d, &[]), &gate).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM e2ee_peer_epochs WHERE uid='123'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .e2ee_snapshot("123", std::slice::from_ref(&own))
+                .unwrap()
+                .records[0]
+                .value,
+            b"own sender chain"
+        );
+        let remote = RecordKey::GroupSender {
+            local: local.clone(),
+            group: "789".into(),
+            sender: peer,
+        };
+        let d = delta(&store, &local, 2, vec![put(remote, b"remote sender chain")]);
+        store.e2ee_commit_receive(receive(&d, &[]), &gate).unwrap();
+        let wrong = RecordKey::GroupSender {
+            local: local.clone(),
+            group: "789".into(),
+            sender: PeerNamespace {
+                uid: "123".into(),
+                platform: Platform::Web,
+                epoch: local.epoch.clone(),
+            },
+        };
+        let d = delta(&store, &local, 3, vec![put(wrong, b"bad")]);
+        assert!(store.e2ee_commit_receive(receive(&d, &[]), &gate).is_err());
+        let unbound = RecordKey::GroupSender {
+            local: local.clone(),
+            group: "789".into(),
+            sender: PeerNamespace {
+                uid: "999".into(),
+                platform: Platform::Pc,
+                epoch: "1".into(),
+            },
+        };
+        let d = delta(&store, &local, 4, vec![put(unbound, b"bad")]);
+        assert!(store.e2ee_commit_receive(receive(&d, &[]), &gate).is_err());
+    }
+    #[test]
+    fn cross_queue_replay_reuses_commit_after_rotation_and_rejects_changed_context() {
+        let (mut store, local, peer) = setup();
+        let gate = GenerationGate::new(1).unwrap();
+        let k = key(&local, 1);
+        let d = delta(&store, &local, 1, vec![put(k.clone(), b"prekey")]);
+        store.e2ee_commit_receive(receive(&d, &[]), &gate).unwrap();
+        let mut context = input_context(2);
+        context.sender = peer.clone();
+        let cipher: [u8; 32] = Sha256::digest(b"fixture encrypted prekey input").into();
+        let digest = receive_input_digest("123", "online", &context, &cipher).unwrap();
+        let operation = store
+            .e2ee_reserve_operation(
+                "123",
+                OperationIdentity::Receive { context: &context },
+                &digest,
+            )
+            .unwrap();
+        let mut d = delta(&store, &local, operation, vec![Mutation::Delete(k.clone())]);
+        d.input_digest = digest;
+        let committed = store
+            .e2ee_commit_receive(
+                Receive {
+                    delta: &d,
+                    messages: &[message("same")],
+                    queue: "online",
+                    cursor: 10,
+                    context: context.clone(),
+                    ciphertext_digest: cipher,
+                },
+                &gate,
+            )
+            .unwrap();
+        assert_eq!(committed.published().len(), 1);
+        let rev = revision(&store.conn, "123").unwrap();
+        store
+            .e2ee_register_peer(
+                "123",
+                &local,
+                "456",
+                Some(peer.epoch.parse().unwrap()),
+                &binding(Platform::Mobile, 9),
+            )
+            .unwrap();
+        let locator = InputLocator {
+            kind: TargetKind::Personal,
+            thread: "d:456",
+            server_id: &context.server_id,
+            sender_uid: "456",
+            sender_platform: Platform::Mobile,
+            registration_id: 0,
+        };
+        let restored = store
+            .e2ee_lookup_committed_input("123", locator, &cipher)
+            .unwrap()
+            .unwrap();
+        assert!(restored.sender == peer);
+        let input = || EncryptedInput {
+            queue: "offline",
+            context: &context,
+            ciphertext_digest: &cipher,
+        };
+        assert!(store
+            .e2ee_committed_receive("123", operation, input(), 1, &gate)
+            .unwrap()
+            .is_none());
+        let replay = store
+            .e2ee_replay_receive(
+                "123",
+                ReplayDelivery {
+                    operation_id: operation,
+                    input: input(),
+                    cursor: 20,
+                    generation: 1,
+                },
+                &gate,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(replay.is_replay() && replay.published().is_empty());
+        assert_eq!(replay.revision(), rev);
+        assert_eq!(replay.acknowledged_cursor(), Some(("offline", 20)));
+        assert!(store.e2ee_snapshot("123", &[k]).unwrap().records.is_empty());
+        assert_eq!(store.page("123", "d:456", None, 10).unwrap().len(), 1);
+        let after = revision(&store.conn, "123").unwrap();
+        let mut different = context.clone();
+        different.thread = "d:999".into();
+        assert!(store
+            .e2ee_replay_receive(
+                "123",
+                ReplayDelivery {
+                    operation_id: operation,
+                    input: EncryptedInput {
+                        queue: "offline",
+                        context: &different,
+                        ciphertext_digest: &cipher
+                    },
+                    cursor: 30,
+                    generation: 1
+                },
+                &gate
+            )
+            .is_err());
+        let changed = [7; 32];
+        assert!(store
+            .e2ee_replay_receive(
+                "123",
+                ReplayDelivery {
+                    operation_id: operation,
+                    input: EncryptedInput {
+                        queue: "offline",
+                        context: &context,
+                        ciphertext_digest: &changed
+                    },
+                    cursor: 30,
+                    generation: 1
+                },
+                &gate
+            )
+            .is_err());
+        store.conn.execute_batch("CREATE TRIGGER reject_replay BEFORE INSERT ON receive_cursors WHEN NEW.queue='retry' BEGIN SELECT RAISE(ABORT,'fixture cursor failure'); END;").unwrap();
+        assert!(store
+            .e2ee_replay_receive(
+                "123",
+                ReplayDelivery {
+                    operation_id: operation,
+                    input: EncryptedInput {
+                        queue: "retry",
+                        context: &context,
+                        ciphertext_digest: &cipher
+                    },
+                    cursor: 30,
+                    generation: 1
+                },
+                &gate
+            )
+            .is_err());
+        assert_eq!(store.receive_cursor("123", "offline").unwrap(), "20");
+        assert_eq!(store.receive_cursor("123", "retry").unwrap(), "1");
+        assert_eq!(revision(&store.conn, "123").unwrap(), after);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM e2ee_deliveries WHERE queue='retry'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        gate.cancel();
+        assert!(store
+            .e2ee_replay_receive(
+                "123",
+                ReplayDelivery {
+                    operation_id: operation,
+                    input: input(),
+                    cursor: 40,
+                    generation: 1
+                },
+                &gate
+            )
+            .is_err());
+    }
+    #[test]
+    fn durable_operation_reservations_survive_failure_and_restart_without_reusing_job_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "zalo-e2ee-ops-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let context = input_context(9);
+        let digest = [9; 32];
+        let first;
+        {
+            let mut store = MessageStore::open(&path).unwrap();
+            first = store
+                .e2ee_reserve_operation(
+                    "123",
+                    OperationIdentity::Receive { context: &context },
+                    &digest,
+                )
+                .unwrap();
+            assert_eq!(first, 1);
+            assert_eq!(
+                store
+                    .e2ee_reserve_operation(
+                        "123",
+                        OperationIdentity::Receive { context: &context },
+                        &digest
+                    )
+                    .unwrap(),
+                first
+            );
+        }
+        {
+            let mut store = MessageStore::open(&path).unwrap();
+            assert_eq!(
+                store
+                    .e2ee_reserve_operation(
+                        "123",
+                        OperationIdentity::Receive { context: &context },
+                        &digest
+                    )
+                    .unwrap(),
+                first
+            );
+            assert!(store
+                .e2ee_reserve_operation(
+                    "123",
+                    OperationIdentity::Receive { context: &context },
+                    &[8; 32]
+                )
+                .is_err());
+            let next = input_context(10);
+            store.conn.execute_batch("CREATE TRIGGER reservation_fault BEFORE INSERT ON e2ee_operation_reservations BEGIN SELECT RAISE(ABORT,'fixture reservation failure'); END;").unwrap();
+            assert!(store
+                .e2ee_reserve_operation(
+                    "123",
+                    OperationIdentity::Receive { context: &next },
+                    &digest
+                )
+                .is_err());
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(
+                        "SELECT last_id FROM e2ee_operation_counters WHERE account='123'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+            store
+                .conn
+                .execute_batch("DROP TRIGGER reservation_fault")
+                .unwrap();
+            assert_eq!(
+                store
+                    .e2ee_reserve_operation(
+                        "123",
+                        OperationIdentity::Receive { context: &next },
+                        &digest
+                    )
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                store
+                    .e2ee_reserve_operation(
+                        "999",
+                        OperationIdentity::Receive { context: &context },
+                        &digest
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn six_full_size_device_payloads_preserve_all_bytes_and_aggregate_budget() {
+        use base64::Engine;
+        let (mut store, local, _) = setup();
+        let gate = GenerationGate::new(1).unwrap();
+        let client = store
+            .e2ee_reserve_send("123", &local, "d:456", &"x".repeat(MAX_TEXT_BYTES), 1000)
+            .unwrap();
+        let cipher = vec![42; MAX_TEXT_BYTES + 64];
+        assert!(cipher.len() <= MAX_CIPHERTEXT_BYTES);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&cipher);
+        let sms=serde_json::to_vec(&serde_json::json!({"devices":(0..6).map(|n|serde_json::json!({"device":n,"cipher":encoded})).collect::<Vec<_>>()})).unwrap();
+        assert!(sms.len() < MAX_DISPATCH_PAYLOAD);
+        let d = delta(&store, &local, 100, vec![put(key(&local, 1), b"ratchet")]);
+        let metadata = b"independent six-device fixture";
+        store
+            .e2ee_commit_send(
+                PreparedSend {
+                    delta: &d,
+                    client_id: client,
+                    ciphertext: &sms,
+                    metadata,
+                },
+                &gate,
+            )
+            .unwrap();
+        let row = store.e2ee_outgoing("123", client).unwrap();
+        assert_eq!(row.ciphertext.unwrap(), sms);
+        let client = store
+            .e2ee_reserve_send("123", &local, "d:456", "second", 1001)
+            .unwrap();
+        let d = delta(
+            &store,
+            &local,
+            101,
+            vec![put(key(&local, 2), b"must not commit")],
+        );
+        let before = revision(&store.conn, "123").unwrap();
+        let boundary = vec![0; MAX_DISPATCH_PAYLOAD - metadata.len() - 2];
+        store
+            .e2ee_commit_send(
+                PreparedSend {
+                    delta: &d,
+                    client_id: client,
+                    ciphertext: &boundary,
+                    metadata,
+                },
+                &gate,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .e2ee_outgoing("123", client)
+                .unwrap()
+                .ciphertext
+                .unwrap()
+                .len(),
+            boundary.len()
+        );
+        let client = store
+            .e2ee_reserve_send("123", &local, "d:456", "third", 1002)
+            .unwrap();
+        let d = delta(
+            &store,
+            &local,
+            102,
+            vec![put(key(&local, 3), b"must not commit")],
+        );
+        let too_large = vec![0; MAX_DISPATCH_PAYLOAD - metadata.len() - 1];
+        assert!(store
+            .e2ee_commit_send(
+                PreparedSend {
+                    delta: &d,
+                    client_id: client,
+                    ciphertext: &too_large,
+                    metadata
+                },
+                &gate
+            )
+            .is_err());
+        assert_eq!(revision(&store.conn, "123").unwrap(), before + 1);
+        assert!(store
+            .e2ee_snapshot("123", &[key(&local, 3)])
+            .unwrap()
+            .records
+            .is_empty());
+        let mut d = delta(&store, &local, 103, vec![]);
+        for n in 1..=65 {
+            d.allowed_keys.push(RecordKey::Session {
+                local: local.clone(),
+                peer: PeerNamespace {
+                    uid: format!("9{n}"),
+                    epoch: n.to_string(),
+                    platform: Platform::Pc,
+                },
+            })
+        }
+        assert!(store
+            .e2ee_commit_send(
+                PreparedSend {
+                    delta: &d,
+                    client_id: client,
+                    ciphertext: b"bounded",
+                    metadata
+                },
+                &gate
+            )
+            .is_err());
+        assert!(store.e2ee_outgoing("123", client).unwrap().state == SendState::Reserved);
     }
     #[test]
     fn receive_is_atomic_replay_safe_and_account_scoped() {
@@ -1614,7 +2655,7 @@ mod tests {
                     messages: &[message("fail")],
                     queue: "signal-personal",
                     cursor: 200,
-                    server_message_id: format!("op-{}", d.operation_id),
+                    context: input_context(d.operation_id),
                     ciphertext_digest: Sha256::digest(d.operation_id.to_be_bytes()).into(),
                 },
                 &gate
@@ -1869,6 +2910,96 @@ mod tests {
         assert!(validate_address(&store.conn, "123", &new_key, true).is_ok());
     }
     #[test]
+    fn released_v4_schema_and_all_existing_bytes_survive_additive_provisioning_tables() {
+        let path = std::env::temp_dir().join(format!(
+            "zalo-released-v4-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let tables = [
+            "conversations",
+            "messages",
+            "outgoing",
+            "outgoing_counters",
+            "receive_cursors",
+            "directory_entries",
+            "e2ee_accounts",
+            "e2ee_local_epochs",
+            "e2ee_peer_epochs",
+            "e2ee_records",
+            "e2ee_inputs",
+            "e2ee_operations",
+            "e2ee_outbox",
+        ];
+        fn dump(conn: &Connection, tables: &[&str]) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+            tables
+                .iter()
+                .map(|table| {
+                    let mut stmt = conn
+                        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                        .unwrap();
+                    let columns = stmt.column_count();
+                    let rows = stmt
+                        .query_map([], |row| {
+                            (0..columns)
+                                .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                        })
+                        .unwrap();
+                    rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+                })
+                .collect()
+        }
+        let before;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!(
+                "../../tests/fixtures/e2ee/released_v4_90b25d5.sql"
+            ))
+            .unwrap();
+            conn.execute_batch("INSERT INTO conversations VALUES('123','d:456','Synthetic released thread',1000);
+            INSERT INTO messages VALUES('123','d:456','released-id','456','Synthetic preserved message',1000);
+            INSERT INTO outgoing VALUES('123','d:456','9','Synthetic unresolved send',1000,'unknown',NULL);
+            INSERT INTO outgoing_counters VALUES('123',9);
+            INSERT INTO receive_cursors VALUES('123','released-queue','100');
+            INSERT INTO directory_entries VALUES('123','d:456','456',0,'Synthetic contact','synthetic contact',NULL,1,0,NULL,1000);
+            INSERT INTO e2ee_accounts VALUES('123',7,1,1,1);
+            INSERT INTO e2ee_local_epochs VALUES('123',1,2,7,zeroblob(32),100,29);
+            INSERT INTO e2ee_peer_epochs VALUES('123',1,1,'456',0,7,zeroblob(32),101,1);
+            INSERT INTO e2ee_records VALUES('123','released-opaque-address',x'0102030405');
+            INSERT INTO e2ee_inputs VALUES('123','released-queue','released-id',zeroblob(32),1);
+            INSERT INTO e2ee_operations VALUES('123',1,x'01',x'02',7,'released-queue',100);
+            INSERT INTO e2ee_outbox VALUES('123',9,'d:456',1,2,'Synthetic encrypted draft',1000,'unknown',x'0504030201',x'7b7d',NULL,1,7,'[]',zeroblob(32));").unwrap();
+            before = dump(&conn, &tables);
+        }
+        {
+            let store = MessageStore::open(&path).unwrap();
+            assert_eq!(dump(&store.conn, &tables), before);
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                4
+            );
+            for table in [
+                "e2ee_local_candidates",
+                "e2ee_pending_records",
+                "e2ee_public_outbox",
+            ] {
+                assert_eq!(
+                    store
+                        .conn
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
     fn v2_v3_migrations_preserve_messages_legacy_outbox_cursors_and_directory() {
         for version in [2, 3] {
             let root = std::env::temp_dir().join(format!(
@@ -1886,7 +3017,7 @@ mod tests {
                 .receive_batch("123", &[], Some(("old-queue", "77")))
                 .unwrap();
             store.conn.execute("INSERT INTO directory_entries(account_id,thread_id,remote_id,is_group,display_name,search_name,observed_at_ms) VALUES('123','d:456','456',0,'Legacy contact','legacy contact',1000)",[]).unwrap();
-            store.conn.execute_batch("DROP TABLE e2ee_outbox;DROP TABLE e2ee_inputs;DROP TABLE e2ee_operations;DROP TABLE e2ee_records;DROP TABLE e2ee_peer_epochs;DROP TABLE e2ee_local_epochs;DROP TABLE e2ee_accounts;").unwrap();
+            store.conn.execute_batch("DROP TABLE e2ee_outbox;DROP TABLE e2ee_verified_outbox; DROP TABLE e2ee_deliveries;DROP TABLE e2ee_operation_reservations;DROP TABLE e2ee_operation_counters;DROP TABLE e2ee_inputs;DROP TABLE e2ee_operations;DROP TABLE e2ee_records;DROP TABLE e2ee_peer_epochs;DROP TABLE e2ee_local_epochs;DROP TABLE e2ee_accounts;").unwrap();
             store
                 .conn
                 .pragma_update(None, "user_version", version)

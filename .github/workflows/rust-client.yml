@@ -18,13 +18,19 @@ jobs:
         working-directory: rust-client
         run: rustup show active-toolchain
       - name: Install Linux build libraries
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev openssl
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev openssl nodejs
       - name: Fetch pinned dependencies
         working-directory: rust-client
         run: cargo fetch --locked --manifest-path Cargo.toml
       - name: Test, lint, and check informational CLI without a display or account
         run: ./scripts/rust/check.sh
-      - name: Test optional protocol adapters and the bounded trust interpreter
+      - name: Check independent Signal wire, receive and business fixtures
+        working-directory: rust-client
+        run: |
+          node tests/fixtures/signal/oracle.cjs
+          node tests/fixtures/signal/receive_oracle.cjs
+          node --max-old-space-size=96 --no-warnings tests/fixtures/signal/business_oracle.cjs
+      - name: Test optional adapters, trust interpreter and inactive Signal coordinator
         working-directory: rust-client
         run: |
           cargo test --locked --offline --manifest-path Cargo.toml --all-features

@@ -4,6 +4,8 @@ The Rust native implementation is authored independently. Electron remains the s
 
 The migration target is full parity with the working Linux Electron application. The evidence-based [feature inventory](FEATURE_PARITY.md) tracks current gaps and acceptance criteria; the existing preview has not met that target. The first directory/recent-preview milestone is implemented and tested in isolation; live compatibility and full history remain incomplete.
 
+The subsequent [unreleased Signal checkpoint](#unreleased-signal-checkpoint-2026-11-02) is separate from the user-tested `470bc5…fabd6` artifact below. It does not activate E2EE in that executable or replace its release acceptance record.
+
 ## Completion gates
 
 | Gate | Required evidence | Status |
@@ -112,6 +114,18 @@ For these historical Legacy30 records only, close the old Rust window, run the u
 | 30,000 | 328.412 / 354.066 ms | 2.696 ms | 7.731 / 8.542 ms | 8.240 ms |
 
 Reproduce with `(cd rust-client && cargo run --release --locked --offline --example bench_directory -- 30000)`. Results measure synchronous local database work, excluding HTTP/decryption, actor queue latency, UI rendering and avatar fetches. They establish no full-client, Electron memory, startup or throughput advantage.
+
+## Unreleased Signal checkpoint (2026-11-02)
+
+Source now includes pure Signal request/receive codecs, stronger atomic storage and an optional real-engine preparation coordinator. `signal-crypto` explicitly selects the embedded engine; default and `live` builds exclude it, while `signal-store` remains a DTO-only bridge. No release executable is rebuilt for this checkpoint.
+
+Independent final gates passed: `./scripts/rust/check.sh` verified **114 Rust tests** (112 library + two CLI), **seven Python tests**, formatting, strict default Clippy, informational no-write/headless checks and the three feature-graph guards. `cargo test --locked --offline --all-features` passed **257 tests** (248 library + two CLI + seven real-engine coordinator integration tests), with two opt-in checks ignored and zero failures. Strict all-target/all-feature Clippy passed. The three independent Node oracles passed **13 requests/two SMS envelopes**, **five ordered queue events** and **three business crypto round-trips**, including 65,536-byte UTF-8. The unchanged standalone engine's earlier 14 unit tests were not repeated. No account, private profile/log, public QR probe or production request was accessed during this QA.
+
+The user-tested release remained byte-identical before and after these checks: `470bc5a5ef94a58e8afe4ee11947f96846e3994018e126d71f5b25672e8fabd6`. These new source-only results do not amend the preceding artifact's 234-test acceptance or claim a newly released application.
+
+Actor-owned planning captures a bounded committed snapshot synchronously. The asynchronous coordinator owns that input without borrowing SQLite, prepares every recipient from one base revision, and returns a sealed candidate to the sole database actor. Commit validates exact local/peer bindings, generation, revision, preparation cancellation/deadline and the planned keyset. A private verified-codec marker plus immutable payload hash enables restart-safe, non-Clone dispatch authority; raw metadata cannot mint it. Failed device preparation discards every overlay; failed SQL can retry a fresh engine job with the same durable intent ID and a new one-time prekey. Preparation cancellation after a successful commit is not durable Cancel Send; authentication generation checks still govern dispatch.
+
+Storage also handles own group-sender records, stable cross-queue replay across retired peer epochs, aggregate dispatch bounds and atomic marker rollback. These paths remain offline foundations: provisioning/prekey upload, live actor activation, group orchestration, production encrypted send/receive and queue ACK are not accepted. See [SIGNAL_CRYPTO.md](SIGNAL_CRYPTO.md), [STORE_E2EE.md](STORE_E2EE.md) and [PROTOCOL_SIGNAL.md](PROTOCOL_SIGNAL.md).
 
 ## Next acceptance work
 

@@ -1,6 +1,6 @@
 //! Optional DTO bridge only. Does not instantiate the embedded engine or enable live E2EE.
-use super::{Delta, Mutation, PeerActivation, RecordKey, Snapshot};
-use anyhow::{anyhow, Result};
+use super::{Delta, LocalNamespace, Mutation, PeerActivation, RecordKey, Snapshot};
+use anyhow::{anyhow, ensure, Result};
 use zalo_signal_engine as engine;
 
 fn key_from_engine(key: &engine::RecordKey) -> Result<RecordKey> {
@@ -30,13 +30,45 @@ pub fn into_engine_snapshot(snapshot: Snapshot) -> Result<engine::Snapshot> {
 /// `allowed_keys` is the operation's planned read/write set, not keys inferred
 /// blindly from engine output. Identity activations originate in verified trust.
 /// Caller must discard the returned overlay/output on any SQL commit failure.
-pub fn into_store_delta(
+pub struct ExpectedJobContext {
+    pub account: String,
+    pub generation: u64,
+    pub engine_job_id: u64,
+    pub durable_operation_id: u64,
+    pub expected_revision: u64,
+    pub local: LocalNamespace,
+    pub allowed_keys: Vec<RecordKey>,
+    pub input_digest: [u8; 32],
+    pub activate_peers: Vec<PeerActivation>,
+}
+pub fn into_store_delta_checked(
     result: engine::OperationResult,
-    allowed_keys: Vec<RecordKey>,
-    input_digest: [u8; 32],
-    activate_peers: Vec<PeerActivation>,
+    context: ExpectedJobContext,
 ) -> Result<(engine::Output, Delta)> {
-    let (account, generation, operation_id, expected_revision, output, delta) = result.into_parts();
+    ensure!(
+        result.account().as_str() == context.account
+            && result.generation() == context.generation
+            && result.operation_id() == context.engine_job_id
+            && result.expected_revision() == context.expected_revision,
+        "Engine job scope mismatch"
+    );
+    super::integer(context.durable_operation_id)?;
+    let planned = context
+        .allowed_keys
+        .iter()
+        .map(|key| {
+            ensure!(
+                key.local() == &context.local,
+                "Planned key has a different local namespace"
+            );
+            key.encoded()
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    ensure!(
+        planned.len() == context.allowed_keys.len() && planned.len() <= super::MAX_RECORDS,
+        "Invalid planned crypto keyset"
+    );
+    let (account, generation, _, expected_revision, output, delta) = result.into_parts();
     let mutations = delta
         .into_mutations()
         .into_iter()
@@ -51,16 +83,26 @@ pub fn into_store_delta(
             engine::Mutation::Delete(key) => Ok(Mutation::Delete(key_from_engine(&key)?)),
         })
         .collect::<Result<Vec<_>>>()?;
+    for mutation in &mutations {
+        let key = match mutation {
+            Mutation::Put(record) => &record.key,
+            Mutation::Delete(key) => key,
+        };
+        ensure!(
+            key.local() == &context.local && planned.contains(&key.encoded()?),
+            "Engine mutation is outside the planned scope"
+        );
+    }
     Ok((
         output,
         Delta {
             account: account.as_str().into(),
             expected_revision,
             generation,
-            operation_id,
-            input_digest,
-            allowed_keys,
-            activate_peers,
+            operation_id: context.durable_operation_id,
+            input_digest: context.input_digest,
+            allowed_keys: context.allowed_keys,
+            activate_peers: context.activate_peers,
             mutations,
         },
     ))

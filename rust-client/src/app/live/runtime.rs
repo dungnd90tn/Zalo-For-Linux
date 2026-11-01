@@ -17,6 +17,8 @@ use url::Url;
 
 #[cfg(test)]
 mod integration_tests;
+#[cfg(feature = "signal-crypto")]
+pub(crate) mod signal_transport;
 
 #[derive(Debug)]
 struct NetworkFailure(LiveDiagnostic);

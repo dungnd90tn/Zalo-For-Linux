@@ -58,6 +58,23 @@ Live requests use the source-verified Linux desktop client type 24. New auth rec
 
 Schema-four storage is additive. Default tests preserve schema-two/three messages, outbox, cursors and directory metadata across migration; optional `signal-store` tests convert bounded typed snapshots/deltas. Dependency checks ensure this DTO feature does not enable QuickJS, libsignal-core or networking. Passing these tests does not enable production E2EE; see [STORE_E2EE.md](STORE_E2EE.md).
 
+## Unreleased Signal preparation checks
+
+The explicit `signal-crypto` feature enables the embedded engine and offline coordinator. Consequently, `--all-features` now includes this engine; ordinary default, `live` and DTO-only `signal-store` builds retain their separate dependency guards. This checkpoint does not replace the user-tested `470bc5…fabd6` executable or activate Signal in its runtime/UI.
+
+Run these inside `rust-client/`, with fetched locked dependencies, a C compiler, OpenSSL and Node.js available:
+
+```sh
+node tests/fixtures/signal/oracle.cjs
+node tests/fixtures/signal/receive_oracle.cjs
+node --max-old-space-size=96 --no-warnings tests/fixtures/signal/business_oracle.cjs
+cargo test --locked --offline --features signal-crypto --test signal_crypto
+cargo test --locked --offline --all-features
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+```
+
+The source oracles compare 13 requests/two SMS envelopes, five ordered session events, and real synthetic crypto round-trips including 64 KiB text. Coordinator tests must use real engine outputs and private temporary SQLite: one account-scoped CAS for all devices, authenticated identity binding, durable verified dispatch provenance, restart, failed-SQL retry, cancellation and stale-result rejection. Actor planning and commit are synchronous; asynchronous engine work owns its snapshot and never borrows `MessageStore` across an await. This is local cryptographic/storage evidence, not live provisioning, send, receive or ACK acceptance. See [PROTOCOL_SIGNAL.md](PROTOCOL_SIGNAL.md).
+
 ## Directory milestone checks
 
 `cargo test --locked --offline --all-features directory` covers the directory parser, isolated TLS/Node cipher oracle, SQLite cache and UI reducers. Optional native-window QA runs the ignored `ui::live::tests::signed_in_offline_native_window_fixture` with an isolated X11 display and `ZALO_UI_FIXTURE_DIRECTORY=1`. It creates a temporary synthetic account with 107 contacts, one group and two cached histories; it is absent from production binaries. Verify 100-row next/back pages, whole-cache Vietnamese search, named open, per-recipient drafts, compact navigation and close. Empty-endpoint diagnostics are expected; no network credentials or production endpoints are supplied.

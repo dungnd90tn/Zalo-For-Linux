@@ -12,6 +12,8 @@ pub mod messaging;
 pub mod qr;
 #[cfg(feature = "live-login")]
 pub mod session;
+#[cfg(feature = "messaging")]
+pub mod signal;
 #[cfg(feature = "trust-wasm")]
 pub mod trust;
 use serde::Serialize;

@@ -11,7 +11,9 @@ use crate::{
 use anyhow::Result;
 use std::{sync::Arc, thread::JoinHandle};
 use tokio::sync::{mpsc, watch};
-mod runtime;
+pub(crate) mod runtime;
+#[cfg(feature = "signal-crypto")]
+pub mod signal_crypto;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveConnection {
