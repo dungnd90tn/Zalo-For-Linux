@@ -94,14 +94,19 @@ An independently written native Rust client is being developed alongside the Ele
 With the pinned Rust toolchain (`rust-client/rust-toolchain.toml`) and the Linux build prerequisites listed in [the validation guide](rust-client/VALIDATION.md):
 
 ```bash
+(cd rust-client && cargo fetch --locked --manifest-path Cargo.toml)
 ./scripts/rust/build.sh                 # locked release build
 ./scripts/rust/run.sh --demo            # offline GUI with synthetic messages
 ./scripts/rust/run.sh --demo --headless # offline worker/database smoke check
-(cd rust-client && cargo fetch --locked --manifest-path Cargo.toml)
+./scripts/rust/run.sh --live            # build optional live features; open signed-out UI
 ./scripts/rust/check.sh                 # offline tests, lint, CLI smoke checks
 ```
 
-The launcher and direct binary share the CLI's XDG paths: data under `${XDG_DATA_HOME:-$HOME/.local/share}/zalo-rust/profiles/<name>`, with configuration/cache under their respective XDG roots. The default name is `rust-demo` with `--demo`, otherwise `rust-pilot`. Optional `ZALO_RUST_PROFILE_ROOT` and `ZALO_RUST_PROFILE` overrides select a disposable location; explicit CLI flags take precedence. Demo data is synthetic. Live Zalo authentication and messaging are not yet implemented; no real-account compatibility or performance improvement is claimed. See [architecture](rust-client/ARCHITECTURE.md), [validation](rust-client/VALIDATION.md), and [migration status](rust-client/MIGRATION_STATUS.md).
+The launcher builds with Cargo feature `live` only when `--live` is supplied. Default/demo builds exclude the HTTP/WebSocket/trust engines. Live mode opens signed out; network activity starts after an explicit login or restore action. The existing hash-verified trust module is bundled for this mode; `--trust-module /absolute/path` is an advanced override.
+
+After building live mode, launch the executable directly with `./rust-client/target/release/zalo-rust --live`; running it does not require Cargo.
+
+The launcher and direct binary share the CLI's XDG paths: data under `${XDG_DATA_HOME:-$HOME/.local/share}/zalo-rust/profiles/<name>`, with configuration/cache under their respective XDG roots. Default profiles are `rust-demo` for `--demo`, `rust-live` for `--live`, and `rust-pilot` otherwise. Optional `ZALO_RUST_PROFILE_ROOT` and `ZALO_RUST_PROFILE` overrides select a disposable location; explicit CLI flags take precedence. Demo data is synthetic. Experimental authentication and encrypted personal/group text transport are implemented, but real-account login and send/receive remain unverified. E2EE/Signal messages, media and calls are unsupported; no encryption downgrade or performance improvement is claimed. See [architecture](rust-client/ARCHITECTURE.md), [validation](rust-client/VALIDATION.md), and [migration status](rust-client/MIGRATION_STATUS.md).
 
 ### Electron packaging
 

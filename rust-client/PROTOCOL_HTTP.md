@@ -3,22 +3,24 @@
 `protocol::http::HttpAdapter` is an independently written, optional concrete
 `reqwest`/Rustls transport for QR and bootstrap `RequestSpec`s. Enable it with
 `--features network`. Default GUI/CLI paths do not construct it or contact Zalo;
-this feature does not enable authentication, sending or session persistence.
+`network` alone does not enable authentication. `live-login` adds the explicit
+user-started coordinator and its private session commit.
 
 Each adapter instance represents one fresh login attempt. Its cookie store and
 client are private and are not cloned, exported or populated from Electron or a
-`PendingCookies` plan. Create a **new adapter** for each new attempt: resetting a
+unverified `PendingCookies` plan. Only the coordinator stages validated confirmation
+cookies for fresh bootstrap, after its mode-specific checks. Create a **new adapter** for each new attempt: resetting a
 `QrDriver` generation does not reset its transport's cookie jar. Server cookies
 remain transient attempt state, never proof of authentication.
 
-The transport accepts GET requests only to HTTPS `wpa.zaloapp.com` or
+The regular transport accepts GET requests only to HTTPS `wpa.zaloapp.com` or
 `wpa.chat.zalo.me`, port 443, with no userinfo or fragments. URLs are capped at
 8192 bytes. It disables redirects, referrer forwarding, environment proxies and
 HTTP/2. An exclusive mutable borrow permits one logical request at a time.
 
 Resource policies are enforced before body processing:
 
-- Request-specific deadlines must be 1–60,000 ms; connect timeout is at most
+- Request-specific deadlines must be 1–180,000 ms; connect timeout is at most
   10 seconds. An outer Tokio deadline includes headers and the entire streamed
   body. Dropping the request future cancels its work; no detached fetch is spawned.
 - Accepted response headers are capped at 128 entries and 32 KiB including names
@@ -45,7 +47,8 @@ response streams: declared/unknown lengths, chunk overflow, tiny chunks,
 header/status rejection, stalled and always-ready deadlines, dropped futures,
 URL policy, cookie isolation/budgets and error-chain redaction. The concrete
 reqwest client constructs successfully and rejects forbidden requests before
-DNS/connect. No test contacts production servers or accesses a real account.
+DNS/connect. Ordinary tests never contact production or real accounts. One ignored, explicitly
+authorized probe exercises public controller QR creation then immediately cancels.
 
 Seven additional integration tests exercise the actual reqwest backend against
 an ephemeral localhost Rustls server. OpenSSL generates a temporary synthetic CA
@@ -64,5 +67,13 @@ cargo test --locked --offline --features network protocol::http::tls_tests
 The certificate generation invokes no network service. Fixture keys are synthetic,
 created in a private temporary directory and removed after loading. The tests do
 not verify Zalo endpoint compatibility, production TLS or a real account flow.
-Trusted-device positive HMAC/signed-list fixtures, account validation and an
-atomic trusted-session commit remain separate gates before UI login activation.
+The coordinator now composes independently tested trust/account/session gates.
+A public API681 probe reached actual QR creation/cancellation; authenticated real
+account behavior remains unverified.
+
+`fetch_poll` has a separate exact origin validator adding `qr-id.zaloapp.com`,
+as observed in the TLS reqqr response and allowed by the bundle's server-issued
+poll-URL contract (login-startup:1278–1279; shared worker:400410). Auth creation,
+bootstrap and cookie scopes are unchanged. The jar neither sends nor installs
+cookies on this pool host. An actual TLS regression proves an absent Cookie
+header there despite populated session/domain cookies on auth origins.

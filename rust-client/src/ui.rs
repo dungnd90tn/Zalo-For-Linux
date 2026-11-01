@@ -1,4 +1,10 @@
 //! Original native desktop UI. File, database, and network work stays off the render thread.
+#[cfg(feature = "messaging")]
+mod delivery;
+#[cfg(feature = "live-login")]
+mod live;
+#[cfg(feature = "live-login")]
+mod login;
 mod visuals;
 
 use crate::app::{Command, DraftBook, Event, Model, Worker, EVENTS_PER_FRAME};
@@ -7,6 +13,7 @@ use crate::profile::Profile;
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke,
 };
+use std::sync::Arc;
 use visuals::{
     avatar, divider, icon, icon_button, Icon, BLUE, CANVAS, HOVER, INK, LINE, MUTED, NAV_BLUE,
     NAV_SELECTED, PALE_BLUE, PLACEHOLDER,
@@ -24,8 +31,10 @@ pub struct NativeApp {
     focus_composer: bool,
     latest_page: bool,
     ime_composing: bool,
+    #[cfg(feature = "live-login")]
+    live: Option<live::LiveState>,
     // The worker shuts down before the profile lock is released.
-    _profile: Profile,
+    _profile: Arc<Profile>,
 }
 
 impl NativeApp {
@@ -60,14 +69,99 @@ impl NativeApp {
             focus_composer: false,
             latest_page: true,
             ime_composing: false,
-            _profile: profile,
+            #[cfg(feature = "live-login")]
+            live: None,
+            _profile: Arc::new(profile),
         })
+    }
+
+    fn is_signed_in(&self) -> bool {
+        #[cfg(feature = "live-login")]
+        {
+            self.live_signed_in()
+        }
+        #[cfg(not(feature = "live-login"))]
+        {
+            false
+        }
+    }
+    fn account_id(&self) -> Option<&str> {
+        #[cfg(feature = "live-login")]
+        {
+            self.live
+                .as_ref()
+                .and_then(|state| state.account.as_ref())
+                .map(|account| account.id.as_str())
+        }
+        #[cfg(not(feature = "live-login"))]
+        {
+            None
+        }
+    }
+    fn account_label(&self) -> &str {
+        #[cfg(feature = "live-login")]
+        if let Some(account) = self.live.as_ref().and_then(|state| state.account.as_ref()) {
+            return if account.name.is_empty() {
+                &account.id
+            } else {
+                &account.name
+            };
+        }
+        if self.demo {
+            "Demo"
+        } else {
+            "Zalo"
+        }
+    }
+    fn connection_label(&self) -> &str {
+        #[cfg(feature = "live-login")]
+        if let Some(state) = &self.live {
+            return state.connection_label();
+        }
+        "Chưa đăng nhập"
+    }
+    fn live_can_send(&self) -> bool {
+        #[cfg(feature = "live-login")]
+        {
+            !self.model.pending
+                && self
+                    .live
+                    .as_ref()
+                    .is_some_and(|state| state.can_send(self.model.selected.as_deref()))
+        }
+        #[cfg(not(feature = "live-login"))]
+        {
+            false
+        }
     }
 
     fn load_latest(&mut self, thread: String) -> bool {
         if !self.drafts.can_select(&thread) {
             self.model.status = "Đã đạt giới hạn bản nháp hội thoại đang mở.".into();
             return false;
+        }
+        #[cfg(feature = "messaging")]
+        if let Some(worker) = self.live.as_ref().and_then(|state| state.worker.as_ref()) {
+            match self
+                .model
+                .select_live_if_accepted(thread.clone(), |command| worker.submit(command))
+            {
+                Ok(()) => {
+                    let _ = self.drafts.select(&thread);
+                    self.latest_page = true;
+                    if let Some(state) = &mut self.live {
+                        state.delivery.edited(&thread, &self.drafts.active.text);
+                        if state.delivery.review(&thread).is_some() {
+                            state.review_dialog = true;
+                        }
+                    }
+                    return true;
+                }
+                Err(error) => {
+                    self.model.status = error.to_string();
+                    return false;
+                }
+            }
         }
         if let Some(worker) = &self.worker {
             match self
@@ -89,6 +183,27 @@ impl NativeApp {
 
     fn older_page(&mut self) {
         if self.model.pending {
+            return;
+        }
+        #[cfg(feature = "messaging")]
+        if let (Some(worker), Some(thread), Some(cursor)) = (
+            self.live.as_ref().and_then(|state| state.worker.as_ref()),
+            self.model.selected.clone(),
+            self.model.messages.first().map(Message::cursor),
+        ) {
+            let generation = self.model.generation.wrapping_add(1);
+            match worker.submit(crate::app::live::LiveCommand::Load {
+                generation,
+                thread,
+                before: Some(cursor),
+            }) {
+                Ok(()) => {
+                    self.model.generation = generation;
+                    self.model.pending = true;
+                    self.latest_page = false;
+                }
+                Err(error) => self.model.status = error.to_string(),
+            }
             return;
         }
         if let (Some(worker), Some(thread), Some(cursor)) = (
@@ -115,6 +230,47 @@ impl NativeApp {
     }
 
     fn send_local(&mut self) {
+        #[cfg(feature = "messaging")]
+        if let Some(state) = &mut self.live {
+            if !state.can_send(self.model.selected.as_deref()) || self.model.pending {
+                return;
+            }
+            if let (Some(worker), Some(thread)) = (&state.worker, self.model.selected.clone()) {
+                if self.drafts.active.in_flight() || self.drafts.active.text.trim().is_empty() {
+                    return;
+                }
+                let mut submitted = None;
+                let result = self.drafts.active.send_live(
+                    self.model.generation,
+                    thread.clone(),
+                    |command| {
+                        let request = match &command {
+                            crate::app::live::LiveCommand::Send { request_id, .. } => {
+                                Some(*request_id)
+                            }
+                            _ => None,
+                        };
+                        let result = worker.submit(command);
+                        if result.is_ok() {
+                            submitted = request;
+                        }
+                        result
+                    },
+                );
+                match result {
+                    Ok(()) => {
+                        if let Some(request) = submitted {
+                            state
+                                .delivery
+                                .submitted(&thread, request, &self.drafts.active.text);
+                        }
+                    }
+                    Err(error) => self.model.status = error.to_string(),
+                }
+                self.focus_composer = true;
+            }
+            return;
+        }
         let (Some(worker), Some(thread)) = (self.worker.as_ref(), self.model.selected.clone())
         else {
             return;
@@ -178,7 +334,7 @@ impl NativeApp {
                 avatar(
                     ui,
                     egui::Rect::from_center_size(rect.center(), vec2(40.0, 40.0)),
-                    "Demo",
+                    self.account_label(),
                 );
                 ui.add_space(27.0);
                 for (kind, title, selected) in [
@@ -283,12 +439,30 @@ impl NativeApp {
                                 }
                             });
                         });
-                    icon_button(
+                    #[cfg(feature = "messaging")]
+                    let open_live = self
+                        .live
+                        .as_ref()
+                        .is_some_and(|state| state.account.is_some() && state.worker.is_some());
+                    #[cfg(not(feature = "messaging"))]
+                    let open_live = false;
+                    if icon_button(
                         ui,
                         Icon::Plus,
-                        "Tạo hội thoại · chưa hỗ trợ trong bản xem trước",
-                        false,
-                    );
+                        if open_live {
+                            "Mở hội thoại Zalo"
+                        } else {
+                            "Tạo hội thoại · chưa hỗ trợ trong bản xem trước"
+                        },
+                        open_live,
+                    )
+                    .clicked()
+                    {
+                        #[cfg(feature = "messaging")]
+                        if let Some(state) = &mut self.live {
+                            state.open_dialog = true;
+                        }
+                    }
                 });
                 ui.add_space(13.0);
                 ui.horizontal(|ui| {
@@ -296,8 +470,9 @@ impl NativeApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!(
-                                "{} hội thoại demo",
-                                self.model.conversations.len()
+                                "{} hội thoại{}",
+                                self.model.conversations.len(),
+                                if self.demo { " demo" } else { "" }
                             ))
                             .color(MUTED)
                             .size(11.0),
@@ -327,6 +502,7 @@ impl NativeApp {
                         thread,
                         &title,
                         self.model.selected.as_deref() == Some(&thread.id),
+                        self.account_id(),
                     )
                     .clicked()
                     {
@@ -352,6 +528,10 @@ impl NativeApp {
             egui::Rect::from_min_max(pos2(rect.left(), rect.bottom() - 55.0), rect.right_bottom());
         ui.painter().rect_filled(footer, 0.0, Color32::WHITE);
         divider(ui, footer.left_top(), footer.right_top());
+        #[cfg(feature = "live-login")]
+        if self.live_account_footer(ui, footer) {
+            return;
+        }
         icon(
             ui,
             egui::Rect::from_min_size(footer.min + vec2(16.0, 17.0), vec2(18.0, 18.0)),
@@ -363,6 +543,8 @@ impl NativeApp {
             Align2::LEFT_TOP,
             if self.demo {
                 "Dữ liệu demo · chỉ lưu trên máy"
+            } else if self.is_signed_in() {
+                self.connection_label()
             } else {
                 "Bản xem trước · chưa đăng nhập"
             },
@@ -417,7 +599,7 @@ impl NativeApp {
                     RichText::new(if self.demo {
                         "Hội thoại minh họa · ngoại tuyến"
                     } else {
-                        "Ứng dụng Rust · bản xem trước"
+                        self.connection_label()
                     })
                     .color(MUTED)
                     .size(10.5),
@@ -457,7 +639,7 @@ impl NativeApp {
     }
 
     fn composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, height: f32) {
-        let enabled = self.demo && self.model.selected.is_some();
+        let enabled = (self.demo || self.is_signed_in()) && self.model.selected.is_some();
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
         ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
         divider(ui, rect.left_top(), rect.right_top());
@@ -486,7 +668,15 @@ impl NativeApp {
                         false,
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("CHỈ LƯU CỤC BỘ").size(9.0).color(MUTED));
+                        ui.label(
+                            RichText::new(if self.demo {
+                                "CHỈ LƯU CỤC BỘ"
+                            } else {
+                                self.connection_label()
+                            })
+                            .size(9.0)
+                            .color(MUTED),
+                        );
                     });
                 });
                 let send_rect = egui::Rect::from_min_size(
@@ -528,6 +718,12 @@ impl NativeApp {
                     );
                     if response.changed() {
                         self.drafts.active.edited();
+                        #[cfg(feature = "messaging")]
+                        if let (Some(state), Some(thread)) =
+                            (&mut self.live, self.model.selected.as_deref())
+                        {
+                            state.delivery.edited(thread, &self.drafts.active.text);
+                        }
                     }
                     if self.focus_composer {
                         response.request_focus();
@@ -535,6 +731,7 @@ impl NativeApp {
                     }
                 });
                 let can_send = enabled
+                    && (self.demo || self.live_can_send())
                     && !self.drafts.active.in_flight()
                     && !self.drafts.active.text.trim().is_empty();
                 let response = ui
@@ -547,7 +744,7 @@ impl NativeApp {
                 ui.painter().text(
                     send_rect.center(),
                     Align2::CENTER_CENTER,
-                    "Lưu",
+                    if self.demo { "Lưu" } else { "Gửi" },
                     FontId::proportional(13.0),
                     if can_send {
                         Color32::WHITE
@@ -558,12 +755,20 @@ impl NativeApp {
                 if response.clicked() {
                     send = true;
                 }
-                response.on_hover_text("Lưu tin nhắn vào demo trên máy này · Ctrl+Enter");
+                response.on_hover_text(if self.demo {
+                    "Lưu tin nhắn vào demo trên máy này · Ctrl+Enter"
+                } else {
+                    "Gửi tin nhắn tới Zalo · Ctrl+Enter"
+                });
                 if height > 110.0 {
                     ui.painter().text(
                         pos2(rect.left() + 20.0, rect.bottom() - 13.0),
                         Align2::LEFT_BOTTOM,
-                        "Ctrl+Enter để lưu · Enter để xuống dòng",
+                        if self.demo {
+                            "Ctrl+Enter để lưu · Enter để xuống dòng"
+                        } else {
+                            "Ctrl+Enter để gửi · Enter để xuống dòng"
+                        },
                         FontId::proportional(9.5),
                         MUTED,
                     );
@@ -614,15 +819,19 @@ impl NativeApp {
                                     (timeline_rect.width() - if compact { 38.0 } else { 62.0 })
                                         .max(100.0),
                                 );
-                                if !self.demo {
+                                if !self.demo && !self.is_signed_in() {
                                     self.welcome(ui);
                                     return;
                                 }
                                 ui.vertical_centered(|ui| {
                                     ui.label(
-                                        RichText::new("Dữ liệu minh họa · không gửi tới Zalo")
-                                            .size(10.0)
-                                            .color(MUTED),
+                                        RichText::new(if self.demo {
+                                            "Dữ liệu minh họa · không gửi tới Zalo"
+                                        } else {
+                                            self.connection_label()
+                                        })
+                                        .size(10.0)
+                                        .color(MUTED),
                                     );
                                     ui.add_space(12.0);
                                     if self.model.has_older
@@ -658,7 +867,7 @@ impl NativeApp {
                                         ui.add_space(18.0);
                                         previous_day = day;
                                     }
-                                    message_bubble(ui, message, compact);
+                                    message_bubble(ui, message, compact, self.account_id());
                                     ui.add_space(13.0);
                                 }
                                 if self.model.messages.is_empty() && !self.model.pending {
@@ -690,7 +899,11 @@ impl NativeApp {
             if self.model.pending {
                 "Đang mở hội thoại…"
             } else {
-                "Demo ngoại tuyến. Tin nhắn chỉ được lưu trên thiết bị này."
+                if self.demo {
+                    "Demo ngoại tuyến. Tin nhắn chỉ được lưu trên thiết bị này."
+                } else {
+                    self.connection_label()
+                }
             }
         } else if self.model.status.starts_with("Stored locally") {
             "Đã lưu trên thiết bị · không gửi tới Zalo"
@@ -731,6 +944,8 @@ impl NativeApp {
                 ui.add_space(8.0);
                 ui.label(RichText::new("Zalo Native · Rust").size(20.0).strong());
                 ui.add_space(12.0);
+                #[cfg(feature = "live-login")]
+                if self.live_information(ui) { return; }
                 ui.label("Giao diện và mã Rust được xây dựng độc lập. Bản demo sử dụng hội thoại giả lập, lưu riêng trong profile demo trên máy này.");
                 ui.add_space(10.0);
                 ui.label("Đã hoạt động: tìm hội thoại, chuyển bản nháp, đọc từng trang và lưu tin nhắn cục bộ.");
@@ -747,6 +962,13 @@ impl NativeApp {
 impl eframe::App for NativeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events(ctx);
+        #[cfg(feature = "live-login")]
+        {
+            self.poll_live(ctx);
+            if self.show_login(ctx) {
+                return;
+            }
+        }
         ctx.input(|input| update_ime_state(&mut self.ime_composing, &input.events));
         let compact = ctx.screen_rect().width() < 940.0;
         self.navigation(ctx, compact);
@@ -774,6 +996,8 @@ impl eframe::App for NativeApp {
         if self.details {
             self.information(ctx);
         }
+        #[cfg(feature = "live-login")]
+        self.live_dialogs(ctx);
     }
 }
 
@@ -801,6 +1025,7 @@ fn conversation_row(
     thread: &Conversation,
     title: &str,
     selected: bool,
+    account: Option<&str>,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(width, 79.0), Sense::click());
     if selected || response.hovered() {
@@ -835,7 +1060,7 @@ fn conversation_row(
         );
         let preview = if thread.last_text.is_empty() {
             "Chưa có tin nhắn".into()
-        } else if thread.last_sender == "You (local demo)" {
+        } else if is_own_sender(&thread.last_sender, account) {
             format!("Bạn: {}", thread.last_text)
         } else {
             thread.last_text.clone()
@@ -892,8 +1117,12 @@ fn date_separator(ui: &mut egui::Ui, milliseconds: i64) {
         .galley(pill.min + vec2(10.0, 2.0), galley, Color32::WHITE);
 }
 
-fn message_bubble(ui: &mut egui::Ui, message: &Message, compact: bool) {
-    let own = message.sender == "You (local demo)";
+fn is_own_sender(sender: &str, account: Option<&str>) -> bool {
+    account.map_or_else(|| sender == "You (local demo)", |account| sender == account)
+}
+
+fn message_bubble(ui: &mut egui::Ui, message: &Message, compact: bool, account: Option<&str>) {
+    let own = is_own_sender(&message.sender, account);
     let max_bubble = (ui.available_width() * if compact { 0.82 } else { 0.76 }).min(490.0);
     ui.with_layout(
         if own {
@@ -948,7 +1177,15 @@ fn message_bubble(ui: &mut egui::Ui, message: &Message, compact: bool) {
                                 let (rect, _) =
                                     ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
                                 icon(ui, rect, Icon::Check, MUTED);
-                                ui.label(RichText::new("Đã lưu trên máy").size(9.0).color(MUTED));
+                                ui.label(
+                                    RichText::new(if account.is_some() {
+                                        "Zalo đã nhận"
+                                    } else {
+                                        "Đã lưu trên máy"
+                                    })
+                                    .size(9.0)
+                                    .color(MUTED),
+                                );
                             }
                         });
                     });
@@ -1034,6 +1271,13 @@ fn date_label(milliseconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_sender_alignment_uses_the_verified_account_without_demo_aliases() {
+        assert!(is_own_sender("123", Some("123")));
+        assert!(!is_own_sender("456", Some("123")));
+        assert!(!is_own_sender("You (local demo)", Some("123")));
+        assert!(is_own_sender("You (local demo)", None));
+    }
     #[test]
     fn vietnamese_search_accepts_tones_case_and_decomposed_input() {
         assert_eq!(fold_search("  NHÓM THIẾT KẾ  "), "nhom thiet ke");

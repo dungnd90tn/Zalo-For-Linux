@@ -80,14 +80,16 @@ proof material only; it cannot install or activate a session.
 A master identifier is not proven to equal the authenticated numeric account UID.
 The guest list verifier is stateless and accepts repeated valid lists inside its
 21-day TTL. Creating a linking proof also has no application clock or attempt
-context parameter. Activation requires authenticated account/context binding,
-QR-attempt freshness, a persisted timestamp/replay policy and the complete
-bootstrap/session integration. Existing profile ownership alone cannot establish
-those protocol claims. Public inspection always returns an explicit
+context parameter. The opt-in coordinator adds authenticated confirmation/bootstrap UID matching,
+attempt freshness, a persisted watermark and atomic session commit; see
+[AUTH_SESSION_CONTRACT.md](AUTH_SESSION_CONTRACT.md). The fixture host alone does
+not establish those protocol claims. Public inspection always returns an explicit
 trust-not-established error, even for a valid signature.
 
 These offline fixtures prove the pinned bundle's cryptographic contracts; they
 do not verify current production endpoints or a complete live login. No transport
 encryption was invented for the primary-linking protobuf. The final application
 direction remains native Rust with the existing Zalo theme, icons and layout.
-No live login or messaging gate has been enabled.
+Live login is explicitly opt-in and preserves PhoneApproved versus TrustedDevice
+assurance. Actual public startup reached classic QR creation/cancellation only;
+no real phone approval/account login or production message exchange was tested.

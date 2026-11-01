@@ -34,3 +34,7 @@ jobs:
         run: ./scripts/rust/build.sh --offline
       - name: Validate the release binary with disposable profiles
         run: python3 scripts/rust/smoke-release.py
+      - name: Build optional live release
+        run: ./scripts/rust/build.sh --offline --features live
+      - name: Check live build diagnostics and offline demo without authentication
+        run: python3 scripts/rust/smoke-release.py --expect-live

@@ -1,5 +1,5 @@
 //! Opt-in, original HTTP transport for the verified authentication request specs.
-//! No UI/CLI path activates it. Cookies are transient, private to one attempt and bounded.
+//! Default paths remain offline; opt-in live login owns one bounded private attempt jar.
 use super::qr::{HttpReply, QrTransport, RequestSpec, MAX_RESPONSE_BYTES};
 use reqwest::{
     cookie::{CookieStore, Jar},
@@ -14,7 +14,7 @@ use std::{
 use url::Url;
 
 const MAX_URL_BYTES: usize = 8192;
-const MAX_TIMEOUT_MS: u64 = 60_000;
+const MAX_TIMEOUT_MS: u64 = 180_000;
 const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 const MAX_RESPONSE_HEADERS: usize = 128;
 const MAX_COOKIE_BYTES: usize = 64 * 1024;
@@ -85,8 +85,13 @@ fn allowed_url(url: &Url) -> bool {
         && url.fragment().is_none()
 }
 fn validate(request: &RequestSpec) -> Result<(), HttpError> {
-    if !allowed_url(&request.url)
-        || request.follow_redirects
+    if !allowed_url(&request.url) {
+        return Err(HttpError::InvalidRequest);
+    }
+    validate_limits(request)
+}
+fn validate_limits(request: &RequestSpec) -> Result<(), HttpError> {
+    if request.follow_redirects
         || !request.include_cookies
         || request.timeout_ms == 0
         || request.timeout_ms > MAX_TIMEOUT_MS
@@ -165,6 +170,55 @@ impl HttpAdapter {
         Ok(Self {
             backend: ReqwestBackend { client, cookies },
         })
+    }
+    #[cfg(all(test, feature = "live-login"))]
+    pub(super) fn local_test_adapter(address: std::net::SocketAddr) -> Self {
+        let cookies = Arc::new(AttemptCookies::default());
+        let client = client_builder(cookies.clone())
+            .resolve("wpa.zaloapp.com", address)
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(
+                reqwest::Certificate::from_der(&tls_tests::material().root).unwrap(),
+            )
+            .build()
+            .unwrap();
+        Self {
+            backend: ReqwestBackend { client, cookies },
+        }
+    }
+    /// Called only by the coordinator after mode-specific confirmation checks.
+    #[cfg(feature = "live-login")]
+    pub(super) fn stage_verified_confirmation(
+        &mut self,
+        pending: &super::bootstrap::PendingCookies,
+    ) -> Result<(), HttpError> {
+        for origin in ["https://wpa.zaloapp.com/", "https://wpa.chat.zalo.me/"] {
+            let url = Url::parse(origin).map_err(|_| HttpError::InvalidRequest)?;
+            let cookie = pending
+                .request_cookie(&url)
+                .ok_or(HttpError::InvalidRequest)?;
+            let header = HeaderValue::from_str(&format!("{cookie}; Secure; HttpOnly; Path=/"))
+                .map_err(|_| HttpError::InvalidRequest)?;
+            self.backend
+                .cookies
+                .set_cookies(&mut [&header].into_iter(), &url);
+        }
+        if self.backend.cookies.exhausted() {
+            return Err(HttpError::CookieBudget);
+        }
+        Ok(())
+    }
+    #[cfg(feature = "live-login")]
+    pub(super) async fn fetch_poll(
+        &mut self,
+        request: &RequestSpec,
+    ) -> Result<HttpReply, HttpError> {
+        super::qr::validate_poll_url(request.url.as_str())
+            .map_err(|_| HttpError::InvalidRequest)?;
+        // CookieStore still refuses every host except the two original auth
+        // hosts: qr-id receives and installs NO cookies, even with a populated jar.
+        validate_limits(request)?;
+        bounded_fetch_validated(&mut self.backend, request).await
     }
     /// Supports QR and bootstrap RequestSpecs. An exclusive borrow serializes requests;
     /// dropping the future cancels polling without spawning detached work.
@@ -269,6 +323,12 @@ async fn bounded_fetch<B: Backend>(
     request: &RequestSpec,
 ) -> Result<HttpReply, HttpError> {
     validate(request)?;
+    bounded_fetch_validated(backend, request).await
+}
+async fn bounded_fetch_validated<B: Backend>(
+    backend: &mut B,
+    request: &RequestSpec,
+) -> Result<HttpReply, HttpError> {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(request.timeout_ms);
     tokio::time::timeout_at(deadline, async {
         let mut head = backend.open(request).await?;
@@ -618,7 +678,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tls_tests {
+pub(crate) mod tls_tests {
     use super::*;
     use rustls::{
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
@@ -637,10 +697,10 @@ mod tls_tests {
         thread::{self, JoinHandle},
     };
 
-    struct Material {
-        root: Vec<u8>,
-        leaf: Vec<u8>,
-        key: Vec<u8>,
+    pub(crate) struct Material {
+        pub(crate) root: Vec<u8>,
+        pub(crate) leaf: Vec<u8>,
+        pub(crate) key: Vec<u8>,
     }
     struct Scratch(PathBuf);
     impl Drop for Scratch {
@@ -648,7 +708,7 @@ mod tls_tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    fn material() -> &'static Material {
+    pub(crate) fn material() -> &'static Material {
         static MATERIAL: OnceLock<Material> = OnceLock::new();
         MATERIAL.get_or_init(|| {
             let scratch = Scratch(std::env::temp_dir().join(format!(
@@ -716,7 +776,7 @@ mod tls_tests {
             fs::write(
                 scratch.0.join("leaf.ext"),
                 concat!(
-                    "subjectAltName=DNS:wpa.zaloapp.com\n",
+                    "subjectAltName=DNS:wpa.zaloapp.com,DNS:qr-id.zaloapp.com\n",
                     "basicConstraints=critical,CA:FALSE\n",
                     "keyUsage=critical,digitalSignature\n",
                     "extendedKeyUsage=serverAuth\n"
@@ -836,7 +896,8 @@ mod tls_tests {
             // no DNS or proxy fallback that can contact an external Zalo server.
             let mut builder = client_builder(cookies.clone())
                 .resolve("wpa.zaloapp.com", self.addr)
-                .resolve("wpa.chat.zalo.me", self.addr);
+                .resolve("wpa.chat.zalo.me", self.addr)
+                .resolve("qr-id.zaloapp.com", self.addr);
             if trusted {
                 builder = builder.tls_built_in_root_certs(false).add_root_certificate(
                     reqwest::Certificate::from_der(&material().root).unwrap(),
@@ -1026,6 +1087,34 @@ mod tls_tests {
         ));
         assert!(!fixture.seen("/followed"));
         assert_eq!(fixture.state.requests.lock().unwrap().len(), 2);
+    }
+    #[cfg(feature = "live-login")]
+    #[tokio::test]
+    async fn real_tls_poll_host_never_receives_populated_auth_jar_cookies() {
+        let fixture = Fixture::start();
+        let mut adapter = fixture.adapter(true);
+        let auth = Url::parse("https://wpa.zaloapp.com/").unwrap();
+        let broad = HeaderValue::from_static(
+            "session-fixture=synthetic; Domain=zaloapp.com; Secure; Path=/",
+        );
+        adapter
+            .backend
+            .cookies
+            .set_cookies(&mut std::iter::once(&broad), &auth);
+        let pending=super::super::bootstrap::PendingCookies::from_confirmation(&serde_json::json!({"uid":"11","dkey":"synthetic-storage","zpw_sek":"synthetic-secret"})).unwrap();
+        adapter.stage_verified_confirmation(&pending).unwrap();
+        assert!(adapter.backend.cookies.cookies(&auth).is_some());
+        let mut request = fixture.request("/ok", 4);
+        request.url.set_host(Some("qr-id.zaloapp.com")).unwrap();
+        assert_eq!(
+            adapter.fetch(&request).await.err(),
+            Some(HttpError::InvalidRequest)
+        );
+        assert_eq!(adapter.fetch_poll(&request).await.unwrap().body, b"abcd");
+        let requests = fixture.state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].host, "qr-id.zaloapp.com");
+        assert!(requests[0].cookie.is_none());
     }
     #[tokio::test]
     async fn real_tls_sends_cookies_only_inside_the_same_attempt() {

@@ -113,7 +113,35 @@ def generate():
 
 
 if __name__ == '__main__':
-    if sys.argv[1:] == ['--verify-signature']:
+    if sys.argv[1:] == ['--signed-list']:
+        request = json.loads(sys.stdin.buffer.read(8193))
+        assert len(json.dumps(request)) <= 8192
+        fixture = generate()
+        primary = bytes.fromhex(fixture['primary_public_hex'])
+        companion = bytes.fromhex(fixture['companion_public_hex'])
+        metadata = bytes.fromhex(fixture['expected_pc_metadata_hex'])
+        device_signature = bytes.fromhex(request['device_signature_hex'])
+        assert verify_signature(companion, b'D2' + metadata + companion + primary, device_signature)
+        account_signature = bytes.fromhex(fixture['account_signature_hex'])
+        timestamp = fixture['timestamp_ms']
+        record = (int_field(1, 123) + byte_field(2, companion) + int_field(3, 42) +
+                  int_field(4, 1) + int_field(5, 1) + byte_field(6, account_signature) +
+                  byte_field(7, device_signature) + int_field(8, timestamp + 86400000))
+        wrapper = byte_field(1, record)
+        master = fixture['master_id'].encode()
+        message = b'L3' + master + primary + struct.pack('<Q', timestamp) + wrapper
+        signature = sign_fixture(clamp(bytes(range(32))), message)
+        encoded = (byte_field(1, master) + byte_field(2, primary) + byte_field(3, wrapper) +
+                   b'\x21' + struct.pack('<Q', timestamp) + byte_field(5, signature))
+        import base64
+        b64 = lambda value: base64.b64encode(value).decode()
+        devices = {'masterId': master.decode(), 'encIdentity': b64(primary),
+                   'encSignature': b64(signature), 'lastUpdateTs': timestamp,
+                   'companions': [{'id': 123, 'linkId': '42', 'encIdentity': b64(companion),
+                                   'platform': 2, 'status': 1, 'expireTs': timestamp + 86400000,
+                                   'encAccSign': b64(account_signature), 'encDeviceSign': b64(device_signature)}]}
+        print(json.dumps({'devices': devices, 'device_list_hex': encoded.hex()}))
+    elif sys.argv[1:] == ['--verify-signature']:
         # Only the test harness calls this bounded independent checker with
         # synthetic public bytes; this is not an application verifier API.
         request = json.loads(sys.stdin.buffer.read(8193))

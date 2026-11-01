@@ -24,39 +24,31 @@ Line references below identify the committed Electron bundles, not live servers:
 
 ## Implemented contract
 
-`protocol::qr::create_request` builds an encrypted legacy-format request with
-`self_g=0`, `qr_form=0`, a fresh caller-supplied device identifier, and no remembered
-accounts. `ResponseCipher` decodes encrypted response data. This is wire-format
-functionality, not enabled UI authentication or a promise that the server accepts
-the frozen version. An optional transport is available under `network`; it never
-activates login automatically. Do not silently disable encryption after a server error.
+The default preview remains offline. Opt-in `live-login` provides a real native
+`LoginController`; the `live` umbrella also enables messaging. Each user-started
+attempt owns a fresh random device ID, private HTTP jar and cancellation generation.
+A 300-second deadline bounds the flow; stale callbacks never publish usable state.
 
-`QrFlow` separates Requested, Scanned, AwaitingConfirmation and TrustRequired.
-Only one poll may run at once; stale/cancelled responses cannot change state.
-Each stage has bounded retry counts. Network failures preserve the current stage.
-No implemented transition reaches Authenticated: confirmation still requires
-verified device-link signatures, account binding and subsequent login bootstrap.
-Never persist confirmation credentials or mark an account online before those
-steps succeed.
+Explicit pre-login flags select classic `PhoneApproved` (`self_g=0, qr_form=0`)
+or `TrustedDevice` (both `1`). Missing/mixed/conflicting flags fail closed.
+Classic mode decodes bounded server PNGs off the UI thread. Trusted mode generates
+QR content and verifies primary HMAC/A1, companion D2 and selected signed-list L3
+on a dedicated Wasmi thread. A failed trusted proof never downgrades assurance.
+Both modes require phone confirmation UID, fresh encrypted bootstrap UID equality,
+immutable profile ownership and atomic durable commit before `Ready`.
+See [AUTH_SESSION_CONTRACT.md](AUTH_SESSION_CONTRACT.md).
 
-Request specs require GET, a separate cookie jar for the attempt, disabled
-redirects, a 2 MiB response cap and bounded timeouts. Poll URLs must use HTTPS,
-port 443, and exactly `wpa.zaloapp.com` or `wpa.chat.zalo.me`, without credentials or
-fragments. Unknown hosts fail closed. Adapters must revalidate each URL and
-enforce these policies during streaming, before reading an entire response.
-The scan request appends the validated locale without duplicating `lang` or
-changing existing token values. Trusted-device confirmation query extensions
-remain blocked on verified signatures.
+Create/bootstrap origins remain exactly HTTPS443 `wpa.zaloapp.com` and
+`wpa.chat.zalo.me`. A separate poll-only policy additionally accepts the observed
+`qr-id.zaloapp.com`; it receives and installs no cookies. URLs reject credentials,
+fragments, alternate ports and lookalikes; redirects remain disabled. Bodies cap
+at 2 MiB, PNG compressed bytes at 512 KiB, dimensions at 1024 per side and pixels
+at 512². Poll timeouts accept the observed 180 seconds, while the attempt deadline
+still bounds retries. HTTP200/code408 retries until the finite retry budget ends.
 
-`QrDriver<T: QrTransport>` runs create/decrypt/scan/confirm asynchronously with a
-watch cancellation channel and per-request Tokio timeout. Its synthetic HTTP
-fixtures cover full encrypted responses, cancellation of pending requests,
-redirect rejection, oversized responses and trust-gated confirmation. There is
-an optional original `HttpAdapter` under the `network` feature. It implements the
-bounded transport policy and uses a fresh private cookie jar per login attempt;
-default GUI/CLI paths never construct it. See [Authentication HTTP Adapter](PROTOCOL_HTTP.md)
-for its exact limits and offline verification boundary. This does not establish
-trusted-device authentication or install sessions.
+The earlier generic `QrFlow`/`QrDriver` remain conservative protocol harnesses:
+they do not independently manufacture authenticated sessions. The UI consumes only
+bounded RGBA/typed progress and an opaque coordinator-created session capability.
 
 ## Independent cryptographic fixture
 
@@ -77,13 +69,14 @@ Expected key: `9E2FEF1536FB6489D9B1FEE6480D0186`.
 Expected signature: `a5124a84eb34d1757e00d7a6049c2aa1`.
 The unit test also pins the full ciphertext and `zcid` produced by Node.
 
-## Remaining live-authentication gates
+## Acceptance boundary
 
-Server config, cookie bootstrap, current endpoint/version acceptance, polling host
-discovery, trust-device signatures/HMAC, account key derivation, session refresh
-and the complete `getLoginInfo` contract still need independently verified
-fixtures and integration. Electron `safeStorage` data is never an input. Live
-authentication remains explicitly unavailable until these gates pass.
+Actual unauthenticated API681 startup and controller QR creation/cancellation have
+passed against the public server. Its flags selected classic PhoneApproved mode.
+No real account was scanned/approved, no credentials imported, and no messages sent.
+Production phone approval, authenticated bootstrap, refresh renewal and messaging
+remain manual acceptance gates. Local TLS and independent cryptographic fixtures
+prove the implemented boundaries without claiming those production outcomes.
 
 ## Trusted-device implementation boundary
 
@@ -99,8 +92,9 @@ before committing trusted-device state.
 
 The binary is 350,023 bytes, has 66 `wbg` function imports and 60 exports, and has
 no WASI interface. The optional `trust-wasm` feature now provides an original Rust
-host using Wasmi 2.0.0's interpreter. It loads this existing binary lazily from an
-explicit path, without copying it or embedding JavaScript. The default client
+host using Wasmi 2.0.0's interpreter. The live feature embeds the existing pinned
+repository binary; an absolute path is an advanced override. Loading is lazy and
+restricted to TrustedDevice attempts/resume, with no JavaScript runtime. The default client
 does not load the runtime. The [engine configuration](https://docs.rs/wasmi/2.0.0/wasmi/struct.Config.html)
 and [store limits](https://docs.rs/wasmi/2.0.0/wasmi/struct.StoreLimitsBuilder.html)
 define the fuel and memory controls used by the host.
@@ -157,13 +151,11 @@ transport encryption is separate and callers must not decrypt the protobuf again
 The JS PC platform value 2 maps to protobuf PC value 1. See
 [TRUST_FIXTURES.md](TRUST_FIXTURES.md) for exact domains and tamper tests.
 
-A master identifier is not yet proven to equal an authenticated account UID;
-the guest verifier also accepts replay inside its TTL. Complete attempt/account
-context, persisted replay policy and bootstrap integration remain prerequisites
-for accepting authentication. Public inspection still explicitly rejects
-activation. No runtime call installs a session, marks authentication usable or
-accesses a real account. Live authentication stays disabled. The application
-direction remains native Rust using the existing Zalo theme, icons and layout.
+Master ID is distinct from authenticated UID, and guest TTL alone does not prevent
+replay. The coordinator now supplies attempt freshness, persisted watermark,
+confirmation/bootstrap UID binding and atomic profile/session commit. Public
+standalone trust inspection still cannot activate login. The application remains
+native Rust using the existing Zalo theme, icons and layout.
 
 A safe future capture uses a disposable account with a manually initiated QR
 flow and a local recorder writing only to a private, ignored directory. Keep

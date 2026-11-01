@@ -1,8 +1,14 @@
 //! Transport boundary. A demo message is never represented as a successful Zalo send.
+#[cfg(feature = "live-login")]
+pub mod auth;
 pub mod bootstrap;
 #[cfg(feature = "network")]
 pub mod http;
+#[cfg(feature = "messaging")]
+pub mod messaging;
 pub mod qr;
+#[cfg(feature = "live-login")]
+pub mod session;
 #[cfg(feature = "trust-wasm")]
 pub mod trust;
 use serde::Serialize;

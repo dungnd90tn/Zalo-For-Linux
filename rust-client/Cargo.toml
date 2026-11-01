@@ -28,6 +28,13 @@ base64 = "0.22"
 md-5 = "0.10"
 url = "2"
 bytes = { version = "1", optional = true }
+aes-gcm = { version = "0.10", optional = true }
+flate2 = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.24", optional = true, default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+percent-encoding = { version = "2", optional = true }
+qrcode = { version = "0.14", optional = true, default-features = false }
+png = { version = "0.18", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["cookies", "rustls-tls"] }
 wasmi = { version = "=2.0.0", optional = true, default-features = false, features = ["std", "validate", "auto-dispatch"] }
 
@@ -35,12 +42,15 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 
 [features]
 default = []
 trust-wasm = ["dep:wasmi"]
 network = ["dep:reqwest", "dep:bytes"]
+live-login = ["network", "trust-wasm", "dep:qrcode", "dep:png"]
+messaging = ["live-login", "dep:aes-gcm", "dep:flate2", "dep:futures-util", "dep:tokio-tungstenite", "dep:percent-encoding"]
+live = ["messaging"]
 
 [dev-dependencies]
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }

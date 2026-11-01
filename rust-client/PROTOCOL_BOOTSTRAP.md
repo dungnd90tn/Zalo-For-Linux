@@ -1,6 +1,6 @@
 # Bootstrap Protocol Evidence
 
-The implementation in `src/protocol/bootstrap.rs` was written independently from facts in this repository's local JavaScript bundles. No external Rust implementation was copied. Fixtures are synthetic; they establish wire-format behavior, not acceptance by current Zalo servers. Live authentication and sending remain disabled.
+The implementation in `src/protocol/bootstrap.rs` was written independently from facts in this repository's local JavaScript bundles. No external Rust implementation was copied. Fixtures are synthetic; they establish wire-format behavior, not acceptance by current Zalo servers. Opt-in live login now composes these primitives; default paths remain offline. Public startup/QR creation passed, while real account bootstrap and messaging remain manual acceptance.
 
 ## Local evidence
 
@@ -23,7 +23,7 @@ All compact-bundle references identify `pc-dist/compact-app-pc.e08d0d44f38873747
 | Confirmation installs `zpw_sek` and completes trust; `zpw_kt` is separately persisted as a refresh token | `pc-dist/lazy/login-startup.cdc0ebe7d54dc91a9c23.js:1373`, `:1571` |
 | Cookie name `zpw_sek`, secure, HttpOnly, scopes `zaloapp.com`, `zalo.me`, `chat.zalo.me` | `main-dist/main.js:13715` |
 
-`dkey` is deliberately treated as opaque storage/bootstrap material. The bundle's legacy `UIN` variable name does not establish that `dkey` is a numeric account ID. The confirmed `uid` remains a separate, still unverified account claim.
+`dkey` is deliberately treated as opaque storage/bootstrap material. The bundle's legacy `UIN` variable name does not establish that `dkey` is a numeric account ID. Confirmation `uid` remains separate and must match decrypted bootstrap `uid` before the coordinator commits the account.
 
 ## Implemented scope
 
@@ -33,8 +33,22 @@ All compact-bundle references identify `pc-dist/compact-app-pc.e08d0d44f38873747
 - Session response decryption supports standard AES key lengths of 16, 24 and 32 bytes after base64 decoding. Independent Node crypto fixtures cover each key length and Unicode plaintext; the encrypted login-info fixture pins the nested envelope structure.
 - `PendingCookies` represents a staging plan only. It validates confirmation fields and cookie bytes, scopes a header to secure Zalo hosts, and keeps the refresh token separate. It does not install a cookie jar, persist a session, bind an account, or mark authentication successful. Secret-bearing structs have no `Debug`/`Serialize` implementation.
 
-## Remaining gates
+## Coordinator and acceptance boundary
 
-An optional concrete HTTP adapter is available behind the `network` feature; default GUI/CLI paths never activate it. It owns an isolated attempt-specific cookie jar and enforces streaming limits, redirect refusal, sanitized errors and deadlines/cancellation. See [PROTOCOL_HTTP.md](PROTOCOL_HTTP.md) for resource policies and the offline fixture boundary. Real TLS-server and live endpoint integration remain unverified.
+`live-login` composes the strict HTTP adapter, mode-specific assurance, confirmation
+and encrypted login-info bootstrap. Pre-login parsing accepts only bounded scalar
+clock/feature settings; it does not grant access to unused service endpoints.
+Encryption flags support boolean or exact integer0/1, as observed from API681.
+Post-login service endpoints retain strict secure-origin validation.
 
-Positive trusted-device linking/HMAC and signed-device-list fixtures, account/profile identity verification, refresh-token behavior, current endpoint/version acceptance and an atomic trusted-session/profile commit are still required. The session AES primitive is a compatibility implementation of observed protocol facts, not a recommendation to reuse this cipher format elsewhere. Electron credentials and `safeStorage` are never read.
+Actual local TLS tests use independently generated Node AES replies to verify
+UID equality/mismatch and complete durable-session publication. A bounded public
+probe reached actual getServerInfo/reqqr, decoded its PNG, then canceled through
+the real controller without scan or account login. This also established the
+actual 180-second poll setting and dedicated exact polling hostname.
+
+Session resume uses stored private cookies followed by fresh UID-matching bootstrap;
+refresh tokens are retained but renewal exchange remains unimplemented. Current
+production account bootstrap and message interoperability require manual acceptance.
+The observed session AES format is compatibility code, not a design recommendation.
+Electron credentials and `safeStorage` are never read.

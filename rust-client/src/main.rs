@@ -14,6 +14,8 @@ struct Cli {
     version: bool,
     doctor: bool,
     demo: bool,
+    live: bool,
+    trust_module: Option<PathBuf>,
     headless: bool,
     profile: Option<String>,
     root: Option<PathBuf>,
@@ -30,9 +32,14 @@ impl Cli {
                 "--version" | "-V" => cli.version = true,
                 "--doctor" => cli.doctor = true,
                 "--demo" => cli.demo = true,
+                "--live" => cli.live = true,
                 "--headless" => cli.headless = true,
                 "--gui" => {}
-                "--profile" | "--profile-root" | "--inspect-electron-copy" | "--source-account" => {
+                "--profile"
+                | "--profile-root"
+                | "--inspect-electron-copy"
+                | "--source-account"
+                | "--trust-module" => {
                     let value = args
                         .next()
                         .filter(|v| !v.starts_with("--"))
@@ -41,6 +48,7 @@ impl Cli {
                         "--profile" => cli.profile = Some(value),
                         "--profile-root" => cli.root = Some(value.into()),
                         "--inspect-electron-copy" => cli.snapshot = Some(value.into()),
+                        "--trust-module" => cli.trust_module = Some(value.into()),
                         _ => cli.account = Some(value),
                     }
                 }
@@ -49,6 +57,19 @@ impl Cli {
         }
         if cli.headless && !cli.demo {
             bail!("--headless requires --demo");
+        }
+        if cli.live && (cli.demo || cli.headless || cli.doctor || cli.snapshot.is_some()) {
+            bail!("Choose --live, --demo, --doctor, or inspection as separate operations");
+        }
+        if cli.trust_module.is_some() && !cli.live {
+            bail!("--trust-module requires --live");
+        }
+        if cli
+            .trust_module
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            bail!("--trust-module must be an absolute path");
         }
         if cli.snapshot.is_some() != cli.account.is_some() {
             bail!("Inspection requires --inspect-electron-copy SNAPSHOT --source-account ID");
@@ -68,9 +89,13 @@ impl Cli {
         Ok(cli)
     }
     fn profile_name(&self) -> &str {
-        self.profile
-            .as_deref()
-            .unwrap_or(if self.demo { "rust-demo" } else { "rust-pilot" })
+        self.profile.as_deref().unwrap_or(if self.demo {
+            "rust-demo"
+        } else if self.live {
+            "rust-live"
+        } else {
+            "rust-pilot"
+        })
     }
 }
 
@@ -78,7 +103,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse(std::env::args().skip(1))?;
     if cli.help {
         println!("Zalo Linux Rust preview\n");
-        println!("Usage: zalo-rust [--gui] [--profile NAME] [--profile-root DIR]\n       zalo-rust --demo [--headless] [--profile NAME] [--profile-root DIR]\n       zalo-rust --doctor\n       zalo-rust --inspect-electron-copy SNAPSHOT --source-account ID\n\n--demo       Offline GUI with synthetic messages and local-only storage\n--headless   Exercise demo worker/storage without opening a window\n--doctor     Print offline environment/capability JSON without creating profiles\n--help, -h   Show help\n--version    Print version\n\nLive Zalo login and sending are not available. Calls, updates, and history import are unavailable.\nDefault profiles: rust-demo for demo, rust-pilot otherwise. Electron data is never opened automatically.");
+        println!("Usage: zalo-rust [--gui] [--profile NAME] [--profile-root DIR]\n       zalo-rust --live [--trust-module ABSOLUTE_PATH] [--profile NAME]\n       zalo-rust --demo [--headless] [--profile NAME] [--profile-root DIR]\n       zalo-rust --doctor\n       zalo-rust --inspect-electron-copy SNAPSHOT --source-account ID\n\n--live       Enable live login and messaging compiled with Cargo feature 'live'\n             Network access starts only after an explicit login/restore action\n--trust-module  Optional advanced override of the bundled, hash-verified trust module\n--demo       Offline GUI with synthetic messages and local-only storage\n--headless   Exercise demo worker/storage without opening a window\n--doctor     Print offline environment/capability JSON without creating profiles\n--help, -h   Show help\n--version    Print version\n\nCalls, updates, and history import are unavailable.\nDefault profiles: rust-live for live, rust-demo for demo, rust-pilot otherwise. Electron data is never opened automatically.");
         return Ok(());
     }
     if cli.version {
@@ -104,6 +129,10 @@ fn main() -> Result<()> {
             x11: bool,
             live_auth_available: bool,
             live_send_available: bool,
+            live_auth_compiled: bool,
+            live_messaging_compiled: bool,
+            authenticated: bool,
+            network_started: bool,
             history_import_available: bool,
             selected_profile: &'a str,
             command_queue_capacity: usize,
@@ -121,6 +150,10 @@ fn main() -> Result<()> {
                 x11,
                 live_auth_available: false,
                 live_send_available: false,
+                live_auth_compiled: cfg!(feature = "live-login"),
+                live_messaging_compiled: cfg!(feature = "messaging"),
+                authenticated: false,
+                network_started: false,
                 history_import_available: false,
                 selected_profile: cli.profile_name(),
                 command_queue_capacity: zalo_rust::app::COMMAND_CAPACITY,
@@ -129,6 +162,9 @@ fn main() -> Result<()> {
             })?
         );
         return Ok(());
+    }
+    if cli.live && !cfg!(feature = "live-login") {
+        bail!("This binary does not include live login. Build with cargo build --locked --release --features live, or use ./scripts/rust/run.sh --live");
     }
     let profile = if let Some(root) = &cli.root {
         Profile::at_root(root, cli.profile_name())?
@@ -154,6 +190,14 @@ fn main() -> Result<()> {
         "Zalo Linux — Rust Preview",
         options,
         Box::new(move |cc| {
+            #[cfg(feature = "live-login")]
+            if cli.live {
+                return Ok(Box::new(zalo_rust::ui::NativeApp::new_live(
+                    cc,
+                    profile,
+                    cli.trust_module,
+                )?));
+            }
             Ok(Box::new(zalo_rust::ui::NativeApp::new(
                 cc, profile, cli.demo,
             )?))
@@ -213,6 +257,10 @@ mod tests {
             &["--profile"][..],
             &["--headless"],
             &["--doctor", "--demo"],
+            &["--live", "--demo"],
+            &["--live", "--doctor"],
+            &["--trust-module", "/tmp/trust.wasm"],
+            &["--live", "--trust-module", "relative.wasm"],
             &["--profile-root", "relative"],
             &["--profile", "../bad"],
             &["--inspect-electron-copy", "copy.db"],
@@ -225,5 +273,6 @@ mod tests {
     fn demo_has_a_distinct_default_profile() {
         assert_eq!(parse(&["--demo"]).unwrap().profile_name(), "rust-demo");
         assert_eq!(parse(&[]).unwrap().profile_name(), "rust-pilot");
+        assert_eq!(parse(&["--live"]).unwrap().profile_name(), "rust-live");
     }
 }

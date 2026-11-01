@@ -86,7 +86,7 @@ impl MessageStore {
     fn initialize(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 1 {
+        if version > 2 {
             bail!("Database was created by a newer client");
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
@@ -102,7 +102,16 @@ impl MessageStore {
                 FOREIGN KEY (account_id, thread_id) REFERENCES conversations(account_id, thread_id));
             CREATE INDEX IF NOT EXISTS message_page ON messages(account_id, thread_id, sent_at_ms DESC, message_id DESC);
             CREATE INDEX IF NOT EXISTS conversation_recent ON conversations(account_id, last_message_at_ms DESC, thread_id);
-            PRAGMA user_version=1; COMMIT;")?;
+            CREATE TABLE IF NOT EXISTS outgoing (
+                account_id TEXT NOT NULL, thread_id TEXT NOT NULL, client_id TEXT NOT NULL,
+                body TEXT NOT NULL, created_at_ms INTEGER NOT NULL, state TEXT NOT NULL,
+                server_id TEXT, PRIMARY KEY(account_id,client_id));
+            CREATE INDEX IF NOT EXISTS outgoing_thread ON outgoing(account_id,thread_id,state);
+            CREATE INDEX IF NOT EXISTS outgoing_server ON outgoing(account_id,thread_id,server_id);
+            CREATE TABLE IF NOT EXISTS outgoing_counters(account_id TEXT PRIMARY KEY,last_id INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS receive_cursors(account_id TEXT NOT NULL,queue TEXT NOT NULL,last_id TEXT NOT NULL,
+                PRIMARY KEY(account_id,queue));
+            PRAGMA user_version=2; COMMIT;")?;
         Ok(Self { conn })
     }
 
@@ -138,6 +147,229 @@ impl MessageStore {
         Ok(snapshot)
     }
 
+    /// Persist the idempotency key before dispatch. Unknown delivery is never blindly replayed.
+    pub fn prepare_outgoing(
+        &mut self,
+        account: &str,
+        thread: &str,
+        text: &str,
+        now_ms: i64,
+    ) -> Result<u64> {
+        validate_id(account)?;
+        validate_id(thread)?;
+        if text.trim().is_empty() || text.len() > crate::domain::MAX_TEXT_BYTES || now_ms < 1 {
+            bail!("Invalid outgoing message");
+        }
+        let tx = self.conn.transaction()?;
+        let unresolved: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM outgoing WHERE account_id=?1 AND state IN ('sending','unknown','acknowledged')",
+            [account],
+            |r| r.get(0),
+        )?;
+        if unresolved >= 100 {
+            bail!("Too many unresolved sends");
+        }
+        let duplicate:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outgoing WHERE account_id=?1 AND thread_id=?2 AND body=?3 AND state IN ('sending','unknown','acknowledged'))",params![account,thread,text],|r|r.get(0))?;
+        if duplicate {
+            bail!("This draft has an unresolved send. Wait for its server echo before sending it again.");
+        }
+        let previous: Option<i64> = tx
+            .query_row(
+                "SELECT last_id FROM outgoing_counters WHERE account_id=?1",
+                [account],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let next = now_ms.max(
+            previous
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Client ID exhausted"))?,
+        );
+        if next > 9_007_199_254_740_991 {
+            bail!("Client ID exhausted");
+        }
+        tx.execute("INSERT INTO outgoing_counters(account_id,last_id) VALUES(?1,?2) ON CONFLICT(account_id) DO UPDATE SET last_id=excluded.last_id",params![account,next])?;
+        tx.execute("INSERT INTO outgoing(account_id,thread_id,client_id,body,created_at_ms,state) VALUES(?1,?2,?3,?4,?5,'sending')",params![account,thread,next.to_string(),text,now_ms])?;
+        tx.commit()?;
+        Ok(next as u64)
+    }
+    pub fn recover_outgoing(&self, account: &str) -> Result<()> {
+        validate_id(account)?;
+        self.conn.execute(
+            "UPDATE outgoing SET state='unknown' WHERE account_id=?1 AND state='sending'",
+            [account],
+        )?;
+        Ok(())
+    }
+    pub fn fail_outgoing(&self, account: &str, client_id: u64, unknown: bool) -> Result<()> {
+        validate_id(account)?;
+        self.conn.execute(
+            "UPDATE outgoing SET state=?3 WHERE account_id=?1 AND client_id=?2 AND state='sending'",
+            params![
+                account,
+                client_id.to_string(),
+                if unknown { "unknown" } else { "rejected" }
+            ],
+        )?;
+        Ok(())
+    }
+    /// Record the server ID independently: local message insertion can fail without losing the ACK.
+    pub fn record_outgoing_ack(
+        &self,
+        account: &str,
+        client_id: u64,
+        server_id: &str,
+    ) -> Result<()> {
+        validate_id(account)?;
+        validate_id(server_id)?;
+        let changed=self.conn.execute("UPDATE outgoing SET state='acknowledged',server_id=?3 WHERE account_id=?1 AND client_id=?2 AND (server_id IS NULL OR server_id=?3)",params![account,client_id.to_string(),server_id])?;
+        if changed != 1 {
+            bail!("Conflicting or missing outgoing acknowledgement");
+        }
+        Ok(())
+    }
+    pub fn reconcile_outgoing(&mut self, account: &str) -> Result<()> {
+        validate_id(account)?;
+        let rows: Vec<(String, String)> = {
+            let mut statement=self.conn.prepare("SELECT client_id,server_id FROM outgoing WHERE account_id=?1 AND state='acknowledged' LIMIT 100")?;
+            let rows = statement.query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (client, server) in rows {
+            self.accept_outgoing(account, client.parse()?, &server, None)?;
+        }
+        Ok(())
+    }
+    pub fn accept_outgoing(
+        &mut self,
+        account: &str,
+        client_id: u64,
+        server_id: &str,
+        timestamp: Option<i64>,
+    ) -> Result<(Message, Conversation)> {
+        validate_id(account)?;
+        validate_id(server_id)?;
+        let tx = self.conn.transaction()?;
+        let(thread,text,created,previous_id):(String,String,i64,Option<String>)=tx.query_row("SELECT thread_id,body,created_at_ms,server_id FROM outgoing WHERE account_id=?1 AND client_id=?2 AND state IN ('sending','unknown','acknowledged','accepted')",params![account,client_id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        if previous_id.as_deref().is_some_and(|id| id != server_id) {
+            bail!("Conflicting server acknowledgement");
+        }
+        let existing_ts:Option<i64>=tx.query_row("SELECT sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",params![account,thread,server_id],|r|r.get(0)).optional()?;
+        let message = Message {
+            account_id: account.into(),
+            thread_id: thread.clone(),
+            id: server_id.into(),
+            sender: account.into(),
+            text,
+            sent_at_ms: existing_ts.or(timestamp).unwrap_or(created),
+        };
+        message.validate()?;
+        insert_validated(&tx, std::slice::from_ref(&message))?;
+        tx.execute("UPDATE outgoing SET state='accepted',server_id=?3 WHERE account_id=?1 AND client_id=?2",params![account,client_id.to_string(),server_id])?;
+        let conversation = tx.query_row(
+            CONVERSATION_SQL,
+            params![account, thread, MAX_PREVIEW_CHARS as i64],
+            conversation_row,
+        )?;
+        tx.commit()?;
+        Ok((message, conversation))
+    }
+    /// Incoming rows and replay cursor commit together. A failure cannot skip server data.
+    pub fn receive_batch(
+        &mut self,
+        account: &str,
+        messages: &[(Message, Option<String>)],
+        cursor: Option<(&str, &str)>,
+    ) -> Result<Vec<(Message, Conversation)>> {
+        validate_id(account)?;
+        if messages.len() > MAX_PAGE_SIZE {
+            bail!("Receive batch exceeds limit");
+        }
+        for (m, _) in messages {
+            m.validate()?;
+            if m.account_id != account {
+                bail!("Incoming account mismatch");
+            }
+        }
+        if let Some((queue, id)) = cursor {
+            validate_id(queue)?;
+            validate_id(id)?;
+            let number = id.parse::<u64>()?;
+            if number == 0 || number > 9_007_199_254_740_991 {
+                bail!("Invalid receive cursor");
+            }
+        }
+        let tx = self.conn.transaction()?;
+        let mut result = Vec::with_capacity(messages.len());
+        for (m, client_id) in messages {
+            let mut adjusted = 0;
+            if m.sender == account {
+                if let Some(client_id) = client_id {
+                    let original:Option<(String,String,Option<String>)>=tx.query_row("SELECT thread_id,body,server_id FROM outgoing WHERE account_id=?1 AND client_id=?2",params![account,client_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                    if let Some((thread, body, previous_id)) = original {
+                        if previous_id.as_deref().is_some_and(|id| id != m.id) {
+                            bail!("Conflicting server echo");
+                        }
+                        if thread != m.thread_id || body != m.text {
+                            bail!("Echo does not match outgoing message");
+                        }
+                        tx.execute("UPDATE outgoing SET state='accepted',server_id=?3 WHERE account_id=?1 AND client_id=?2",params![account,client_id,m.id])?;
+                        adjusted=tx.execute("UPDATE messages SET sent_at_ms=?4 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND sender=?1 AND body=?5 AND sent_at_ms<>?4",params![account,m.thread_id,m.id,m.sent_at_ms,m.text])?;
+                    }
+                }
+            }
+            let inserted = insert_validated(&tx, std::slice::from_ref(m))?;
+            if adjusted > 0 {
+                tx.execute("UPDATE conversations SET last_message_at_ms=(SELECT MAX(sent_at_ms) FROM messages WHERE account_id=?1 AND thread_id=?2) WHERE account_id=?1 AND thread_id=?2",params![account,m.thread_id])?;
+            }
+            if inserted > 0 || adjusted > 0 {
+                let c = tx.query_row(
+                    CONVERSATION_SQL,
+                    params![account, m.thread_id, MAX_PREVIEW_CHARS as i64],
+                    conversation_row,
+                )?;
+                result.push((m.clone(), c));
+            }
+        }
+        if let Some((queue, id)) = cursor {
+            tx.execute("INSERT INTO receive_cursors(account_id,queue,last_id) VALUES(?1,?2,?3) ON CONFLICT(account_id,queue) DO UPDATE SET last_id=CASE WHEN length(excluded.last_id)>length(last_id) OR (length(excluded.last_id)=length(last_id) AND excluded.last_id>last_id) THEN excluded.last_id ELSE last_id END",params![account,queue,id])?;
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+    pub fn receive_cursor(&self, account: &str, queue: &str) -> Result<String> {
+        validate_id(account)?;
+        validate_id(queue)?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT last_id FROM receive_cursors WHERE account_id=?1 AND queue=?2",
+                params![account, queue],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| "1".into()))
+    }
+
+    pub fn open_conversation(
+        &self,
+        account: &str,
+        thread: &str,
+        title: &str,
+    ) -> Result<Conversation> {
+        validate_id(account)?;
+        validate_id(thread)?;
+        if title.is_empty() || title.len() > 256 {
+            bail!("Invalid conversation title");
+        }
+        self.conn.execute("INSERT INTO conversations(account_id,thread_id,title,last_message_at_ms) VALUES(?1,?2,?3,0) ON CONFLICT(account_id,thread_id) DO NOTHING",params![account,thread,title])?;
+        Ok(self.conn.query_row(
+            CONVERSATION_SQL,
+            params![account, thread, MAX_PREVIEW_CHARS as i64],
+            conversation_row,
+        )?)
+    }
     pub fn set_title(&self, account: &str, thread: &str, title: &str) -> Result<()> {
         validate_id(account)?;
         validate_id(thread)?;
@@ -423,5 +655,131 @@ mod tests {
         s.delete("a", "t", "new").unwrap();
         assert_eq!(s.conversations("a", 10).unwrap()[0].last_message_at_ms, 1);
         assert!(s.page("a", "t", None, MAX_PAGE_SIZE + 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod live_storage_tests {
+    use super::*;
+    fn outgoing(s: &mut MessageStore) -> u64 {
+        s.prepare_outgoing("11", "d:22", "hello", 1700000000000)
+            .unwrap()
+    }
+    fn echo(id: &str, ts: i64) -> Message {
+        Message {
+            account_id: "11".into(),
+            thread_id: "d:22".into(),
+            id: id.into(),
+            sender: "11".into(),
+            text: "hello".into(),
+            sent_at_ms: ts,
+        }
+    }
+    #[test]
+    fn client_ids_are_persisted_monotonic_scoped_safe_integers_and_unknown_is_never_replayed() {
+        let mut s = MessageStore::in_memory().unwrap();
+        let first = outgoing(&mut s);
+        assert_eq!(first, 1700000000000);
+        s.fail_outgoing("11", first, true).unwrap();
+        assert!(s
+            .prepare_outgoing("11", "d:22", "hello", 1700000000000)
+            .is_err());
+        let second = s.prepare_outgoing("11", "d:22", "different", 1).unwrap();
+        assert_eq!(second, first + 1);
+        assert_eq!(s.prepare_outgoing("33", "d:22", "hello", 1).unwrap(), 1);
+        s.recover_outgoing("11").unwrap();
+        assert!(s.prepare_outgoing("11", "d:22", "different", 1).is_err());
+        assert!(s
+            .prepare_outgoing("11", "d:22", "overflow", 9_007_199_254_740_992)
+            .is_err());
+    }
+    #[test]
+    fn echo_before_and_after_http_ack_never_duplicates_and_cannot_rebind_server_id() {
+        for echo_first in [true, false] {
+            let mut s = MessageStore::in_memory().unwrap();
+            let id = outgoing(&mut s);
+            if echo_first {
+                s.receive_batch("11", &[(echo("900", 20), Some(id.to_string()))], None)
+                    .unwrap();
+            }
+            let (m, _) = s.accept_outgoing("11", id, "900", Some(19)).unwrap();
+            assert_eq!(m.sent_at_ms, if echo_first { 20 } else { 19 });
+            s.receive_batch("11", &[(echo("900", 20), Some(id.to_string()))], None)
+                .unwrap();
+            assert_eq!(
+                s.page("11", "d:22", None, 10).unwrap(),
+                vec![echo("900", 20)]
+            );
+            assert!(s.accept_outgoing("11", id, "901", None).is_err());
+            assert!(s
+                .receive_batch("11", &[(echo("901", 21), Some(id.to_string()))], None)
+                .is_err());
+            assert_eq!(s.page("11", "d:22", None, 10).unwrap().len(), 1);
+        }
+    }
+    #[test]
+    fn ack_is_kept_when_message_insert_fails_and_reconciliation_never_sends_network() {
+        let mut s = MessageStore::in_memory().unwrap();
+        let id = outgoing(&mut s);
+        s.record_outgoing_ack("11", id, "900").unwrap();
+        s.conn.execute_batch("CREATE TRIGGER fail_live BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+        assert!(s.accept_outgoing("11", id, "900", None).is_err());
+        let row: (String, String) = s
+            .conn
+            .query_row(
+                "SELECT state,server_id FROM outgoing WHERE account_id='11'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("acknowledged".into(), "900".into()));
+        assert!(s.prepare_outgoing("11", "d:22", "hello", 1).is_err());
+        s.conn.execute_batch("DROP TRIGGER fail_live").unwrap();
+        s.reconcile_outgoing("11").unwrap();
+        assert_eq!(s.page("11", "d:22", None, 10).unwrap().len(), 1);
+    }
+    #[test]
+    fn receive_cursor_is_atomic_account_scoped_and_never_moves_back_on_duplicate_replay() {
+        let mut s = MessageStore::in_memory().unwrap();
+        let m = echo("900", 20);
+        assert_eq!(
+            s.receive_batch("11", &[(m.clone(), None)], Some(("510_0", "100")))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(s
+            .receive_batch(
+                "11",
+                &[(
+                    Message {
+                        text: "conflict".into(),
+                        ..m.clone()
+                    },
+                    None
+                )],
+                Some(("510_0", "200"))
+            )
+            .is_err());
+        assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "100");
+        assert!(s
+            .receive_batch("33", &[(m.clone(), None)], Some(("510_0", "200")))
+            .is_err());
+        assert_eq!(s.receive_cursor("33", "510_0").unwrap(), "1");
+        assert!(s
+            .receive_batch("11", &[(m, None)], Some(("510_0", "99")))
+            .unwrap()
+            .is_empty());
+        assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "100");
+    }
+    #[test]
+    fn reopening_target_preserves_title_latest_timestamp_and_preview() {
+        let mut s = MessageStore::in_memory().unwrap();
+        s.insert_batch(&[echo("900", 20)]).unwrap();
+        s.set_title("11", "d:22", "Known friend").unwrap();
+        let c = s.open_conversation("11", "d:22", "Zalo ID 22").unwrap();
+        assert_eq!(c.title, "Known friend");
+        assert_eq!(c.last_message_at_ms, 20);
+        assert_eq!(c.last_text, "hello");
     }
 }

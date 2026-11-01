@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository contains an Electron Linux port and an independently authored Rust native preview.
+This repository contains an Electron Linux port and independent Rust native preview.
 
 - `bootstrap.js`: Electron entry point and Linux startup/relaunch patches.
 - `main-dist/`: main-process and preload bundles; `pc-dist/`: renderer bundles, HTML, and assets.
@@ -21,7 +21,8 @@ This repository contains an Electron Linux port and an independently authored Ru
 - `python3 generate-jxl-addon.py`: rebuild the JPEG XL addon.
 
 - `./scripts/rust/build.sh --offline`: build the locked release preview after fetching dependencies.
-- `./scripts/rust/run.sh --demo`: launch synthetic offline conversations in a separate profile.
+- `./scripts/rust/run.sh --demo`: launch offline synthetic conversations.
+- `./scripts/rust/run.sh --live`: build and launch optional login/messaging.
 - `./scripts/rust/check.sh`: Rust formatting, tests, Clippy, and displayless CLI/tooling checks.
 - `python3 scripts/rust/smoke-release.py`: verify the built binary with disposable profiles.
 

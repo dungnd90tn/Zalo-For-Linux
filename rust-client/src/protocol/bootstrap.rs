@@ -3,7 +3,7 @@
 use super::qr::{
     encrypt_parameters, sign_parameters, RequestSpec, ResponseCipher, MAX_RESPONSE_BYTES,
 };
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
@@ -165,11 +165,11 @@ fn envelope(body: &[u8]) -> std::result::Result<Value, BootstrapError> {
 pub fn decode_server_info(
     status: u16,
     body: &[u8],
-) -> std::result::Result<ServerConfig, BootstrapError> {
+) -> std::result::Result<PreloginConfig, BootstrapError> {
     if status != 200 {
         return Err(BootstrapError::Http(status));
     }
-    ServerConfig::parse(&envelope(body)?)
+    PreloginConfig::parse(&envelope(body)?)
 }
 /// ParamCipher decrypts the full inner envelope, not just its `data` field.
 pub fn decode_login_reply(
@@ -188,8 +188,80 @@ pub fn decode_login_reply(
     LoginInfo::parse(&envelope(&plaintext)?)
 }
 
+/// Pre-login settings cannot authorize message/service endpoints or session cookies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QrMode {
+    PhoneApproved,
+    TrustedDevice,
+}
+#[derive(Debug)]
+pub struct PreloginConfig {
+    pub qr_mode: Option<QrMode>,
+    pub trusted_qr: bool,
+    pub server_time_seconds: Option<i64>,
+    pub parameter_encryption: Option<bool>,
+}
+impl PreloginConfig {
+    fn parse(value: &Value) -> std::result::Result<Self, BootstrapError> {
+        let object = value.as_object().ok_or(BootstrapError::Malformed)?;
+        // Only bounded scalar settings enter the auth parser. Unused service maps
+        // may contain routes/schemes that are not supported by the live messenger.
+        let mut selected = serde_json::Map::new();
+        if let Some(time) = object.get("server_time") {
+            selected.insert("server_time".into(), time.clone());
+        }
+        for spelling in ["setttings", "settings"] {
+            let mut auth = serde_json::json!({});
+            for path in [
+                "encryption/enable",
+                "trusted_device/self_g",
+                "trusted_device/qr_format_trust_device",
+            ] {
+                if let Some(flag) = value.pointer(&format!("/{spelling}/authen/{path}")) {
+                    if !matches!(flag, Value::Bool(_) | Value::Number(_) | Value::Null) {
+                        return Err(BootstrapError::Malformed);
+                    }
+                    let (section, key) = path.split_once('/').unwrap();
+                    if auth.get(section).is_none() {
+                        auth[section] = serde_json::json!({});
+                    }
+                    auth[section][key] = flag.clone();
+                }
+            }
+            selected.insert(spelling.into(), serde_json::json!({"authen":auth}));
+        }
+        let parsed = ServerConfig::parse(&Value::Object(selected))?;
+        for name in ["self_g", "qr_format_trust_device"] {
+            let before = value.pointer(&format!("/setttings/authen/trusted_device/{name}"));
+            let after = value.pointer(&format!("/settings/authen/trusted_device/{name}"));
+            if before.is_some() && after.is_some() && before != after {
+                return Err(BootstrapError::Malformed);
+            }
+        }
+        let flags = value
+            .pointer("/setttings/authen/trusted_device")
+            .or_else(|| value.pointer("/settings/authen/trusted_device"));
+        let qr_mode = match flags.map(|flags| {
+            (
+                flags.get("self_g").and_then(Value::as_i64),
+                flags.get("qr_format_trust_device").and_then(Value::as_i64),
+            )
+        }) {
+            Some((Some(0), Some(0))) => Some(QrMode::PhoneApproved),
+            Some((Some(1), Some(1))) => Some(QrMode::TrustedDevice),
+            _ => None,
+        };
+        Ok(Self {
+            qr_mode,
+            trusted_qr: parsed.trusted_qr,
+            server_time_seconds: parsed.server_time_seconds,
+            parameter_encryption: parsed.parameter_encryption,
+        })
+    }
+}
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    pub trusted_qr: bool,
     pub server_time_seconds: Option<i64>,
     pub parameter_encryption: Option<bool>,
     pub services: BTreeMap<String, Vec<Url>>,
@@ -216,7 +288,12 @@ impl ServerConfig {
         }
         let parameter_encryption = before
             .or(after)
-            .map(|v| v.as_bool().ok_or(BootstrapError::Malformed))
+            .map(|v| match v {
+                Value::Bool(flag) => Ok(*flag),
+                Value::Number(number) if number.as_u64() == Some(0) => Ok(false),
+                Value::Number(number) if number.as_u64() == Some(1) => Ok(true),
+                _ => Err(BootstrapError::Malformed),
+            })
             .transpose()?;
         let mut services = BTreeMap::new();
         if let Some(map) = object.get("zpw_service_map_v3") {
@@ -234,7 +311,15 @@ impl ServerConfig {
                 services.insert(name.clone(), endpoint_list(Some(urls), false)?);
             }
         }
+        let trusted = value
+            .pointer("/setttings/authen/trusted_device")
+            .or_else(|| value.pointer("/settings/authen/trusted_device"));
+        let trusted_qr = trusted.is_some_and(|v| {
+            v.get("self_g").and_then(Value::as_i64) == Some(1)
+                && v.get("qr_format_trust_device").and_then(Value::as_i64) == Some(1)
+        });
         Ok(Self {
+            trusted_qr,
             server_time_seconds,
             parameter_encryption,
             services,
@@ -288,16 +373,22 @@ fn trusted_host(host: &str) -> bool {
 /// Secret-bearing bootstrap result. `dkey` is legacy UIN/storage material, not a verified user ID.
 /// No Debug/Serialize implementation; persisting or activating this result is a separate trust gate.
 pub struct LoginInfo {
+    pub account_id: String,
     pub config: ServerConfig,
     storage_key: String,
     pub session_cipher: SessionCipher,
 }
 impl LoginInfo {
     pub fn parse(data: &Value) -> std::result::Result<Self, BootstrapError> {
+        let account_id = secret_field(data, "uid", 64)?;
+        if !account_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(BootstrapError::Malformed);
+        }
         let storage_key = secret_field(data, "dkey", 1024)?;
         let key = secret_field(data, "zpw_enk", 1024)?;
         let session_cipher = SessionCipher::from_base64(&key)?;
         Ok(Self {
+            account_id,
             config: ServerConfig::parse(data)?,
             storage_key,
             session_cipher,
@@ -309,9 +400,26 @@ impl LoginInfo {
 }
 
 pub struct SessionCipher {
-    key: Vec<u8>,
+    pub(super) key: Vec<u8>,
 }
 impl SessionCipher {
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<String> {
+        if plaintext.len() > MAX_RESPONSE_BYTES {
+            bail!("session payload exceeds limit");
+        }
+        let encrypted = match self.key.len() {
+            16 => cbc::Encryptor::<aes::Aes128>::new_from_slices(&self.key, &ZERO_IV)
+                .map_err(|_| anyhow::anyhow!("invalid session cipher"))?
+                .encrypt_padded_vec_mut::<Pkcs7>(plaintext),
+            24 => cbc::Encryptor::<aes::Aes192>::new_from_slices(&self.key, &ZERO_IV)
+                .map_err(|_| anyhow::anyhow!("invalid session cipher"))?
+                .encrypt_padded_vec_mut::<Pkcs7>(plaintext),
+            _ => cbc::Encryptor::<aes::Aes256>::new_from_slices(&self.key, &ZERO_IV)
+                .map_err(|_| anyhow::anyhow!("invalid session cipher"))?
+                .encrypt_padded_vec_mut::<Pkcs7>(plaintext),
+        };
+        Ok(STANDARD.encode(encrypted))
+    }
     pub fn from_base64(key: &str) -> std::result::Result<Self, BootstrapError> {
         if key.len() > 1024 {
             return Err(BootstrapError::Malformed);
@@ -360,10 +468,10 @@ fn secret_field(
 
 /// A staging plan, never an installed cookie jar or accepted session.
 pub struct PendingCookies {
-    account_id: String,
-    storage_key: String,
-    session_cookie: String,
-    refresh_token: Option<String>,
+    pub(super) account_id: String,
+    pub(super) storage_key: String,
+    pub(super) session_cookie: String,
+    pub(super) refresh_token: Option<String>,
 }
 impl PendingCookies {
     pub fn from_confirmation(data: &Value) -> std::result::Result<Self, BootstrapError> {
@@ -432,6 +540,60 @@ mod tests {
         }
     }
     #[test]
+    fn qr_mode_never_downgrades_missing_mixed_or_conflicting_flags() {
+        for flags in [
+            serde_json::json!({}),
+            serde_json::json!({"self_g":1,"qr_format_trust_device":0}),
+            serde_json::json!({"self_g":0,"qr_format_trust_device":1}),
+            serde_json::json!({"self_g":0,"qr_format_trust_device":2}),
+            serde_json::json!({"self_g":"0","qr_format_trust_device":0}),
+        ] {
+            let value = serde_json::json!({"setttings":{"authen":{"trusted_device":flags}}});
+            assert!(PreloginConfig::parse(&value)
+                .map(|v| v.qr_mode.is_none())
+                .unwrap_or(true));
+        }
+        let conflict = serde_json::json!({"setttings":{"authen":{"trusted_device":{"self_g":0,"qr_format_trust_device":0}}},"settings":{"authen":{"trusted_device":{"self_g":1,"qr_format_trust_device":1}}}});
+        assert!(PreloginConfig::parse(&conflict).is_err());
+        assert_eq!(PreloginConfig::parse(&serde_json::json!({"setttings":{"authen":{"trusted_device":{"self_g":0,"qr_format_trust_device":0}}}})).unwrap().qr_mode,Some(QrMode::PhoneApproved));
+    }
+    #[test]
+    fn prelogin_ignores_unused_routes_without_granting_them_to_a_session() {
+        let value = serde_json::json!({"server_time":1700000000,"setttings":{"authen":{"encryption":{"enable":1},"trusted_device":{"self_g":1,"qr_format_trust_device":1}}},"zpw_service_map_v3":{"unused":["http://unused.invalid/path"]},"zpw_ws":["wss://ws1.zalo.me/socket"]});
+        let parsed = decode_server_info(
+            200,
+            &serde_json::to_vec(&serde_json::json!({"error_code":0,"data":value})).unwrap(),
+        )
+        .unwrap();
+        assert!(parsed.trusted_qr);
+        assert_eq!(parsed.parameter_encryption, Some(true));
+        assert!(ServerConfig::parse(&value).is_err());
+    }
+    #[test]
+    fn public_prelogin_integer_encryption_flag_is_strictly_supported() {
+        for (flag, expected) in [
+            (serde_json::json!(1), true),
+            (serde_json::json!(0), false),
+            (serde_json::json!(true), true),
+        ] {
+            let value = serde_json::json!({"setttings":{"authen":{"encryption":{"enable":flag},"trusted_device":{"self_g":1,"qr_format_trust_device":1}}}});
+            let parsed = ServerConfig::parse(&value).unwrap();
+            assert_eq!(parsed.parameter_encryption, Some(expected));
+            assert!(parsed.trusted_qr);
+        }
+        for flag in [
+            serde_json::json!(2),
+            serde_json::json!(-1),
+            serde_json::json!("1"),
+            serde_json::json!(null),
+        ] {
+            assert!(ServerConfig::parse(
+                &serde_json::json!({"setttings":{"authen":{"encryption":{"enable":flag}}}})
+            )
+            .is_err());
+        }
+    }
+    #[test]
     fn server_request_matches_independent_node_signature_and_local_field_contract() {
         let request = server_info_request(&ServerInfoInput {
             imei: "fixture-imei",
@@ -476,10 +638,11 @@ mod tests {
         let (_, cipher) = login_info_request(&login_input()).unwrap();
         // Independently generated with Node crypto AES256CBC, fixed QR parameter key,
         // and synthetic session fields. This is not a capture of a successful account.
-        let encrypted="nWqS/+3ptzV3WbEutt6y3ajhUU1tfIXV5EH8HSxtxEG3R3Koa5MIWKMpMVNliv0vVcMK8tq3rN0/SgrjmasIs5UTWu91O8NAITE5zUzlbCUyic01fpxPmBFpYsJVofTKUar4BrMpy505XxJoQSxJNK9LrJnm2F3BqLQ18KkconglrsKJHhdVJQEwNswdBBNlbdTRZEuL/VAG+neEgxfL00wE8xCYBvlWWOVJpBZz6sYeZLYvxX7as8EGOtBnLAsRl5IzRAy6y5q+G8jg2c8QS0nqH7hGPXEv1IrA95eTBxDAzIK7sHGfpvcVA7fGea4EcblIjHhML/pCBK/zFtev1phCxtaTDkKXpXcTFrHD9z1hIo7jLVKUnflOayoLtk10Xe7NXb9M97fi5R65xFMmgDDMfKABS968aG3AcF1QAet7zAgAiQJeeFwCXW3G7xuq";
+        let encrypted="nWqS/+3ptzV3WbEutt6y3ajhUU1tfIXV5EH8HSxtxEG3R3Koa5MIWKMpMVNliv0vVcMK8tq3rN0/SgrjmasIs5UTWu91O8NAITE5zUzlbCUyic01fpxPmBFpYsJVofTKUar4BrMpy505XxJoQSxJNK9LrJnm2F3BqLQ18KkconglrsKJHhdVJQEwNswdBBNlbdTRZEuL/VAG+neEgxfL00wE8xCYBvlWWOVJpBZz6sYeZLYvxX7as8EGOtBnLAsRl5IzRAy6y5q+G8jg2c8QS0nqH7hGPXEv1IrA95eTBxDAzIK7sHGfpvcVA7fGea4EcblIjHhML/pCBK/zFtev1phCxtaTDkKXpXcTFrHD9z1hIo7jLVKUnflOayoLtk10Xe7NXb9M97fi5R65xFMmgF7bZ5/fNu8v1b2gFM5iezOyu37k7wm8FgCaL/e/RR+s";
         let outer = serde_json::to_vec(&json!({"error_code":0,"data":encrypted})).unwrap();
         let parsed = decode_login_reply(200, &outer, &cipher).unwrap();
         assert!(parsed.has_storage_key());
+        assert_eq!(parsed.account_id, "11");
         assert_eq!(
             parsed.config.services["profile"][0].host_str(),
             Some("profile-wpa.zaloapp.com")

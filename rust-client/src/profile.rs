@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,6 +32,10 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Check all durable owner authorities without creating or changing them.
+    pub fn check_account(&self, account: &str) -> Result<()> {
+        check_account_at(&self.paths.data_dir, account)
+    }
     /// Permanently associate this profile with its first authenticated account.
     pub fn bind_account(&self, account: &str) -> Result<()> {
         bind_account_at(&self.paths.data_dir, account)
@@ -110,7 +114,42 @@ pub fn bind_account(account: &str) -> Result<()> {
     bind_account_at(&std::env::current_dir()?, account)
 }
 
+fn check_account_at(data_dir: &Path, account: &str) -> Result<()> {
+    if account.is_empty() || account.len() > 64 || !account.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("invalid account ID");
+    }
+    for (name, field, limit) in [
+        (".account-owner.json", "account_id", 4096_u64),
+        ("auth-state.json", "owner_uid", 3 * 1024 * 1024),
+    ] {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let file = match options.open(data_dir.join(name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        check_private_file(&file)?;
+        let mut bytes = Vec::new();
+        file.take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            bail!("account record exceeds limit");
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).context("invalid account ownership record")?;
+        if value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || value.get(field).and_then(serde_json::Value::as_str) != Some(account)
+        {
+            bail!("this profile belongs to another account; choose a different --profile NAME");
+        }
+    }
+    Ok(())
+}
+
 fn bind_account_at(data_dir: &Path, account: &str) -> Result<()> {
+    check_account_at(data_dir, account)?;
     if account.is_empty() || account.len() > 64 || !account.bytes().all(|b| b.is_ascii_digit()) {
         bail!("authenticated account ID must contain 1–64 digits");
     }
@@ -282,6 +321,58 @@ pub fn atomic_write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Fully written/fsynced private replacement, not visible at its final path yet.
+/// Commit only after the caller's generation/authorization linearization point.
+pub struct PreparedSecret {
+    temporary: PathBuf,
+    target: PathBuf,
+    parent: PathBuf,
+}
+impl PreparedSecret {
+    pub fn commit(self) -> Result<()> {
+        fs::rename(&self.temporary, &self.target)?;
+        File::open(&self.parent)?.sync_all()?;
+        Ok(())
+    }
+}
+impl Drop for PreparedSecret {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
+    }
+}
+pub fn prepare_secret(path: &Path, bytes: &[u8]) -> Result<PreparedSecret> {
+    let parent = path.parent().context("missing private parent")?;
+    reject_symlink_components(parent)?;
+    check_private_dir(parent)?;
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            bail!("secret target must be regular");
+        }
+        #[cfg(unix)]
+        if meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1 {
+            bail!("secret target ownership invalid");
+        }
+    }
+    let temporary = parent.join(format!(
+        ".prepared-{}-{}.tmp",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&temporary)?;
+    let prepared = PreparedSecret {
+        temporary,
+        target: path.to_owned(),
+        parent: parent.to_owned(),
+    };
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(prepared)
 }
 
 #[cfg(test)]

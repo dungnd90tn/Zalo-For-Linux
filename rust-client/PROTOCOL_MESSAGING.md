@@ -1,0 +1,30 @@
+# Native messaging wire evidence
+
+Implementation is independently authored from the current local PC JavaScript bundles. No external Rust client source is included. The network feature is opt-in (`--features live`, `--live`); offline demo never constructs a live session.
+
+## Local evidence
+
+All line references below refer to `pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js` in this checkout.
+
+- `399824–399841`: legacy text POST `/api/message/sms` (command 11151), `/api/group/sendmsg` (11163). Session AES-CBC encrypted `params` form field; plaintext JSON contains `message`, numeric `clientId`, `imei`, and either `toid` or `grid` plus server-derived `visibility` (ordinary-group default 0; getter evidence `156861–156865`). Common query `zpw_ver` / `zpw_type`: `398136–398140`, construction `398186–398196`. This format has no extra request signature.
+- `440600–440625`: HTTP success requires both outer `error_code: 0` and a successfully session-decrypted inner `error_code: 0`. An HTTP 200 alone is insufficient. Native send acceptance requires an actual `data.msgId`; acceptance does not claim delivery/read by the recipient.
+- `37661–37667`, `37971–37994`: socket binary header is version byte, little-endian u16 command, subcommand byte, followed by UTF-8 JSON.
+- `37712–37745`, `37824–37870`: outer encryption 1 is base64 + zlib; 2 is URL-decoded base64 AES-GCM + zlib; 3 is AES-GCM without zlib. GCM uses 16-byte IV, 16-byte additional authenticated data, remaining ciphertext plus 16-byte tag. The socket AUTH response supplies its own key, distinct from the HTTP session key. The inner success envelope establishes the socket session; key presence alone does not.
+- `248922–248940`: AUTH 1, heartbeat 2, personal push 501, group push 521, missing-message 534, message retrieval 570. `404409–404425` defines `msgs` / `groupMsgs` / `pageMsgs`, sender and recipient routing. Native threads use `d:<uid>` and `g:<grid>` to avoid kind collisions.
+- `116859–116931`: server-advertised offline queues, `first`, `reqId`, `lastId`, `preIds`, `more`. `48716–48740`: per-queue `queueStatus.lastId`. For `more` pages, `116903–116918` explicitly passes `data.lastActionId` into the next request. Native continuation honors that value even when `queueStatus` is absent, persists a fallback cursor only after message commit, rejects nonadvancing cursors, and caps one offline queue at 10,000 pages. A failed message commit cannot advance a cursor or request the next page.
+
+## Encryption capability boundary
+
+Personal plaintext eligibility is derived from request-correlated command 563, using the exact paginated `reqIid`, `first`, `lastId` request (`404176–404220`). Every page must include explicit `hasMore`, `err: 0`, and all four arrays `threads`, `waitUids`, `uids`, `pendingUids`. Any occurrence of the target forbids a legacy send. Missing arrays, unknown schema, incomplete pagination, repeated cursor, 15-second overall deadline, or intervening encryption-state event grants no permission. `164623–164679` confirms server threads and waiting identities define enabled sessions. No session deletion, downgrade or bundle replacement is requested.
+
+Group eligibility uses session-encrypted GET `/api/group/getgi/v2` (`398677–398692`), matching target `groupId` and explicit false/zero `e2ee`. Group state checks at `161956–161960` show that the server flag controls encryption. Signal messages and queues are not consumed or acknowledged; supported text in a mixed legacy batch is retained and unsupported media/encryption receives an explicit placeholder without displaying ciphertext.
+
+## Runtime and validation
+
+A private SQLite actor and a separate Tokio network thread communicate through bounded queues. Socket frames are capped at 1 MiB, decompression at 4 MiB, database batches at 200; HTTP bodies at 1 MiB. Redirects are disabled, TLS remains verified, credentials are sent only to verified session origins, and transport errors are replaced with secret-free messages. Cancellation interrupts nested network requests and saturated UI event publication; render-thread drop does not join disk/network I/O.
+
+HTTP operations execute serially in the network worker, each with a 15-second deadline. Socket processing can pause during these requests; this limits throughput during a slow send. Durable receive cursors allow replay after a disconnect. This stage does not claim uninterrupted high-traffic receipt during stalled HTTP. Heartbeats use a matching event ID, a 30-second interval, and a 5-second pong deadline when the worker is processing sockets; reconnect delay caps at 30 seconds plus bounded jitter and resets only after 30 seconds of authenticated uptime.
+
+Outbox client IDs are durable, monotonically increasing, account-scoped JavaScript-safe integers. A send is never retried automatically. Unknown delivery blocks sending the identical draft again. A verified ACK is recorded separately before message persistence; failed local insertion is retried locally and reconciled on restart. Server echo before/after ACK converges to one server message ID. Cursor and message replay remain account/thread scoped.
+
+Tests include independently generated Node AES-GCM/zlib known answers; scoped SQLite/outbox/ACK-failure regressions; and actual local TLS/RFC6455 servers exercising cookie/SNI validation, complete capability resolution, personal/group encrypted HTTP requests and ACK persistence, redirects, oversized responses, stalled requests, and event backpressure cancellation. Three tests drive the actual `run_inner` command loop through local TLS/WebSocket injection, checking personal/group offline batches, cursor/deduplication, SQLite-before-Received publication, real Send commands through encrypted HTTP ACK to Sent, stalled-send cancellation, and saturated Received-event cancellation. These synthetic fixtures do not prove compatibility with a live account. Live login and production send/receive remain unverified until an authorized manual account check; Signal/E2EE messaging and media are not implemented.

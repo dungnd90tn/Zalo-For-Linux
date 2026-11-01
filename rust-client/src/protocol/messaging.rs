@@ -1,0 +1,759 @@
+//! Independently derived legacy text and socket wire formats from the local PC bundles.
+//! Signal/E2EE commands are never downgraded to these legacy endpoints.
+use crate::domain::{Message, MAX_TEXT_BYTES};
+use aes::cipher::consts::U16;
+use aes_gcm::{
+    aead::{Aead, Payload},
+    AesGcm, KeyInit,
+};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use flate2::read::ZlibDecoder;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::io::Read;
+use url::Url;
+
+pub const MAX_FRAME: usize = 1024 * 1024;
+pub const MAX_INFLATED: usize = 4 * 1024 * 1024;
+pub const MAX_BATCH: usize = 200;
+pub const API_VERSION: &str = "681";
+pub const API_TYPE: &str = "30";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThreadKind {
+    Direct,
+    Group,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub kind: ThreadKind,
+    pub remote_id: String,
+}
+impl Target {
+    pub fn new(kind: ThreadKind, remote_id: &str) -> Result<Self, WireError> {
+        numeric_id(remote_id)?;
+        Ok(Self {
+            kind,
+            remote_id: remote_id.into(),
+        })
+    }
+    pub fn thread_id(&self) -> String {
+        format!(
+            "{}:{}",
+            if self.kind == ThreadKind::Direct {
+                "d"
+            } else {
+                "g"
+            },
+            self.remote_id
+        )
+    }
+    pub fn from_thread(thread: &str) -> Result<Self, WireError> {
+        let (kind, id) = thread.split_once(':').ok_or(WireError::Invalid)?;
+        Self::new(
+            match kind {
+                "d" => ThreadKind::Direct,
+                "g" => ThreadKind::Group,
+                _ => return Err(WireError::Invalid),
+            },
+            id,
+        )
+    }
+}
+pub fn numeric_id(id: &str) -> Result<(), WireError> {
+    if id.is_empty()
+        || id.len() > 24
+        || !id.bytes().all(|b| b.is_ascii_digit())
+        || id.starts_with('0')
+    {
+        return Err(WireError::Invalid);
+    }
+    Ok(())
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireError {
+    Invalid,
+    Oversize,
+    Crypto,
+    Unsupported,
+    Service(i64),
+    Authentication,
+}
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Invalid => "Invalid messaging response",
+            Self::Oversize => "Messaging response exceeds limit",
+            Self::Crypto => "Messaging integrity check failed",
+            Self::Unsupported => "This message encryption or type is not supported",
+            Self::Service(_) => "The server rejected this messaging request",
+            Self::Authentication => "The server rejected this session",
+        })
+    }
+}
+impl std::error::Error for WireError {}
+
+pub fn text_parameters(
+    target: &Target,
+    text: &str,
+    client_id: u64,
+    imei: &str,
+) -> Result<Value, WireError> {
+    numeric_id(&target.remote_id)?;
+    if text.trim().is_empty()
+        || text.len() > MAX_TEXT_BYTES
+        || imei.is_empty()
+        || imei.len() > 256
+        || client_id == 0
+        || client_id > 9_007_199_254_740_991
+    {
+        return Err(WireError::Invalid);
+    }
+    let mut v = json!({"message":text,"clientId":client_id,"imei":imei});
+    match target.kind {
+        ThreadKind::Direct => v["toid"] = json!(target.remote_id),
+        ThreadKind::Group => {
+            v["grid"] = json!(target.remote_id);
+            v["visibility"] = json!(0);
+        }
+    }
+    Ok(v)
+}
+pub fn send_url(root: &Url, kind: ThreadKind) -> Result<Url, WireError> {
+    validate_origin(root, "https")?;
+    let mut url = root.clone();
+    url.set_path(match kind {
+        ThreadKind::Direct => "/api/message/sms",
+        ThreadKind::Group => "/api/group/sendmsg",
+    });
+    url.query_pairs_mut()
+        .append_pair("zpw_ver", API_VERSION)
+        .append_pair("zpw_type", API_TYPE);
+    Ok(url)
+}
+pub fn socket_url(root: &Url, now_ms: i64) -> Result<Url, WireError> {
+    validate_origin(root, "wss")?;
+    let mut url = root.clone();
+    url.query_pairs_mut()
+        .append_pair("zpw_ver", API_VERSION)
+        .append_pair("zpw_type", API_TYPE)
+        .append_pair("t", &now_ms.to_string());
+    Ok(url)
+}
+pub fn validate_origin(url: &Url, scheme: &str) -> Result<(), WireError> {
+    let host = url.host_str().ok_or(WireError::Invalid)?;
+    if url.scheme() != scheme
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+        || url.path() != "/"
+        || !(host == "zalo.me"
+            || host.ends_with(".zalo.me")
+            || host == "zaloapp.com"
+            || host.ends_with(".zaloapp.com"))
+    {
+        return Err(WireError::Invalid);
+    }
+    Ok(())
+}
+pub fn encode_frame(cmd: u16, sub_cmd: u8, data: &Value) -> Result<Vec<u8>, WireError> {
+    let body = serde_json::to_vec(data).map_err(|_| WireError::Invalid)?;
+    if body.len() > MAX_FRAME - 4 {
+        return Err(WireError::Oversize);
+    }
+    let mut result = Vec::with_capacity(body.len() + 4);
+    result.extend_from_slice(&[1, cmd as u8, (cmd >> 8) as u8, sub_cmd]);
+    result.extend_from_slice(&body);
+    Ok(result)
+}
+#[derive(Debug)]
+pub struct DecodedFrame {
+    pub cmd: u16,
+    pub sub_cmd: u8,
+    pub payload: Value,
+}
+#[derive(Default)]
+pub struct FrameDecoder {
+    key: Vec<u8>,
+    authenticated: bool,
+}
+impl FrameDecoder {
+    pub fn authenticated(&self) -> bool {
+        self.authenticated
+    }
+    pub fn decode(&mut self, bytes: &[u8]) -> Result<DecodedFrame, WireError> {
+        if bytes.len() > MAX_FRAME {
+            return Err(WireError::Oversize);
+        }
+        if bytes.len() < 6 || bytes[0] != 1 {
+            return Err(WireError::Invalid);
+        }
+        let cmd = u16::from_le_bytes([bytes[1], bytes[2]]);
+        let sub_cmd = bytes[3];
+        let outer: Value = serde_json::from_slice(&bytes[4..]).map_err(|_| WireError::Invalid)?;
+        service_code(&outer)?;
+        if cmd == 2 {
+            return Ok(DecodedFrame {
+                cmd,
+                sub_cmd,
+                payload: outer,
+            });
+        }
+        if cmd == 563 {
+            if !self.authenticated {
+                return Err(WireError::Authentication);
+            }
+            return Ok(DecodedFrame {
+                cmd,
+                sub_cmd,
+                payload: outer,
+            });
+        }
+        if cmd == 1 {
+            self.authenticated = false;
+            let key = STANDARD
+                .decode(
+                    outer
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .ok_or(WireError::Invalid)?,
+                )
+                .map_err(|_| WireError::Crypto)?;
+            if ![16, 24, 32].contains(&key.len()) {
+                return Err(WireError::Crypto);
+            }
+            self.key = key;
+        } else if !self.authenticated {
+            return Err(WireError::Authentication);
+        }
+        let encryption = outer
+            .get("encrypt")
+            .and_then(Value::as_u64)
+            .ok_or(WireError::Invalid)?;
+        let raw = outer.get("data").ok_or(WireError::Invalid)?;
+        if cmd == 1 && encryption == 0 {
+            return Err(WireError::Invalid);
+        }
+        let payload = match encryption {
+            0 => match raw {
+                Value::String(s) => parse_inner(s.as_bytes())?,
+                Value::Object(_) => raw.clone(),
+                _ => return Err(WireError::Invalid),
+            },
+            1..=3 => {
+                let s = raw.as_str().ok_or(WireError::Invalid)?;
+                let decoded = if encryption == 1 {
+                    STANDARD.decode(s).map_err(|_| WireError::Crypto)?
+                } else {
+                    self.decrypt_gcm(s)?
+                };
+                if encryption == 3 {
+                    parse_inner(&decoded)?
+                } else {
+                    let mut z = ZlibDecoder::new(decoded.as_slice());
+                    let mut result = Vec::new();
+                    z.by_ref()
+                        .take((MAX_INFLATED + 1) as u64)
+                        .read_to_end(&mut result)
+                        .map_err(|_| WireError::Invalid)?;
+                    if result.len() > MAX_INFLATED {
+                        return Err(WireError::Oversize);
+                    }
+                    if z.total_in() as usize != decoded.len() {
+                        return Err(WireError::Invalid);
+                    }
+                    parse_inner(&result)?
+                }
+            }
+            _ => return Err(WireError::Unsupported),
+        };
+        service_code(&payload)?;
+        if cmd == 1 {
+            self.authenticated = true
+        }
+        Ok(DecodedFrame {
+            cmd,
+            sub_cmd,
+            payload,
+        })
+    }
+    fn decrypt_gcm(&self, s: &str) -> Result<Vec<u8>, WireError> {
+        let decoded = percent_encoding::percent_decode_str(s)
+            .decode_utf8()
+            .map_err(|_| WireError::Invalid)?;
+        let bytes = STANDARD
+            .decode(decoded.as_bytes())
+            .map_err(|_| WireError::Crypto)?;
+        if bytes.len() < 48 {
+            return Err(WireError::Crypto);
+        }
+        let nonce = aes_gcm::Nonce::<U16>::from_slice(&bytes[..16]);
+        let input = Payload {
+            msg: &bytes[32..],
+            aad: &bytes[16..32],
+        };
+        let result = match self.key.len() {
+            16 => AesGcm::<aes::Aes128, U16>::new_from_slice(&self.key)
+                .map_err(|_| WireError::Crypto)?
+                .decrypt(nonce, input),
+            24 => AesGcm::<aes::Aes192, U16>::new_from_slice(&self.key)
+                .map_err(|_| WireError::Crypto)?
+                .decrypt(nonce, input),
+            32 => AesGcm::<aes::Aes256, U16>::new_from_slice(&self.key)
+                .map_err(|_| WireError::Crypto)?
+                .decrypt(nonce, input),
+            _ => return Err(WireError::Crypto),
+        };
+        result.map_err(|_| WireError::Crypto)
+    }
+}
+fn parse_inner(bytes: &[u8]) -> Result<Value, WireError> {
+    if bytes.len() > MAX_INFLATED {
+        return Err(WireError::Oversize);
+    }
+    serde_json::from_slice(bytes).map_err(|_| WireError::Invalid)
+}
+pub fn service_code(value: &Value) -> Result<(), WireError> {
+    let code = value
+        .get("error_code")
+        .and_then(Value::as_i64)
+        .ok_or(WireError::Invalid)?;
+    match code {
+        0 => Ok(()),
+        600 | 102 => Err(WireError::Authentication),
+        other => Err(WireError::Service(other)),
+    }
+}
+pub fn id_string(v: &Value) -> Result<String, WireError> {
+    let id = if let Some(s) = v.as_str() {
+        s.to_owned()
+    } else if let Some(n) = v.as_u64() {
+        n.to_string()
+    } else {
+        return Err(WireError::Invalid);
+    };
+    numeric_id(&id)?;
+    Ok(id)
+}
+#[derive(Debug)]
+pub struct Incoming {
+    pub message: Message,
+    pub client_id: Option<String>,
+    pub unsupported: bool,
+}
+/// Only actual legacy webchat text is decoded; encrypted/media payloads are refused explicitly.
+pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>, WireError> {
+    numeric_id(account)?;
+    service_code(payload)?;
+    let data = payload
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or(WireError::Invalid)?;
+    let mut result = Vec::new();
+    for (field, kind) in [
+        ("msgs", ThreadKind::Direct),
+        ("groupMsgs", ThreadKind::Group),
+        ("pageMsgs", ThreadKind::Direct),
+    ] {
+        let Some(array) = data.get(field) else {
+            continue;
+        };
+        let array = array.as_array().ok_or(WireError::Invalid)?;
+        if array.len() + result.len() > MAX_BATCH {
+            return Err(WireError::Oversize);
+        }
+        for v in array {
+            let message_type = v
+                .get("msgType")
+                .and_then(Value::as_str)
+                .ok_or(WireError::Invalid)?;
+            if message_type.is_empty()
+                || message_type.len() > 64
+                || !message_type
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+            {
+                return Err(WireError::Invalid);
+            }
+            let unsupported = message_type != "webchat";
+            let raw_sender = v.get("uidFrom").ok_or(WireError::Invalid)?;
+            let sender = if raw_sender.as_str() == Some("0") || raw_sender.as_u64() == Some(0) {
+                account.to_owned()
+            } else {
+                id_string(raw_sender)?
+            };
+            let raw_to = v.get("idTo").ok_or(WireError::Invalid)?;
+            let to = if raw_to.as_str() == Some("0") || raw_to.as_u64() == Some(0) {
+                account.to_owned()
+            } else {
+                id_string(raw_to)?
+            };
+            if kind == ThreadKind::Direct && sender != account && to != account {
+                return Err(WireError::Invalid);
+            }
+            let peer = if kind == ThreadKind::Group || sender == account {
+                to
+            } else {
+                sender.clone()
+            };
+            let thread = Target::new(kind, &peer)?.thread_id();
+            let ts = v.get("ts").ok_or(WireError::Invalid)?;
+            let ts = if let Some(s) = ts.as_str() {
+                s.parse().map_err(|_| WireError::Invalid)?
+            } else {
+                ts.as_i64().ok_or(WireError::Invalid)?
+            };
+            let message = Message {
+                account_id: account.into(),
+                thread_id: thread,
+                id: id_string(v.get("msgId").ok_or(WireError::Invalid)?)?,
+                sender,
+                text: if unsupported {
+                    format!("[Tin nhắn {message_type} chưa được hỗ trợ]")
+                } else {
+                    v.get("content")
+                        .and_then(Value::as_str)
+                        .ok_or(WireError::Invalid)?
+                        .into()
+                },
+                sent_at_ms: ts,
+            };
+            message.validate().map_err(|_| WireError::Invalid)?;
+            let client_id = v.get("cliMsgId").map(id_string).transpose()?;
+            result.push(Incoming {
+                message,
+                client_id,
+                unsupported,
+            });
+        }
+    }
+    Ok(result)
+}
+#[derive(Debug, PartialEq, Eq)]
+pub struct SendAck {
+    pub server_id: String,
+    pub timestamp_ms: Option<i64>,
+}
+/// Call only after decrypting both the outer HTTP envelope and session-encrypted inner envelope.
+pub fn send_ack(payload: &Value) -> Result<SendAck, WireError> {
+    service_code(payload)?;
+    let data = payload.get("data").ok_or(WireError::Invalid)?;
+    let server_id = id_string(data.get("msgId").ok_or(WireError::Invalid)?)?;
+    let timestamp_ms = data
+        .get("ts")
+        .map(|v| {
+            if let Some(s) = v.as_str() {
+                s.parse().map_err(|_| WireError::Invalid)
+            } else {
+                v.as_i64().ok_or(WireError::Invalid)
+            }
+        })
+        .transpose()?;
+    if timestamp_ms.is_some_and(|t| t < 0) {
+        return Err(WireError::Invalid);
+    }
+    Ok(SendAck {
+        server_id,
+        timestamp_ms,
+    })
+}
+
+/// A complete, request-correlated server snapshot; partial/unknown schemas confer no permission.
+pub fn legacy_direct_allowed(
+    payload: &Value,
+    request_id: &str,
+    target: &str,
+) -> Result<(bool, Option<String>), WireError> {
+    service_code(payload)?;
+    let response = payload
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or(WireError::Invalid)?;
+    if response.get("reqId").and_then(Value::as_str) != Some(request_id) {
+        return Err(WireError::Invalid);
+    }
+    let data = response
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or(WireError::Invalid)?;
+    if data.get("err").and_then(Value::as_i64).unwrap_or(-1) != 0 {
+        return Err(WireError::Unsupported);
+    }
+    let has_more = data
+        .get("hasMore")
+        .and_then(Value::as_bool)
+        .ok_or(WireError::Unsupported)?;
+    let mut encrypted = false;
+    for name in ["threads", "waitUids", "uids", "pendingUids"] {
+        let entries = data
+            .get(name)
+            .and_then(Value::as_array)
+            .filter(|a| a.len() <= 100_000)
+            .ok_or(WireError::Unsupported)?;
+        for entry in entries {
+            let uid = match name {
+                "threads" | "pendingUids" => {
+                    id_string(entry.get("uid").ok_or(WireError::Invalid)?)?
+                }
+                _ => id_string(entry)?,
+            };
+            if uid == target {
+                encrypted = true;
+            }
+        }
+    }
+    let next = if has_more {
+        Some(id_string(data.get("lastId").ok_or(WireError::Invalid)?)?)
+    } else {
+        None
+    };
+    Ok((!encrypted, next))
+}
+pub fn legacy_group_allowed(payload: &Value, target: &str) -> Result<u64, WireError> {
+    service_code(payload)?;
+    let data = payload.get("data").ok_or(WireError::Invalid)?;
+    let group = data
+        .get("groupId")
+        .map(id_string)
+        .transpose()?
+        .ok_or(WireError::Unsupported)?;
+    if group != target {
+        return Err(WireError::Invalid);
+    }
+    let visibility = match data.get("visibility") {
+        None => 0,
+        Some(v) => v
+            .as_u64()
+            .filter(|v| *v <= 255)
+            .ok_or(WireError::Unsupported)?,
+    };
+    match data.get("e2ee") {
+        Some(Value::Bool(false)) => Ok(visibility),
+        Some(Value::Number(n)) if n.as_u64() == Some(0) => Ok(visibility),
+        _ => Err(WireError::Unsupported),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn authenticated() -> FrameDecoder {
+        FrameDecoder {
+            key: (0..32).collect(),
+            authenticated: true,
+        }
+    }
+    fn frame(cmd: u16, value: Value) -> Vec<u8> {
+        encode_frame(cmd, 0, &value).unwrap()
+    }
+    #[test]
+    fn socket_aes_gcm_matches_independent_node_16_byte_iv_aad_and_zlib_fixture() {
+        let fixtures=[(2,"oKGio6SlpqeoqaqrrK2ur8DBwsPExcbHyMnKy8zNzs9SP4jqUuDnvOwUUH+iXdgisJUSMzcYGPhPuDx8NHsJ0b4bSDW/HvPMxcP/96oQhcJI6PaomAxkJlQ0c+XNxbomHb4x0MgMY7hWX82d/yAxKHquoJnb0RQN7pFBDZpr+V5yVnKVu1ajGSkbvNzLKDwdg7w4OVZ71wLw30lzGhltpMZxTC4MzS4F4nNvrKgBsSSr6JbP+w4eed2V7C4bKhyCUFPIo7GtZdhM"),(3,"oKGio6SlpqeoqaqrrK2ur8DBwsPExcbHyMnKy8zNzs9RgUbOaqK/KaDxe9TPLr28oCEiDR8Wa9fffxnRahcc3Hezkwrxlc3SgysKgCpwldw4U8M2uyeXA9cIXEiDCNOOQPrUOCr1j1izvDxwCcnB35xMgYh9b6vGhmgddN4/MDnwOBmVFkBHgYnhjkzojMZ+MgIpX24Zi8QmfdulvymYtsSyaIwO4S3v2PDBNPrchKwcZ0yvmUyPLSj7mbjNkSGM0b3fZXMlZOOTUcxkqtSHEdNulGbXymzNOacnXwZ9CtvCs0nCDQYvFeS2")];
+        for (encryption, data) in fixtures {
+            let mut decoder = authenticated();
+            let decoded = decoder
+                .decode(&frame(
+                    501,
+                    json!({"error_code":0,"encrypt":encryption,"data":data}),
+                ))
+                .unwrap();
+            let messages = incoming_messages("11", &decoded.payload).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].message.text, "Xin chào Linux");
+            assert_eq!(messages[0].message.id, "9007199254740993");
+            assert_eq!(messages[0].message.thread_id, "d:22");
+            let mut corrupted = STANDARD.decode(data).unwrap();
+            *corrupted.last_mut().unwrap() ^= 1;
+            assert_eq!(authenticated().decode(&frame(501,json!({"error_code":0,"encrypt":encryption,"data":STANDARD.encode(corrupted)}))).unwrap_err(),WireError::Crypto);
+        }
+    }
+    #[test]
+    fn auth_is_only_established_after_valid_key_and_successful_inner_envelope() {
+        let mut decoder = FrameDecoder::default();
+        use std::io::Write;
+        let mut encoded =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoded
+            .write_all(br#"{"error_code":0,"data":{"qCmds":[]}}"#)
+            .unwrap();
+        let auth = json!({"error_code":0,"key":STANDARD.encode([7;32]),"encrypt":1,"data":STANDARD.encode(encoded.finish().unwrap())});
+        assert!(decoder.decode(&frame(1, auth)).is_ok());
+        assert!(decoder.authenticated());
+        assert!(decoder
+            .decode(&frame(
+                1,
+                json!({"error_code":0,"key":"invalid","encrypt":0,"data":{}})
+            ))
+            .is_err());
+        assert!(!decoder.authenticated());
+        assert_eq!(
+            FrameDecoder::default()
+                .decode(&frame(
+                    501,
+                    json!({"error_code":0,"encrypt":0,"data":{"error_code":0}})
+                ))
+                .unwrap_err(),
+            WireError::Authentication
+        );
+    }
+    #[test]
+    fn rejects_frame_and_inflation_bombs_unknown_encryption_and_auth_failures() {
+        assert_eq!(
+            authenticated().decode(&vec![0; MAX_FRAME + 1]).unwrap_err(),
+            WireError::Oversize
+        );
+        assert_eq!(
+            authenticated()
+                .decode(&frame(501, json!({"error_code":0,"encrypt":99,"data":"x"})))
+                .unwrap_err(),
+            WireError::Unsupported
+        );
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        z.write_all(&vec![b' '; MAX_INFLATED + 1]).unwrap();
+        let compressed = z.finish().unwrap();
+        assert_eq!(
+            authenticated()
+                .decode(&frame(
+                    501,
+                    json!({"error_code":0,"encrypt":1,"data":STANDARD.encode(compressed)})
+                ))
+                .unwrap_err(),
+            WireError::Oversize
+        );
+        assert_eq!(
+            authenticated()
+                .decode(&frame(501, json!({"error_code":102})))
+                .unwrap_err(),
+            WireError::Authentication
+        );
+        assert_eq!(
+            authenticated()
+                .decode(&frame(501, json!({"error_code":-102})))
+                .unwrap_err(),
+            WireError::Service(-102)
+        );
+    }
+    #[test]
+    fn routes_peer_self_echo_and_groups_without_numeric_id_collision_and_hides_unsupported_content()
+    {
+        let mut base = json!({"uidFrom":"22","idTo":"11","msgId":"1","cliMsgId":"2","ts":"7","msgType":"webchat","content":"plain"});
+        let payload =
+            json!({"error_code":0,"data":{"msgs":[base.clone()],"groupMsgs":[base.clone()]}});
+        let messages = incoming_messages("11", &payload).unwrap();
+        assert_eq!(messages[0].message.thread_id, "d:22");
+        assert_eq!(messages[1].message.thread_id, "g:11");
+        base["uidFrom"] = json!("0");
+        base["idTo"] = json!("22");
+        base["msgId"] = json!("3");
+        let mut secure = base.clone();
+        secure["msgType"] = json!("chat.e2ee");
+        secure["content"] = json!("must-not-render-ciphertext");
+        secure["msgId"] = json!("4");
+        let mixed = incoming_messages("11", &json!({"error_code":0,"data":{"msgs":[base,secure]}}))
+            .unwrap();
+        assert_eq!(mixed[0].message.sender, "11");
+        assert_eq!(mixed[0].message.thread_id, "d:22");
+        assert_eq!(mixed[0].message.text, "plain");
+        assert!(mixed[1].unsupported);
+        assert!(!mixed[1].message.text.contains("must-not-render"));
+    }
+    #[test]
+    fn capability_requires_correlated_complete_explicit_schema_and_rejects_encrypted_members() {
+        let complete = json!({"error_code":0,"data":{"reqId":"r1","data":{"err":0,"hasMore":false,"uids":[],"waitUids":[],"threads":[],"pendingUids":[]}}});
+        assert_eq!(
+            legacy_direct_allowed(&complete, "r1", "22").unwrap(),
+            (true, None)
+        );
+        assert!(legacy_direct_allowed(&complete, "other", "22").is_err());
+        let mut partial = complete.clone();
+        partial["data"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("threads");
+        assert!(legacy_direct_allowed(&partial, "r1", "22").is_err());
+        partial = complete.clone();
+        partial["data"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("hasMore");
+        assert!(legacy_direct_allowed(&partial, "r1", "22").is_err());
+        partial = complete.clone();
+        partial["data"]["data"]["hasMore"] = json!(true);
+        assert!(legacy_direct_allowed(&partial, "r1", "22").is_err());
+        for name in ["uids", "waitUids", "threads", "pendingUids"] {
+            let mut encrypted = complete.clone();
+            encrypted["data"]["data"][name] =
+                json!([if name == "threads" || name == "pendingUids" {
+                    json!({"uid":"22"})
+                } else {
+                    json!("22")
+                }]);
+            assert_eq!(
+                legacy_direct_allowed(&encrypted, "r1", "22").unwrap(),
+                (false, None)
+            );
+        }
+        assert!(legacy_group_allowed(
+            &json!({"error_code":0,"data":{"groupId":"22","e2ee":false}}),
+            "22"
+        )
+        .is_ok());
+        for flag in [json!(true), json!(1), json!(null), json!("false")] {
+            assert!(legacy_group_allowed(
+                &json!({"error_code":0,"data":{"groupId":"22","e2ee":flag}}),
+                "22"
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn personal_and_group_requests_preserve_text_and_explicit_target_kinds() {
+        for kind in [ThreadKind::Direct, ThreadKind::Group] {
+            let target = Target::new(kind, "22").unwrap();
+            assert_eq!(Target::from_thread(&target.thread_id()).unwrap(), target);
+            let params =
+                text_parameters(&target, "xin & + = chào", 1760000000000, "device").unwrap();
+            assert_eq!(params["message"], "xin & + = chào");
+            assert_eq!(params["clientId"], 1760000000000_u64);
+            assert_eq!(
+                params[if kind == ThreadKind::Direct {
+                    "toid"
+                } else {
+                    "grid"
+                }],
+                "22"
+            );
+        }
+        assert!(Target::new(ThreadKind::Direct, "0").is_err());
+        assert!(Target::new(ThreadKind::Group, "g22").is_err());
+        assert!(Target::new(ThreadKind::Direct, "22\n").is_err());
+        assert!(send_url(
+            &Url::parse("https://chat.zalo.me").unwrap(),
+            ThreadKind::Direct
+        )
+        .unwrap()
+        .as_str()
+        .contains("/api/message/sms?zpw_ver=681&zpw_type=30"));
+        for bad in [
+            "https://zalo.me.example.org",
+            "https://user@chat.zalo.me",
+            "http://chat.zalo.me",
+            "https://chat.zalo.me:444",
+            "https://chat.zalo.me/?token=secret",
+        ] {
+            assert!(send_url(&Url::parse(bad).unwrap(), ThreadKind::Direct).is_err());
+        }
+        assert_eq!(
+            send_ack(
+                &json!({"error_code":0,"data":{"msgId":"9007199254740993","ts":"1760000000001"}})
+            )
+            .unwrap()
+            .server_id,
+            "9007199254740993"
+        );
+        assert!(send_ack(&json!({"error_code":0,"data":{}})).is_err());
+    }
+}

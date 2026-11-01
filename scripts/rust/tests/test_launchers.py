@@ -10,6 +10,49 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class LauncherTests(unittest.TestCase):
+    def test_live_selects_build_feature_preserves_cli_and_never_runs_a_failed_build(self):
+        with tempfile.TemporaryDirectory(prefix="rust live launcher ") as directory:
+            root = Path(directory)
+            mock_bin = root / "bin"
+            mock_bin.mkdir()
+            target = root / "custom target"
+            (target / "release").mkdir(parents=True)
+            app = target / "release/zalo-rust"
+            app.write_text("#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+            app.chmod(0o755)
+            cargo = mock_bin / "cargo"
+            cargo.write_text(
+                "#!/usr/bin/env python3\nimport json,os,sys\n"
+                "with open(os.environ['MOCK_LOG'], 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                "if sys.argv[1] == 'build' and os.environ.get('MOCK_BUILD_FAILURE'): sys.exit(42)\n"
+                "if sys.argv[1] == 'metadata': print(json.dumps({'target_directory':os.environ['CARGO_TARGET_DIR']}))\n"
+            )
+            cargo.chmod(0o755)
+            log = root / "cargo.jsonl"
+            env = os.environ.copy()
+            env.update(PATH=str(mock_bin) + os.pathsep + env["PATH"], MOCK_LOG=str(log), CARGO_TARGET_DIR=str(target), ZALO_RUST_PROFILE="env-profile", ZALO_RUST_PROFILE_ROOT=str(root / "env root"))
+            launcher = str(REPO_ROOT / "scripts/rust/run.sh")
+            for options in (["--live"], ["--gui"], ["--profile", "cli-profile", "--live", "--trust-module", str(root / "trust module.wasm")], ["--demo", "--headless"]):
+                log.unlink(missing_ok=True)
+                result = subprocess.run([launcher, *options], cwd=root, env=env, check=True, capture_output=True, text=True)
+                self.assertEqual(json.loads(result.stdout), ["--profile-root", str(root / "env root"), "--profile", "env-profile", *options])
+                build, metadata = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertEqual(build[0], "build")
+                self.assertIn("--locked", build)
+                self.assertIn("--release", build)
+                if "--live" in options:
+                    self.assertEqual(build[build.index("--features") + 1], "live")
+                else:
+                    self.assertNotIn("--features", build, "ordinary/demo builds must keep network features disabled")
+                self.assertEqual(metadata[0], "metadata")
+                self.assertIn("--offline", metadata)
+            env["MOCK_BUILD_FAILURE"] = "1"
+            log.unlink()
+            failed = subprocess.run([launcher, "--live"], cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 42)
+            self.assertEqual(failed.stdout, "", "a failed live build must never execute a stale binary")
+            self.assertEqual(len(log.read_text().splitlines()), 1)
+
     def test_launchers_preserve_arguments_pinned_toolchain_directory_and_target_path(self):
         with tempfile.TemporaryDirectory(prefix="rust launcher ") as directory:
             root = Path(directory)

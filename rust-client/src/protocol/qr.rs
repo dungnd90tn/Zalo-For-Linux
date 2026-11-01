@@ -65,9 +65,17 @@ pub struct QrRequestInput<'a> {
     pub nonce_hex: &'a str,
 }
 
-/// Build the encrypted legacy-format QR request. Trusted-device QR format is
-/// deliberately not requested until its signatures can be independently verified.
+/// Build the encrypted server-rendered, phone-approved QR request.
 pub fn create_request(input: &QrRequestInput<'_>) -> Result<(RequestSpec, ResponseCipher)> {
+    create_request_mode(input, false)
+}
+pub fn create_trusted_request(input: &QrRequestInput<'_>) -> Result<(RequestSpec, ResponseCipher)> {
+    create_request_mode(input, true)
+}
+fn create_request_mode(
+    input: &QrRequestInput<'_>,
+    trusted: bool,
+) -> Result<(RequestSpec, ResponseCipher)> {
     if input.imei.is_empty()
         || input.imei.len() > 128
         || input.computer_name.is_empty()
@@ -96,8 +104,8 @@ pub fn create_request(input: &QrRequestInput<'_>) -> Result<(RequestSpec, Respon
         imei: input.imei,
         computer_name: input.computer_name,
         logged_uids: "",
-        self_g: 0,
-        qr_form: 0,
+        self_g: u8::from(trusted),
+        qr_form: u8::from(trusted),
     })?;
     let (mut params, key) =
         encrypt_parameters(input.imei, input.first_launch_ms, input.nonce_hex, &payload)?;
@@ -201,7 +209,7 @@ pub(super) fn percent_decode(text: &str) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-fn validate_login_url(text: &str) -> Result<Url> {
+pub(super) fn validate_login_url(text: &str) -> Result<Url> {
     if text.len() > 8192 {
         bail!("login URL exceeds length limit");
     }
@@ -218,6 +226,27 @@ fn validate_login_url(text: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// Exact server-issued polling origins, separately from cookie-bearing auth origins.
+#[cfg(feature = "live-login")]
+pub(super) fn validate_poll_url(text: &str) -> Result<Url> {
+    if text.len() > 8192 {
+        bail!("poll URL exceeds length limit");
+    }
+    let url = Url::parse(text).map_err(|_| anyhow::anyhow!("invalid poll URL"))?;
+    if url.scheme() != "https"
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || !matches!(
+            url.host_str(),
+            Some("wpa.zaloapp.com" | "wpa.chat.zalo.me" | "qr-id.zaloapp.com")
+        )
+    {
+        bail!("poll URL violates authentication polling policy");
+    }
+    Ok(url)
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QrState {
     Idle,

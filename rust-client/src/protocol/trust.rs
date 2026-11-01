@@ -153,14 +153,18 @@ pub struct IdentityKeys {
     pub public_key: Vec<u8>,
     pub private_key: Vec<u8>,
 }
-pub struct LinkingSecret([u8; 32]);
+pub struct LinkingSecret(pub(super) [u8; 32]);
 pub struct EncodedLinkingQr(String);
 impl EncodedLinkingQr {
     pub fn text(&self) -> &str {
         &self.0
     }
 }
+#[derive(Clone)]
 pub struct CompanionProof {
+    pub companion_id: u32,
+    pub link_id: u64,
+    pub linking_timestamp_ms: u64,
     pub linking_metadata: Vec<u8>,
     pub account_signature: Vec<u8>,
     pub device_signature: Vec<u8>,
@@ -189,6 +193,13 @@ impl TrustHost {
             bail!("trust WASM hash differs from the pinned protocol ABI");
         }
         Self::from_bytes(&bytes)
+    }
+    pub fn bundled() -> Result<Self> {
+        let bytes=include_bytes!("../../../pc-dist/libs/trusted_device_protocol_bg.c6da592e2114c13d62a77d3e37aa722c.wasm");
+        if format!("{:x}", Sha256::digest(bytes)) != EXPECTED_WASM_SHA256 {
+            bail!("bundled trust ABI hash mismatch");
+        }
+        Self::from_bytes(bytes)
     }
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut config = Config::default();
@@ -381,6 +392,16 @@ impl TrustHost {
                 let pointer = fields[0];
                 let result = (|| {
                     Ok(CompanionProof {
+                        companion_id: self.integer_getter(
+                            "zprototrustcompanionlinkingdata_companionId",
+                            pointer,
+                        )? as u32,
+                        link_id: self
+                            .integer_getter("zprototrustcompanionlinkingdata_linkId", pointer)?,
+                        linking_timestamp_ms: self.integer_getter(
+                            "zprototrustcompanionlinkingdata_linkingTimestamp",
+                            pointer,
+                        )?,
                         linking_metadata: self.byte_getter(
                             "zprototrustcompanionlinkingdata_linkingMetadata",
                             pointer,
@@ -425,7 +446,7 @@ impl TrustHost {
         bail!("device-list inspection does not establish companion or account trust");
     }
 
-    fn verify_device_list_bytes(
+    pub(super) fn verify_device_list_bytes(
         &mut self,
         encoded: &[u8],
         primary_key: &[u8],
@@ -579,6 +600,24 @@ impl TrustHost {
             }
         });
         self.finish_frame(result)
+    }
+    fn integer_getter(&mut self, name: &str, pointer: i32) -> Result<u64> {
+        let function = self
+            .instance
+            .get_func(&self.store, name)
+            .context("missing integer ABI")?;
+        let output = function.ty(&self.store).results()[0];
+        let mut result = [if output == wasmi::ValType::I64 {
+            Val::I64(0)
+        } else {
+            Val::I32(0)
+        }];
+        self.call(name, &[Val::I32(pointer)], &mut result)?;
+        match result[0] {
+            Val::I64(value) => Ok(value as u64),
+            Val::I32(value) => Ok(value as u32 as u64),
+            _ => bail!("unexpected integer ABI"),
+        }
     }
     fn byte_getter(&mut self, name: &str, pointer: i32) -> Result<Vec<u8>> {
         let frame = self.stack(-16)?;
