@@ -7,6 +7,8 @@ mod directory;
 mod live;
 #[cfg(feature = "live-login")]
 mod login;
+#[cfg(feature = "messaging")]
+mod stickers;
 mod visuals;
 
 use crate::app::{Command, DraftBook, Event, Model, Worker, EVENTS_PER_FRAME};
@@ -683,6 +685,13 @@ impl NativeApp {
         ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
         divider(ui, rect.left_top(), rect.right_top());
         let mut send = false;
+        let ime_active = self.ime_composing
+            || ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Ime(_)))
+            });
         positioned_ui(
             ui,
             egui::UiBuilder::new().max_rect(rect.shrink2(vec2(18.0, 8.0))),
@@ -727,34 +736,44 @@ impl NativeApp {
                     pos2(send_rect.left() - 14.0, rect.bottom() - 20.0),
                 );
                 positioned_ui(ui, egui::UiBuilder::new().max_rect(editor_rect), |ui| {
-                    let composer_id = ui.make_persistent_id("message_composer");
-                    let ime_active = self.ime_composing
-                        || ctx.input(|input| {
-                            input
-                                .events
-                                .iter()
-                                .any(|event| matches!(event, egui::Event::Ime(_)))
-                        });
+                    // Cursor, undo, and provisional IME selection belong to this draft.
+                    let composer_id = ui.make_persistent_id((
+                        "message_composer",
+                        self.account_id(),
+                        self.model.selected.as_deref(),
+                    ));
                     // Consume the shortcut before TextEdit can turn Enter into a newline.
                     if !ime_active
                         && ctx.memory(|memory| memory.has_focus(composer_id))
+                        && ctx.input(|input| input.events.iter().any(|event| matches!(event,egui::Event::Key {key:egui::Key::Enter,pressed:true,repeat:false,modifiers,..} if modifiers.matches_logically(egui::Modifiers::COMMAND))))
                         && ctx.input_mut(|input| {
                             input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)
                         })
                     {
                         send = true;
                     }
-                    let response = ui.add_enabled(
-                        enabled,
-                        egui::TextEdit::multiline(&mut self.drafts.active.text)
-                            .id(composer_id)
-                            .hint_text("Nhập tin nhắn…")
-                            .desired_rows(2)
-                            .desired_width(editor_rect.width())
-                            .frame(false)
-                            .char_limit(crate::domain::MAX_TEXT_BYTES)
-                            .margin(egui::Margin::ZERO),
-                    );
+                    ui.set_clip_rect(ui.clip_rect().intersect(editor_rect));
+                    let response = egui::ScrollArea::vertical()
+                        .id_salt("composer_scroll")
+                        .auto_shrink([false, false])
+                        .min_scrolled_height(editor_rect.height())
+                        .max_height(editor_rect.height())
+                        .show(ui, |ui| {
+                            let size = vec2(ui.available_width(), editor_rect.height());
+                            ui.add_enabled(
+                                enabled,
+                                egui::TextEdit::multiline(&mut self.drafts.active.text)
+                                    .id(composer_id)
+                                    .hint_text("Nhập tin nhắn…")
+                                    .desired_rows(1)
+                                    .min_size(size)
+                                    .desired_width(size.x)
+                                    .frame(false)
+                                    .char_limit(crate::domain::MAX_TEXT_BYTES)
+                                    .margin(egui::Margin::ZERO),
+                            )
+                        })
+                        .inner;
                     if response.changed() {
                         self.drafts.active.edited();
                         #[cfg(feature = "messaging")]
@@ -770,6 +789,7 @@ impl NativeApp {
                     }
                 });
                 let can_send = enabled
+                    && !ime_active
                     && (self.demo || self.live_can_send())
                     && !self.drafts.active.in_flight()
                     && !self.drafts.active.text.trim().is_empty();
@@ -896,6 +916,7 @@ impl NativeApp {
                                         });
                                     }
                                 });
+                                let own_account = self.account_id().map(str::to_owned);
                                 let mut previous_day = None;
                                 for message in &self.model.messages {
                                     let day = local_parts(message.sent_at_ms)
@@ -906,7 +927,12 @@ impl NativeApp {
                                         ui.add_space(18.0);
                                         previous_day = day;
                                     }
-                                    message_bubble(ui, message, compact, self.account_id());
+                                    #[cfg(feature = "messaging")]
+                                    let sticker_cache = self.live.as_mut().and_then(|state| state.account.as_ref().map(|_| &mut state.stickers));
+                                    message_bubble(ui, message, compact, own_account.as_deref(),
+                                        #[cfg(feature = "messaging")]
+                                        sticker_cache,
+                                    );
                                     ui.add_space(13.0);
                                 }
                                 #[cfg(feature = "messaging")]
@@ -1201,7 +1227,13 @@ fn is_own_sender(sender: &str, account: Option<&str>) -> bool {
     account.map_or_else(|| sender == "You (local demo)", |account| sender == account)
 }
 
-fn message_bubble(ui: &mut egui::Ui, message: &Message, compact: bool, account: Option<&str>) {
+fn message_bubble(
+    ui: &mut egui::Ui,
+    message: &Message,
+    compact: bool,
+    account: Option<&str>,
+    #[cfg(feature = "messaging")] sticker_cache: Option<&mut stickers::StickerCache>,
+) {
     let own = is_own_sender(&message.sender, account);
     let max_bubble = (ui.available_width() * if compact { 0.82 } else { 0.76 }).min(490.0);
     ui.with_layout(
@@ -1243,10 +1275,51 @@ fn message_bubble(ui: &mut egui::Ui, message: &Message, compact: bool, account: 
                                 .color(MUTED),
                             );
                         }
-                        ui.add(
-                            egui::Label::new(RichText::new(&message.text).size(14.0).color(INK))
+                        if let Some(sticker) = &message.sticker {
+                            #[cfg(feature = "messaging")]
+                            let rendered = match sticker_cache {
+                                Some(cache)
+                                    if ui.is_rect_visible(egui::Rect::from_min_size(
+                                        ui.cursor().min,
+                                        vec2(130.0, 150.0),
+                                    )) =>
+                                {
+                                    match cache.visible(ui.ctx(), *sticker) {
+                                        stickers::Presentation::Image(texture) => {
+                                            let size = texture.size_vec2();
+                                            let scale = 130.0 / size.x.max(size.y);
+                                            ui.add(
+                                                egui::Image::new(&texture)
+                                                    .fit_to_exact_size(size * scale),
+                                            )
+                                            .on_hover_text("Nhãn dán · ảnh xem trước tĩnh");
+                                        }
+                                        stickers::Presentation::Loading => {
+                                            sticker_placeholder(ui, "Đang tải nhãn dán…");
+                                        }
+                                        stickers::Presentation::Unavailable(reason) => {
+                                            sticker_placeholder(ui, "Chưa tải được nhãn dán")
+                                                .on_hover_text(reason);
+                                        }
+                                    }
+                                    true
+                                }
+                                _ => false,
+                            };
+                            #[cfg(not(feature = "messaging"))]
+                            let rendered = false;
+                            if !rendered {
+                                let _ = sticker;
+                                sticker_placeholder(ui, "Nhãn dán");
+                            }
+                        } else {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&message.text).size(14.0).color(INK),
+                                )
                                 .wrap(),
-                        );
+                            );
+                        }
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(clock_label(message.sent_at_ms))
@@ -1274,12 +1347,40 @@ fn message_bubble(ui: &mut egui::Ui, message: &Message, compact: bool, account: 
     );
 }
 
+fn sticker_placeholder(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    egui::Frame::none()
+        .fill(PALE_BLUE)
+        .rounding(8.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.set_width(106.0);
+            ui.set_min_height(106.0);
+            ui.vertical_centered(|ui| {
+                ui.add_space(25.0);
+                let (rect, _) = ui.allocate_exact_size(vec2(25.0, 25.0), Sense::hover());
+                icon(ui, rect, Icon::Smile, MUTED);
+                ui.add(egui::Label::new(RichText::new(label).size(11.0).color(MUTED)).wrap());
+            });
+        })
+        .response
+}
+
 fn update_ime_state(composing: &mut bool, events: &[egui::Event]) {
     for event in events {
         if let egui::Event::Ime(event) = event {
             match event {
                 egui::ImeEvent::Preedit(text) => *composing = !text.is_empty(),
-                egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled => *composing = false,
+                egui::ImeEvent::Commit(text) => {
+                    *composing = false;
+                    if !text.is_empty() {
+                        use crate::diagnostics::{Event, Kind, Reason, Stage};
+                        crate::diagnostics::record(
+                            Event::new(Kind::Debug, Stage::InputMethod, Reason::Ready)
+                                .bytes(text.len()),
+                        );
+                    }
+                }
+                egui::ImeEvent::Disabled => *composing = false,
                 egui::ImeEvent::Enabled => {}
             }
         }

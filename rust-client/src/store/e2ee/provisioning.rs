@@ -900,6 +900,7 @@ mod tests {
                 id: "old-history".into(),
                 sender: "456".into(),
                 text: "Synthetic retained history".into(),
+                sticker: None,
                 sent_at_ms: 1000,
             }])
             .unwrap();

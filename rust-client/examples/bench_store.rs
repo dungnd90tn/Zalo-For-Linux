@@ -25,6 +25,7 @@ fn sample(index: usize) -> Message {
         account_id: ACCOUNT.into(), thread_id: THREAD.into(), id: format!("{index:010}"),
         sender: "synthetic-sender".into(),
         text: format!("Synthetic message {index:010}: bounded transactions and indexed cursor pagination with twenty timestamp ties."),
+        sticker:None,
         sent_at_ms: EPOCH_MS + (index / 20) as i64,
     }
 }

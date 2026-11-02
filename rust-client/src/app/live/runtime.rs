@@ -1,4 +1,5 @@
 use super::*;
+use crate::diagnostics::StorageOperation;
 use crate::{
     app::directory::{DirectoryCategory, DirectoryFetcher, DirectorySink, DirectoryStage},
     protocol::messaging::{self as wire, DecodedFrame, FrameDecoder, Target, WireError},
@@ -17,6 +18,47 @@ use url::Url;
 
 #[cfg(test)]
 mod integration_tests;
+
+#[test]
+fn outgoing_mismatch_diagnostics_report_only_closed_field_flags() {
+    let mut store = crate::store::MessageStore::in_memory().unwrap();
+    let id = store
+        .prepare_outgoing("11", "d:22", "synthetic stored private body", 1000)
+        .unwrap();
+    store.record_outgoing_ack("11", id, "900").unwrap();
+    store.accept_outgoing("11", id, "900", Some(1000)).unwrap();
+    let message = crate::domain::Message {
+        account_id: "11".into(),
+        thread_id: "d:22".into(),
+        id: "900".into(),
+        sender: "11".into(),
+        text: "synthetic changed private body".into(),
+        sticker: None,
+        sent_at_ms: 1001,
+    };
+    let error = store
+        .receive_batch("11", &[(message, None)], None)
+        .unwrap_err();
+    let event = storage_failure_event(&error, StorageOperation::ReceiveBatch);
+    let encoded = serde_json::to_string(&event).unwrap();
+    let value: Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(value["storage_mismatch_mask"], 2);
+    assert_eq!(value["storage_failure"], "outgoing_mismatch");
+    assert!(!encoded.contains("private body"));
+    assert!(value.get("sqlite_code").is_none());
+    for invalid in [0, 8, 255] {
+        let value = serde_json::to_value(
+            crate::diagnostics::Event::new(
+                crate::diagnostics::Kind::Failure,
+                crate::diagnostics::Stage::Storage,
+                crate::diagnostics::Reason::Io,
+            )
+            .storage_mismatch(Some(invalid)),
+        )
+        .unwrap();
+        assert!(value.get("storage_mismatch_mask").is_none());
+    }
+}
 #[cfg(feature = "signal-crypto")]
 pub(crate) mod signal_transport;
 
@@ -64,6 +106,50 @@ impl NetworkFailure {
         result
     }
 }
+#[derive(Debug)]
+struct StorageContext(StorageOperation);
+impl std::fmt::Display for StorageContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Local storage operation {:?} failed", self.0)
+    }
+}
+impl std::error::Error for StorageContext {}
+fn storage_result<T>(operation: StorageOperation, result: Result<T>) -> Result<T> {
+    result.map_err(|error| error.context(StorageContext(operation)))
+}
+fn record_storage_failure(error: &anyhow::Error, operation: StorageOperation) {
+    crate::diagnostics::record(storage_failure_event(error, operation));
+}
+fn storage_failure_event(
+    error: &anyhow::Error,
+    operation: StorageOperation,
+) -> crate::diagnostics::Event {
+    use crate::diagnostics::{Event, Kind, Reason, Stage, StorageFailure};
+    use crate::store::FailureReason;
+    let failure = match crate::store::classify_failure(error) {
+        FailureReason::ConflictingMessage => StorageFailure::ConflictingMessage,
+        FailureReason::ConflictingEcho => StorageFailure::ConflictingEcho,
+        FailureReason::OutgoingMismatch => StorageFailure::OutgoingMismatch,
+        FailureReason::ConflictingMetadata => StorageFailure::ConflictingMetadata,
+        FailureReason::Validation => StorageFailure::Validation,
+        FailureReason::Sqlite => StorageFailure::Sqlite,
+        FailureReason::Other => StorageFailure::Other,
+    };
+    let sqlite_code = error.downcast_ref::<rusqlite::Error>().and_then(|error| {
+        if let rusqlite::Error::SqliteFailure(code, _) = error {
+            Some(code.extended_code)
+        } else {
+            None
+        }
+    });
+    Event::new(Kind::Failure, Stage::Storage, Reason::Io)
+        .storage(operation, failure, sqlite_code)
+        .storage_mismatch(
+            error
+                .downcast_ref::<crate::store::OutgoingMismatchFields>()
+                .map(|fields| fields.mask()),
+        )
+}
 fn wire_error(error: &anyhow::Error) -> Option<&WireError> {
     error
         .downcast_ref::<wire::FrameFailure>()
@@ -71,6 +157,10 @@ fn wire_error(error: &anyhow::Error) -> Option<&WireError> {
         .or_else(|| error.downcast_ref::<WireError>())
 }
 fn diagnostic(error: &anyhow::Error, stage: LiveStage) -> LiveDiagnostic {
+    if let Some(storage) = error.downcast_ref::<StorageContext>() {
+        record_storage_failure(error, storage.0);
+        return NetworkFailure::new(LiveStage::Storage, LiveCategory::Storage).0;
+    }
     if let Some(network) = error.downcast_ref::<NetworkFailure>() {
         record_failure(network.0, None);
         return network.0;
@@ -238,8 +328,14 @@ impl Database {
                         MessageStore::open(&profile.paths.data_dir.join("messages.sqlite"))
                     })
                     .and_then(|mut s| {
-                        s.recover_outgoing(&account)?;
-                        s.reconcile_outgoing(&account)?;
+                        storage_result(
+                            StorageOperation::RecoverOutgoing,
+                            s.recover_outgoing(&account),
+                        )?;
+                        storage_result(
+                            StorageOperation::ReconcileOutgoing,
+                            s.reconcile_outgoing(&account),
+                        )?;
                         Ok(s)
                     });
                 let mut store = match opened {
@@ -247,10 +343,9 @@ impl Database {
                         let _ = ready.send(Ok(()));
                         s
                     }
-                    Err(_) => {
-                        let _ = ready.send(Err(anyhow::anyhow!(
-                            "Cannot open this account's private message database"
-                        )));
+                    Err(error) => {
+                        let _ =
+                            ready.send(storage_result::<()>(StorageOperation::Open, Err(error)));
                         return;
                     }
                 };
@@ -270,6 +365,13 @@ impl Database {
     ) -> Result<T> {
         self.handle()?.call(job).await
     }
+    async fn call_with<T: Send + 'static>(
+        &self,
+        operation: StorageOperation,
+        job: impl FnOnce(&mut MessageStore) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        storage_result(operation, self.call(job).await)
+    }
     fn handle(&self) -> Result<DatabaseHandle> {
         Ok(DatabaseHandle {
             jobs: self
@@ -281,6 +383,13 @@ impl Database {
     }
 }
 impl DatabaseHandle {
+    async fn call_with<T: Send + 'static>(
+        &self,
+        operation: StorageOperation,
+        job: impl FnOnce(&mut MessageStore) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        storage_result(operation, self.call(job).await)
+    }
     async fn call<T: Send + 'static>(
         &self,
         job: impl FnOnce(&mut MessageStore) -> Result<T> + Send + 'static,
@@ -315,7 +424,7 @@ impl DirectorySink for RuntimeDirectorySink {
             return Err(directory_failure(DirectoryCategory::Storage));
         }
         self.db
-            .call(move |store| {
+            .call_with(StorageOperation::DirectoryWrite, move |store| {
                 store.apply_directory_batch(&batch)?;
                 Ok(())
             })
@@ -484,7 +593,9 @@ impl DirectorySync {
             // Read after obtaining UI capacity: earlier Received/Sent commits
             // are included, and later socket events cannot overtake this read.
             let conversations = db
-                .call(move |store| store.conversations(&account, crate::domain::MAX_PAGE_SIZE))
+                .call_with(StorageOperation::Conversations, move |store| {
+                    store.conversations(&account, crate::domain::MAX_PAGE_SIZE)
+                })
                 .await?;
             self.conversations_changed = false;
             permit.send(LiveEvent::DirectoryChanged {
@@ -800,7 +911,12 @@ impl Connection {
         let queue = format!("{cmd}_{sub}");
         let id = match continuation {
             Some(id) => id.to_owned(),
-            None => db.call(move |s| s.receive_cursor(&account, &queue)).await?,
+            None => {
+                db.call_with(StorageOperation::ReceiveCursor, move |s| {
+                    s.receive_cursor(&account, &queue)
+                })
+                .await?
+            }
         };
         let numeric = safe_cursor(&id)?;
         let progress = self.offline_progress.entry((cmd, sub)).or_default();
@@ -969,7 +1085,7 @@ impl Connection {
                 }
                 let cursor = cursors.first().cloned();
                 let stored = db
-                    .call(move |s| {
+                    .call_with(StorageOperation::ReceiveBatch, move |s| {
                         s.receive_batch(
                             &account,
                             &messages,
@@ -979,8 +1095,10 @@ impl Connection {
                     .await?;
                 for (queue, id) in cursors.into_iter().skip(1) {
                     let account = events.account.clone();
-                    db.call(move |s| s.receive_batch(&account, &[], Some((&queue, &id))))
-                        .await?;
+                    db.call_with(StorageOperation::ReceiveCursorWrite, move |s| {
+                        s.receive_batch(&account, &[], Some((&queue, &id)))
+                    })
+                    .await?;
                 }
                 for (message, conversation) in stored {
                     trace(
@@ -1197,7 +1315,7 @@ async fn persist_ack(
         let server = ack.server_id.clone();
         let timestamp = ack.timestamp_ms;
         let result = db
-            .call(move |s| {
+            .call_with(StorageOperation::PersistAck, move |s| {
                 s.record_outgoing_ack(&account, id, &server)?;
                 s.accept_outgoing(&account, id, &server, timestamp)
             })
@@ -1243,7 +1361,7 @@ async fn handle_command(
             let account = events.account.clone();
             let search = query.clone();
             let result = db
-                .call(move |store| {
+                .call_with(StorageOperation::DirectoryRead, move |store| {
                     store.directory_page(&account, is_group, &search, after.as_ref(), PAGE_SIZE + 1)
                 })
                 .await;
@@ -1285,7 +1403,7 @@ async fn handle_command(
                 ThreadKind::Group => format!("Nhóm {remote_id}"),
             };
             let result = db
-                .call(move |s| {
+                .call_with(StorageOperation::OpenConversation, move |s| {
                     let title = s
                         .directory_record(&account, &thread)?
                         .map(|entry| entry.display_name)
@@ -1321,7 +1439,7 @@ async fn handle_command(
             let account = events.account.clone();
             let requested = thread.clone();
             let result = db
-                .call(move |s| {
+                .call_with(StorageOperation::LoadHistory, move |s| {
                     s.page(
                         &account,
                         &requested,
@@ -1374,8 +1492,14 @@ async fn handle_command(
             let visibility = match eligible {
                 Ok(visibility) => visibility,
                 Err(error) => {
-                    let _ = diagnostic(&error, LiveStage::Send);
-                    let message = if wire_error(&error)
+                    let storage_failed = error.downcast_ref::<StorageContext>().is_some();
+                    let detail = diagnostic(&error, LiveStage::Send);
+                    if storage_failed {
+                        events.diagnostic(detail).await?;
+                    }
+                    let message = if storage_failed {
+                        "Chưa lưu được dữ liệu nhận trên thiết bị. Kết nối đã tạm dừng; bản nháp được giữ lại."
+                    } else if wire_error(&error)
                         .is_some_and(|e| matches!(e, WireError::Unsupported))
                     {
                         "Hội thoại mã hóa đầu cuối hoặc chưa xác minh được trạng thái mã hóa. Bản nháp được giữ lại."
@@ -1393,6 +1517,10 @@ async fn handle_command(
                             server_accepted: false,
                         })
                         .await?;
+                    if storage_failed {
+                        events.connection(LiveConnection::Offline).await?;
+                        return Ok(CommandOutcome::PauseTransport);
+                    }
                     if wire_error(&error) == Some(&WireError::Authentication) {
                         events
                             .diagnostic(diagnostic(&error, LiveStage::Authentication))
@@ -1407,7 +1535,9 @@ async fn handle_command(
             let thread_copy = thread.clone();
             let text_copy = text.clone();
             let prepared = db
-                .call(move |s| s.prepare_outgoing(&account, &thread_copy, &text_copy, now_ms()))
+                .call_with(StorageOperation::PrepareOutgoing, move |s| {
+                    s.prepare_outgoing(&account, &thread_copy, &text_copy, now_ms())
+                })
                 .await;
             let id = match prepared {
                 Ok(id) => id,
@@ -1425,7 +1555,28 @@ async fn handle_command(
                     );
                     let account = events.account.clone();
                     let result = persist_ack(db, &account, id, ack).await;
-                    match result{Ok((message,conversation))=>events.emit(LiveEvent::Sent{account_id:events.account.clone(),generation,thread,request_id,message,conversation}).await?,Err(_)=>events.emit(LiveEvent::SendFailed{account_id:events.account.clone(),generation,thread,request_id,error:"Zalo đã nhận nhưng chưa lưu được xác nhận trên thiết bị. Không gửi lại.".into(),unknown_delivery:true,server_accepted:true}).await?,}
+                    match result {
+                        Ok((message, conversation)) => {
+                            events
+                                .emit(LiveEvent::Sent {
+                                    account_id: events.account.clone(),
+                                    generation,
+                                    thread,
+                                    request_id,
+                                    message,
+                                    conversation,
+                                })
+                                .await?
+                        }
+                        Err(error) => {
+                            events
+                                .diagnostic(diagnostic(&error, LiveStage::Storage))
+                                .await?;
+                            events.emit(LiveEvent::SendFailed{account_id:events.account.clone(),generation,thread,request_id,error:"Zalo đã nhận nhưng chưa lưu được xác nhận trên thiết bị. Không gửi lại.".into(),unknown_delivery:true,server_accepted:true}).await?;
+                            events.connection(LiveConnection::Offline).await?;
+                            return Ok(CommandOutcome::PauseTransport);
+                        }
+                    }
                 }
                 Err(error) => {
                     let _ = diagnostic(&error, LiveStage::Send);
@@ -1434,8 +1585,10 @@ async fn handle_command(
                     });
                     let expired = wire_error(&error) == Some(&WireError::Authentication);
                     let account = events.account.clone();
-                    db.call(move |s| s.fail_outgoing(&account, id, !known))
-                        .await?;
+                    db.call_with(StorageOperation::FailOutgoing, move |s| {
+                        s.fail_outgoing(&account, id, !known)
+                    })
+                    .await?;
                     events
                         .emit(LiveEvent::SendFailed {
                             account_id: events.account.clone(),
@@ -1487,7 +1640,9 @@ async fn run_inner(
     let db = Database::open(profile, events.account.clone()).await?;
     let account = events.account.clone();
     let conversations = db
-        .call(move |s| s.conversations(&account, crate::domain::MAX_PAGE_SIZE))
+        .call_with(StorageOperation::Conversations, move |s| {
+            s.conversations(&account, crate::domain::MAX_PAGE_SIZE)
+        })
         .await?;
     events
         .emit(LiveEvent::Ready {
@@ -1531,7 +1686,16 @@ async fn run_inner(
                     next_connect = tokio::time::Instant::now();
                     continue;
                 }
-                match handle_command(command, &mut connection, &db, events, &session, &client).await? {
+                let outcome = match handle_command(command, &mut connection, &db, events, &session, &client).await {
+                    Ok(outcome) => outcome,
+                    Err(error) if error.downcast_ref::<StorageContext>().is_some() => {
+                        events.diagnostic(diagnostic(&error, LiveStage::Storage)).await?;
+                        events.connection(LiveConnection::Offline).await?;
+                        CommandOutcome::PauseTransport
+                    }
+                    Err(error) => return Err(error),
+                };
+                match outcome {
                     CommandOutcome::Shutdown => return Ok(()),
                     CommandOutcome::PauseTransport => { connection=None;network_paused=true; },
                     CommandOutcome::Continue => {},
@@ -1564,7 +1728,16 @@ async fn run_inner(
                                 trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
                                 break None;
                             }
-                            match handle_command(command, &mut connection, &db, events, &session, &client).await? {
+                            let outcome = match handle_command(command, &mut connection, &db, events, &session, &client).await {
+                    Ok(outcome) => outcome,
+                    Err(error) if error.downcast_ref::<StorageContext>().is_some() => {
+                        events.diagnostic(diagnostic(&error, LiveStage::Storage)).await?;
+                        events.connection(LiveConnection::Offline).await?;
+                        CommandOutcome::PauseTransport
+                    }
+                    Err(error) => return Err(error),
+                };
+                match outcome {
                                 CommandOutcome::Shutdown => return Ok(()),
                                 CommandOutcome::PauseTransport => { network_paused=true;break None; },
                                 CommandOutcome::Continue => {},
@@ -1610,6 +1783,12 @@ async fn run_inner(
                         connection = None;
                         network_paused = true;
                         events.connection(state).await?;
+                        continue;
+                    }
+                    if error.downcast_ref::<StorageContext>().is_some() {
+                        connection = None;
+                        network_paused = true;
+                        events.connection(LiveConnection::Offline).await?;
                         continue;
                     }
                     if error.downcast_ref::<NetworkFailure>().is_none() {

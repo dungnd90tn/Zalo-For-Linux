@@ -1829,6 +1829,7 @@ impl MessageStore {
             id: server_id.into(),
             sender: owner.into(),
             text: body,
+            sticker: None,
             sent_at_ms: existing.or(timestamp).unwrap_or(created),
         };
         message.validate()?;
@@ -1948,6 +1949,7 @@ mod tests {
             id: id.into(),
             sender: "456".into(),
             text: "secret fixture".into(),
+            sticker: None,
             sent_at_ms: 1000,
         }
     }

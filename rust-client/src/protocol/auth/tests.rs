@@ -972,6 +972,13 @@ fn phone_tls_fixture(trusted: bool) -> (HttpAdapter, thread::JoinHandle<()>) {
     (HttpAdapter::local_test_adapter(address), server)
 }
 fn phone_tls_server(trusted: bool) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+    phone_tls_server_mode(trusted, None, false)
+}
+fn phone_tls_server_mode(
+    trusted: bool,
+    initial_rejection: Option<i64>,
+    hold_qr: bool,
+) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
     use rustls::{
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
         ServerConfig, ServerConnection, StreamOwned,
@@ -997,7 +1004,17 @@ fn phone_tls_server(trusted: bool) -> (std::net::SocketAddr, thread::JoinHandle<
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let mut png = Vec::new();
-        {
+        if hold_qr {
+            let pixels = qr_pixels("zalo-native-synthetic-startup-fixture").unwrap();
+            let mut encoder = png::Encoder::new(&mut png, pixels.width, pixels.height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&pixels.rgba)
+                .unwrap();
+        } else {
             let mut encoder = png::Encoder::new(&mut png, 2, 2);
             encoder.set_color(png::ColorType::Grayscale);
             encoder.set_depth(png::BitDepth::Eight);
@@ -1007,7 +1024,7 @@ fn phone_tls_server(trusted: bool) -> (std::net::SocketAddr, thread::JoinHandle<
                 .write_image_data(&[0, 255, 255, 0])
                 .unwrap();
         }
-        let routes = if trusted {
+        let mut routes = if trusted {
             vec![
                 "/api/login/getServerInfo",
                 "/api/login/reqqr",
@@ -1022,7 +1039,20 @@ fn phone_tls_server(trusted: bool) -> (std::net::SocketAddr, thread::JoinHandle<
                 "/api/login/getLoginInfo",
             ]
         };
-        for route in routes {
+        if hold_qr {
+            routes.truncate(2);
+        }
+        if initial_rejection.is_some() {
+            routes.insert(
+                0,
+                if initial_rejection == Some(-503) {
+                    "/api/login/getServerInfo"
+                } else {
+                    "/api/login/getLoginInfo"
+                },
+            );
+        }
+        for (index, route) in routes.into_iter().enumerate() {
             let (socket, _) = listener.accept().unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
@@ -1066,7 +1096,7 @@ fn phone_tls_server(trusted: bool) -> (std::net::SocketAddr, thread::JoinHandle<
                     serde_json::json!({"server_time":now_ms().unwrap()/1000,"setttings":{"authen":{"encryption":{"enable":1},"trusted_device":{"self_g":u8::from(trusted),"qr_format_trust_device":u8::from(trusted)}}}})
                 }
                 "/api/login/reqqr" => {
-                    serde_json::json!({"token_id":"synthetic-token","base64_qr":STANDARD.encode(&png),"chk_wait_scan":"https://wpa.zaloapp.com/fixture-scan?token=synthetic","chk_wait_cfirm":"https://wpa.zaloapp.com/fixture-confirm?token=synthetic","qr_timeout":1,"qr_retry":1})
+                    serde_json::json!({"token_id":"synthetic-token","base64_qr":STANDARD.encode(&png),"chk_wait_scan":"https://wpa.zaloapp.com/fixture-scan?token=synthetic","chk_wait_cfirm":"https://wpa.zaloapp.com/fixture-confirm?token=synthetic","qr_timeout":if hold_qr{180}else{1},"qr_retry":1})
                 }
                 "/fixture-scan" => serde_json::json!({"avatar":"","display_name":"Synthetic"}),
                 "/fixture-confirm" => {
@@ -1075,7 +1105,9 @@ fn phone_tls_server(trusted: bool) -> (std::net::SocketAddr, thread::JoinHandle<
                 }
                 _ => Value::Null,
             };
-            let response = if route == "/api/login/reqqr" || route == "/api/login/getLoginInfo" {
+            let response = if index == 0 && initial_rejection == Some(-503) {
+                b"temporary fixture failure".to_vec()
+            } else if route == "/api/login/reqqr" || route == "/api/login/getLoginInfo" {
                 if route.ends_with("getLoginInfo") {
                     assert!(request
                         .lines()
@@ -1093,7 +1125,9 @@ fn phone_tls_server(trusted: bool) -> (std::net::SocketAddr, thread::JoinHandle<
                     .unwrap();
                 let mut input =
                     serde_json::json!({"query":path.split_once('?').unwrap().1,"uid":"11"});
-                if route.ends_with("reqqr") {
+                if let (0, Some(code)) = (index, initial_rejection) {
+                    input["response"] = serde_json::json!({"error_code":code,"data":null});
+                } else if route.ends_with("reqqr") {
                     input["response"] = serde_json::json!({"error_code":0,"data":data});
                 }
                 child
@@ -1110,12 +1144,35 @@ fn phone_tls_server(trusted: bool) -> (std::net::SocketAddr, thread::JoinHandle<
             };
             write!(
                 tls,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                if index == 0 && initial_rejection == Some(-503) {
+                    "503 Service Unavailable"
+                } else {
+                    "200 OK"
+                },
                 response.len()
             )
             .unwrap();
             tls.write_all(&response).unwrap();
             tls.flush().unwrap();
+        }
+        if hold_qr {
+            // Keep a real local long-poll pending until GUI cancellation closes
+            // it. No confirmation/Ready can escape into messaging transports.
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let mut tls = StreamOwned::new(ServerConnection::new(config).unwrap(), socket);
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") && header.len() < 16384 {
+                let mut byte = [0];
+                if tls.read_exact(&mut byte).is_err() {
+                    return;
+                }
+                header.push(byte[0]);
+            }
+            let _ = tls.read(&mut [0]);
         }
     });
     (address, server)
@@ -1233,7 +1290,7 @@ async fn bootstrap_failures_preserve_sanitized_stage_and_code_without_false_serv
 }
 
 #[tokio::test]
-async fn actual_controller_new_linux_identity_survives_atomic_commit_and_verified_resume() {
+async fn actual_controller_startup_auto_qr_then_verified_session_without_manual_resume() {
     let scratch = Scratch::new();
     let profile = Arc::new(Profile::at_root(&scratch.0, "controller-linux24").unwrap());
     let (address, server) = phone_tls_server(false);
@@ -1244,7 +1301,7 @@ async fn actual_controller_new_linux_identity_survives_atomic_commit_and_verifie
         AuthTransport::Local(address),
     )
     .unwrap();
-    let generation = controller.begin().unwrap();
+    let generation = controller.startup().unwrap();
     let mut saw_qr = false;
     let session = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -1284,7 +1341,7 @@ async fn actual_controller_new_linux_identity_survives_atomic_commit_and_verifie
         AuthTransport::Local(address),
     )
     .unwrap();
-    let generation = controller.resume().unwrap();
+    let generation = controller.startup().unwrap();
     let session = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match controller.events.recv().await.unwrap() {
@@ -1312,6 +1369,21 @@ async fn actual_controller_new_linux_identity_survives_atomic_commit_and_verifie
             .unwrap()
             .client_type,
         ClientType::PcLinux24
+    );
+    let generation = controller.logout().unwrap();
+    tokio::time::timeout(Duration::from_secs(3),async {
+        loop {if matches!(controller.events.recv().await,Some(LoginEvent::SignedOut{generation:g}) if g==generation){break;}}
+    }).await.unwrap();
+    assert!(AuthRecord::load(&profile)
+        .unwrap()
+        .unwrap()
+        .active
+        .is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), controller.events.recv())
+            .await
+            .is_err(),
+        "explicit logout must not restart login"
     );
 }
 #[tokio::test]
@@ -1345,6 +1417,7 @@ async fn legacy_missing_client_type_requires_approval_without_network_or_any_dis
                 id: "kept".into(),
                 sender: "12".into(),
                 text: "Preserved history".into(),
+                sticker: None,
                 sent_at_ms: 1,
             }])
             .unwrap();
@@ -1428,4 +1501,242 @@ fn new_record_requires_explicit_supported_type_but_v1_defaults_only_to_legacy() 
             .client_type,
         ClientType::PcLinux24
     );
+}
+
+fn write_phone_approved_session(profile: &Profile) -> Vec<u8> {
+    let mut record = AuthRecord::empty("11");
+    let mut active = saved();
+    active.proof = SessionProof::PhoneApproved;
+    record.active = Some(active);
+    let encoded = record.encode().unwrap();
+    crate::profile::atomic_write_secret(
+        &profile.paths.data_dir.join(session::AUTH_STATE_FILE),
+        &encoded,
+    )
+    .unwrap();
+    encoded
+}
+
+#[tokio::test]
+async fn startup_verified_authentication_expiry_automatically_opens_fresh_qr() {
+    let scratch = Scratch::new();
+    let profile = Arc::new(Profile::at_root(&scratch.0, "startup-expired").unwrap());
+    write_phone_approved_session(&profile);
+    let (address, server) = phone_tls_server_mode(false, Some(600), false);
+    let mut controller = LoginController::with_transport(
+        profile.clone(),
+        None,
+        repaint(),
+        AuthTransport::Local(address),
+    )
+    .unwrap();
+    let generation = controller.startup().unwrap();
+    let mut qr = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match controller.events.recv().await.unwrap() {
+                LoginEvent::Qr { generation: g, .. } if g == generation => qr = true,
+                LoginEvent::Ready {
+                    generation: g,
+                    session,
+                } if g == generation => {
+                    assert!(qr, "verified expiry must enter QR before fresh Ready");
+                    assert_eq!(session.account_id(), "11");
+                    break;
+                }
+                LoginEvent::Failed { error, .. } => panic!("expired startup failed {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn startup_service_failure_preserves_saved_session_and_never_enters_qr() {
+    let scratch = Scratch::new();
+    let profile = Arc::new(Profile::at_root(&scratch.0, "startup-retry").unwrap());
+    let before = write_phone_approved_session(&profile);
+    let (address, server) = bootstrap_tls_server_reply(
+        "11",
+        Some(serde_json::json!({"error_code":18060,"data":null})),
+    );
+    let mut controller = LoginController::with_transport(
+        profile.clone(),
+        None,
+        repaint(),
+        AuthTransport::Local(address),
+    )
+    .unwrap();
+    let generation = controller.startup().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match controller.events.recv().await.unwrap() {
+                LoginEvent::Progress {
+                    stage: LoginStage::CreatingQr,
+                    ..
+                }
+                | LoginEvent::Qr { .. } => panic!("non-auth failure must not force QR"),
+                LoginEvent::Failed {
+                    generation: g,
+                    error,
+                } if g == generation => {
+                    assert!(matches!(
+                        error,
+                        LoginFailure::Bootstrap(bootstrap::BootstrapFailure {
+                            category: bootstrap::BootstrapError::EncryptionRejected(18060),
+                            ..
+                        })
+                    ));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        fs::read(profile.paths.data_dir.join(session::AUTH_STATE_FILE)).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn startup_fallback_policy_does_not_expire_sessions_on_network_http_or_unknown_service_errors() {
+    use bootstrap::{BootstrapError as E, BootstrapFailure as F, BootstrapStage as S};
+    for error in [
+        LoginFailure::Network,
+        LoginFailure::Expired,
+        LoginFailure::Rejected,
+        LoginFailure::Storage,
+        LoginFailure::Malformed,
+        LoginFailure::Cancelled,
+        LoginFailure::Bootstrap(F {
+            stage: S::Http,
+            category: E::Http(401),
+        }),
+        LoginFailure::Bootstrap(F {
+            stage: S::InnerEnvelope,
+            category: E::ServiceRejected(500),
+        }),
+        LoginFailure::Bootstrap(F {
+            stage: S::ResponseDecryption,
+            category: E::EncryptionRejected(18060),
+        }),
+    ] {
+        assert!(
+            !requires_fresh_login(error),
+            "ambiguous failure preserves credentials: {error}"
+        );
+    }
+    assert!(requires_fresh_login(LoginFailure::FreshApprovalRequired));
+    assert!(requires_fresh_login(LoginFailure::Bootstrap(F {
+        stage: S::InnerEnvelope,
+        category: E::AuthenticationRejected(102)
+    })));
+}
+
+#[cfg(feature = "messaging")]
+pub(super) fn startup_fixture(
+    profile: Arc<Profile>,
+    repaint: Arc<dyn Fn() + Send + Sync>,
+    mode: &str,
+) -> Result<LoginController> {
+    let (address, _server) = match mode {
+        "qr" => phone_tls_server_mode(false, None, true),
+        "retry" => {
+            write_phone_approved_session(&profile);
+            bootstrap_tls_server_reply(
+                "11",
+                Some(serde_json::json!({"error_code":18060,"data":null})),
+            )
+        }
+        _ => anyhow::bail!("Unknown synthetic startup fixture mode"),
+    };
+    LoginController::with_transport(profile, None, repaint, AuthTransport::Local(address))
+}
+
+#[tokio::test]
+async fn startup_without_saved_session_retries_transient_failure_then_opens_qr_without_mode_choice()
+{
+    let scratch = Scratch::new();
+    let profile = Arc::new(Profile::at_root(&scratch.0, "startup-no-session-retry").unwrap());
+    let (address, server) = phone_tls_server_mode(false, Some(-503), false);
+    let mut controller = LoginController::with_transport(
+        profile.clone(),
+        None,
+        repaint(),
+        AuthTransport::Local(address),
+    )
+    .unwrap();
+    let generation = controller.startup().unwrap();
+    tokio::time::timeout(Duration::from_secs(5),async{loop{if matches!(controller.events.recv().await,Some(LoginEvent::Failed{generation:g,..})if g==generation){break;}}}).await.unwrap();
+    assert!(AuthRecord::load(&profile).unwrap().is_none());
+    let generation = controller.startup().unwrap();
+    let mut saw_qr = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match controller.events.recv().await.unwrap() {
+                LoginEvent::Qr { generation: g, .. } if g == generation => saw_qr = true,
+                LoginEvent::Ready { generation: g, .. } if g == generation => {
+                    assert!(saw_qr);
+                    break;
+                }
+                LoginEvent::Failed { error, .. } => panic!("startup retry failed {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn startup_connection_failure_and_retry_never_force_qr_or_mutate_saved_session() {
+    let scratch = Scratch::new();
+    let profile = Arc::new(Profile::at_root(&scratch.0, "startup-network-retry").unwrap());
+    let before = write_phone_approved_session(&profile);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut controller = LoginController::with_transport(
+        profile.clone(),
+        None,
+        repaint(),
+        AuthTransport::Local(address),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let generation = controller.startup().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match controller.events.recv().await.unwrap() {
+                    LoginEvent::Qr { .. }
+                    | LoginEvent::Progress {
+                        stage: LoginStage::CreatingQr,
+                        ..
+                    } => panic!("network failure cannot force QR"),
+                    LoginEvent::Failed {
+                        generation: g,
+                        error,
+                    } if g == generation => {
+                        assert_eq!(error, LoginFailure::Network);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read(profile.paths.data_dir.join(session::AUTH_STATE_FILE)).unwrap(),
+            before
+        );
+    }
 }

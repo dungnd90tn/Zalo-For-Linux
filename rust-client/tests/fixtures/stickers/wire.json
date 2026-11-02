@@ -1,0 +1,25 @@
+{
+  "provenance": "own original normalizeMessageType and _sendStickerCmd; public synthetic metadata",
+  "type": "chat.sticker",
+  "normalized": 3,
+  "content": {
+    "id": 20695,
+    "catId": 10047,
+    "type": 3
+  },
+  "thumbnail": "https://api.zaloapp.com/api/emoticon/sticker/webpc?size=130&eid=20695",
+  "builtins": [
+    {
+      "id": 1,
+      "catId": 0,
+      "type": 7,
+      "thumbnail": "https://stc-chat.zdn.vn/images/stickers/default/thumb/1.png"
+    },
+    {
+      "id": 30,
+      "catId": 0,
+      "type": 7,
+      "thumbnail": "https://stc-chat.zdn.vn/images/stickers/default/thumb/30.png"
+    }
+  ]
+}

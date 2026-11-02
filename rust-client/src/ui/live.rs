@@ -43,6 +43,8 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub directory: super::directory::DirectoryView,
     #[cfg(feature = "messaging")]
+    pub stickers: super::stickers::StickerCache,
+    #[cfg(feature = "messaging")]
     pub review_dialog: bool,
     #[cfg(feature = "messaging")]
     pub open_dialog: bool,
@@ -54,18 +56,21 @@ pub(super) struct LiveState {
 }
 
 impl LiveState {
+    #[cfg(all(test, feature = "messaging"))]
     pub fn new(
         profile: Arc<Profile>,
         trust: Option<PathBuf>,
         ctx: &egui::Context,
     ) -> anyhow::Result<Self> {
         let repaint = ctx.clone();
-        Ok(Self {
-            controller: LoginController::new(
-                profile,
-                trust,
-                Arc::new(move || repaint.request_repaint()),
-            )?,
+        let controller =
+            LoginController::new(profile, trust, Arc::new(move || repaint.request_repaint()))?;
+        Ok(Self::with_controller(controller, ctx))
+    }
+
+    fn with_controller(controller: LoginController, _ctx: &egui::Context) -> Self {
+        Self {
+            controller,
             login: LoginView::default(),
             account: None,
             #[cfg(feature = "messaging")]
@@ -73,7 +78,7 @@ impl LiveState {
             #[cfg(feature = "messaging")]
             session: None,
             #[cfg(feature = "messaging")]
-            context: ctx.clone(),
+            context: _ctx.clone(),
             #[cfg(feature = "messaging")]
             reason: None,
             #[cfg(feature = "messaging")]
@@ -83,6 +88,8 @@ impl LiveState {
             #[cfg(feature = "messaging")]
             directory: Default::default(),
             #[cfg(feature = "messaging")]
+            stickers: Default::default(),
+            #[cfg(feature = "messaging")]
             review_dialog: false,
             #[cfg(feature = "messaging")]
             open_dialog: false,
@@ -91,14 +98,14 @@ impl LiveState {
             #[cfg(feature = "messaging")]
             group: false,
             logout_dialog: false,
-        })
+        }
     }
 
     fn action(&mut self, action: Action) {
         match action {
             Action::Begin | Action::Resume => {
                 let result = if action == Action::Resume {
-                    self.controller.resume()
+                    self.controller.startup()
                 } else {
                     self.controller.begin()
                 };
@@ -338,8 +345,30 @@ impl NativeApp {
         profile: Profile,
         trust: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        Self::new_live_with_factory(cc, profile, trust, LoginController::new)
+    }
+
+    fn new_live_with_factory(
+        cc: &eframe::CreationContext<'_>,
+        profile: Profile,
+        trust: Option<PathBuf>,
+        factory: impl FnOnce(
+            Arc<Profile>,
+            Option<PathBuf>,
+            Arc<dyn Fn() + Send + Sync>,
+        ) -> anyhow::Result<LoginController>,
+    ) -> anyhow::Result<Self> {
         let mut app = Self::new(cc, profile, false)?;
-        app.live = Some(LiveState::new(app._profile.clone(), trust, &cc.egui_ctx)?);
+        let repaint = cc.egui_ctx.clone();
+        let controller = factory(
+            app._profile.clone(),
+            trust,
+            Arc::new(move || repaint.request_repaint()),
+        )?;
+        let mut state = LiveState::with_controller(controller, &cc.egui_ctx);
+        let generation = state.controller.startup()?;
+        state.login.start(generation, true);
+        app.live = Some(state);
         app.model.status.clear();
         Ok(app)
     }
@@ -426,6 +455,7 @@ impl NativeApp {
                     #[cfg(feature = "messaging")]
                     {
                         state.directory = Default::default();
+                        state.stickers = Default::default();
                         state.session = Some(session);
                         state.ensure_worker(self._profile.clone());
                     }
@@ -444,6 +474,7 @@ impl NativeApp {
                         state.connection = LiveConnection::Offline;
                         state.delivery = Default::default();
                         state.directory = Default::default();
+                        state.stickers = Default::default();
                         state.review_dialog = false;
                     }
                     self.model = Model::default();
@@ -540,6 +571,8 @@ impl NativeApp {
         {
             state.worker_closed(&mut self.model, &mut self.drafts, self.latest_page);
         }
+        #[cfg(feature = "messaging")]
+        state.stickers.poll(ctx, deadline, &mut remaining);
         if !state.controller.events.is_empty() {
             ctx.request_repaint();
         }
@@ -581,6 +614,7 @@ impl NativeApp {
                             state.connection = LiveConnection::Offline;
                             state.delivery = Default::default();
                             state.directory = Default::default();
+                            state.stickers = Default::default();
                             state.review_dialog = false;
                         }
                         self.model = Model::default();
@@ -1100,6 +1134,7 @@ mod tests {
         let (mut app, root) = fixture(&ctx);
         let thread = "d:22";
         let original = crate::domain::Message {
+            sticker: None,
             account_id: "11".into(),
             thread_id: thread.into(),
             id: "501".into(),
@@ -1201,6 +1236,264 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn online_incoming_chat_accepts_pointer_focus_and_keyboard_input() {
+        for (width, height) in [(1200.0, 780.0), (640.0, 480.0)] {
+            for connection in [LiveConnection::Online, LiveConnection::Offline] {
+                let ctx = egui::Context::default();
+                let (mut app, root) = fixture(&ctx);
+                app.live.as_mut().unwrap().connection = connection;
+                let message = crate::domain::Message {
+                    sticker: None,
+                    account_id: "11".into(),
+                    thread_id: "d:22".into(),
+                    id: "incoming-1".into(),
+                    sender: "22".into(),
+                    text: "Tin nhận kiểm thử".into(),
+                    sent_at_ms: 1700000000000,
+                };
+                app.model.apply_live(
+                    LiveEvent::Received {
+                        account_id: "11".into(),
+                        message: message.clone(),
+                        conversation: Conversation {
+                            id: "d:22".into(),
+                            title: "Liên hệ kiểm thử".into(),
+                            last_message_at_ms: message.sent_at_ms,
+                            last_text: message.text.clone(),
+                            last_sender: "22".into(),
+                        },
+                    },
+                    "11",
+                    true,
+                );
+                app.model.selected = Some("d:22".into());
+                app.drafts.select("d:22").unwrap();
+                let mut frame = |events| {
+                    ctx.run(
+                        egui::RawInput {
+                            events,
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, height),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| app.workspace(ctx),
+                    )
+                };
+                frame(vec![]);
+                let output = frame(vec![]);
+                let rect = text_rect(&output, "Nhập tin nhắn…").expect("editor must be visible");
+                let pos = egui::pos2(width - 250.0, height - 25.0);
+                frame(vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ]);
+                frame(vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }]);
+                frame(vec![egui::Event::Text("Có thể gõ tin nhắn".into())]);
+                assert_eq!(
+                    app.drafts.active.text, "Có thể gõ tin nhắn",
+                    "typing at {width}x{height}, {connection:?}, editor={rect:?}"
+                );
+                assert!(
+                    !app.live_can_send(),
+                    "no worker must never become a verified send route"
+                );
+                drop(app);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[test]
+    fn composition_and_commit_frames_cannot_send_but_later_fresh_shortcut_can() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        app.live = None;
+        app.demo = true;
+        app.worker =
+            Some(crate::app::Worker::demo(root.join("ime-demo.sqlite"), Arc::new(|| {})).unwrap());
+        app.model.selected = Some("welcome".into());
+        app.drafts.select("welcome").unwrap();
+        app.focus_composer = true;
+        fn frame(app: &mut NativeApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.input(|input| {
+                        super::super::update_ime_state(&mut app.ime_composing, &input.events)
+                    });
+                    egui::CentralPanel::default().show(ctx, |ui| app.composer(ui, ctx, 150.0));
+                },
+            );
+        }
+        fn shortcut(repeat: bool) -> egui::Event {
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat,
+                modifiers: egui::Modifiers::COMMAND,
+            }
+        }
+        frame(&mut app, &ctx, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("việt".into())),
+            ],
+        );
+        frame(&mut app, &ctx, vec![shortcut(false)]);
+        assert!(!app.drafts.active.in_flight(), "active preedit cannot send");
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Commit("việt".into())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                shortcut(false),
+            ],
+        );
+        assert!(
+            !app.drafts.active.in_flight(),
+            "commit and shortcut in the same frame cannot send"
+        );
+        frame(&mut app, &ctx, vec![shortcut(true)]);
+        assert!(
+            !app.drafts.active.in_flight(),
+            "held key after commit cannot send"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+        );
+        frame(&mut app, &ctx, vec![shortcut(false)]);
+        assert!(
+            app.drafts.active.in_flight(),
+            "fresh shortcut outside composition must still submit"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conversation_drafts_have_distinct_ime_cursor_and_undo_state() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        app.model.selected = Some("d:22".into());
+        app.drafts.select("d:22").unwrap();
+        app.drafts.active.text = "Bản nháp A ".into();
+        fn frame(app: &mut NativeApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.composer(ui, ctx, 150.0));
+                },
+            );
+        }
+        app.focus_composer = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("việt".into())),
+            ],
+        );
+        let first = ctx.memory(|m| m.focused()).unwrap();
+        app.model.selected = Some("d:33".into());
+        app.drafts.select("d:33").unwrap();
+        app.drafts.active.text = "Bản nháp B nguyên vẹn".into();
+        app.focus_composer = true;
+        frame(&mut app, &ctx, vec![]);
+        let second = ctx.memory(|m| m.focused()).unwrap();
+        assert_ne!(
+            first, second,
+            "IME and undo must belong to the selected draft"
+        );
+        // The focus-aware bridge turns the old widget's delayed cancellation
+        // into Disabled only, never empty Preedit against the new selection.
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
+        );
+        assert_eq!(app.drafts.active.text, "Bản nháp B nguyên vẹn");
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn long_multiline_draft_is_clipped_to_editor_and_does_not_cover_actions() {
+        for (width, height) in [(1200.0, 780.0), (640.0, 480.0)] {
+            let ctx = egui::Context::default();
+            let (mut app, root) = fixture(&ctx);
+            app.live.as_mut().unwrap().connection = LiveConnection::Online;
+            app.model.selected = Some("d:22".into());
+            app.drafts.select("d:22").unwrap();
+            app.drafts.active.text = (1..=20).map(|i| format!("Dòng kiểm thử {i}\n")).collect();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, height),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.workspace(ctx),
+            );
+            let shape = output
+                .shapes
+                .iter()
+                .find(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => {
+                        text.galley.job.text.contains("Dòng kiểm thử 1")
+                    }
+                    _ => false,
+                })
+                .expect("long draft text must render");
+            assert!(
+                shape.clip_rect.bottom() <= height - 20.0,
+                "draft cannot cover bottom shortcut hint"
+            );
+            assert!(
+                shape.clip_rect.right() <= width - 116.0,
+                "draft cannot cover send button"
+            );
+            assert_eq!(app.drafts.active.text.lines().count(), 20);
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
     /// Native-window fixture exists only in the test binary, with no external endpoints.
     #[test]
     #[ignore = "requires isolated X11 display; QA closes the window via WM_DELETE_WINDOW"]
@@ -1211,8 +1504,10 @@ mod tests {
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| (640.0..=1600.0).contains(v))
             .unwrap_or(1200.0);
+        let sticker = std::env::var_os("ZALO_UI_FIXTURE_STICKER").is_some();
+        let online = std::env::var_os("ZALO_UI_FIXTURE_ONLINE").is_some();
         let directory = std::env::var_os("ZALO_UI_FIXTURE_DIRECTORY").is_some();
-        let cached = directory || std::env::var_os("ZALO_UI_FIXTURE_CACHED").is_some();
+        let cached = sticker || directory || std::env::var_os("ZALO_UI_FIXTURE_CACHED").is_some();
         let root = Arc::new(std::sync::Mutex::new(None));
         let cleanup = root.clone();
         eframe::run_native(
@@ -1227,8 +1522,29 @@ mod tests {
                 ..Default::default()
             },
             Box::new(move |cc| {
+                if let Ok(mode) = std::env::var("ZALO_UI_FIXTURE_LOGIN") {
+                    let path = std::env::temp_dir().join(format!(
+                        "native-startup-gui-{}",
+                        crate::domain::local_message_id().unwrap()
+                    ));
+                    let profile = Profile::at_root(&path, "fixture")?;
+                    *root.lock().unwrap() = Some(path);
+                    return NativeApp::new_live_with_factory(
+                        cc,
+                        profile,
+                        None,
+                        move |profile, _, repaint| {
+                            LoginController::startup_fixture(profile, repaint, &mode)
+                        },
+                    )
+                    .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                    .map_err(Into::into);
+                }
                 let (mut app, path) = fixture(&cc.egui_ctx);
                 *root.lock().unwrap() = Some(path);
+                if online {
+                    app.live.as_mut().unwrap().connection = LiveConnection::Online;
+                }
                 if cached {
                     let messages: Vec<_> = [
                         ("d:22", "22", "Tin nhắn kiểm thử đã lưu"),
@@ -1237,6 +1553,7 @@ mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (thread, sender, text))| crate::domain::Message {
+                        sticker: None,
                         account_id: "11".into(),
                         thread_id: thread.into(),
                         id: format!("fixture-{}", i + 1),
@@ -1264,6 +1581,83 @@ mod tests {
                     app.model.messages = vec![messages[0].clone()];
                     app.drafts.select("d:22").unwrap();
                     app.drafts.active.text = "Bản nháp ngoại tuyến".into();
+                }
+                if sticker {
+                    use crate::domain::{Message, StickerDescriptor, LEGACY_STICKER_PLACEHOLDER};
+                    let descriptor = StickerDescriptor {
+                        sticker_id: 1,
+                        category_id: 0,
+                        sticker_type: 7,
+                    };
+                    let unavailable = StickerDescriptor {
+                        sticker_id: 1,
+                        category_id: 10,
+                        sticker_type: 3,
+                    };
+                    let mut pixels = vec![0u8; 130 * 130 * 4];
+                    for y in 0..130i32 {
+                        for x in 0..130i32 {
+                            let r = (x - 65).pow(2) + (y - 65).pow(2);
+                            if r <= 58i32.pow(2) {
+                                let eyes = (x - 45).pow(2) + (y - 52).pow(2) < 25
+                                    || (x - 85).pow(2) + (y - 52).pow(2) < 25;
+                                let mouth = y > 72
+                                    && y < 91
+                                    && ((x - 65).pow(2) + (y - 60).pow(2)) > 760
+                                    && ((x - 65).pow(2) + (y - 60).pow(2)) < 1000;
+                                let color = if eyes || mouth {
+                                    [8, 27, 58, 255]
+                                } else {
+                                    [255, 210, 70, 255]
+                                };
+                                pixels[((y * 130 + x) * 4) as usize
+                                    ..((y * 130 + x) * 4 + 4) as usize]
+                                    .copy_from_slice(&color);
+                            }
+                        }
+                    }
+                    let messages: Vec<_> = [descriptor, unavailable]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, sticker)| Message {
+                            account_id: "11".into(),
+                            thread_id: "d:22".into(),
+                            id: format!("fixture-sticker-{i}"),
+                            sender: "22".into(),
+                            text: LEGACY_STICKER_PLACEHOLDER.into(),
+                            sticker: Some(sticker),
+                            sent_at_ms: 1700000010000 + i as i64,
+                        })
+                        .collect();
+                    let mut store = crate::store::MessageStore::open(
+                        &app._profile.paths.data_dir.join("messages.sqlite"),
+                    )
+                    .unwrap();
+                    store.insert_batch(&messages).unwrap();
+                    app.model.messages.extend(messages);
+                    app.model.conversations = store.conversations("11", 200).unwrap();
+                    let state = app.live.as_mut().unwrap();
+                    let mut encoded = Vec::new();
+                    {
+                        let mut encoder = png::Encoder::new(&mut encoded, 130, 130);
+                        encoder.set_color(png::ColorType::Rgba);
+                        encoder.set_depth(png::BitDepth::Eight);
+                        encoder
+                            .write_header()
+                            .unwrap()
+                            .write_image_data(&pixels)
+                            .unwrap();
+                    }
+                    let (width, height, decoded) =
+                        crate::app::stickers::decode_fixture_png(&encoded).unwrap();
+                    state.stickers.seed(
+                        &cc.egui_ctx,
+                        descriptor,
+                        width,
+                        height,
+                        decoded.as_ref().clone(),
+                    );
+                    state.stickers.seed_failure(&cc.egui_ctx, unavailable);
                 }
                 if directory {
                     use crate::store::directory::{DirectoryBatch, DirectoryRecord};

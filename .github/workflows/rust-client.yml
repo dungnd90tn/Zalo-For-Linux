@@ -24,9 +24,11 @@ jobs:
         run: cargo fetch --locked --manifest-path Cargo.toml
       - name: Test, lint, and check informational CLI without a display or account
         run: ./scripts/rust/check.sh
-      - name: Check independent Signal wire, receive and business fixtures
+      - name: Check source-derived text, sticker and Signal fixtures
         working-directory: rust-client
         run: |
+          node tests/fixtures/messaging/plain_text_oracle.cjs
+          node tests/fixtures/stickers/oracle.cjs
           node tests/fixtures/signal/oracle.cjs
           node tests/fixtures/signal/receive_oracle.cjs
           node --max-old-space-size=96 --no-warnings tests/fixtures/signal/business_oracle.cjs

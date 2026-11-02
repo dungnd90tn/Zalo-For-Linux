@@ -238,6 +238,7 @@ mod tests {
             id: id.into(),
             sender: "12".into(),
             text: text.into(),
+            sticker: None,
             sent_at_ms: 100,
         }
     }

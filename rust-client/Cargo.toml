@@ -65,3 +65,7 @@ tokio = { version = "1", features = ["test-util"] }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Preserve Linux XIM/Wayland composition with the pinned egui 0.29 input adapter.
+[patch.crates-io]
+egui-winit = { path = "vendor/egui-winit" }

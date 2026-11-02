@@ -610,6 +610,7 @@ mod tests {
             id: "900".into(),
             sender: "11".into(),
             text: "hello".into(),
+            sticker: None,
             sent_at_ms: 20,
         }
     }

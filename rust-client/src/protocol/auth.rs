@@ -113,6 +113,7 @@ pub enum LoginEvent {
 enum Control {
     Begin(u64),
     Resume(u64),
+    Startup(u64),
     Cancel(Cancellation),
     Logout(u64),
     Stop,
@@ -152,6 +153,14 @@ impl LoginController {
         repaint: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self> {
         Self::with_transport(profile, trust_module, repaint, AuthTransport::Production)
+    }
+    #[cfg(all(test, feature = "messaging"))]
+    pub(crate) fn startup_fixture(
+        profile: Arc<Profile>,
+        repaint: Arc<dyn Fn() + Send + Sync>,
+        mode: &str,
+    ) -> Result<Self> {
+        tests::startup_fixture(profile, repaint, mode)
     }
     fn with_transport(
         profile: Arc<Profile>,
@@ -229,6 +238,23 @@ impl LoginController {
         crate::diagnostics::record(crate::diagnostics::Event::new(
             crate::diagnostics::Kind::Transition,
             crate::diagnostics::Stage::Login,
+            crate::diagnostics::Reason::Requested,
+        ));
+        Ok(generation)
+    }
+    /// Called once by the explicit live UI. Session disk I/O and networking
+    /// remain on the authentication worker, never the caller's render thread.
+    pub fn startup(&self) -> Result<u64> {
+        let permit = self
+            .controls
+            .try_reserve()
+            .map_err(|_| LoginFailure::Busy)?;
+        let generation = self.advance();
+        self.attempt.fetch_max(generation, Ordering::AcqRel);
+        permit.send(Control::Startup(generation));
+        crate::diagnostics::record(crate::diagnostics::Event::new(
+            crate::diagnostics::Kind::Transition,
+            crate::diagnostics::Stage::Resume,
             crate::diagnostics::Reason::Requested,
         ));
         Ok(generation)
@@ -395,7 +421,7 @@ async fn controller_loop(
     let last_commit = AtomicU64::new(0);
     loop {
         let command = tokio::select! {biased;changed=cancel_notice.changed()=>{if changed.is_err(){break;}Control::Cancel(*cancel_notice.borrow_and_update())},command=rx.recv()=>{let Some(command)=command else{break};command}};
-        let (generation, resume) = match command {
+        let (generation, resume, startup) = match command {
             Control::Stop => break,
             Control::Cancel(cancel) => {
                 let g = cancel.generation;
@@ -429,8 +455,9 @@ async fn controller_loop(
                 .await;
                 continue;
             }
-            Control::Begin(g) => (g, false),
-            Control::Resume(g) => (g, true),
+            Control::Begin(g) => (g, false, false),
+            Control::Resume(g) => (g, true, false),
+            Control::Startup(g) => (g, false, true),
         };
         if epoch.load(Ordering::Acquire) & GENERATION_MASK != generation {
             continue;
@@ -443,7 +470,13 @@ async fn controller_loop(
             last_commit: &last_commit,
             repaint: &repaint,
         };
-        let work = authenticate(profile.clone(), module.clone(), resume, &context, transport);
+        let work = async {
+            if startup {
+                authenticate_startup(profile.clone(), module.clone(), &context, transport).await
+            } else {
+                authenticate(profile.clone(), module.clone(), resume, &context, transport).await
+            }
+        };
         let result = tokio::select! {biased;_ = notice.changed()=>Err(LoginFailure::Cancelled),result=tokio::time::timeout(Duration::from_secs(OVERALL_SECONDS),work)=>result.unwrap_or(Err(LoginFailure::Expired))};
         if epoch.load(Ordering::Acquire) & GENERATION_MASK == generation {
             if let Err(error) = result {
@@ -1024,6 +1057,42 @@ fn validate_saved_context(
     }
     Ok(())
 }
+fn requires_fresh_login(error: LoginFailure) -> bool {
+    matches!(error, LoginFailure::FreshApprovalRequired)
+        || matches!(error, LoginFailure::Bootstrap(failure) if failure.category.invalidates_authentication())
+}
+
+async fn authenticate_startup(
+    profile: Arc<Profile>,
+    module: Option<PathBuf>,
+    context: &Attempt<'_>,
+    transport: AuthTransport,
+) -> std::result::Result<(), LoginFailure> {
+    emit(
+        context.tx,
+        LoginEvent::Progress {
+            generation: context.generation,
+            stage: LoginStage::Restoring,
+        },
+        context.repaint,
+    );
+    let active = AuthRecord::load(&profile)
+        .map_err(|_| LoginFailure::Storage)?
+        .is_some_and(|record| record.active.is_some());
+    if !active {
+        return authenticate(profile, module, false, context, transport).await;
+    }
+    match authenticate(profile.clone(), module.clone(), true, context, transport).await {
+        Err(error) if requires_fresh_login(error) => {
+            // Only verified authentication rejection or an explicit identity
+            // migration permits fresh QR. Network/schema/HTTP failures keep the
+            // saved session and remain retryable instead of forcing login.
+            authenticate(profile, module, false, context, transport).await
+        }
+        result => result,
+    }
+}
+
 async fn authenticate(
     profile: Arc<Profile>,
     module: Option<PathBuf>,

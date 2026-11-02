@@ -13,6 +13,7 @@ cargo tree --locked --offline --manifest-path "$MANIFEST" -e normal --prefix non
 cargo tree --locked --offline --manifest-path "$MANIFEST" --features signal-store -e normal --prefix none | python3 -c 'import sys; lines=sys.stdin.read().splitlines(); assert not any(line.startswith(("wasmi ", "reqwest ", "tokio-tungstenite ", "rquickjs", "libsignal-core ")) for line in lines), "signal-store DTOs enabled a protocol or cryptographic runtime"; print("Signal storage DTOs exclude embedded cryptography and network engines.")'
 cargo tree --locked --offline --manifest-path "$MANIFEST" --features live -e normal --prefix none | python3 -c 'import sys; lines=sys.stdin.read().splitlines(); assert not any(line.startswith(("zalo-signal-engine ", "rquickjs", "libsignal-core ")) for line in lines), "live mode enabled the inactive Signal engine"; print("Live mode excludes the optional Signal engine.")'
 cargo test --locked --manifest-path "$MANIFEST" --offline
+cargo test --locked --manifest-path "$MANIFEST" --offline -p egui-winit --lib linux_ime
 cargo clippy --locked --manifest-path "$MANIFEST" --offline --all-targets -- -D warnings
 SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/zalo-rust-smoke.XXXXXXXX")"
 trap 'rm -rf -- "$SMOKE_ROOT"' EXIT

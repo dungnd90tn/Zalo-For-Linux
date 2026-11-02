@@ -137,6 +137,28 @@ gated ACKs, exact ciphertext dispatch, unknown-delivery reconciliation and group
 membership/capability validation. The current module does not claim these paths work
 on a production account.
 
+## Inactive provisioning proof checkpoint
+
+The optional `signal-crypto` child keeps at most 16 correlated requests / 256 KiB,
+with socket epoch, authentication generation, durable attempt ID and exact public
+payload hash checks. Upload writes consume a durable READY→SENDING receipt and
+recheck cancellation/socket authority immediately before sending. A successful 540
+without a positive server timestamp remains `AcceptedNeedsMetadata`. Lost ACKs
+become `Unknown`; neither state permits uploading the same prekeys again.
+
+Query-only reconciliation requires 564 metadata, a complete own-541 response with
+exactly one matching PC identity/signed prekey (other valid platforms may exist),
+and a second unchanged, positive 564 timestamp. Registration-ID equality alone
+never proves identity. Unknown uploads retain unknown OPK acceptance. Terminal
+metadata races, stale scopes and malformed replies cannot mint a proof.
+
+This child is **not connected to the live run loop**. Six focused tests include
+strict local TLS/private Connection ACK, missing timestamp and lost-ACK cases.
+Reconnection can retain the original attempt capability in memory; process restart
+currently leaves recovered uploads held `Unknown`. A future opaque, query-only
+restore capability and atomic proof-acceptance/activation transaction are still
+required. No active epoch is installed by this checkpoint.
+
 ## Offline acceptance
 
 ```sh

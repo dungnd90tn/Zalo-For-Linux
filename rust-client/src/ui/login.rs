@@ -30,6 +30,8 @@ pub(super) struct LoginView {
     phase: Phase,
     error: Option<String>,
     qr: Option<egui::TextureHandle>,
+    retry_restore: bool,
+    startup_attempt: bool,
 }
 
 impl LoginView {
@@ -39,6 +41,8 @@ impl LoginView {
 
     pub fn start(&mut self, generation: u64, restoring: bool) {
         self.generation = generation;
+        self.retry_restore = restoring;
+        self.startup_attempt = restoring;
         self.phase = if restoring {
             Phase::Restoring
         } else {
@@ -51,6 +55,8 @@ impl LoginView {
     pub fn signed_out(&mut self, generation: u64) {
         self.generation = generation;
         self.phase = Phase::SignedOut;
+        self.retry_restore = false;
+        self.startup_attempt = false;
         self.error = None;
         self.qr = None;
     }
@@ -60,6 +66,9 @@ impl LoginView {
             return;
         }
         self.phase = phase;
+        if phase == Phase::CreatingQr {
+            self.retry_restore = false;
+        }
         if !matches!(phase, Phase::WaitingForScan) {
             self.qr = None;
         }
@@ -246,6 +255,10 @@ impl LoginView {
                 "Đang khôi phục phiên…",
                 "Kiểm tra phiên đã lưu trước khi mở hội thoại.",
             ),
+            Phase::Failed if self.retry_restore => (
+                "Chưa khôi phục được phiên",
+                "Phiên đã lưu vẫn được giữ. Kiểm tra kết nối và thử lại.",
+            ),
             Phase::Failed => ("Chưa thể đăng nhập", "Bạn có thể tạo mã mới và thử lại."),
         };
         ui.label(RichText::new(title).size(14.0).strong());
@@ -268,7 +281,9 @@ impl LoginView {
                 .add_enabled(
                     enabled,
                     egui::Button::new(
-                        RichText::new(if self.phase == Phase::Failed {
+                        RichText::new(if self.retry_restore {
+                            "Thử lại phiên đã lưu"
+                        } else if self.phase == Phase::Failed {
                             "Tạo mã QR mới"
                         } else {
                             "Đăng nhập bằng mã QR"
@@ -280,18 +295,22 @@ impl LoginView {
                 )
                 .clicked()
             {
-                action = Some(Action::Begin);
+                action = Some(if self.startup_attempt {
+                    Action::Resume
+                } else {
+                    Action::Begin
+                });
             }
             ui.add_space(3.0);
-            if ui
-                .add_enabled(
-                    enabled,
-                    egui::Button::new(RichText::new("Tiếp tục phiên đã lưu").color(BLUE))
-                        .frame(false),
-                )
-                .clicked()
+            if self.retry_restore
+                && ui
+                    .add_enabled(
+                        enabled,
+                        egui::Button::new(RichText::new("Tạo mã QR mới").color(BLUE)).frame(false),
+                    )
+                    .clicked()
             {
-                action = Some(Action::Resume);
+                action = Some(Action::Begin);
             }
         } else {
             ui.horizontal(|ui| {
@@ -347,6 +366,77 @@ mod tests {
         assert!(view.qr.is_none());
     }
     #[test]
+    fn startup_failure_primary_retry_reevaluates_worker_state_and_logout_stays_manual() {
+        for (width, height) in [(1200.0, 780.0), (640.0, 480.0)] {
+            let ctx = egui::Context::default();
+            super::super::visuals::install(&ctx);
+            let mut view = LoginView::default();
+            for (qr_started, label, expected) in [
+                (false, "Thử lại phiên đã lưu", Action::Resume),
+                (true, "Tạo mã QR mới", Action::Resume),
+            ] {
+                view.start(1, true);
+                if qr_started {
+                    view.progress(1, Phase::CreatingQr);
+                }
+                view.failed(1, "Không thể kết nối");
+                let mut action = None;
+                let mut frame = |events: Vec<egui::Event>| {
+                    ctx.run(
+                        egui::RawInput {
+                            events,
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                vec2(width, height),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                action = view.show(ui, true);
+                            });
+                        },
+                    )
+                };
+                let output = frame(vec![]);
+                let pos = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                            Some(text.pos + text.galley.size() / 2.0)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                frame(vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ]);
+                frame(vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }]);
+                assert!(action == Some(expected));
+            }
+            view.signed_out(2);
+            assert!(!view.startup_attempt && !view.retry_restore);
+            view.progress(1, Phase::Restoring);
+            assert!(
+                view.phase == Phase::SignedOut,
+                "late progress must not revive login after logout"
+            );
+        }
+    }
+
+    #[test]
     fn qr_rgba_validation_rejects_unbounded_and_truncated_images() {
         assert_eq!(validated_rgba_size(0, 200), None);
         assert_eq!(validated_rgba_size(1025, 1), None);
@@ -364,8 +454,9 @@ mod tests {
         super::super::visuals::install(&ctx);
         let mut view = LoginView::default();
         for (phase, expected) in [
-            (Phase::SignedOut, "Tiếp tục phiên đã lưu"),
+            (Phase::SignedOut, "Đăng nhập bằng mã QR"),
             (Phase::WaitingForScan, "Hủy đăng nhập"),
+            (Phase::Restoring, "Hủy đăng nhập"),
         ] {
             view.phase = phase;
             let output = ctx.run(

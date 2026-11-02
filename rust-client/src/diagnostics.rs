@@ -32,6 +32,8 @@ pub enum Kind {
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
+    InputMethod,
+    StickerAssets,
     Startup,
     Shutdown,
     Profile,
@@ -52,6 +54,7 @@ pub enum Stage {
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
+    ResourceLimit,
     Started,
     CreatingQr,
     WaitingForScan,
@@ -127,8 +130,47 @@ impl CommandTag {
         }
     }
 }
+/// Fixed storage labels contain no SQL, row identifiers, paths, or payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageOperation {
+    Open,
+    RecoverOutgoing,
+    ReconcileOutgoing,
+    Actor,
+    DirectoryWrite,
+    Conversations,
+    ReceiveCursor,
+    ReceiveBatch,
+    ReceiveCursorWrite,
+    PersistAck,
+    DirectoryRead,
+    OpenConversation,
+    LoadHistory,
+    PrepareOutgoing,
+    FailOutgoing,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageFailure {
+    ConflictingMessage,
+    ConflictingEcho,
+    OutgoingMismatch,
+    ConflictingMetadata,
+    Validation,
+    Sqlite,
+    Other,
+}
 #[derive(Clone, Copy, Serialize)]
 pub struct Event {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_operation: Option<StorageOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_failure: Option<StorageFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sqlite_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_mismatch_mask: Option<u8>,
     kind: Kind,
     stage: Stage,
     reason: Reason,
@@ -156,6 +198,10 @@ pub struct Event {
 impl Event {
     pub fn new(kind: Kind, stage: Stage, reason: Reason) -> Self {
         Self {
+            storage_operation: None,
+            storage_failure: None,
+            sqlite_code: None,
+            storage_mismatch_mask: None,
             kind,
             stage,
             reason,
@@ -171,8 +217,24 @@ impl Event {
             server_code_out_of_range: false,
         }
     }
+    pub fn storage(
+        mut self,
+        operation: StorageOperation,
+        failure: StorageFailure,
+        sqlite_code: Option<i32>,
+    ) -> Self {
+        self.storage_operation = Some(operation);
+        self.storage_failure = Some(failure);
+        self.sqlite_code = sqlite_code.and_then(|code| u16::try_from(code).ok());
+        self
+    }
     pub fn http_status(mut self, value: Option<u16>) -> Self {
         self.http_status = value.filter(|v| (100..=599).contains(v));
+        self
+    }
+    /// Closed flags only: thread=1, body=2, rich content=4. Never payload data.
+    pub fn storage_mismatch(mut self, mask: Option<u8>) -> Self {
+        self.storage_mismatch_mask = mask.filter(|mask| (1..=7).contains(mask));
         self
     }
     pub fn server_code(mut self, value: Option<i64>) -> Self {
@@ -239,6 +301,10 @@ pub struct Logger {
 impl Logger {
     /// Initialize before opening the GUI. Shutdown drains at most the bounded
     /// queue on the writer thread; no UI/network event performs filesystem I/O.
+    #[cfg(all(test, feature = "messaging"))]
+    pub(crate) fn isolated_for_test(cache: &Path, verbose: bool) -> Result<Self> {
+        Self::spawn(cache, verbose, FILE_LIMIT)
+    }
     pub fn start(cache: &Path, verbose: bool) -> Result<Self> {
         let logger = Self::spawn(cache, verbose, FILE_LIMIT)?;
         let mut global = GLOBAL

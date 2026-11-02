@@ -28,6 +28,9 @@ enum Reply {
     Oversize,
     Stall,
     Runtime,
+    EchoAfterAck(bool),
+    ConflictingReceive,
+    Stickers,
     RuntimeStall,
     ControlHeartbeats,
     OfflinePages,
@@ -52,6 +55,8 @@ struct State {
     directory_stalled: AtomicBool,
     observed_commands: Mutex<Vec<u16>>,
     pings: AtomicUsize,
+    http_sends: AtomicUsize,
+    echoed: AtomicBool,
 }
 struct Fixture {
     addr: SocketAddr,
@@ -326,7 +331,7 @@ fn serve(
             let _ = ws.read();
             return;
         }
-        let auth = json!({"error_code":0,"data":{"qCmds":if matches!(reply,Reply::Runtime|Reply::RuntimeStall|Reply::DirectoryStall|Reply::ControlHeartbeats){json!([{"cmd":510,"subCmd":0},{"cmd":511,"subCmd":0}])}else{json!([{"cmd":510,"subCmd":0}])}}});
+        let auth = json!({"error_code":0,"data":{"qCmds":if matches!(reply,Reply::Runtime|Reply::Stickers|Reply::RuntimeStall|Reply::DirectoryStall|Reply::ControlHeartbeats){json!([{"cmd":510,"subCmd":0},{"cmd":511,"subCmd":0}])}else{json!([{"cmd":510,"subCmd":0}])}}});
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         z.write_all(&serde_json::to_vec(&auth).unwrap()).unwrap();
         let auth_frame = if matches!(reply, Reply::ControlHeartbeats) {
@@ -383,6 +388,21 @@ fn serve(
                         .unwrap();
                     }
                     if cmd == 563 {
+                        if let Reply::EchoAfterAck(different_client_id) = reply {
+                            if state.http_sends.load(Ordering::SeqCst) > 0
+                                && !state.echoed.swap(true, Ordering::SeqCst)
+                            {
+                                let mut message = json!({"uidFrom":"11","idTo":"22","msgId":"901","ts":"1760000000999","msgType":"webchat","content":"Xin chào Linux"});
+                                if different_client_id {
+                                    message["cliMsgId"] = json!("999999999999");
+                                }
+                                let payload = json!({"error_code":0,"encrypt":0,"data":{"error_code":0,"data":{"msgs":[message]}}});
+                                let bytes = wire::encode_frame(501, 0, &payload).unwrap();
+                                ws.send(tungstenite::Message::Binary(bytes.clone()))
+                                    .unwrap();
+                                ws.send(tungstenite::Message::Binary(bytes)).unwrap();
+                            }
+                        }
                         let response = json!({"error_code":0,"data":{"reqId":data["reqId"],"data":{"err":0,"hasMore":false,"uids":[],"threads":[],"waitUids":[],"pendingUids":[]}}});
                         ws.send(tungstenite::Message::Binary(
                             wire::encode_frame(563, 0, &json!({"error_code":0,"encrypt":0,"data":serde_json::to_string(&response).unwrap()})).unwrap(),
@@ -393,6 +413,8 @@ fn serve(
                         && matches!(
                             reply,
                             Reply::Runtime
+                                | Reply::ConflictingReceive
+                                | Reply::Stickers
                                 | Reply::RuntimeStall
                                 | Reply::DirectoryStall
                                 | Reply::ControlHeartbeats
@@ -405,13 +427,37 @@ fn serve(
                         let mut payload =
                             json!({"error_code":0,"data":{"more":false,"queueStatus":{}}});
                         payload["data"][field] = json!([{"uidFrom":"22","idTo":if group{"22"}else{"11"},"msgId":server_id,"cliMsgId":if group{"1760000000002"}else{"1760000000001"},"ts":"1760000000001","msgType":"webchat","content":if group{"group incoming"}else{"personal incoming"}}]);
+                        if matches!(reply, Reply::Stickers) {
+                            let sticker = json!({"uidFrom":"22","idTo":if group{"22"}else{"11"},"msgId":if group{"805"}else{"803"},"ts":"1760000000002","msgType":"chat.sticker","content":{"id":20695,"catId":10047,"type":3}});
+                            payload["data"][field]
+                                .as_array_mut()
+                                .unwrap()
+                                .push(sticker.clone());
+                            if !group {
+                                let mut bad = sticker;
+                                bad["msgId"] = json!("804");
+                                bad["content"] = json!({"id":"encrypted-private-token","catId":"not-a-number","type":{}});
+                                payload["data"][field].as_array_mut().unwrap().push(bad);
+                            }
+                        }
                         payload["data"]["queueStatus"][queue] =
                             json!({"lastId":if group{"200"}else{"100"},"ids":[],"evict":0});
                         let outer = json!({"error_code":0,"encrypt":0,"data":payload});
                         let frame = wire::encode_frame(cmd, 0, &outer).unwrap();
                         ws.send(tungstenite::Message::Binary(frame.clone()))
                             .unwrap();
-                        ws.send(tungstenite::Message::Binary(frame)).unwrap();
+                        if matches!(reply, Reply::ConflictingReceive) {
+                            let mut conflict = outer;
+                            conflict["data"]["data"][field][0]["content"] =
+                                json!("conflicting synthetic content");
+                            conflict["data"]["data"]["queueStatus"][queue]["lastId"] = json!("999");
+                            ws.send(tungstenite::Message::Binary(
+                                wire::encode_frame(cmd, 0, &conflict).unwrap(),
+                            ))
+                            .unwrap();
+                        } else {
+                            ws.send(tungstenite::Message::Binary(frame)).unwrap();
+                        }
                     }
                     if cmd == 2 {
                         let ping = state.pings.fetch_add(1, Ordering::SeqCst) + 1;
@@ -580,7 +626,18 @@ fn serve(
             assert_eq!(route, "/api/message/sms");
             assert_eq!(parameters["toid"], "22");
         }
-        json!({"error_code":0,"data":{"msgId":if route=="/api/group/sendmsg"{"902"}else{"901"},"ts":"1760000000001"}})
+        let server_id = if matches!(reply, Reply::EchoAfterAck(_)) {
+            if state.http_sends.fetch_add(1, Ordering::SeqCst) == 0 {
+                "901"
+            } else {
+                "902"
+            }
+        } else if route == "/api/group/sendmsg" {
+            "902"
+        } else {
+            "901"
+        };
+        json!({"error_code":0,"data":{"msgId":server_id,"ts":"1760000000001"}})
     };
     let response=serde_json::to_vec(&json!({"error_code":0,"data":cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()})).unwrap();
     write!(
@@ -941,6 +998,80 @@ async fn actual_runtime_cancels_stalled_send_without_retry_and_preserves_durable
     );
 }
 #[tokio::test]
+async fn actual_runtime_persists_mixed_sticker_metadata_before_publish_and_replay_is_idempotent() {
+    let fixture = Fixture::new(Reply::Stickers);
+    let (commands, rx) = mpsc::channel(8);
+    let (tx, mut events) = mpsc::channel(8);
+    let (stop, cancel) = watch::channel(false);
+    let task = tokio::spawn(run_with_transports(
+        fixture.profile.clone(),
+        fixture.session(),
+        rx,
+        tx,
+        Arc::new(|| {}),
+        cancel,
+        fixture.transports(),
+    ));
+    let mut ids = std::collections::HashSet::new();
+    let mut stickers = 0;
+    tokio::time::timeout(Duration::from_secs(5),async {
+        while ids.len()<5 {match events.recv().await.unwrap() {
+            LiveEvent::Received {message,..}=>{
+                assert!(ids.insert(message.id.clone()),"duplicate receive event");
+                let connection=rusqlite::Connection::open_with_flags(fixture.profile.paths.data_dir.join("messages.sqlite"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+                let count:i64=connection.query_row("SELECT count(*) FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",rusqlite::params![message.account_id,message.thread_id,message.id],|row|row.get(0)).unwrap();assert_eq!(count,1);
+                if let Some(sticker)=&message.sticker {
+                    stickers+=1;let raw:String=connection.query_row("SELECT metadata FROM message_content WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",rusqlite::params![message.account_id,message.thread_id,message.id],|row|row.get(0)).unwrap();assert_eq!(serde_json::from_str::<crate::domain::StickerDescriptor>(&raw).unwrap(),*sticker);assert_eq!(message.text,crate::domain::LEGACY_STICKER_PLACEHOLDER);
+                } else if message.id=="804" {assert!(!message.text.contains("private-token"));}
+            },LiveEvent::Fault{error,..}=>panic!("sticker runtime fault: {error}"),_=>{}
+        }}
+    }).await.unwrap();
+    assert_eq!(stickers, 2);
+    commands
+        .send(LiveCommand::Load {
+            generation: 9,
+            thread: "d:22".into(),
+            before: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match events.recv().await.unwrap() {
+                LiveEvent::Page {
+                    generation: 9,
+                    messages,
+                    ..
+                } => {
+                    assert_eq!(messages.len(), 3);
+                    assert_eq!(messages.iter().filter(|m| m.sticker.is_some()).count(), 1);
+                    break;
+                }
+                LiveEvent::Fault { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    stop.send_replace(true);
+    task.await.unwrap();
+    let connection = rusqlite::Connection::open_with_flags(
+        fixture.profile.paths.data_dir.join("messages.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM messages WHERE account_id='11'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 5);
+}
+
+#[tokio::test]
 async fn actual_runtime_cancels_when_received_event_backpressure_blocks_the_live_socket() {
     let f = Fixture::new(Reply::Runtime);
     let transports = f.transports();
@@ -1083,7 +1214,7 @@ async fn actual_runtime_does_not_advance_cursor_or_request_next_page_if_message_
     conn.execute_batch("CREATE TRIGGER fail_page BEFORE INSERT ON messages WHEN NEW.body='page-one' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
     drop(conn);
     let transports = f.transports();
-    let (_commands, rx) = mpsc::channel(16);
+    let (commands, rx) = mpsc::channel(16);
     let (tx, mut events) = mpsc::channel(4);
     let (_stop, cancel) = watch::channel(false);
     let task = tokio::spawn(run_with_transports(
@@ -1097,13 +1228,24 @@ async fn actual_runtime_does_not_advance_cursor_or_request_next_page_if_message_
     ));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if matches!(events.recv().await, Some(LiveEvent::Fault { .. })) {
+            if matches!(
+                events.recv().await,
+                Some(LiveEvent::Connection {
+                    state: LiveConnection::Offline,
+                    ..
+                })
+            ) {
                 break;
             }
         }
     })
     .await
     .unwrap();
+    assert!(
+        !task.is_finished(),
+        "local actor remains available after failed receive"
+    );
+    commands.send(LiveCommand::Shutdown).await.unwrap();
     tokio::time::timeout(Duration::from_millis(500), task)
         .await
         .unwrap()
@@ -1367,6 +1509,7 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
             id: "700".into(),
             sender: "22".into(),
             text: "cached before the failed connection".into(),
+            sticker: None,
             sent_at_ms: 1,
         };
         {
@@ -1811,6 +1954,7 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
         id: "999".into(),
         sender: "33".into(),
         text: "arrived after the directory commit".into(),
+        sticker: None,
         sent_at_ms: 100,
     };
     let stored = message.clone();
@@ -2235,4 +2379,249 @@ async fn actual_runtime_survives_three_source_pongs_then_sends_via_layered_563_a
             "logs cannot retain fixture payloads or credentials"
         )
     }
+}
+
+#[tokio::test]
+async fn http_ack_then_own_websocket_echo_without_matching_client_id_remains_usable() {
+    for different_client_id in [false, true] {
+        let f = Fixture::new(Reply::EchoAfterAck(different_client_id));
+        let (commands, rx) = mpsc::channel(16);
+        let (tx, mut events) = mpsc::channel(4);
+        let (stop, cancel) = watch::channel(false);
+        let task = tokio::spawn(run_with_transports(
+            f.profile.clone(),
+            f.session(),
+            rx,
+            tx,
+            Arc::new(|| {}),
+            cancel,
+            f.transports(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    LiveEvent::Connection {
+                        state: LiveConnection::Online,
+                        ..
+                    } => break,
+                    LiveEvent::Fault { error, .. } => panic!("unexpected startup failure {error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let mut echoes = 0;
+        for request_id in [1, 2] {
+            commands
+                .send(LiveCommand::Send {
+                    generation: 1,
+                    thread: "d:22".into(),
+                    // The real TLS fixture decrypts the request and requires the
+                    // same canonical text as the durable outgoing row and echo.
+                    text: "\u{feff} \tXin chào Linux \r\n".into(),
+                    request_id,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5),async {
+                loop {match events.recv().await.unwrap() {
+                    LiveEvent::Sent{request_id:actual,message,..}=>{assert_eq!(actual,request_id);assert_eq!(message.text,"Xin chào Linux");assert_eq!(message.id,if request_id==1{"901"}else{"902"});break;}
+                    LiveEvent::Received{message,..} if message.id=="901"=>{
+                        echoes+=1;assert_eq!(message.sent_at_ms,1760000000999);
+                        let db=rusqlite::Connection::open_with_flags(f.profile.paths.data_dir.join("messages.sqlite"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+                        let durable:i64=db.query_row("SELECT sent_at_ms FROM messages WHERE account_id='11' AND thread_id='d:22' AND message_id='901'",[],|r|r.get(0)).unwrap();
+                        assert_eq!(durable,message.sent_at_ms);
+                    }
+                    LiveEvent::Diagnostic{diagnostic,..} if diagnostic.category==LiveCategory::Storage=>panic!("valid own echo must not cause storage failure"),
+                    LiveEvent::SendFailed{error,..}|LiveEvent::Fault{error,..}=>panic!("unexpected send failure {error}"),_=>{}
+                }}
+            }).await.unwrap();
+        }
+        assert_eq!(echoes, 1, "duplicate echo must not duplicate publication");
+        let db = rusqlite::Connection::open_with_flags(
+            f.profile.paths.data_dir.join("messages.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let canonical:bool=db.query_row("SELECT count(*)=2 AND min(body)=?1 AND max(body)=?1 FROM outgoing WHERE account_id='11'",["Xin chào Linux"],|row|row.get(0)).unwrap();
+        assert!(
+            canonical,
+            "durable intents must match the decrypted HTTP payload and received echo"
+        );
+        drop(db);
+        assert_eq!(
+            f.state.http_sends.load(Ordering::SeqCst),
+            2,
+            "each explicit send dispatched exactly once"
+        );
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failed_atomic_receive_pauses_transport_keeps_cursor_and_local_history_available() {
+    let f = Fixture::new(Reply::ConflictingReceive);
+    let (commands, rx) = mpsc::channel(16);
+    let (tx, mut events) = mpsc::channel(4);
+    let (stop, cancel) = watch::channel(false);
+    let task = tokio::spawn(run_with_transports(
+        f.profile.clone(),
+        f.session(),
+        rx,
+        tx,
+        Arc::new(|| {}),
+        cancel,
+        f.transports(),
+    ));
+    let mut received = 0;
+    let mut storage = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap() {
+                LiveEvent::Received { .. } => received += 1,
+                LiveEvent::Diagnostic { diagnostic, .. } => {
+                    if diagnostic.category == LiveCategory::Storage {
+                        storage = true;
+                        assert_eq!(diagnostic.stage, LiveStage::Storage);
+                    }
+                }
+                LiveEvent::Connection {
+                    state: LiveConnection::Offline,
+                    ..
+                } if storage => break,
+                LiveEvent::Fault { error, .. } => {
+                    panic!("storage failure must not stop actor {error}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(received, 1, "failed batch cannot publish a changed row");
+    commands
+        .send(LiveCommand::Load {
+            generation: 2,
+            thread: "d:22".into(),
+            before: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match events.recv().await.unwrap() {
+                LiveEvent::Page {
+                    generation: 2,
+                    messages,
+                    ..
+                } => {
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(messages[0].text, "personal incoming");
+                    break;
+                }
+                LiveEvent::Fault { error, .. } => panic!("local history actor closed {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let db = rusqlite::Connection::open_with_flags(
+        f.profile.paths.data_dir.join("messages.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let cursor: String = db
+        .query_row(
+            "SELECT last_id FROM receive_cursors WHERE account_id='11' AND queue='510_0'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cursor, "100", "failed atomic batch must not advance cursor");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        f.state.upgrades.load(Ordering::SeqCst),
+        1,
+        "storage failure requires explicit retry"
+    );
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn sqlite_failure_log_is_structural_and_visible_without_debug_and_never_contains_trigger_text() {
+    let root = std::env::temp_dir().join(crate::domain::local_message_id().unwrap());
+    fs::create_dir(&root).unwrap();
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE incoming(body TEXT); CREATE TRIGGER reject_incoming BEFORE INSERT ON incoming BEGIN SELECT RAISE(ABORT, 'private_sql https://private.invalid/?cookie=private_cookie private_body /private/profile/path'); END;").unwrap();
+    let raw = db
+        .execute("INSERT INTO incoming VALUES ('private_body')", [])
+        .unwrap_err();
+    assert!(
+        raw.to_string().contains("private_cookie"),
+        "test must carry an actual SQLite trigger failure payload"
+    );
+    let error = storage_result::<()>(StorageOperation::ReceiveBatch, Err(raw.into())).unwrap_err();
+    let logger = crate::diagnostics::Logger::isolated_for_test(&root, false).unwrap();
+    let path = logger.path().to_owned();
+    logger.record(storage_failure_event(
+        &error,
+        StorageOperation::ReceiveBatch,
+    ));
+    drop(logger);
+    let log = fs::read_to_string(&path).unwrap();
+    for private in [
+        "private_sql",
+        "private.invalid",
+        "private_cookie",
+        "private_body",
+        "/private/profile/path",
+        "INSERT INTO",
+        "reject_incoming",
+    ] {
+        assert!(
+            !log.contains(private),
+            "storage diagnostics must not contain error payloads"
+        );
+    }
+    let records: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let event = records
+        .iter()
+        .find(|event| event["storage_operation"] == "receive_batch")
+        .expect("failure recorded even when verbose false");
+    assert_eq!(event["storage_failure"], "sqlite");
+    assert_eq!(
+        event["sqlite_code"], 1811,
+        "extended SQLITE_CONSTRAINT_TRIGGER code"
+    );
+    assert_eq!(event["kind"], "failure");
+    assert_eq!(event["stage"], "storage");
+    let detail = diagnostic(&error, LiveStage::Synchronization);
+    assert_eq!(detail.stage, LiveStage::Storage);
+    assert_eq!(detail.category, LiveCategory::Storage);
+    let typed = storage_result::<()>(
+        StorageOperation::ReceiveBatch,
+        Err(crate::store::FailureReason::ConflictingMessage.into()),
+    )
+    .unwrap_err();
+    let event = serde_json::to_value(storage_failure_event(
+        &typed,
+        StorageOperation::ReceiveBatch,
+    ))
+    .unwrap();
+    assert_eq!(event["storage_failure"], "conflicting_message");
+    assert!(event.get("sqlite_code").is_none());
+    fs::remove_dir_all(root).unwrap();
 }

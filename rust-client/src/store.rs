@@ -1,26 +1,100 @@
 //! SQLite storage owned by one background thread. All pages have a fixed upper bound.
-use crate::domain::{validate_id, Conversation, Cursor, Message, MAX_PAGE_SIZE, MAX_PREVIEW_CHARS};
+use crate::domain::{
+    canonical_plain_text, validate_id, Conversation, Cursor, Message, MAX_PAGE_SIZE,
+    MAX_PREVIEW_CHARS,
+};
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 pub mod directory;
 pub mod e2ee;
+pub mod message_content;
+
+/// Closed, payload-free storage diagnostics. Never log an arbitrary error chain:
+/// database driver messages can include SQL or data from a failing trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureReason {
+    ConflictingMessage,
+    ConflictingEcho,
+    OutgoingMismatch,
+    ConflictingMetadata,
+    Validation,
+    Sqlite,
+    Other,
+}
+impl std::fmt::Display for FailureReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ConflictingMessage => "Conflicting stored message",
+            Self::ConflictingEcho => "Conflicting outgoing acknowledgement or echo",
+            Self::OutgoingMismatch => "Echo does not match its outgoing message",
+            Self::ConflictingMetadata => "Conflicting stored message metadata",
+            Self::Validation => "Invalid storage input",
+            Self::Sqlite => "Database operation failed",
+            Self::Other => "Storage operation failed",
+        })
+    }
+}
+impl std::error::Error for FailureReason {}
+
+/// Structural mismatch only: no text, identifiers, URLs, or keys are retained.
+#[derive(Debug, Clone, Copy)]
+pub struct OutgoingMismatchFields {
+    thread: bool,
+    body: bool,
+    content_type: bool,
+}
+impl OutgoingMismatchFields {
+    /// Bit 0: thread; bit 1: body; bit 2: rich content instead of plain text.
+    pub fn mask(self) -> u8 {
+        u8::from(self.thread) | (u8::from(self.body) << 1) | (u8::from(self.content_type) << 2)
+    }
+}
+impl std::fmt::Display for OutgoingMismatchFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Outgoing echo fields do not match")
+    }
+}
+impl std::error::Error for OutgoingMismatchFields {}
+
+pub fn classify_failure(error: &anyhow::Error) -> FailureReason {
+    // anyhow typed contexts participate in downcasting, but are not necessarily
+    // exposed as that concrete type by std::error::Error::source/chain.
+    if let Some(reason) = error.downcast_ref::<FailureReason>() {
+        return *reason;
+    }
+    if let Some(reason) = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<FailureReason>())
+    {
+        return *reason;
+    }
+    if error.chain().any(|source| source.is::<rusqlite::Error>()) {
+        FailureReason::Sqlite
+    } else {
+        FailureReason::Other
+    }
+}
 
 const CURSOR_PAGE_SQL: &str =
-    "SELECT account_id,thread_id,message_id,sender,body,sent_at_ms FROM messages
-    WHERE account_id=?1 AND thread_id=?2 AND (sent_at_ms,message_id)<(?3,?4)
-    ORDER BY sent_at_ms DESC,message_id DESC LIMIT ?5";
+    "SELECT m.account_id,m.thread_id,m.message_id,m.sender,m.body,m.sent_at_ms,
+    CASE WHEN length(CAST(content.metadata AS BLOB))<=256 THEN content.metadata ELSE NULL END FROM messages m
+    LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
+    WHERE m.account_id=?1 AND m.thread_id=?2 AND (m.sent_at_ms,m.message_id)<(?3,?4)
+    ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?5";
 const CONVERSATIONS_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
-    COALESCE(substr(m.body,1,?3),''),COALESCE(m.sender,'') FROM conversations c
+    CASE WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),'') END,COALESCE(m.sender,'') FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
+    LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
     WHERE c.account_id=?1 ORDER BY c.last_message_at_ms DESC,c.thread_id LIMIT ?2";
 const CONVERSATION_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
-    COALESCE(substr(m.body,1,?3),''),COALESCE(m.sender,'') FROM conversations c
+    CASE WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),'') END,COALESCE(m.sender,'') FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
+    LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
     WHERE c.account_id=?1 AND c.thread_id=?2";
 fn conversation_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
     Ok(Conversation {
@@ -55,8 +129,9 @@ fn insert_validated(conn: &Connection, messages: &[Message]) -> Result<usize> {
                 .optional()?;
             if let Some(previous) = previous {
                 if previous != (m.sender.clone(), m.text.clone(), m.sent_at_ms) {
-                    bail!("Conflicting payload for an existing message ID");
+                    bail!(FailureReason::ConflictingMessage);
                 }
+                message_content::persist(conn, m, true)?;
                 continue;
             }
             thread.execute(params![m.account_id, m.thread_id, m.sent_at_ms])?;
@@ -68,6 +143,7 @@ fn insert_validated(conn: &Connection, messages: &[Message]) -> Result<usize> {
                 m.text,
                 m.sent_at_ms
             ])?;
+            message_content::persist(conn, m, false)?;
         }
     }
     Ok(inserted)
@@ -116,6 +192,7 @@ impl MessageStore {
             ")?;
         directory::initialize(&conn)?;
         e2ee::initialize(&conn)?;
+        message_content::initialize(&conn)?;
         conn.execute_batch("PRAGMA user_version=4; COMMIT;")?;
         Ok(Self { conn })
     }
@@ -162,7 +239,11 @@ impl MessageStore {
     ) -> Result<u64> {
         validate_id(account)?;
         validate_id(thread)?;
-        if text.trim().is_empty() || text.len() > crate::domain::MAX_TEXT_BYTES || now_ms < 1 {
+        if text.len() > crate::domain::MAX_TEXT_BYTES || now_ms < 1 {
+            bail!("Invalid outgoing message");
+        }
+        let text = canonical_plain_text(text);
+        if text.is_empty() {
             bail!("Invalid outgoing message");
         }
         let tx = self.conn.transaction()?;
@@ -174,7 +255,25 @@ impl MessageStore {
         if unresolved >= 100 {
             bail!("Too many unresolved sends");
         }
-        let duplicate:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM outgoing WHERE account_id=?1 AND thread_id=?2 AND body=?3 AND state IN ('sending','unknown','acknowledged'))",params![account,thread,text],|r|r.get(0))?;
+        let duplicate = {
+            // Released unresolved intents may contain the original untrimmed
+            // draft. Compare canonically without modifying or redispatching them.
+            // The account count above is <100; stream one capped body at a time.
+            let mut statement=tx.prepare_cached("SELECT CASE WHEN length(CAST(body AS BLOB))<=?3 THEN body ELSE NULL END FROM outgoing WHERE account_id=?1 AND thread_id=?2 AND state IN ('sending','unknown','acknowledged') LIMIT 100")?;
+            let rows = statement.query_map(
+                params![account, thread, crate::domain::MAX_TEXT_BYTES as i64],
+                |row| row.get::<_, Option<String>>(0),
+            )?;
+            let mut duplicate = false;
+            for body in rows {
+                let body = body?.ok_or(FailureReason::Validation)?;
+                if canonical_plain_text(&body) == text {
+                    duplicate = true;
+                    break;
+                }
+            }
+            duplicate
+        };
         if duplicate {
             bail!("This draft has an unresolved send. Wait for its server echo before sending it again.");
         }
@@ -228,9 +327,10 @@ impl MessageStore {
     ) -> Result<()> {
         validate_id(account)?;
         validate_id(server_id)?;
-        let changed=self.conn.execute("UPDATE outgoing SET state='acknowledged',server_id=?3 WHERE account_id=?1 AND client_id=?2 AND (server_id IS NULL OR server_id=?3)",params![account,client_id.to_string(),server_id])?;
+        let changed=self.conn.execute("UPDATE outgoing SET state='acknowledged',server_id=?3 WHERE account_id=?1 AND client_id=?2 AND (server_id IS NULL OR server_id=?3)
+            AND NOT EXISTS(SELECT 1 FROM outgoing other WHERE other.account_id=outgoing.account_id AND other.thread_id=outgoing.thread_id AND other.server_id=?3 AND other.client_id<>outgoing.client_id)",params![account,client_id.to_string(),server_id])?;
         if changed != 1 {
-            bail!("Conflicting or missing outgoing acknowledgement");
+            bail!(FailureReason::ConflictingEcho);
         }
         Ok(())
     }
@@ -258,7 +358,15 @@ impl MessageStore {
         let tx = self.conn.transaction()?;
         let(thread,text,created,previous_id):(String,String,i64,Option<String>)=tx.query_row("SELECT thread_id,body,created_at_ms,server_id FROM outgoing WHERE account_id=?1 AND client_id=?2 AND state IN ('sending','unknown','acknowledged','accepted')",params![account,client_id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
         if previous_id.as_deref().is_some_and(|id| id != server_id) {
-            bail!("Conflicting server acknowledgement");
+            bail!(FailureReason::ConflictingEcho);
+        }
+        let ambiguous: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outgoing WHERE account_id=?1 AND thread_id=?2 AND server_id=?3 AND client_id<>?4)",
+            params![account,thread,server_id,client_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if ambiguous {
+            bail!(FailureReason::ConflictingEcho);
         }
         let existing_ts:Option<i64>=tx.query_row("SELECT sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",params![account,thread,server_id],|r|r.get(0)).optional()?;
         let message = Message {
@@ -267,6 +375,7 @@ impl MessageStore {
             id: server_id.into(),
             sender: account.into(),
             text,
+            sticker: None,
             sent_at_ms: existing_ts.or(timestamp).unwrap_or(created),
         };
         message.validate()?;
@@ -287,22 +396,22 @@ impl MessageStore {
         messages: &[(Message, Option<String>)],
         cursor: Option<(&str, &str)>,
     ) -> Result<Vec<(Message, Conversation)>> {
-        validate_id(account)?;
+        validate_id(account).map_err(|_| FailureReason::Validation)?;
         if messages.len() > MAX_PAGE_SIZE {
-            bail!("Receive batch exceeds limit");
+            bail!(FailureReason::Validation);
         }
         for (m, _) in messages {
-            m.validate()?;
+            m.validate().map_err(|_| FailureReason::Validation)?;
             if m.account_id != account {
-                bail!("Incoming account mismatch");
+                bail!(FailureReason::Validation);
             }
         }
         if let Some((queue, id)) = cursor {
-            validate_id(queue)?;
-            validate_id(id)?;
-            let number = id.parse::<u64>()?;
+            validate_id(queue).map_err(|_| FailureReason::Validation)?;
+            validate_id(id).map_err(|_| FailureReason::Validation)?;
+            let number = id.parse::<u64>().map_err(|_| FailureReason::Validation)?;
             if number == 0 || number > 9_007_199_254_740_991 {
-                bail!("Invalid receive cursor");
+                bail!(FailureReason::Validation);
             }
         }
         let tx = self.conn.transaction()?;
@@ -310,25 +419,82 @@ impl MessageStore {
         for (m, client_id) in messages {
             let mut adjusted = 0;
             if m.sender == account {
-                if let Some(client_id) = client_id {
-                    let original:Option<(String,String,Option<String>)>=tx.query_row("SELECT thread_id,body,server_id FROM outgoing WHERE account_id=?1 AND client_id=?2",params![account,client_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-                    if let Some((thread, body, previous_id)) = original {
-                        if previous_id.as_deref().is_some_and(|id| id != m.id) {
-                            bail!("Conflicting server echo");
-                        }
-                        if thread != m.thread_id || body != m.text {
-                            bail!("Echo does not match outgoing message");
-                        }
-                        tx.execute("UPDATE outgoing SET state='accepted',server_id=?3 WHERE account_id=?1 AND client_id=?2",params![account,client_id,m.id])?;
-                        adjusted=tx.execute("UPDATE messages SET sent_at_ms=?4 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND sender=?1 AND body=?5 AND sent_at_ms<>?4",params![account,m.thread_id,m.id,m.sent_at_ms,m.text])?;
+                let explicit: Option<(String, String, String, Option<String>)> = client_id
+                    .as_ref()
+                    .map(|client_id| {
+                        tx.query_row("SELECT client_id,thread_id,body,server_id FROM outgoing WHERE account_id=?1 AND client_id=?2",params![account,client_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()
+                    })
+                    .transpose()?
+                    .flatten();
+                // When cliMsgId does not resolve, an already recorded HTTP ACK
+                // provides a separate, durable binding to that message.
+                // Query at most two rows because the server-ID index is not unique.
+                let bound: Vec<(String, String, String, Option<String>)> = {
+                    let mut statement=tx.prepare_cached("SELECT client_id,thread_id,body,server_id FROM outgoing WHERE account_id=?1 AND thread_id=?2 AND server_id=?3 LIMIT 2")?;
+                    let rows = statement.query_map(params![account, m.thread_id, m.id], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?;
+                    rows.collect::<rusqlite::Result<_>>()?
+                };
+                if bound.len() > 1
+                    || explicit
+                        .as_ref()
+                        .zip(bound.first())
+                        .is_some_and(|(a, b)| a.0 != b.0)
+                {
+                    bail!(FailureReason::ConflictingEcho);
+                }
+                if let Some((client_id, thread, body, previous_id)) =
+                    explicit.or_else(|| bound.into_iter().next())
+                {
+                    if previous_id.as_deref().is_some_and(|id| id != m.id) {
+                        bail!(FailureReason::ConflictingEcho);
                     }
+                    // Released versions sent/stored the untrimmed composer draft.
+                    // Repair only its exact, already ACK-bound server echo. No
+                    // arbitrary text normalization, ID reassignment, or replay send.
+                    let repair_body = body != m.text
+                        && previous_id.as_deref() == Some(m.id.as_str())
+                        && canonical_plain_text(&body) == m.text
+                        && !m.text.is_empty();
+                    let mismatch = OutgoingMismatchFields {
+                        thread: thread != m.thread_id,
+                        body: body != m.text && !repair_body,
+                        content_type: m.sticker.is_some(),
+                    };
+                    if mismatch.mask() != 0 {
+                        return Err(
+                            anyhow::Error::new(mismatch).context(FailureReason::OutgoingMismatch)
+                        );
+                    }
+                    if repair_body {
+                        let rich:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM message_content WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)",params![account,m.thread_id,m.id],|row|row.get(0))?;
+                        if rich {
+                            bail!(FailureReason::ConflictingMetadata);
+                        }
+                        let existing:Option<(String,String)>=tx.query_row("SELECT sender,body FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",params![account,m.thread_id,m.id],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+                        if existing
+                            .as_ref()
+                            .is_some_and(|(sender, text)| sender != account || text != &body)
+                        {
+                            bail!(FailureReason::ConflictingMessage);
+                        }
+                        adjusted=tx.execute("UPDATE messages SET body=?6,sent_at_ms=?4 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND sender=?1 AND body=?5",params![account,m.thread_id,m.id,m.sent_at_ms,body,m.text])?;
+                        tx.execute(
+                            "UPDATE outgoing SET body=?3 WHERE account_id=?1 AND client_id=?2",
+                            params![account, client_id, m.text],
+                        )?;
+                    }
+                    tx.execute("UPDATE outgoing SET state='accepted',server_id=?3 WHERE account_id=?1 AND client_id=?2",params![account,client_id,m.id])?;
+                    adjusted+=tx.execute("UPDATE messages SET sent_at_ms=?4 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND sender=?1 AND body=?5 AND sent_at_ms<>?4",params![account,m.thread_id,m.id,m.sent_at_ms,m.text])?;
                 }
             }
+            let sticker_enriched = m.sticker.is_some() && message_content::load(&tx, m)?.is_none();
             let inserted = insert_validated(&tx, std::slice::from_ref(m))?;
             if adjusted > 0 {
                 tx.execute("UPDATE conversations SET last_message_at_ms=(SELECT MAX(sent_at_ms) FROM messages WHERE account_id=?1 AND thread_id=?2) WHERE account_id=?1 AND thread_id=?2",params![account,m.thread_id])?;
             }
-            if inserted > 0 || adjusted > 0 {
+            if inserted > 0 || adjusted > 0 || sticker_enriched {
                 let c = tx.query_row(
                     CONVERSATION_SQL,
                     params![account, m.thread_id, MAX_PREVIEW_CHARS as i64],
@@ -409,6 +575,7 @@ impl MessageStore {
                 id: r.get(2)?,
                 sender: r.get(3)?,
                 text: r.get(4)?,
+                sticker: message_content::decode(r.get(6)?),
                 sent_at_ms: r.get(5)?,
             })
         };
@@ -420,8 +587,10 @@ impl MessageStore {
             )?;
             mapped.collect::<rusqlite::Result<_>>()?
         } else {
-            let mut stmt = self.conn.prepare_cached("SELECT account_id,thread_id,message_id,sender,body,sent_at_ms FROM messages
-                WHERE account_id=?1 AND thread_id=?2 ORDER BY sent_at_ms DESC,message_id DESC LIMIT ?3")?;
+            let mut stmt = self.conn.prepare_cached("SELECT m.account_id,m.thread_id,m.message_id,m.sender,m.body,m.sent_at_ms,
+                CASE WHEN length(CAST(content.metadata AS BLOB))<=256 THEN content.metadata ELSE NULL END FROM messages m
+                LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
+                WHERE m.account_id=?1 AND m.thread_id=?2 ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?3")?;
             let mapped = stmt.query_map(params![account, thread, limit as i64], row)?;
             mapped.collect::<rusqlite::Result<_>>()?
         };
@@ -468,6 +637,7 @@ mod tests {
             id: id.into(),
             sender: "A".into(),
             text: format!("Message {id}"),
+            sticker: None,
             sent_at_ms: ts,
         }
     }
@@ -484,10 +654,7 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         let plan = plan.join(" ");
-        assert!(
-            plan.contains("SEARCH messages USING INDEX message_page"),
-            "{plan}"
-        );
+        assert!(plan.contains("SEARCH m USING INDEX message_page"), "{plan}");
         assert!(plan.contains("(sent_at_ms,message_id)<(?,?)"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     }
@@ -677,6 +844,7 @@ mod live_storage_tests {
             id: id.into(),
             sender: "11".into(),
             text: "hello".into(),
+            sticker: None,
             sent_at_ms: ts,
         }
     }
@@ -721,6 +889,405 @@ mod live_storage_tests {
                 .is_err());
             assert_eq!(s.page("11", "d:22", None, 10).unwrap().len(), 1);
         }
+    }
+    #[test]
+    fn acknowledged_echo_with_missing_or_foreign_client_id_reconciles_server_timestamp() {
+        for timestamp in [None, Some(1700000000003)] {
+            for client_id in [None, Some("123456789".to_owned())] {
+                let mut s = MessageStore::in_memory().unwrap();
+                let id = outgoing(&mut s);
+                s.record_outgoing_ack("11", id, "900").unwrap();
+                s.accept_outgoing("11", id, "900", timestamp).unwrap();
+                let received = s
+                    .receive_batch(
+                        "11",
+                        &[(echo("900", 1700000000007), client_id.clone())],
+                        Some(("510_0", "100")),
+                    )
+                    .unwrap();
+                assert_eq!(received.len(), 1);
+                assert_eq!(received[0].0.sent_at_ms, 1700000000007);
+                assert_eq!(received[0].1.last_message_at_ms, 1700000000007);
+                assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "100");
+                assert!(s
+                    .receive_batch(
+                        "11",
+                        &[(echo("900", 1700000000007), client_id)],
+                        Some(("510_0", "101")),
+                    )
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(s.page("11", "d:22", None, 10).unwrap().len(), 1);
+            }
+        }
+    }
+    #[test]
+    fn legacy_acknowledged_boundary_whitespace_echo_is_reconciled_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "zalo-legacy-text-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(include_str!(
+                "../tests/fixtures/e2ee/released_v4_90b25d5.sql"
+            ))
+            .unwrap();
+        {
+            let mut s = MessageStore::open(&path).unwrap();
+            let id = s
+                .prepare_outgoing("11", "d:22", "  chào \r\n", 1700000000000)
+                .unwrap();
+            // Exact pre-fix persisted outgoing bytes, including boundary whitespace.
+            s.conn
+                .execute("UPDATE outgoing SET body=?1", ["  chào \r\n"])
+                .unwrap();
+            s.record_outgoing_ack("11", id, "900").unwrap();
+            s.accept_outgoing("11", id, "900", None).unwrap();
+        }
+        {
+            let mut s = MessageStore::open(&path).unwrap();
+            let mut received = echo("900", 1700000000007);
+            received.text = "chào".into();
+            let result = s
+                .receive_batch("11", &[(received.clone(), None)], Some(("510_0", "100")))
+                .unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(
+                s.page("11", "d:22", None, 10).unwrap(),
+                vec![received.clone()]
+            );
+            assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "100");
+            let body: String = s
+                .conn
+                .query_row("SELECT body FROM outgoing", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(body, "chào");
+            assert!(s
+                .receive_batch("11", &[(received, None)], Some(("510_0", "101")))
+                .unwrap()
+                .is_empty());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn legacy_plain_send_persists_only_the_shared_canonical_body_without_editing_the_draft() {
+        let mut s = MessageStore::in_memory().unwrap();
+        let draft = "\u{feff} \tchào  bạn\n tốt \r\n".to_owned();
+        let id = s
+            .prepare_outgoing("11", "d:22", &draft, 1700000000000)
+            .unwrap();
+        let body: String = s
+            .conn
+            .query_row("SELECT body FROM outgoing", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(body, "chào  bạn\n tốt");
+        assert_eq!(draft, "\u{feff} \tchào  bạn\n tốt \r\n");
+        s.fail_outgoing("11", id, true).unwrap();
+        assert!(s
+            .prepare_outgoing("11", "d:22", "chào  bạn\n tốt", 1700000000001)
+            .is_err());
+    }
+    #[test]
+    fn released_unresolved_raw_body_blocks_equivalent_new_draft_without_allocating_an_id() {
+        for state in ["unknown", "sending", "acknowledged"] {
+            let mut s = MessageStore::in_memory().unwrap();
+            let id = s.prepare_outgoing("11", "d:22", "chào  bạn", 1000).unwrap();
+            let raw = "\u{feff} \tchào  bạn \r\n";
+            s.conn
+                .execute("UPDATE outgoing SET body=?1,state=?2", params![raw, state])
+                .unwrap();
+            for draft in ["chào  bạn", raw] {
+                assert!(
+                    s.prepare_outgoing("11", "d:22", draft, 2000).is_err(),
+                    "{state} must not be blindly resent"
+                );
+            }
+            let stored:(String,String,i64)=s.conn.query_row("SELECT body,state,(SELECT last_id FROM outgoing_counters WHERE account_id='11') FROM outgoing WHERE account_id='11' AND client_id=?1",[id.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            assert_eq!(stored, (raw.into(), state.into(), 1000));
+            let count: i64 = s
+                .conn
+                .query_row("SELECT count(*) FROM outgoing", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+            // Boundary equivalence does not collapse meaningful internal spaces.
+            assert!(s.prepare_outgoing("11", "d:22", "chào bạn", 2000).is_ok());
+        }
+    }
+    #[test]
+    fn legacy_boundary_repair_is_atomic_and_never_relaxes_noncanonical_or_unbound_content() {
+        for variant in 0..9 {
+            let mut s = MessageStore::in_memory().unwrap();
+            let id = s
+                .prepare_outgoing("11", "d:22", "hello", 1700000000000)
+                .unwrap();
+            let old = " \u{feff}chào  bạn\n tốt\t ";
+            s.conn
+                .execute("UPDATE outgoing SET body=?1", [old])
+                .unwrap();
+            if variant != 6 {
+                s.record_outgoing_ack("11", id, "900").unwrap();
+                s.accept_outgoing("11", id, "900", Some(19)).unwrap();
+            }
+            s.receive_batch("11", &[], Some(("510_0", "100"))).unwrap();
+            let mut incoming = echo("900", 20);
+            incoming.text = "chào  bạn\n tốt".into();
+            let mut client = None;
+            match variant {
+                0=>s.conn.execute_batch("CREATE TRIGGER reject_legacy_cursor BEFORE UPDATE ON receive_cursors BEGIN SELECT RAISE(ABORT,'synthetic cursor failure'); END;").unwrap(),
+                1=>incoming.text="chào bạn\n tốt".into(),
+                2=>incoming.text="cha\u{0300}o  bạn\n tốt".into(),
+                3=>{incoming.thread_id="d:33".into();client=Some(id.to_string());},
+                4=>incoming.sender="22".into(),
+                5=>{incoming.text=crate::domain::LEGACY_STICKER_PLACEHOLDER.into();incoming.sticker=Some(crate::domain::StickerDescriptor{sticker_id:1,category_id:0,sticker_type:7});},
+                6=>client=Some(id.to_string()),
+                7=>{s.conn.execute("UPDATE messages SET body='unrelated stored content'",[]).unwrap();},
+                _=>{s.conn.execute("INSERT INTO message_content(account_id,thread_id,message_id,kind,metadata) VALUES('11','d:22','900','sticker','{}')",[]).unwrap();},
+            }
+            let error = s
+                .receive_batch("11", &[(incoming.clone(), client)], Some(("510_0", "101")))
+                .unwrap_err();
+            let expected = match variant {
+                0 => FailureReason::Sqlite,
+                4 | 7 => FailureReason::ConflictingMessage,
+                8 => FailureReason::ConflictingMetadata,
+                _ => FailureReason::OutgoingMismatch,
+            };
+            assert_eq!(classify_failure(&error), expected, "variant {variant}");
+            if expected == FailureReason::OutgoingMismatch {
+                let mask = error
+                    .downcast_ref::<OutgoingMismatchFields>()
+                    .unwrap()
+                    .mask();
+                assert!((1..=7).contains(&mask));
+                if variant == 3 {
+                    assert_eq!(mask, 1);
+                }
+                if variant == 5 {
+                    assert_eq!(mask, 6);
+                }
+            }
+            let body: String = s
+                .conn
+                .query_row("SELECT body FROM outgoing", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(body, old);
+            assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "100");
+            if variant == 0 {
+                assert_eq!(s.page("11", "d:22", None, 10).unwrap()[0].text, old);
+                s.conn
+                    .execute_batch("DROP TRIGGER reject_legacy_cursor")
+                    .unwrap();
+                s.receive_batch("11", &[(incoming, None)], Some(("510_0", "101")))
+                    .unwrap();
+                assert_eq!(
+                    s.page("11", "d:22", None, 10).unwrap()[0].text,
+                    "chào  bạn\n tốt"
+                );
+            }
+        }
+    }
+    #[test]
+    fn acknowledged_echo_fallback_survives_restart_and_echo_before_ack() {
+        let path = std::env::temp_dir().join(format!(
+            "zalo-ack-echo-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        {
+            let mut s = MessageStore::open(&path).unwrap();
+            let id = outgoing(&mut s);
+            s.record_outgoing_ack("11", id, "900").unwrap();
+            s.accept_outgoing("11", id, "900", None).unwrap();
+        }
+        {
+            let mut s = MessageStore::open(&path).unwrap();
+            s.recover_outgoing("11").unwrap();
+            s.receive_batch("11", &[(echo("900", 20), None)], Some(("510_0", "100")))
+                .unwrap();
+            assert_eq!(
+                s.page("11", "d:22", None, 10).unwrap(),
+                vec![echo("900", 20)]
+            );
+            assert!(s
+                .receive_batch(
+                    "11",
+                    &[(echo("900", 20), Some("foreign".into()))],
+                    Some(("510_0", "101"))
+                )
+                .unwrap()
+                .is_empty());
+        }
+        std::fs::remove_file(path).unwrap();
+        let mut s = MessageStore::in_memory().unwrap();
+        let id = outgoing(&mut s);
+        s.receive_batch("11", &[(echo("900", 20), Some("foreign".into()))], None)
+            .unwrap();
+        s.record_outgoing_ack("11", id, "900").unwrap();
+        s.accept_outgoing("11", id, "900", Some(19)).unwrap();
+        assert_eq!(
+            s.page("11", "d:22", None, 10).unwrap(),
+            vec![echo("900", 20)]
+        );
+    }
+    #[test]
+    fn echo_fallback_cannot_retime_arbitrary_rows_or_override_conflicting_client_binding() {
+        for variant in 0..5 {
+            let mut s = MessageStore::in_memory().unwrap();
+            let id = outgoing(&mut s);
+            s.record_outgoing_ack("11", id, "900").unwrap();
+            s.accept_outgoing("11", id, "900", Some(19)).unwrap();
+            s.receive_batch("11", &[], Some(("510_0", "100"))).unwrap();
+            let mut incoming = echo("900", 20);
+            let mut client = None;
+            let expected = match variant {
+                0 => {
+                    incoming.text = "different body".into();
+                    FailureReason::OutgoingMismatch
+                }
+                1 => {
+                    incoming.sender = "22".into();
+                    FailureReason::ConflictingMessage
+                }
+                2 => {
+                    incoming.thread_id = "d:33".into();
+                    let mut old = incoming.clone();
+                    old.sent_at_ms = 19;
+                    s.insert_batch(&[old]).unwrap();
+                    FailureReason::ConflictingMessage
+                }
+                3 => {
+                    incoming.id = "901".into();
+                    client = Some(id.to_string());
+                    FailureReason::ConflictingEcho
+                }
+                _ => {
+                    let second = s.prepare_outgoing("11", "d:33", "different", 1).unwrap();
+                    client = Some(second.to_string());
+                    FailureReason::ConflictingEcho
+                }
+            };
+            let mut fresh = echo("new", 21);
+            fresh.sender = "22".into();
+            let error = s
+                .receive_batch(
+                    "11",
+                    &[(fresh, None), (incoming, client)],
+                    Some(("510_0", "200")),
+                )
+                .unwrap_err();
+            assert_eq!(classify_failure(&error), expected);
+            assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "100");
+            assert_eq!(
+                s.page("11", "d:22", None, 10).unwrap(),
+                vec![echo("900", 19)]
+            );
+            let state: String = s
+                .conn
+                .query_row(
+                    "SELECT state FROM outgoing WHERE account_id='11' AND client_id=?1",
+                    [id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "accepted");
+        }
+    }
+    #[test]
+    fn server_id_binding_is_unique_per_thread_and_ambiguous_legacy_binding_is_rejected() {
+        let mut s = MessageStore::in_memory().unwrap();
+        let first = outgoing(&mut s);
+        s.record_outgoing_ack("11", first, "900").unwrap();
+        s.accept_outgoing("11", first, "900", Some(19)).unwrap();
+        let second = s.prepare_outgoing("11", "d:22", "hello", 1).unwrap();
+        assert_eq!(
+            classify_failure(&s.record_outgoing_ack("11", second, "900").unwrap_err()),
+            FailureReason::ConflictingEcho
+        );
+        assert_eq!(
+            classify_failure(
+                &s.accept_outgoing("11", second, "900", Some(19))
+                    .unwrap_err()
+            ),
+            FailureReason::ConflictingEcho
+        );
+        s.conn
+            .execute(
+                "UPDATE outgoing SET server_id='900' WHERE client_id=?1",
+                [second.to_string()],
+            )
+            .unwrap();
+        let error = s
+            .receive_batch("11", &[(echo("900", 20), None)], Some(("510_0", "100")))
+            .unwrap_err();
+        assert_eq!(classify_failure(&error), FailureReason::ConflictingEcho);
+        assert_eq!(
+            s.page("11", "d:22", None, 10).unwrap(),
+            vec![echo("900", 19)]
+        );
+        assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "1");
+        let third = s.prepare_outgoing("11", "d:33", "other thread", 1).unwrap();
+        s.record_outgoing_ack("11", third, "900").unwrap();
+        s.accept_outgoing("11", third, "900", Some(20)).unwrap();
+        assert_eq!(
+            s.page("11", "d:33", None, 10).unwrap()[0].text,
+            "other thread"
+        );
+    }
+    #[test]
+    fn typed_storage_classification_never_requires_driver_or_payload_strings() {
+        let error = anyhow::Error::new(FailureReason::ConflictingEcho)
+            .context("private context is not a diagnostic field");
+        assert_eq!(classify_failure(&error), FailureReason::ConflictingEcho);
+        let s = MessageStore::in_memory().unwrap();
+        let error: anyhow::Error = s
+            .conn
+            .execute_batch("SELECT private_fixture_secret FROM absent_fixture_table")
+            .unwrap_err()
+            .into();
+        assert_eq!(classify_failure(&error), FailureReason::Sqlite);
+        assert_eq!(
+            classify_failure(&error).to_string(),
+            "Database operation failed"
+        );
+    }
+    #[test]
+    fn echo_timestamp_reconciliation_and_outbox_state_roll_back_if_cursor_commit_fails() {
+        let mut s = MessageStore::in_memory().unwrap();
+        let id = outgoing(&mut s);
+        s.record_outgoing_ack("11", id, "900").unwrap();
+        s.accept_outgoing("11", id, "900", Some(19)).unwrap();
+        s.receive_batch("11", &[], Some(("510_0", "100"))).unwrap();
+        s.conn.execute_batch("UPDATE outgoing SET state='acknowledged'; CREATE TRIGGER reject_echo_cursor BEFORE UPDATE ON receive_cursors BEGIN SELECT RAISE(ABORT,'synthetic cursor failure'); END;").unwrap();
+        let error = s
+            .receive_batch("11", &[(echo("900", 20), None)], Some(("510_0", "101")))
+            .unwrap_err();
+        assert_eq!(classify_failure(&error), FailureReason::Sqlite);
+        assert_eq!(
+            s.page("11", "d:22", None, 10).unwrap(),
+            vec![echo("900", 19)]
+        );
+        assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "100");
+        assert_eq!(s.conversations("11", 10).unwrap()[0].last_message_at_ms, 19);
+        let state: String = s
+            .conn
+            .query_row(
+                "SELECT state FROM outgoing WHERE account_id='11'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "acknowledged");
+        s.conn
+            .execute_batch("DROP TRIGGER reject_echo_cursor")
+            .unwrap();
+        assert_eq!(
+            s.receive_batch("11", &[(echo("900", 20), None)], Some(("510_0", "101")))
+                .unwrap()
+                .len(),
+            1
+        );
     }
     #[test]
     fn ack_is_kept_when_message_insert_fails_and_reconciliation_never_sends_network() {

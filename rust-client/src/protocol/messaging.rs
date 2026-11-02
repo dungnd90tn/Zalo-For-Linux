@@ -1,7 +1,9 @@
 //! Independently derived legacy text and socket wire formats from the local PC bundles.
 //! Signal/E2EE commands are never downgraded to these legacy endpoints.
 use super::client::ClientType;
-use crate::domain::{Message, MAX_TEXT_BYTES};
+use crate::domain::{
+    canonical_plain_text, Message, StickerDescriptor, MAX_STICKER_ID, MAX_TEXT_BYTES,
+};
 use aes::cipher::consts::U16;
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -100,13 +102,16 @@ pub fn text_parameters(
     imei: &str,
 ) -> Result<Value, WireError> {
     numeric_id(&target.remote_id)?;
-    if text.trim().is_empty()
-        || text.len() > MAX_TEXT_BYTES
+    if text.len() > MAX_TEXT_BYTES
         || imei.is_empty()
         || imei.len() > 256
         || client_id == 0
         || client_id > 9_007_199_254_740_991
     {
+        return Err(WireError::Invalid);
+    }
+    let text = canonical_plain_text(text);
+    if text.is_empty() {
         return Err(WireError::Invalid);
     }
     let mut v = json!({"message":text,"clientId":client_id,"imei":imei});
@@ -486,7 +491,37 @@ pub struct Incoming {
     pub client_id: Option<String>,
     pub unsupported: bool,
 }
-/// Only actual legacy webchat text is decoded; encrypted/media payloads are refused explicitly.
+// Stickers carry a catalog address, never an image URL. Unknown/malformed media
+// stays an explicit placeholder without poisoning other messages in a batch.
+fn sticker_descriptor(message: &Value) -> Option<StickerDescriptor> {
+    if message.get("msgType")?.as_str()? != "chat.sticker" || message.get("e2eeExt").is_some() {
+        return None;
+    }
+    let content = message.get("content")?.as_object()?;
+    fn number(value: &Value) -> Option<u64> {
+        if let Some(number) = value.as_u64() {
+            return (number <= MAX_STICKER_ID).then_some(number);
+        }
+        let string = value.as_str()?;
+        if string.is_empty()
+            || string.len() > 16
+            || !string.bytes().all(|b| b.is_ascii_digit())
+            || (string.len() > 1 && string.starts_with('0'))
+        {
+            return None;
+        }
+        let number: u64 = string.parse().ok()?;
+        (number <= MAX_STICKER_ID).then_some(number)
+    }
+    let descriptor = StickerDescriptor {
+        sticker_id: number(content.get("id")?)?,
+        category_id: number(content.get("catId")?)?,
+        sticker_type: number(content.get("type")?)?.try_into().ok()?,
+    };
+    descriptor.validate().ok()?;
+    Some(descriptor)
+}
+/// Actual legacy webchat text and bounded chat.sticker catalog metadata only.
 pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>, WireError> {
     numeric_id(account)?;
     service_code(payload)?;
@@ -520,7 +555,8 @@ pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>
             {
                 return Err(WireError::Invalid);
             }
-            let unsupported = message_type != "webchat";
+            let sticker = sticker_descriptor(v);
+            let unsupported = message_type != "webchat" && sticker.is_none();
             let raw_sender = v.get("uidFrom").ok_or(WireError::Invalid)?;
             let sender = if raw_sender.as_str() == Some("0") || raw_sender.as_u64() == Some(0) {
                 account.to_owned()
@@ -553,7 +589,7 @@ pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>
                 thread_id: thread,
                 id: id_string(v.get("msgId").ok_or(WireError::Invalid)?)?,
                 sender,
-                text: if unsupported {
+                text: if message_type != "webchat" {
                     format!("[Tin nhắn {message_type} chưa được hỗ trợ]")
                 } else {
                     v.get("content")
@@ -561,6 +597,7 @@ pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>
                         .ok_or(WireError::Invalid)?
                         .into()
                 },
+                sticker,
                 sent_at_ms: ts,
             };
             message.validate().map_err(|_| WireError::Invalid)?;
@@ -904,6 +941,62 @@ mod tests {
         assert!(!mixed[1].message.text.contains("must-not-render"));
     }
     #[test]
+    fn source_sticker_metadata_survives_mixed_batches_without_rendering_urls_or_ciphertext() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/stickers/wire.json")).unwrap();
+        let base = json!({"uidFrom":"22","idTo":"11","msgId":"101","ts":7,"msgType":fixture["type"],"content":fixture["content"]});
+        let mut bad = base.clone();
+        bad["msgId"] = json!("102");
+        bad["content"]["id"] = json!("secret-ciphertext");
+        let mut malicious = base.clone();
+        malicious["msgId"] = json!("103");
+        malicious["content"]["id"] = json!("https://private.invalid/token");
+        let mut secure = base.clone();
+        secure["msgId"] = json!("104");
+        secure["e2eeExt"] = json!({"iid":3});
+        let mut text = base.clone();
+        text["msgId"] = json!("105");
+        text["msgType"] = json!("webchat");
+        text["content"] = json!("still received");
+        let result=incoming_messages("11",&json!({"error_code":0,"data":{"msgs":[base.clone(),bad,malicious,secure,text],"groupMsgs":[base]}})).unwrap();
+        assert_eq!(result.len(), 6);
+        assert_eq!(
+            result[0].message.sticker.as_ref().unwrap().sticker_id,
+            20695
+        );
+        assert_eq!(
+            result[0].message.text,
+            crate::domain::LEGACY_STICKER_PLACEHOLDER
+        );
+        assert!(!result[0].unsupported);
+        for item in &result[1..4] {
+            assert!(item.unsupported);
+            assert!(item.message.sticker.is_none());
+            assert!(!item.message.text.contains("secret"));
+            assert!(!item.message.text.contains("https"));
+        }
+        assert_eq!(result[4].message.text, "still received");
+        assert_eq!(result[5].message.thread_id, "g:11");
+        assert!(result[5].message.sticker.is_some());
+        for id in [
+            json!("01"),
+            json!(-1),
+            json!(9_007_199_254_740_992u64),
+            json!(1.5),
+            json!({}),
+        ] {
+            let mut bad = result_fixture(&fixture);
+            bad["content"]["id"] = id;
+            assert!(sticker_descriptor(&bad).is_none());
+        }
+        let mut strings = result_fixture(&fixture);
+        strings["content"] = json!({"id":"20695","catId":"10047","type":"3"});
+        assert!(sticker_descriptor(&strings).is_some());
+        fn result_fixture(fixture: &Value) -> Value {
+            json!({"msgType":fixture["type"],"content":fixture["content"]})
+        }
+    }
+    #[test]
     fn capability_requires_correlated_complete_explicit_schema_and_rejects_encrypted_members() {
         let complete = json!({"error_code":0,"data":{"reqId":"r1","data":{"err":0,"hasMore":false,"uids":[],"waitUids":[],"threads":[],"pendingUids":[]}}});
         assert_eq!(
@@ -960,6 +1053,14 @@ mod tests {
             let params =
                 text_parameters(&target, "xin & + = chào", 1760000000000, "device").unwrap();
             assert_eq!(params["message"], "xin & + = chào");
+            let params = text_parameters(
+                &target,
+                "\u{feff} \tchào  bạn\n tốt \r\n",
+                1760000000000,
+                "device",
+            )
+            .unwrap();
+            assert_eq!(params["message"], "chào  bạn\n tốt");
             assert_eq!(params["clientId"], 1760000000000_u64);
             assert_eq!(
                 params[if kind == ThreadKind::Direct {
