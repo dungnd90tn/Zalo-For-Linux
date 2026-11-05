@@ -4,7 +4,7 @@ The Rust native implementation is authored independently. Electron remains the s
 
 The migration target is full parity with the working Linux Electron application. The evidence-based [feature inventory](FEATURE_PARITY.md) tracks current gaps and acceptance criteria; the existing preview has not met that target. The first directory/recent-preview milestone is implemented and tested in isolation; live compatibility and full history remain incomplete.
 
-The [native UI contract checkpoint](#native-ui-contract-checkpoint-2026-11-05) below is the newest verified local candidate. The information-message release was confirmed Online by the user. The authenticated-routing, receive-schema, theme/icon, user-tested heartbeat/logging and earlier source-only Signal checkpoints retain their historical acceptance records; no LIVE build activates Signal.
+The [initial 16:9 window checkpoint](#initial-169-window-checkpoint-2026-11-06) below is the newest verified local candidate. The information-message release was confirmed Online by the user. The authenticated-routing, receive-schema, theme/icon, user-tested heartbeat/logging and earlier source-only Signal checkpoints retain their historical acceptance records; no LIVE build activates Signal.
 
 ## Completion gates
 
@@ -351,3 +351,46 @@ candidate through approved scoped tooling: SHA-256
 the installed path with `--live`, original icon and matching window identity.
 No app/profile/account launch accompanied installation; production acceptance
 still requires the user's restart.
+
+## Wayland decoration checkpoint (2026-11-05)
+
+The Linux-only normal winit dependency restores `wayland-csd-adwaita`, including
+title text, where a Wayland compositor requests client decorations. It preserves
+server decoration policy, existing viewport defaults, native DPI and Zalo UI.
+Production-only default/LIVE feature graphs confirm the feature; five required
+registry packages were added without changing any existing locked version.
+
+The final locked offline LIVE candidate is **20,771,424 bytes**, SHA-256
+`c6520a7b7caa4a68a9027ad68caf46cd0cced034632fef417ba45e8bde0591bd`.
+Verification passes 194 default/410 LIVE Rust tests, five IME adapter and
+19 Python tests, formatting, strict default/LIVE all-target Clippy, schema-seven
+release smoke and disposable no-network/no-write doctor checks. Synthetic X11
+startup, wide/compact resize and normal close pass with zero network connects.
+Logs/proof use `/tmp/zalo-gnome-*`; [VALIDATION.md](VALIDATION.md) records scope.
+
+Native GNOME Wayland titlebar appearance still requires user acceptance; X11
+screenshots cannot establish it. Adwaita auto preferences do not establish full
+custom GTK theme support. No account/profile was opened; the previous compatible
+schema-seven executable is archived at `/tmp/zalo-gnome-previous-a398`.
+
+The coordinator installed the exact candidate through approved scoped tooling
+and independently confirmed SHA-256
+`c6520a7b7caa4a68a9027ad68caf46cd0cced034632fef417ba45e8bde0591bd`,
+20,771,424 bytes, mode 0755 and the correct **Zalo Native** desktop command/icon/
+window identity. Installation did not launch the app or open account/profile
+data. Native GNOME Wayland visual acceptance remains pending the user's restart.
+
+## Initial 16:9 window checkpoint (2026-11-06)
+
+Startup content size is now 1280×720 logical points, retaining the 640×480
+minimum, free resizing and native DPI. The final locked offline LIVE artifact is
+**20,771,424 bytes**, SHA-256
+`473377efbf4c2ca4f82b13d4b5f3c4816a2c04339331a7ff8a9e77d408ef67bd`.
+Formatting, LIVE all-target compilation, three CLI tests and schema-seven release
+smoke pass. Actual production `--demo` startup on a disposable isolated X11
+display creates 1280×720 content without fixture overrides or resize commands;
+normal close exits 0, releases its lock and records zero network connections.
+See [VALIDATION.md](VALIDATION.md) and `/tmp/zalo-default169-*` proof.
+No personal profile/account was opened. The previous compatible executable is
+`/tmp/zalo-default169-previous-c652`; GNOME Wayland decoration acceptance remains
+pending independently of this initial-size change.

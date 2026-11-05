@@ -60,6 +60,11 @@ live-login = ["network", "trust-wasm", "dep:qrcode", "dep:png"]
 messaging = ["live-login", "dep:aes-gcm", "dep:flate2", "dep:futures-util", "dep:tokio-tungstenite", "dep:percent-encoding", "dep:image", "dep:jxl-oxide", "dep:jxl-bitstream", "dep:jxl-oxide-common"]
 live = ["messaging"]
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# eframe disables winit defaults; restore Adwaita CSD for Wayland compositors
+# without server decorations while retaining the compositor's decoration policy.
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
+
 [dev-dependencies]
 winit = { version = "0.30", default-features = false, features = ["x11"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }

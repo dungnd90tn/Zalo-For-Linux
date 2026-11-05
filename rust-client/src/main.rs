@@ -225,7 +225,7 @@ fn main() -> Result<()> {
             .with_title("Zalo Linux — Rust Preview")
             .with_app_id(APPLICATION_ID)
             .with_icon(application_icon()?)
-            .with_inner_size([1024.0, 720.0])
+            .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([640.0, 480.0]),
         ..Default::default()
     };

@@ -28,7 +28,7 @@ Cài đặt mở từ rail hoặc màn đăng nhập: Sáng/Tối/Hệ thống/T
 
 Hiện tại, [ui.rs](src/ui.rs) tổ chức rail, danh sách và khung chat. Rail rộng 64; danh sách mặc định 344, kéo được trong khoảng 280–420; header chat cao 68.
 
-Dưới chiều rộng 940, danh sách/danh bạ chuyển thành màn riêng; nút quay lại giữ hội thoại và bản nháp. Cửa sổ mặc định 1024×720, tối thiểu 640×480. Composer cao 100 khi chiều cao còn lại dưới 340, ngược lại 132.
+Dưới chiều rộng 940, danh sách/danh bạ chuyển thành màn riêng; nút quay lại giữ hội thoại và bản nháp. Vùng nội dung cửa sổ mặc định 1280×720 đơn vị logic (16:9), tối thiểu 640×480. Composer cao 100 khi chiều cao còn lại dưới 340, ngược lại 132.
 
 Thông tin hội thoại nằm ở sidebar phải rộng 344 khi còn đủ ít nhất 360 cho chat. Khi hẹp, trang thông tin thay khung chat; quay lại giữ đúng hội thoại/bản nháp. Nội dung chỉ dùng dữ liệu đã lưu, đóng khi đổi tài khoản/thread; không dựng nút thao tác chưa được nối.
 

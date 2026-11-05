@@ -1,308 +1,217 @@
-# Zalo Linux Port 2026
+# Zalo Native for Linux
 
-⚠️ **Work in Progress** - This project is under active development.
+**A native Zalo client for Linux, built in Rust.**
 
-A Linux port of Zalo, bringing the popular Vietnamese messaging application to the Linux platform.
+The application combines an `egui`/`eframe` interface, SQLite-backed local history and asynchronous networking workers. It renders without a WebView and uses the repository's existing Zalo theme, fonts and icons to keep the familiar messaging experience.
 
-<img width="1280" height="799" alt="image" src="https://github.com/user-attachments/assets/7f3000e2-6d5d-4bc1-a4c1-d334f4d7a3e9" />
+**Status: active native preview.** QR login, saved-session restore, incoming text and photos have reached real-account use. The client remains a partial implementation: complete bidirectional messaging, synchronization and long-running behavior still need acceptance. Performance comparisons against equivalent workloads have not been completed.
 
-## How It Works
+This is a community project, unaffiliated with Zalo or VNG Corporation.
 
-This is an unofficial port of the **Zalo macOS desktop client** to Linux — not a web wrapper. Calls are not supported yet.
+## What the client does today
 
-The starting point was:
+- **Sign in with QR.** Startup restores a saved session automatically or opens QR login. Confirmed expiry requests a new QR; transient connection errors preserve the session and offer Retry.
+- **Keep local conversations usable.** Cached history, contact/group names, recent previews and per-conversation drafts remain available while offline. Unknown senders use neutral labels.
+- **Display incoming content.** Text, structured notices, static sticker previews, photos and bounded OA/shared-card previews have native presentations. PNG/JPEG/WebP and a static JPEG XL subset are supported; cached images open in a native viewer.
+- **Adapt to the window.** Wide and compact layouts preserve drafts and selection. Font roles and bounded image frames stay consistent as the window grows.
+- **Use the existing Zalo appearance.** Light, Dark, System and Custom modes, original glyphs and per-profile appearance settings are included.
+- **Expose actionable diagnostics.** Connection faults show a stage/category, with bounded structural logs for investigation.
 
-1. Extracting the `.dmg` from the macOS version
-2. Locating `app.asar` at `/Applications/Zalo.app/Contents/Resources/`
-3. Extracting it with `asar extract app.asar app`
-4. Running the extracted app with Electron
+Poll messages show embedded notices/questions; poll details, results and voting are unavailable. Unknown card templates retain an explicit fallback rather than pretending to support their actions.
 
-Running the bundle is only half of it. The macOS client leans on native addons shipped as Mach-O binaries, which do nothing on Linux, so several of them had to be reverse-engineered and rebuilt. That work — plus the launcher, packaging and hardening layer — is what this repository actually contains.
+## Build and run
 
-### Electron version
+### Linux build dependencies
 
-The port runs on **Electron 43.3.0** (Chromium 150, Node 24), pinned by version *and* SHA-256 in `start.sh`.
+This is a userspace application: choose dependencies by distribution, rather than kernel version. No custom kernel or kernel headers are required. The GUI needs a desktop session and a working OpenGL graphics driver; keep the driver appropriate for your hardware.
 
-It previously shipped Electron 22.3.27 (Chromium 108), which had been end-of-life since 2023. The upgrade took two fixes:
+Current validation targets Linux x86_64. The package names below have been checked against distribution indexes; this does not mean an end-to-end build and desktop test has been completed on every listed distribution.
 
-- **Login hung after the QR scan.** `webContents.incrementCapturerCount()` was removed in Electron 23 and sat in a comma expression *before* the `did-finish-load` handler was attached, so the handler that closes the login window was never registered. Both bundles now guard the call.
-- **Chat photos stopped loading.** Zalo serves message photos as JPEG XL; Chromium dropped its JXL decoder in version 110, and upstream's `zjxl` fallback is macOS/Windows only. A Linux `zjxl` addon now covers it (see below).
-
-Set `ZALO_ELECTRON_VERSION` to try another build. Always pair it with a throwaway `HOME` — a different Chromium major rewrites the IndexedDB schema in `~/.config/ZaloData` and going back deletes it as corrupt, destroying your stored session.
-
-## Installation
-
-| | Prefix | Self-update | Sandbox |
-|---|---|---|---|
-| **`.deb`** | `/opt/zalo` | no — your package manager owns it | SUID `chrome-sandbox`, works everywhere |
-| **AppImage** | AppImage mount | prompts, opens the releases page | user-namespace sandbox |
-| **`install.sh`** | `~/.local/share/zalo` | yes, via `update.sh` | user-namespace sandbox |
-
-The `.deb` is the most robust of the three: its `postinst` installs `chrome-sandbox` setuid root, so the Chromium sandbox works even on distributions that restrict unprivileged user namespaces (Ubuntu 24.04+ does by default).
-
-### Option 1: `.deb` package
-
-Download the latest `.deb` from the [Releases](https://github.com/realdtn2/zalo-linux-2026/releases/latest) page, then:
+**Ubuntu / Debian** — [Ubuntu package index](https://packages.ubuntu.com/noble/libgl1-mesa-dev), [Debian package index](https://packages.debian.org/trixie/libxkbcommon-x11-0):
 
 ```bash
-sudo apt install ./zalo_*_amd64.deb
+sudo apt update
+sudo apt install build-essential pkg-config git curl ca-certificates python3 \
+  libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libgl1-mesa-dev
 ```
 
-### Option 2: AppImage
-
-Download the latest AppImage from the [Releases](https://github.com/realdtn2/zalo-linux-2026/releases/latest) page, then:
+**Fedora** — [OpenGL development package](https://packages.fedoraproject.org/pkgs/libglvnd/libglvnd-devel/):
 
 ```bash
-chmod +x Zalo-*.AppImage
-./Zalo-*.AppImage
+sudo dnf install gcc gcc-c++ make pkgconf-pkg-config git curl ca-certificates python3 \
+  libxkbcommon-devel libxkbcommon-x11 wayland-devel libX11-devel libglvnd-devel
 ```
 
-No installation needed — fully self-contained, and **no `libfuse2` required**.
-
-### Option 3: Install script
+**Arch Linux** — [build tools](https://archlinux.org/packages/core/any/base-devel/), [X11 keyboard library](https://archlinux.org/packages/extra/x86_64/libxkbcommon-x11/):
 
 ```bash
-git clone https://github.com/realdtn2/zalo-linux-2026.git
-cd zalo-linux-2026
-./install.sh
+sudo pacman -Syu --needed base-devel git curl ca-certificates python \
+  libxkbcommon libxkbcommon-x11 wayland libx11 libglvnd
 ```
 
-## Usage
-
-**Launch the application**: open Zalo from your application launcher or desktop launcher.
-
-**Start manually**:
+### Get the source
 
 ```bash
-./start.sh
+git clone https://github.com/dungnd90tn/Zalo-For-Linux.git
+cd Zalo-For-Linux
 ```
 
-`start.sh` downloads and verifies Electron on first run, then launches **with the Chromium sandbox**, falling back to `--no-sandbox` only if the sandbox genuinely cannot start (and telling you how to fix it properly). `ZALO_NO_SANDBOX=1` is the deliberate escape hatch.
+Commands below run from the repository root unless stated otherwise.
 
-**Update the application** (install-script target only):
+### Install the pinned toolchain and build
+
+Install `rustup` using the [official Rust installation guide](https://rust-lang.org/tools/install/), then reopen your terminal so its tools are on `PATH`. The repository pins **Rust 1.99.1** with `rustfmt` and `clippy` in [rust-toolchain.toml](rust-client/rust-toolchain.toml):
 
 ```bash
-./update.sh
+rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+(cd rust-client && cargo fetch --locked)
+./scripts/rust/build.sh --offline
 ```
 
-## Building from source
+Fetch needs network access; subsequent build/check commands can work offline once dependencies are cached. Build helpers select the pinned toolchain automatically. Run direct Cargo commands inside `rust-client/` so the pin applies. With a custom Cargo target directory, use that directory instead of the default binary paths shown below.
 
-### Rust client preview
-
-An independently written native Rust client is being developed alongside the Electron port. It keeps a native UI using this repository's existing Zalo theme, fonts and icons, without a WebView or copied reference-project implementation. Electron remains the current supported application while the Rust domain, storage, background runtime, and protocol integration are validated.
-
-With the pinned Rust toolchain (`rust-client/rust-toolchain.toml`) and the Linux build prerequisites listed in [the validation guide](rust-client/VALIDATION.md):
+### Explore without an account
 
 ```bash
-(cd rust-client && cargo fetch --locked --manifest-path Cargo.toml)
-./scripts/rust/build.sh                 # locked release build
-./scripts/rust/run.sh --demo            # offline GUI with synthetic messages
-./scripts/rust/run.sh --demo --headless # offline worker/database smoke check
-./scripts/rust/run.sh --live            # build optional live features; restore session or show QR
-./scripts/rust/check.sh                 # offline tests, lint, CLI smoke checks
+./scripts/rust/run.sh --demo
 ```
 
-The launcher builds with Cargo feature `live` only when `--live` is supplied. Default/demo builds exclude the HTTP/WebSocket/trust engines. Live mode starts one asynchronous saved-session check: it restores a saved session or opens QR login when none exists. Confirmed authentication expiry opens a fresh QR; connection and service failures preserve the saved session and offer Retry. Cancel/logout do not restart login automatically. The existing hash-verified trust module is bundled for this mode; `--trust-module /absolute/path` is an advanced override.
-
-After building live mode, launch the executable directly with `./rust-client/target/release/zalo-rust --live`; running it does not require Cargo. Close an older Rust window first. Sessions saved by the earlier type-30 preview require a new QR scan for the source-verified Linux client type 24; the app preserves history and asks for fresh approval instead of rewriting old credentials.
-
-Appearance settings (gear → Cài đặt giao diện) provide Light, Dark, System and Custom modes, saved per profile. Advanced settings expose the original token catalog and all verified Zalo/Screencap glyph aliases; catalog entries do not enable unsupported features. Only bound color roles affect existing widgets; other saved tokens remain available for future components. Custom backgrounds also accept bounded two-stop gradients. See [theme coverage](rust-client/UI_THEME.md).
-
-The native window reuses the existing Zalo app icon. For a separate Linux launcher/dock identity after building, run `python3 scripts/rust/install-desktop.py`; [desktop integration](rust-client/linux/README.md) lists the four user-scoped files and dry-run option. Electron’s launcher is preserved.
-
-Normal launches automatically write structural diagnostics to the selected profile's cache at `diagnostics/native.log`; the terminal prints its absolute path. Run `./rust-client/target/release/zalo-rust --doctor --profile rust-live` to locate the live profile's log without creating files. Use the same `--profile-root`/`--profile` overrides as the launch. Up to four private 256 KiB files rotate automatically. `--debug-log` adds bounded protocol metadata; logs exclude message text, account identifiers, URLs, cookies, credentials and raw server responses.
-
-Structured `msginfo.actionlist` notices now display readable Vietnamese text while preserving the complete original content in SQLite, through both socket receive and recent previews. Embedded actions remain read-only and do not open links or download images. Current additive schema six retains history/outbox/stickers/information messages/cursors; pre-v6 executable backups cannot reopen a migrated profile and are not a database downgrade path. See [messaging contracts](rust-client/PROTOCOL_MESSAGING.md#structured-information-messages) and [current acceptance](rust-client/MIGRATION_STATUS.md).
-
-Incoming photos and OA `chat.webcontent` now preserve complete source content and render bounded native snapshots. Visible CDN thumbnails support PNG/JPEG/WebP and a static JXL subset, with scoped memory caches, retry and a cached native viewer. OA custom Vietnamese previews/metadata render; unknown remote templates remain read-only with an explicit fallback. Matching old placeholders can enrich only when replay/recent previews actually return their payload; missing old content is not recovered automatically. Original-image browser links require a click. See [media contracts and limits](rust-client/PROTOCOL_MEDIA.md).
-
-The launcher and direct binary share the CLI's XDG paths: data under `${XDG_DATA_HOME:-$HOME/.local/share}/zalo-rust/profiles/<name>`, with configuration/cache under their respective XDG roots. Default profiles are `rust-demo` for `--demo`, `rust-live` for `--live`, and `rust-pilot` otherwise. Optional `ZALO_RUST_PROFILE_ROOT` and `ZALO_RUST_PROFILE` overrides select a disposable location; explicit CLI flags take precedence. Demo data is synthetic. The earlier heartbeat/logging LIVE binary reached Online and completed five consecutive real-server heartbeat cycles over about 155 seconds, then closed normally without an observed error/offline event. The user subsequently confirmed incoming plain text. The composer/sticker build fixes the full editor click area and adds bounded static PNG previews for newly received typed stickers. The latest Linux IME bridge was independently tested with actual x-unikey 1.0.4-16 through X11/IBus/XIM, including Telex and focus changes; native Wayland remains unverified. Real-account verification of these fixes and outgoing messages remains pending. Old unsupported sticker rows lack catalog IDs and are not automatically refetched. The latest storage fix shares Electron's exact boundary-text trimming across HTTP/outbox and narrowly reconciles matching ACK-bound legacy echoes, without replaying unresolved sends. Local regressions pass; the user-reported outgoing mismatch still needs a real retry. Incoming bubbles now resolve cached contact names and matching initials; unknown users retain a neutral label, and group-member discovery/avatar downloading remain incomplete. Longer operation, directory contents and full personal/group exchange remain unverified. E2EE/Signal messages, media uploads, file/voice/video attachments and calls are unsupported; no encryption downgrade or performance improvement is claimed. See [architecture](rust-client/ARCHITECTURE.md), [validation](rust-client/VALIDATION.md), and [migration status](rust-client/MIGRATION_STATUS.md).
-
-### Electron packaging
+Demo mode uses synthetic conversations and does not contact Zalo. For a displayless storage/worker check:
 
 ```bash
-./build-deb.sh                 # → dist/zalo_<version>_amd64.deb
-./build-appimage.sh            # → dist/Zalo-<version>-x86_64.AppImage
-python3 generate-addon.py      # rebuild the Linux db-cross-v4 addon
-python3 generate-jxl-addon.py  # rebuild the Linux zjxl (JPEG XL) addon
+./scripts/rust/run.sh --demo --headless
 ```
 
-Requirements:
+### Sign in to Zalo
 
-- `build-appimage.sh` — `wget`, `unzip`, `sha256sum`
-- `build-deb.sh` — the above plus `dpkg-deb`, `fakeroot`, `python3` with Pillow
-- `generate-addon.py` — `liblzma-dev`, `libssl-dev`, node + npx
-- `generate-jxl-addon.py` — `libjxl-dev`, `libjpeg-turbo8-dev`, node + npx
+```bash
+./scripts/rust/run.sh --live
+```
 
-Every artifact these scripts download — Electron, appimagetool, the AppImage runtime — is pinned to an exact version *and* verified against a pinned SHA-256 before use. Nothing resolves a rolling tag.
+The script builds the optional live features and launches the app. On first use, scan the QR code and approve login on your phone; later launches check the saved session automatically. The phone-number tab is explanatory: **phone-number login is not implemented**.
 
-## Features
+After a live build, run the executable directly without Cargo:
 
-### `zcall` (Audio & Video Calling)
+```bash
+./rust-client/target/release/zalo-rust --live
+```
 
-**Status:** ❌ Unported (Stubbed)
+Live mode contacts Zalo using the selected native profile. Default/demo builds exclude the optional HTTP, WebSocket and trust engines. Live builds also leave the experimental Signal engine inactive.
 
-**Description:**
-A massive proprietary VoIP and WebRTC stack built around custom ZRTP-based encryption. Implemented through `zcall_mac.node` and responsible for all voice and video calling functionality.
+### Install the application launcher
 
----
+Build live mode immediately before installing: the desktop entry launches `--live`, and a later default/demo build can replace the workspace executable.
 
-### `db-cross-v4` (Backup Decryption Engine)
+```bash
+./scripts/rust/build.sh --offline --features live
+python3 scripts/rust/install-desktop.py --dry-run
+python3 scripts/rust/install-desktop.py
+```
 
-**Status:** ✅ Ported
+Open **Zalo Native** from your application menu. The installer copies the executable, creates a user-scoped desktop entry and installs the existing Zalo app icon. It does not launch the app, enable autostart or change profiles.
 
-**Description:**
-Replaces the original macOS Mach-O binary. Intercepts backup restoration calls to decompress and decrypt proprietary ZDB4.0 backup containers using AES-256-CBC and LZMA2, enabling full chat history recovery.
+Run the installer again after rebuilding to update the installed copy, then close the old window and reopen Zalo Native. See [desktop integration](rust-client/linux/README.md) for managed paths, custom binaries and disposable staging.
 
-**State:**
-Fully reverse-engineered and reimplemented in C++ (`generate-addon.py`). The Linux replacement is complete and currently active. Entry names inside a container are attacker-controlled, so every path join is validated against the output directory — absolute paths, `..` and symlinked components are rejected.
+## Current boundaries
 
----
+The [feature parity checklist](rust-client/FEATURE_PARITY.md) separates implemented behavior from verified acceptance. In particular:
 
-### `zjxl` (JPEG-XL Codec Support)
+| Area | Remaining work |
+| --- | --- |
+| Messaging | Complete real-account personal/group send–receive acceptance, reconnect behavior and long-running operation |
+| Synchronization | Full remote history, complete member discovery and downloaded avatars |
+| Content | Media uploads, file/voice attachments, animated stickers and remaining OA layouts |
+| Message actions | Replies, forwards, mentions, reactions, recall/delete and read receipts |
+| Polls and search | Poll detail/results/voting and full message search |
+| Linux integration | Tray/notifications, screenshot integration and broader desktop acceptance |
+| Login and encryption | Phone-number authentication and production Signal/E2EE messaging |
+| Distribution | Native release packages, updater and backup/history import |
 
-**Status:** ✅ Ported
+Voice/video calls are unsupported. Unsupported encryption is never treated as ordinary text. Shared-card, poll and remaining OA behavior still require real-account verification; passing synthetic fixtures does not establish universal template support or full parity.
 
-**Description:**
-Decodes the JPEG XL images Zalo serves for message photos. Upstream ships this only as Mach-O/PE and otherwise relies on Chromium, which removed JPEG XL in version 110 — so on Electron 43 Linux had no decoder at all and every chat photo collapsed into a download placeholder that re-downloading could never fix.
+X11 input/rendering and an IME adapter have test coverage. Native Wayland font clarity, window integration and IME behavior still need desktop acceptance. A local test suite does not establish compatibility with every compositor or input method.
 
-**State:**
-Rebuilt for Linux as an N-API addon over libjxl and libjpeg-turbo (`generate-jxl-addon.py`), exposing the same seven entry points the app calls. libjxl and its dependencies are vendored next to the addon, so it does not depend on the host distribution shipping a matching libjxl.
+## Profiles and privacy
 
----
+The client keeps data, configuration and cache in their respective XDG directories under `zalo-rust/profiles/<name>`. Default profile names are:
 
-### Screen capture
+| Mode | Profile |
+| --- | --- |
+| `--demo` | `rust-demo` |
+| `--live` | `rust-live` |
+| Neither flag | `rust-pilot` |
 
-**Status:** ✅ Ported
+Use `--profile-root` and `--profile` for explicit locations, or `ZALO_RUST_PROFILE_ROOT` and `ZALO_RUST_PROFILE` with the run script. Explicit CLI flags take precedence. Use disposable profiles for development; never share credentials, session files or history databases.
 
-**Description:**
-Upstream ships the capture UI as a per-platform Qt binary (`ZaloCap.exe` / `ZaloHelper.app`), so on Linux the app spawned a path that does not exist and the feature never worked.
+SQLite migrations preserve supported existing data. Older executables may not understand a newer schema; replacing a binary does not downgrade its database. Existing desktop history is not imported automatically.
 
-**State:**
-Replaced by `native/zalo-cap-linux`, a helper that re-execs the bundled Electron and speaks the same stdio protocol, with region select and annotation. It captures through `org.freedesktop.portal.Screenshot`, which the permission store remembers — granted once, then silent. (`desktopCapturer` was rejected: it reopens the "share your screen" picker on every single call.)
+### Diagnose a problem
 
----
+Inspect capabilities and locate the live profile's diagnostics without starting login or writing profile data:
 
-### `zimage` (Advanced Image Processing)
+```bash
+./rust-client/target/release/zalo-rust --doctor --profile rust-live
+```
 
-**Status:** ❌ Unported
+Normal launches write rotating structural logs at the selected cache profile's `diagnostics/native.log`; the terminal and doctor output show the path. Add bounded protocol metadata when reproducing a connection problem:
 
-**Description:**
-Performs computationally intensive image operations such as thumbnail generation, resizing, and image transformations using the bundled `libvips-cpp` library.
+```bash
+./rust-client/target/release/zalo-rust --live --debug-log
+```
 
----
+Logs omit message text, account identifiers, URLs, cookies, credentials and raw responses. Review any report before sharing it. A connection error should be investigated through its diagnostic stage/category; clearing a profile is not a routine recovery step.
 
-### `mp4thumb` (Video Thumbnail Generation)
+## Development and verification
 
-**Status:** ❌ Unported
+Run the default checks from the repository root:
 
-**Description:**
-Generates image thumbnails from `.mp4` attachments. Functions as a native macOS wrapper around a statically linked FFmpeg component that extracts preview frames.
+```bash
+./scripts/rust/check.sh
+```
 
----
+This checks formatting, Rust/Python tooling tests, Clippy, dependency boundaries and informational/headless CLI behavior. For optional-feature integration coverage:
 
-### `file-utilities` (Fast Directory Sizing)
+```bash
+(
+  cd rust-client
+  cargo test --locked --offline --all-features
+  cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+)
+```
 
-**Status:** ❌ Unported (Throws Error)
+Protocol fixtures require the `openssl` executable and permission to bind local loopback sockets. To verify a live release binary with disposable synthetic profiles:
 
-**Description:**
-A Rust-based NAPI-RS module used for high-performance recursive directory size calculations.
+```bash
+./scripts/rust/build.sh --offline --features live
+python3 scripts/rust/smoke-release.py --expect-live
+```
 
----
+Run that block from the repository root. Release smoke does not sign in to a real account. GUI, IME and real-account checks remain separate; [validation](rust-client/VALIDATION.md) records reproducible procedures and their limits. The root `package.json` is not the native application's build or test entry point.
 
-### `zwalker` (Recursive Directory Scanner)
+## Project structure
 
-**Status:** ❌ Unported (Stubbed)
+| Location | Purpose |
+| --- | --- |
+| `rust-client/src/` | Domain models, SQLite storage, workers, protocol adapters, profiles and native UI |
+| `rust-client/src/ui/` | Login, conversation, media, settings and shared UI components |
+| `rust-client/examples/` | Synthetic performance and storage harnesses |
+| `scripts/rust/` | Build/run/check helpers, desktop installer, smoke checks and tooling tests |
+| `rust-client/vendor/egui-winit/` | Pinned Linux IME adapter changes |
+| `pc-dist/` | Existing Zalo fonts, icons, theme assets and protocol reference bundles |
 
-**Description:**
-Traverses the filesystem to locate files, index content, and discover backups.
+Network requests, storage work and media decoding belong off the render path. Keep queues/caches bounded, preserve account/conversation scope, and guard against stale asynchronous results. See [architecture](rust-client/ARCHITECTURE.md) for the implementation model.
 
----
+## Contributing and documentation
 
-### `file-utils` (Low-Level File System Utilities)
+Start with [Repository Guidelines](AGENTS.md) for contribution rules. Describe the changed behavior and verification, and attach screenshots for UI changes. Native UI work follows [UI Design](rust-client/UI_DESIGN.md) and [UI agent rules](rust-client/src/ui/AGENTS.md), including the existing theme/icon system and consistent sizing.
 
-**Status:** ❌ Unported (Returns "not support")
+- [Architecture](rust-client/ARCHITECTURE.md): application boundaries and worker/storage design.
+- [Feature parity](rust-client/FEATURE_PARITY.md): implemented flows, gaps and acceptance criteria.
+- [UI theme](rust-client/UI_THEME.md): appearance modes, source assets and token coverage.
+- [Media contracts](rust-client/PROTOCOL_MEDIA.md): supported content, decoding and resource limits.
+- [Validation](rust-client/VALIDATION.md): test commands and desktop acceptance evidence.
+- [Migration status](rust-client/MIGRATION_STATUS.md): implementation checkpoints and current verification history.
 
-**Description:**
-Provides native wrappers around common filesystem operations such as moving, copying, and manipulating files.
+Zalo branding and bundled assets remain attributable to their respective owners. Integration work does not imply affiliation or endorsement; bundled third-party code retains its own notices.
 
----
-
-### `v8-profiles` (CPU Profiling)
-
-**Status:** ❌ Unported
-
-**Description:**
-A macOS-specific profiling module used to analyze V8 JavaScript engine performance.
-
----
-
-### `zfile` (Disk Information)
-
-**Status:** ❌ Unported (Stubbed)
-
-**Description:**
-Retrieves disk usage statistics, storage capacity information, and available free space.
-
----
-
-### `sqlite3` (Local Database Engine)
-
-**Status:** ✅ Supported
-
-**Description:**
-The native database engine used to access local message shard databases (`.db` files).
-
-**State:**
-The original macOS binary has been replaced with a Linux ELF build (`node_sqlite3.node`) bundled within the application. Functionality is fully operational.
-
----
-
-### `zaloLogger` (IPC Logging)
-
-**Status:** ✅ Supported
-
-**Description:**
-Custom logging infrastructure utilizing an IPC transport layer.
-
-**State:**
-Implemented entirely in cross-platform JavaScript and requires no platform-specific porting work.
-
-## Security notes
-
-Beyond moving off an end-of-life Chromium, this port:
-
-- launches **with** the Chromium sandbox rather than disabling it unconditionally, and installs the SUID sandbox helper in the `.deb`
-- verifies every downloaded artifact against a pinned SHA-256, and stages extractions so an interrupted download never leaves a half-populated Electron directory
-- disables the bundled `electron-updater`'s `autoDownload` / `autoInstallOnAppQuit`, which would otherwise download and install upstream builds behind your back
-- applies the main window's Content-Security-Policy to the renderer pages that shipped without one
-
-Note that the ~300k lines of minified vendor bundles in `main-dist/` and `pc-dist/` have not been audited.
-
-## Troubleshooting
-
-**"It asks me to log in every time."** Zalo encrypts its session with Electron `safeStorage`, which on Linux means Chromium OSCrypt backed by your keyring. If the keyring is not reachable — a bare TTY, an SSH session, a desktop where gnome-keyring never unlocked — Chromium falls back to a hardcoded key and the stored session can no longer be decrypted. Make sure `gnome-keyring` or `kwallet` is running; the `.deb` depends on `libsecret-1-0` for this reason.
-
-**Zalo restarts itself and dies immediately** (an apport report in `/var/crash/` with `SIGTRAP`, and `traps: electron ... trap int3` in the journal). Fixed in v1.3.3. Electron's own `app.relaunch()` starts the new instance with `no_new_privs` set, which disables the setuid sandbox helper; on Ubuntu 24.04+ the user-namespace fallback is blocked by AppArmor, so the relaunched instance had no usable sandbox and aborted. The launcher now relaunches from the browser process instead, and the successor's output is kept in `~/.config/ZaloData/relaunch.log`.
-
-**The screenshot permission prompt keeps appearing.** The first capture asks through the desktop portal; grant it and the answer is remembered. `xdg-desktop-portal` and its backend for your desktop need to be installed.
-
-## Contributing
-
-This is an active work-in-progress project. Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/your-feature`)
-3. Commit your changes (`git commit -m 'Add your feature'`)
-4. Push to the branch (`git push origin feature/your-feature`)
-5. Open a Pull Request
-
-Note that the main branch is `latest`, not `main`.
-
-## Disclaimer
-
-⚠️ This is a community port and is not officially affiliated with Zalo or VNG Corporation.
-
-## Support
-
-For issues, questions, or suggestions, please open an issue on the [GitHub Issues](https://github.com/realdtn2/zalo-linux-2026/issues) page.
+Report reproducible bugs or propose improvements through [GitHub Issues](https://github.com/dungnd90tn/Zalo-For-Linux/issues). Include the build/version, desktop environment, display backend, reproduction steps and sanitized diagnostics when relevant.

@@ -500,3 +500,67 @@ approved scoped tooling into **Zalo Native**: SHA-256
 20,410,880 bytes, mode 0755. Desktop `Exec --live`, original icon and
 `StartupWMClass=zalo-linux-rust-preview` match the managed installation.
 Installation did not launch the app or open personal profile/account data.
+
+## Linux Wayland window decorations (2026-11-05)
+
+Linux production dependencies now enable winit's `wayland-csd-adwaita` feature,
+restoring its normal Adwaita client decorations when the compositor requests
+client-side decoration. Previously, eframe's disabled default features left
+winit using the basic fallback frame. Server decorations, native DPI, viewport
+defaults and the app's Zalo theme remain unchanged.
+
+Independent default/LIVE feature graphs use only normal/build edges and confirm
+Adwaita plus `ab_glyph` title rendering. The lock adds exactly five registry
+packages; all existing versions/checksums remain unchanged. Upstream auto mode
+reads portal appearance/button layout and GNOME title-font preferences; this is
+not full arbitrary GTK CSS support or a live settings-watch implementation.
+
+Final checks pass **194 default Rust**, **410 LIVE Rust** (407 library + three
+CLI, two opt-in fixtures ignored), **five IME adapter** and **19 Python** tests,
+formatting and strict default/LIVE all-target Clippy. The locked offline LIVE
+artifact is **20,771,424 bytes**, SHA-256
+`c6520a7b7caa4a68a9027ad68caf46cd0cced034632fef417ba45e8bde0591bd`.
+Schema-seven smoke passes restart/legacy preservation, 19 messages/six threads,
+locking, private bounded diagnostics and informational no-write checks with
+`network_used=false`. Separate disposable doctor confirms compiled live support,
+no authentication/network startup and no profile writes.
+
+Approved isolated X11 startup/resize/close at 1200×780 and 640×480 exits 0 with
+zero network connects. Images are `gnome-csd-x11-regression-{wide,compact}.png`
+under `/tmp/zalo-rust-gui-check/`; they verify client regression, not Wayland
+titlebar appearance. Native GNOME Wayland visual acceptance remains pending.
+No real profile/account was opened. Logs/proof use `/tmp/zalo-gnome-*`; the
+previous schema-seven executable is `/tmp/zalo-gnome-previous-a398`.
+
+The coordinator installed and independently verified this exact candidate with
+approved scoped tooling: SHA-256
+`c6520a7b7caa4a68a9027ad68caf46cd0cced034632fef417ba45e8bde0591bd`,
+20,771,424 bytes and mode 0755. The managed **Zalo Native** desktop launcher
+retains its installed `Exec --live`, original icon and matching window identity.
+Installation did not launch the app or open account/profile data; native GNOME
+Wayland appearance awaits the user's restart.
+
+## Initial 16:9 window (2026-11-06)
+
+Production startup now requests a **1280×720 logical-point content area**;
+the minimum remains 640×480 and normal resizing/native DPI remain unchanged.
+Formatting, locked offline LIVE all-target `cargo check`, three CLI tests,
+release build and schema-seven disposable smoke pass. No new cosmetic assertion
+test or repeat of the unrelated full feature matrix was added.
+
+The actual production release, launched with `--demo` and a disposable profile,
+initially creates a 1280×720 client window on isolated X11 at scale 1/96 DPI.
+The driver sends no resize command and uses no fixture viewport override.
+`default169-production.png` and its JSON sidecar under
+`/tmp/zalo-rust-gui-check/` record the full unscaled content image. Normal close
+exits 0, releases the profile lock and makes zero Internet connections.
+
+Artifact SHA-256 is
+`473377efbf4c2ca4f82b13d4b5f3c4816a2c04339331a7ff8a9e77d408ef67bd`,
+**20,771,424 bytes**. Smoke preserves schema seven, restart/legacy history,
+19 messages/six threads, private diagnostics and informational no-write behavior
+with `network_used=false`. Logs/proof use `/tmp/zalo-default169-*`; the previous
+compatible executable is `/tmp/zalo-default169-previous-c652`. No personal
+profile/account was opened; GNOME Wayland decoration acceptance remains separate.
+
+The coordinator installed and independently verified this exact artifact (SHA-256 `473377efbf4c2ca4f82b13d4b5f3c4816a2c04339331a7ff8a9e77d408ef67bd`, 20,771,424 bytes, mode 0755) without launching the app or opening account/profile data.
