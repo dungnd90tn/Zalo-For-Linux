@@ -564,3 +564,37 @@ compatible executable is `/tmp/zalo-default169-previous-c652`. No personal
 profile/account was opened; GNOME Wayland decoration acceptance remains separate.
 
 The coordinator installed and independently verified this exact artifact (SHA-256 `473377efbf4c2ca4f82b13d4b5f3c4816a2c04339331a7ff8a9e77d408ef67bd`, 20,771,424 bytes, mode 0755) without launching the app or opening account/profile data.
+
+## Avatar status and account menus (2026-11-06)
+
+Signed-in status now appears on the rail avatar; its popup exposes connection
+details and recovery. The persistent status banner and account/logout footer,
+including reserved space, are removed. The gear opens separate appearance and
+logout actions; logout still requires confirmation. Signed-out users only see
+appearance. The palette adds four original-source roles (35 roles/38 tokens).
+
+Seven pointer/state regressions cover menu routing, confirmation cancellation,
+draft/session preservation, blocked background sending/navigation, outside/Esc/
+same-anchor dismissal, scoped focus restoration, stale account/auth/thread
+invalidation, resize anchoring and fully clipped recovery controls. Final checks
+pass **194 default Rust**, **445 all-feature Rust**, **five IME adapter** and
+**19 Python** tests, formatting, strict default/all-feature all-target Clippy,
+and catalog/inventory reproducibility. Two opt-in native fixtures remain ignored
+in the normal suite.
+
+Approved isolated X11 captures cover Light/Dark, synthetic Online/Offline and
+1200×780/640×480. Online is a test-only display override, not transport evidence.
+The refreshed Offline status popups keep both recovery actions visible after
+gear-to-status switching. All sessions close normally with zero network
+connects. Images/logs use `/tmp/zalo-rust-gui-check/account-*`; final gate proofs
+use `/tmp/zalo-account-final-*`. No personal profile/account was opened. Existing
+native Wayland and fresh real x-unikey acceptance boundaries remain unchanged.
+
+The locked offline LIVE artifact is **20,778,592 bytes**, SHA-256
+`f7d840780939684ede192070bb823c6e917bec372cf990507adcc89ceb61d5f6`.
+Schema-seven smoke passes restart/legacy preservation, 19 messages/six threads,
+locking, private bounded diagnostics and informational no-write checks with
+`network_used=false`. Separate disposable doctor confirms compiled live support,
+no authentication/network startup and no profile writes.
+
+The coordinator installed and independently verified this exact artifact (SHA-256 `f7d840780939684ede192070bb823c6e917bec372cf990507adcc89ceb61d5f6`, 20,778,592 bytes, mode 0755) with matching Zalo Native launcher/icon/window identity, without launching the app or opening account/profile data.

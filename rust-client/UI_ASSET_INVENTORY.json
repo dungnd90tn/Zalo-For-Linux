@@ -74671,6 +74671,8 @@
     "native_icon_codepoint_mismatches": [],
     "native_icon_variants_without_binding": [],
     "native_token_names": [
+      "--G60",
+      "--WA100",
       "--accent-blue-bg",
       "--accent-green-bg",
       "--accent-orange-bg",
@@ -74688,8 +74690,10 @@
       "--button-secondary-neutral-pressed",
       "--curtain",
       "--divider",
+      "--grey-dot",
       "--icon-navbar-disabled",
       "--icon-navbar-normal",
+      "--icon-warning",
       "--layer-background",
       "--layer-background-hover",
       "--layer-background-leftmenu-selected",
@@ -75789,7 +75793,6 @@
       "--G40",
       "--G50",
       "--G55",
-      "--G60",
       "--G70",
       "--G80",
       "--G85",
@@ -75967,7 +75970,6 @@
       "--V_Gradient_SKB55GR55",
       "--WA0",
       "--WA10",
-      "--WA100",
       "--WA15",
       "--WA20",
       "--WA25",
@@ -76327,7 +76329,6 @@
       "--focused-transition-in",
       "--focused-transition-out",
       "--gradient-angle",
-      "--grey-dot",
       "--group-topic-height",
       "--icon-count-noti-disable-bg",
       "--icon-count-noti-enable-bg",
@@ -76342,7 +76343,6 @@
       "--icon-primary",
       "--icon-secondary",
       "--icon-success",
-      "--icon-warning",
       "--input-field-bg-filled",
       "--input-field-bg-filled-hover",
       "--input-field-bg-filled-pressed",
@@ -145772,6 +145772,30 @@
         ]
       },
       {
+        "role": "status_online",
+        "source_tokens": [
+          "--G60"
+        ]
+      },
+      {
+        "role": "status_connecting",
+        "source_tokens": [
+          "--icon-warning"
+        ]
+      },
+      {
+        "role": "status_offline",
+        "source_tokens": [
+          "--grey-dot"
+        ]
+      },
+      {
+        "role": "status_ring",
+        "source_tokens": [
+          "--WA100"
+        ]
+      },
+      {
         "role": "avatar_accents",
         "source_tokens": [
           "--accent-blue-bg",
@@ -145788,9 +145812,9 @@
       "sha256": "4e3ebe5924e773d29e69d2d7bc41b5ab86159d0a36588670fa28e96127c11b91"
     },
     "theme_source": {
-      "bytes": 17006,
+      "bytes": 17405,
       "path": "rust-client/src/theme.rs",
-      "sha256": "bdc31d816f7b5cc981c41c86964028f42efa50e245f654eae9a1979f8e0299eb"
+      "sha256": "f69c8eced82d9456dcb471017731265605de2811066029d1227065e8c47469a0"
     }
   },
   "schema_version": 1,

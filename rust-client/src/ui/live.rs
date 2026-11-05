@@ -244,34 +244,19 @@ impl LiveState {
 
 impl NativeApp {
     #[cfg(feature = "messaging")]
-    pub(super) fn live_connection_notice(&mut self, ctx: &egui::Context) {
-        let colors = crate::theme::palette(ctx);
-        let enabled = !self.modal_blocked && !self.modal_open();
+    pub(super) fn live_recovery(&mut self, ui: &mut egui::Ui) {
         let Some(state) = &mut self.live else {
             return;
         };
         if state.account.is_none() || state.connection == LiveConnection::Online {
             return;
         }
-        let mut action = None;
-        egui::TopBottomPanel::top("live_connection_notice")
-            .min_height(90.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(colors.selected)
-                    .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
-            )
-            .show(ctx, |ui| {
-                if !enabled {
-                    ui.disable();
-                }
-                action = recovery_controls(
-                    ui,
-                    state.connection,
-                    state.worker.is_some(),
-                    state.reason.as_deref(),
-                );
-            });
+        let action = recovery_controls(
+            ui,
+            state.connection,
+            state.worker.is_some(),
+            state.reason.as_deref(),
+        );
         match action {
             Some(RecoveryAction::Retry) => {
                 if let Some(worker) = &state.worker {
@@ -290,8 +275,10 @@ impl NativeApp {
                 state.ensure_worker(self._profile.clone());
                 state.open_dialog = true;
             }
-            Some(RecoveryAction::Logout) => state.logout_dialog = true,
             None => {}
+        }
+        if action.is_some() {
+            self.account_popup = None;
         }
     }
 
@@ -317,49 +304,6 @@ impl NativeApp {
         ui.label(
             "Chưa hỗ trợ gọi điện, gửi ảnh/tệp hoặc nhập lịch sử. Có thể xem ảnh và nội dung được chia sẻ đã nhận.",
         );
-        ui.add_space(10.0);
-        if ui.button("Đăng xuất").clicked() {
-            state.logout_dialog = true;
-        }
-        true
-    }
-
-    pub(super) fn live_account_footer(&mut self, ui: &mut egui::Ui, rect: egui::Rect) -> bool {
-        let colors = crate::theme::palette(ui.ctx());
-        let account_label = self.account_label().to_owned();
-        let Some(state) = self.live.as_mut() else {
-            return false;
-        };
-        let Some(_) = state.account.as_ref() else {
-            return false;
-        };
-        let mut content =
-            ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(14.0, 8.0))));
-        let mut logout = false;
-        content.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.set_max_width((rect.width() - 115.0).max(80.0));
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&account_label).size(super::visuals::TEXT_BODY),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(&account_label);
-                ui.label(
-                    egui::RichText::new(state.connection_label())
-                        .size(super::visuals::TEXT_SMALL)
-                        .color(colors.text_secondary),
-                );
-            });
-            if ui.small_button("Đăng xuất").clicked() {
-                logout = true;
-            }
-        });
-        if logout {
-            state.logout_dialog = true;
-        }
         true
     }
 
@@ -411,6 +355,7 @@ impl NativeApp {
         if state.account.is_some() {
             return false;
         }
+        let mut settings_response = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(colors.surface))
             .show(ctx, |ui| {
@@ -422,22 +367,29 @@ impl NativeApp {
                     egui::vec2(ui.available_width(), 32.0),
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        if super::visuals::icon_button(
+                        let response = super::visuals::icon_button(
                             ui,
                             super::visuals::Icon::Settings,
-                            "Cài đặt giao diện",
+                            "Cài đặt và tài khoản",
                             true,
-                        )
-                        .clicked()
-                        {
-                            self.settings_open = true;
-                        }
+                        );
+                        settings_response = Some(response);
                     },
                 );
                 if let Some(action) = state.login.show(ui, enabled) {
                     state.action(action);
                 }
             });
+        if let Some(response) = settings_response {
+            self.prepare_account_popup_trigger(
+                super::account::PopupKind::Settings,
+                response.rect,
+                &response,
+            );
+            if response.clicked() {
+                self.toggle_account_popup(super::account::PopupKind::Settings, response.rect);
+            }
+        }
         true
     }
 
@@ -938,7 +890,6 @@ fn show_target_dialog(
 enum RecoveryAction {
     Retry,
     Open,
-    Logout,
 }
 
 /// The same recovery controls remain reachable when the compact sidebar is hidden.
@@ -957,20 +908,20 @@ fn recovery_controls(
     );
     let expired = connection == LiveConnection::Expired;
     ui.spacing_mut().item_spacing.y = 5.0;
-    ui.label(
-        egui::RichText::new(if expired {
-            "Phiên đăng nhập đã hết hạn"
-        } else if !worker_alive {
-            "Gửi nhận đã dừng · vẫn giữ bản nháp"
-        } else if active {
-            "Đang kết nối tới Zalo…"
-        } else {
-            "Ngoại tuyến · vẫn có thể đọc tin đã lưu và soạn bản nháp"
-        })
-        .size(12.0)
-        .family(egui::FontFamily::Name("Zalo Semibold".into()))
-        .color(colors.text_primary),
-    );
+    if !active && !expired {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(if worker_alive {
+                    "Bạn vẫn có thể đọc tin đã lưu và soạn bản nháp."
+                } else {
+                    "Gửi nhận đã dừng; bản nháp được giữ nguyên."
+                })
+                .size(super::visuals::TEXT_SMALL)
+                .color(colors.text_secondary),
+            )
+            .wrap(),
+        );
+    }
     if let Some(reason) = reason {
         ui.add(
             egui::Label::new(
@@ -994,15 +945,8 @@ fn recovery_controls(
         if ui.small_button("Mở hội thoại").clicked() {
             action = Some(RecoveryAction::Open);
         }
-        if ui
-            .small_button(if expired {
-                "Đăng nhập lại"
-            } else {
-                "Đăng xuất"
-            })
-            .clicked()
-        {
-            action = Some(RecoveryAction::Logout);
+        if expired {
+            ui.add(egui::Label::new("Mở menu bánh răng để đăng xuất và đăng nhập lại.").wrap());
         }
     });
     action
@@ -1057,6 +1001,8 @@ pub(in crate::ui) mod tests {
                 modal_blocked: false,
                 modal_focus: None,
                 settings_open: false,
+                account_popup: None,
+                account_trigger_focus: None,
                 theme: crate::theme::ThemeController::new(
                     profile.paths.config_dir.clone(),
                     Arc::new(|| {}),
@@ -1064,6 +1010,7 @@ pub(in crate::ui) mod tests {
                 .unwrap(),
                 settings: super::super::settings::Settings::default(),
                 fixture_system_theme: None,
+                fixture_connection: None,
                 focus_composer: false,
                 latest_page: true,
                 ime_composing: false,
@@ -1113,6 +1060,7 @@ pub(in crate::ui) mod tests {
                 .unwrap()
                 .id
                 .clone();
+            let session = app.live.as_ref().unwrap().session.as_ref().unwrap().clone();
             for (dialog, dismiss) in [(0, "Hủy"), (1, "Hủy"), (2, "Đã hiểu")] {
                 let state = app.live.as_mut().unwrap();
                 state.logout_dialog = dialog == 0;
@@ -1172,6 +1120,7 @@ pub(in crate::ui) mod tests {
                 let state = app.live.as_ref().unwrap();
                 assert!(!state.logout_dialog && !state.open_dialog && !state.review_dialog);
                 assert_eq!(state.account.as_ref().unwrap().id, account_id);
+                assert!(Arc::ptr_eq(state.session.as_ref().unwrap(), &session));
                 assert_eq!(app.drafts.active.text, "Bản nháp cần giữ nguyên");
                 assert!(
                     state.worker.is_none(),
@@ -1208,24 +1157,25 @@ pub(in crate::ui) mod tests {
                         });
                     },
                 );
-                for label in [
-                    "Kết nối lại",
-                    "Mở hội thoại",
-                    "Đăng xuất",
-                    "Kết nối TLS chưa hoàn tất.",
-                ] {
+                for label in ["Kết nối lại", "Mở hội thoại", "Kết nối TLS chưa hoàn tất."]
+                {
                     let rect = text_rect(&output, label)
                         .unwrap_or_else(|| panic!("missing {label} at {width}"));
                     assert!(rect.bottom() <= 480.0 && rect.right() <= width);
                 }
             }
+            let ordinary = render(&mut app, &ctx, width);
+            assert!(text_rect(&ordinary, "Kết nối lại").is_none());
+            assert!(text_rect(&ordinary, "Kết nối TLS chưa hoàn tất.").is_none());
+            app.toggle_account_popup(
+                super::super::account::PopupKind::Status,
+                egui::Rect::from_center_size(egui::pos2(32.0, 43.0), egui::vec2(40.0, 40.0)),
+            );
+            render(&mut app, &ctx, width);
+            render(&mut app, &ctx, width);
             let output = render(&mut app, &ctx, width);
-            for label in [
-                "Kết nối lại",
-                "Mở hội thoại",
-                "Đăng xuất",
-                "Mở hội thoại bằng ID",
-            ] {
+            for label in ["Kết nối lại", "Mở hội thoại", "Kết nối TLS chưa hoàn tất."]
+            {
                 let rect = text_rect(&output, label).unwrap_or_else(|| {
                     panic!(
                         "workspace missing {label} at {width}; texts={:?}",
@@ -1341,7 +1291,6 @@ pub(in crate::ui) mod tests {
         for (label, expected) in [
             ("Kết nối lại", RecoveryAction::Retry),
             ("Mở hội thoại", RecoveryAction::Open),
-            ("Đăng xuất", RecoveryAction::Logout),
         ] {
             let mut action = None;
             let mut draw = |events| {
@@ -1903,6 +1852,8 @@ pub(in crate::ui) mod tests {
                 *root.lock().unwrap() = Some(path);
                 if online {
                     app.live.as_mut().unwrap().connection = LiveConnection::Online;
+                    // Synthetic visual state only; no production authentication claim.
+                    app.fixture_connection = Some(LiveConnection::Online);
                 }
                 if cached {
                     let messages: Vec<_> = [

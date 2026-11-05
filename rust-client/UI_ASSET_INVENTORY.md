@@ -30,13 +30,13 @@ Snapshot hiện tại trong JSON:
 | Quy tắc `content` | 3.661; gồm chuỗi rỗng và nội dung trang trí, không chỉ icon |
 | Class `fa-*` liên hệ với `content` | 1.021 class; gồm alias và class trong selector ghép, không phải 1.021 glyph riêng biệt |
 | `@font-face` / tệp font | 46 khai báo / 16 tệp; không đồng nghĩa 46 font khác nhau |
-| Binding native | 31 role / 34 token nguồn; 15 icon ngữ nghĩa |
+| Binding native | 35 role / 38 token nguồn; 15 icon ngữ nghĩa |
 | Registry có thể vẽ | 1.034 glyph/alias xác minh cmap: 1.020 Zalo + 14 Screencap |
 | Tham chiếu `var()` / URL CSS | 443 tên biến / 183 lần tham chiếu URL |
 
 Mỗi nguồn CSS, font và tài sản URL cục bộ có fingerprint SHA-256 trong JSON; runtime JS có hash và anchor enum/query. Số lượng là snapshot kiểm tra bằng `--check`, không phải giới hạn cố định để giữ khi tài sản đổi.
 
-JSON ghi 51 tên biến được tham chiếu nhưng không có khai báo trong CSS thuộc phạm vi này; cần kiểm tra fallback hoặc nguồn runtime trước khi nối. 726 token chưa có binding Palette tường minh vẫn nằm trong catalog. Không tự kết luận mọi class là icon riêng cần thêm hoặc mọi biến chưa khai báo là lỗi.
+JSON ghi 51 tên biến được tham chiếu nhưng không có khai báo trong CSS thuộc phạm vi này; cần kiểm tra fallback hoặc nguồn runtime trước khi nối. 720 token chưa có binding Palette tường minh vẫn nằm trong catalog. Không tự kết luận mọi class là icon riêng cần thêm hoặc mọi biến chưa khai báo là lỗi.
 
 Runtime gốc trong `pc-dist/compact-app-pc.e08d0d44f38873747a6b.js` có theme `light`, `dark`, `custom`; chế độ cấu hình `LIGHT=0`, `DARK=1`, `SYSTEM=2`, `CUSTOM=3` và truy vấn `(prefers-color-scheme: dark)`.
 

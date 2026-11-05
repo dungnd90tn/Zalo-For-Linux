@@ -22,7 +22,7 @@ Client dùng egui/eframe native, không WebView/Electron. Không sao chép mã h
 
 Font Segoe UI regular/Semibold/Bold và hai icon font gốc khởi tạo một lần; metadata 12, body/button 14, nội dung chat 15, heading 18, tiêu đề modal 16 đơn vị logic egui. Không dùng chữ phụ 9–11,5 để tiết kiệm chỗ. Catalog giữ toàn bộ token và 1.034 glyph/alias đã kiểm cmap; raster chỉ khi dùng. [Kiểm kê](UI_ASSET_INVENTORY.md) phân biệt nguồn đầy đủ với thành phần native.
 
-Cài đặt mở từ rail hoặc màn đăng nhập: Sáng/Tối/Hệ thống/Tùy chỉnh, lưu riêng trong profile bằng worker. System theo tín hiệu egui/winit; thiếu tín hiệu dùng Light, chưa xác nhận mọi desktop Linux. Custom kế thừa Light, ghi đè màu/reset; gradient hai điểm màu hỗ trợ nền chat, rail và surface. Token/editor và danh mục icon nằm trong Nâng cao, đóng mặc định; không tự bật tính năng chưa hỗ trợ.
+Bấm bánh răng mở menu; chọn “Thiết lập giao diện” để mở Sáng/Tối/Hệ thống/Tùy chỉnh, lưu riêng trong profile bằng worker. Khi đã đăng nhập, mục “Đăng xuất” riêng chỉ mở hộp xác nhận; Hủy giữ phiên và bản nháp. Màn đăng nhập chỉ có mục giao diện. System theo tín hiệu egui/winit; thiếu tín hiệu dùng Light, chưa xác nhận mọi desktop Linux. Custom kế thừa Light, ghi đè màu/reset; gradient hai điểm màu hỗ trợ nền chat, rail và surface. Token/editor và danh mục icon nằm trong Nâng cao, đóng mặc định; không tự bật tính năng chưa hỗ trợ.
 
 ## Bố cục và thành phần
 
@@ -34,7 +34,7 @@ Thông tin hội thoại nằm ở sidebar phải rộng 344 khi còn đủ ít 
 
 Resize/maximize cùng DPI chỉ tăng vùng đọc, không nhân cỡ chữ hay chiều rộng rail/list/sidebar, chiều cao header hoặc hitbox. Ảnh/sticker giữ tỉ lệ, có giới hạn kích thước và không phóng vượt số pixel nguồn; viewer căn ảnh giữa hai chiều trong khung tối đa 740×540, chỉ thu nhỏ khi cửa sổ thiếu chỗ; chú thích cuộn riêng để liên kết ảnh gốc vẫn tới được. Khi DPI màn hình đổi, toolkit raster lại font theo mật độ pixel thật; không ép zoom/DPI toàn ứng dụng hoặc kéo giãn bitmap.
 
-Modal dùng `dialog.rs`: curtain theo token gốc, header cao 48, tiêu đề 16, glyph đóng 24 trong hitbox 30, viền bo 4, body cuộn có padding 14×16. Footer là hàng nút cao 32 cộng padding, không kéo giãn theo chiều cao cửa sổ. Khi modal mở, chặn cả pointer, phím tắt và dispatch nền; đóng modal chỉ khôi phục focus khi tài khoản/thread/generation còn khớp. Settings, mở hội thoại, đăng xuất, kiểm tra gửi và thông tin ứng dụng dùng cùng quy tắc.
+Modal dùng `dialog.rs`: curtain theo token gốc, header cao 48, tiêu đề 16, glyph đóng 24 trong hitbox 30, viền bo 4, body cuộn có padding 14×16. Footer là hàng nút cao 32 cộng padding, không kéo giãn theo chiều cao cửa sổ. Khi modal mở, chặn cả pointer, phím tắt và dispatch nền; đóng modal chỉ khôi phục focus khi tài khoản/thread/generation còn khớp. Settings, mở hội thoại, đăng xuất, kiểm tra gửi và thông tin ứng dụng dùng cùng quy tắc. Popup avatar/bánh răng cũng chặn thao tác nền; Escape, bấm ngoài hoặc bấm lại nút neo để đóng. Vị trí popup bám nút neo khi resize; đổi tài khoản, thế hệ đăng nhập hoặc hội thoại hủy popup và không khôi phục focus sang scope khác.
 
 | Thành phần | Nơi sửa chính |
 | --- | --- |
@@ -53,7 +53,7 @@ Hiện tại, mở `--live` tự gửi lệnh startup đến worker. Worker đ�
 
 Hủy/đăng xuất không tự chạy lại startup trong cửa sổ hiện tại. Generation loại bỏ kết quả cũ. Đăng nhập số điện thoại chưa hỗ trợ; tab hiện chỉ giải thích giới hạn, giữ lần QR đang chạy và cho phép hủy. Nhóm nút dưới QR có khung hữu hạn, căn cùng trục giữa với mã QR; thao tác chuyển tab không bắt đầu một phiên xác thực khác.
 
-Trạng thái Online chỉ đến từ xác thực transport. Khi Offline, vẫn cho đọc cache, chọn liên hệ và soạn nháp. Banner phải nêu nguyên nhân an toàn, có kết nối lại/đăng xuất; không suy diễn online của từng người. Lỗi batch lưu dữ liệu tạm dừng transport, giữ lịch sử/cursor và thao tác cục bộ.
+Trạng thái Online chỉ đến từ xác thực transport, hiển thị bằng chấm cạnh avatar trên rail; không suy diễn online của từng người. Bấm avatar xem trạng thái, nguyên nhân lỗi an toàn và thao tác kết nối lại/mở hội thoại; phiên hết hạn hướng dẫn đăng xuất qua menu bánh răng. Không đặt banner trạng thái hoặc footer tài khoản/đăng xuất thường trực. Khi Offline, vẫn cho đọc cache, chọn liên hệ và soạn nháp. Lỗi batch lưu dữ liệu tạm dừng transport, giữ lịch sử/cursor và thao tác cục bộ.
 
 ## Tin nhắn và danh tính
 

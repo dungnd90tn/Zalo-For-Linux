@@ -1,4 +1,7 @@
 //! Original native desktop UI. File, database, and network work stays off the render thread.
+mod account;
+#[cfg(all(test, feature = "messaging"))]
+mod account_tests;
 #[cfg(feature = "messaging")]
 mod delivery;
 mod dialog;
@@ -39,11 +42,13 @@ const CONVERSATION_INFO_WIDTH: f32 = 344.0;
 const MIN_CHAT_WIDTH_WITH_INFO: f32 = 360.0;
 const COMPACT_BREAKPOINT: f32 = 940.0;
 
+#[derive(Clone)]
 struct ModalFocus {
     id: egui::Id,
     account: Option<String>,
     thread: Option<String>,
     generation: u64,
+    auth_generation: Option<u64>,
 }
 
 pub struct NativeApp {
@@ -59,10 +64,14 @@ pub struct NativeApp {
     modal_blocked: bool,
     modal_focus: Option<ModalFocus>,
     settings_open: bool,
+    account_popup: Option<account::Popup>,
+    account_trigger_focus: Option<ModalFocus>,
     theme: crate::theme::ThemeController,
     settings: settings::Settings,
     #[cfg(test)]
     fixture_system_theme: Option<egui::Theme>,
+    #[cfg(all(test, feature = "messaging"))]
+    fixture_connection: Option<crate::app::live::LiveConnection>,
     focus_composer: bool,
     latest_page: bool,
     ime_composing: bool,
@@ -111,10 +120,14 @@ impl NativeApp {
             modal_blocked: false,
             modal_focus: None,
             settings_open: false,
+            account_popup: None,
+            account_trigger_focus: None,
             theme,
             settings: settings::Settings::default(),
             #[cfg(test)]
             fixture_system_theme: None,
+            #[cfg(all(test, feature = "messaging"))]
+            fixture_connection: None,
             focus_composer: false,
             latest_page: true,
             ime_composing: false,
@@ -136,7 +149,7 @@ impl NativeApp {
     }
 
     fn modal_open(&self) -> bool {
-        if self.settings_open || self.details {
+        if self.settings_open || self.details || self.account_popup.is_some() {
             return true;
         }
         #[cfg(feature = "live-login")]
@@ -154,12 +167,11 @@ impl NativeApp {
 
     fn latch_modal_input(&mut self, ctx: &egui::Context) {
         if self.modal_open() && !self.modal_blocked {
-            self.modal_focus = ctx.memory(|memory| memory.focused()).map(|id| ModalFocus {
-                id,
-                account: self.account_id().map(str::to_owned),
-                thread: self.model.selected.clone(),
-                generation: self.model.generation,
-            });
+            self.modal_focus = self
+                .account_popup
+                .as_mut()
+                .and_then(|popup| popup.focus.take())
+                .or_else(|| self.modal_focus_snapshot(ctx));
             if let Some(focus) = &self.modal_focus {
                 ctx.memory_mut(|memory| memory.surrender_focus(focus.id));
             }
@@ -168,11 +180,23 @@ impl NativeApp {
     }
 
     fn update_modal_input(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton { pressed: true, .. }
+                        | egui::Event::Key { pressed: true, .. }
+                )
+            })
+        }) {
+            self.account_trigger_focus = None;
+        }
         if !self.modal_open() && self.modal_blocked {
             if let Some(focus) = self.modal_focus.take() {
                 if focus.account.as_deref() == self.account_id()
                     && focus.thread == self.model.selected
                     && focus.generation == self.model.generation
+                    && focus.auth_generation == self.auth_generation()
                 {
                     ctx.memory_mut(|memory| memory.request_focus(focus.id));
                 }
@@ -448,12 +472,7 @@ impl NativeApp {
                     colors.nav_background,
                 );
                 ui.add_space(21.0);
-                let (rect, _) = ui.allocate_exact_size(vec2(RAIL_WIDTH, 44.0), Sense::hover());
-                avatar(
-                    ui,
-                    egui::Rect::from_center_size(rect.center(), vec2(40.0, 40.0)),
-                    self.account_label(),
-                );
+                self.account_avatar(ui);
                 ui.add_space(27.0);
                 #[cfg(feature = "messaging")]
                 let directory = self.directory_visible();
@@ -567,6 +586,7 @@ impl NativeApp {
                         let (rect, response) =
                             ui.allocate_exact_size(vec2(RAIL_WIDTH, 46.0), Sense::click());
                         if self.settings_open
+                            || self.account_popup_is(account::PopupKind::Settings)
                             || response.hovered()
                             || response.is_pointer_button_down_on()
                         {
@@ -575,7 +595,9 @@ impl NativeApp {
                                 0.0,
                                 if response.is_pointer_button_down_on() {
                                     colors.nav_pressed
-                                } else if self.settings_open {
+                                } else if self.settings_open
+                                    || self.account_popup_is(account::PopupKind::Settings)
+                                {
                                     colors.nav_selected
                                 } else {
                                     colors.nav_hover
@@ -589,10 +611,15 @@ impl NativeApp {
                             colors.nav_text,
                         );
                         visuals::nav_focus_outline(ui, &response, rect);
+                        self.prepare_account_popup_trigger(
+                            account::PopupKind::Settings,
+                            rect,
+                            &response,
+                        );
                         if response.clicked() {
-                            self.settings_open = !self.settings_open;
+                            self.toggle_account_popup(account::PopupKind::Settings, rect);
                         }
-                        response.on_hover_text("Cài đặt giao diện");
+                        response.on_hover_text("Cài đặt và tài khoản");
                     },
                 );
             });
@@ -683,7 +710,9 @@ impl NativeApp {
         let mut selection = None;
         egui::ScrollArea::vertical()
             .id_salt("conversation_list")
-            .max_height((ui.available_height() - 64.0).max(60.0))
+            .max_height(
+                (ui.available_height() - if self.is_signed_in() { 0.0 } else { 64.0 }).max(60.0),
+            )
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
@@ -741,15 +770,14 @@ impl NativeApp {
                 self.compact_list = false;
             }
         }
+        if self.is_signed_in() {
+            return;
+        }
         let rect = ui.max_rect();
         let footer =
             egui::Rect::from_min_max(pos2(rect.left(), rect.bottom() - 55.0), rect.right_bottom());
         visuals::background(ui, footer, "--layer-background", colors.surface);
         divider(ui, footer.left_top(), footer.right_top());
-        #[cfg(feature = "live-login")]
-        if self.live_account_footer(ui, footer) {
-            return;
-        }
         icon(
             ui,
             egui::Rect::from_min_size(footer.min + vec2(16.0, 17.0), vec2(18.0, 18.0)),
@@ -761,8 +789,6 @@ impl NativeApp {
             Align2::LEFT_TOP,
             if self.demo {
                 "Dữ liệu demo · chỉ lưu trên máy"
-            } else if self.is_signed_in() {
-                self.connection_label()
             } else {
                 "Bản xem trước · chưa đăng nhập"
             },
@@ -842,8 +868,15 @@ impl NativeApp {
                 ui.label(
                     RichText::new(if self.demo {
                         "Hội thoại minh họa · ngoại tuyến"
+                    } else if self
+                        .model
+                        .selected
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("g:"))
+                    {
+                        "Nhóm trò chuyện"
                     } else {
-                        self.connection_label()
+                        "Trò chuyện riêng"
                     })
                     .color(colors.text_secondary)
                     .size(visuals::TEXT_SMALL),
@@ -1271,11 +1304,10 @@ impl NativeApp {
     }
 
     fn workspace(&mut self, ctx: &egui::Context) {
+        self.sync_account_popup();
         let colors = crate::theme::palette(ctx);
         let compact = ctx.screen_rect().width() < COMPACT_BREAKPOINT;
         self.navigation(ctx, compact);
-        #[cfg(feature = "messaging")]
-        self.live_connection_notice(ctx);
         self.latch_modal_input(ctx);
         #[cfg(feature = "messaging")]
         let show_directory = self.directory_visible();
@@ -1362,6 +1394,7 @@ impl NativeApp {
         if let Some(state) = &mut self.live {
             media::viewer(ctx, &mut state.media);
         }
+        self.show_account_popup(ctx);
     }
 
     fn welcome(&self, ui: &mut egui::Ui) {
@@ -1563,12 +1596,20 @@ impl eframe::App for NativeApp {
         self.poll_events(ctx);
         #[cfg(feature = "live-login")]
         self.poll_live(ctx);
+        #[cfg(all(test, feature = "messaging"))]
+        if let Some(connection) = self.fixture_connection {
+            if let Some(state) = &mut self.live {
+                state.connection = connection;
+            }
+        }
+        self.sync_account_popup();
         self.update_modal_input(ctx);
         #[cfg(feature = "live-login")]
         {
             if self.show_login(ctx) {
                 self.conversation_details = None;
                 self.latch_modal_input(ctx);
+                self.show_account_popup(ctx);
                 if self.settings_open {
                     self.settings
                         .show(ctx, &mut self.settings_open, &mut self.theme);
