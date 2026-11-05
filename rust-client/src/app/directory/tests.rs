@@ -56,6 +56,7 @@ enum Scenario {
     UnsafeRedirect,
     Oversize,
     Stall,
+    Preview(u8),
 }
 #[derive(Default)]
 struct State {
@@ -279,19 +280,264 @@ fn serve(
         }
         "/api/preloadconvers/get-last-msgs" => {
             assert_eq!(params["threadIdLocalMsgId"], "{}");
-            json!({"msgs":[{"msgId":"501","uidFrom":"12","idTo":"11","msgType":"webchat","content":"Xin chào","ts":"1700000000123"}],"groupMsgs":[{"msgId":"502","uidFrom":"12","idTo":"77","msgType":"webchat","content":"Lịch họp","ts":"1700000000124"}],"eeMsgs":[{"synthetic_encrypted_pending":true}]})
+            if let Scenario::Preview(mode) = scenario {
+                preview_data(mode)
+            } else {
+                json!({"msgs":[{"msgId":"501","uidFrom":"12","idTo":"11","msgType":"webchat","content":"Xin chào","ts":"1700000000123"}],"groupMsgs":[{"msgId":"502","uidFrom":"12","idTo":"77","msgType":"webchat","content":"Lịch họp","ts":"1700000000124"}],"eeMsgs":[{"synthetic_encrypted_pending":true}]})
+            }
         }
         _ => panic!("unexpected synthetic directory route"),
     };
-    let body = oracle("encrypt", &data.to_string());
+    let body = if url.path() == "/api/preloadconvers/get-last-msgs" {
+        match scenario {
+            Scenario::Preview(10) => b"{".to_vec(),
+            Scenario::Preview(11) => br#"{"error_code":0,"data":{}}"#.to_vec(),
+            Scenario::Preview(12) => oracle("encrypt-plaintext", "not-json"),
+            Scenario::Preview(13) => oracle(
+                "encrypt-plaintext",
+                r#"{"error_code":"bad-type","data":{}}"#,
+            ),
+            _ => oracle("encrypt", &data.to_string()),
+        }
+    } else {
+        oracle("encrypt", &data.to_string())
+    };
     let header=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(&body);
     let _ = stream.flush();
 }
+
+fn preview_data(mode: u8) -> Value {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../../tests/fixtures/messaging/media.json")).unwrap();
+    let content = |name: &str| {
+        fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == name)
+            .unwrap()["content"]
+            .clone()
+    };
+    let row = |id: &str, from: &str, to: &str, kind: &str, content: Value| {
+        json!({
+            "msgId":id,"uidFrom":from,"idTo":to,"msgType":kind,"content":content,"ts":"1700000000123"
+        })
+    };
+    match mode {
+        1 => json!({}),
+        2 => json!({"clearUnreads":[{"idTo":"12","lastMsgId":"900"}],"lastActionId":"900"}),
+        3 => json!({"msgs":null,"groupMsgs":null,"pageMsgs":null,"eeMsgs":null}),
+        4 => {
+            let mut rows: Vec<_> = (1000..1201)
+                .map(|id| {
+                    row(
+                        &id.to_string(),
+                        "12",
+                        "99",
+                        "webchat",
+                        json!("valid-prefix"),
+                    )
+                })
+                .collect();
+            rows.last_mut().unwrap()["idTo"] = json!({"malformed":true});
+            json!({"msgs":rows})
+        }
+        5 => {
+            json!({"msgs":[row("501","12","99","webchat",json!("first")),row("501","12","99","webchat",json!("conflict"))]})
+        }
+        6 => json!({"msgs":[row("501","12","99","webchat",json!("prefix"))],"pageMsgs":{}}),
+        7 => {
+            let mut encrypted = row("501", "12", "99", "webchat", Value::Null);
+            encrypted["isE2EE"] = json!(true);
+            json!({"msgs":[encrypted],"eeMsgs":[{"opaque":"pending"}]})
+        }
+        8 => Value::Null,
+        9 => {
+            json!({"msgs":[row("501","12","99","webchat",json!("prefix")),row("503","12","99","chat.photo",Value::Null)]})
+        }
+        _ => json!({
+            "msgs":[row("501","12","99","webchat",json!("peer-addressed text")),
+                row("502","0","12","webchat",json!("own sentinel echo")),
+                row("503","12","99","chat.photo",content("photo_object")),
+                row("504","12","99","chat.webcontent",content("webcontent_string")),
+                row("601","13","99","webchat",json!("direct collision"))],
+            "groupMsgs":[row("601","13","77","webchat",json!("group collision"))],
+            "pageMsgs":[row("505","14","99","chat.recommended",json!({"action":"unknown.synthetic"}))],"eeMsgs":null
+        }),
+    }
+}
 struct Sink {
     store: MessageStore,
     commits: usize,
+}
+#[tokio::test]
+async fn authenticated_preview_source_shapes_and_rejections_preserve_local_state_without_queue_ack()
+{
+    use crate::protocol::{directory::PreviewField, messaging::FrameReason};
+    for mode in 0..=13 {
+        let fixture = Fixture::new(Scenario::Preview(mode));
+        let session = fixture.session();
+        if mode == 0 {
+            assert!(
+                crate::protocol::directory::parse_previews("11", &preview_data(mode)).is_err(),
+                "untrusted generic parsing must retain recipient membership checks"
+            );
+        }
+        let mut sink = Sink {
+            store: MessageStore::open(&fixture.profile.paths.data_dir.join("messages.sqlite"))
+                .unwrap(),
+            commits: 0,
+        };
+        let cached = crate::domain::Message {
+            account_id: "11".into(),
+            thread_id: "d:12".into(),
+            id: "499".into(),
+            sender: "12".into(),
+            text: "retained cached body".into(),
+            sticker: None,
+            media: None,
+            sent_at_ms: 100,
+        };
+        sink.store
+            .receive_batch("11", &[(cached.clone(), None)], Some(("511_1", "900")))
+            .unwrap();
+        sink.store
+            .prepare_outgoing("11", "d:12", "unresolved outgoing text", 101)
+            .unwrap();
+        let observer = rusqlite::Connection::open_with_flags(
+            fixture.profile.paths.data_dir.join("messages.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let pending = |connection: &rusqlite::Connection| {
+            connection
+                .query_row("SELECT body,state,server_id FROM outgoing", [], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap()
+        };
+        let old_pending = pending(&observer);
+        let (_stop, cancel) = watch::channel(false);
+        let report = fixture
+            .fetcher()
+            .synchronize(&session, &mut sink, cancel)
+            .await
+            .unwrap();
+        assert!(
+            report.completed_friends && report.completed_groups,
+            "unrelated discovery stages remain usable: {report:?}"
+        );
+        assert_eq!(sink.store.receive_cursor("11", "511_1").unwrap(), "900");
+        assert_eq!(
+            pending(&observer),
+            old_pending,
+            "previews never acknowledge or rewrite an outgoing intent"
+        );
+        assert!(sink
+            .store
+            .page("11", "d:12", None, 50)
+            .unwrap()
+            .contains(&cached));
+        assert!(sink.store.page("12", "d:12", None, 50).unwrap().is_empty());
+        if mode == 0 {
+            assert!(report.failures.is_empty(), "{report:?}");
+            assert!(report.completed_previews);
+            assert_eq!(report.preview_messages, 7);
+            let direct = sink.store.page("11", "d:12", None, 50).unwrap();
+            assert_eq!(direct.len(), 5);
+            assert_eq!(direct.iter().find(|m| m.id == "502").unwrap().sender, "11");
+            for id in ["503", "504"] {
+                assert!(direct.iter().find(|m| m.id == id).unwrap().media.is_some());
+                assert!(sink
+                    .store
+                    .message_media("11", "d:12", id)
+                    .unwrap()
+                    .is_some());
+            }
+            assert_eq!(
+                sink.store.page("11", "d:13", None, 10).unwrap()[0].id,
+                "601"
+            );
+            assert_eq!(
+                sink.store.page("11", "g:77", None, 10).unwrap()[0].id,
+                "601"
+            );
+            assert_eq!(
+                sink.store.page("11", "d:14", None, 10).unwrap()[0].text,
+                "[Tin nhắn chat.recommended chưa được hỗ trợ]"
+            );
+        } else if (1..=3).contains(&mode) || mode == 7 {
+            assert!(report.failures.is_empty(), "{report:?}");
+            assert_eq!(report.preview_messages, 0);
+            assert_eq!(report.unsupported_encrypted, if mode == 7 { 2 } else { 0 });
+            assert_eq!(report.completed_previews, mode != 7);
+            assert_eq!(
+                sink.store.page("11", "d:12", None, 50).unwrap(),
+                vec![cached]
+            );
+        } else {
+            assert_eq!(report.failures.len(), 1, "{report:?}");
+            let failure = report.failures[0];
+            assert_eq!(failure.stage, DirectoryStage::Previews);
+            assert_eq!(failure.category, DirectoryCategory::Schema);
+            let parser = failure
+                .parser
+                .expect("preview rejection must retain a closed boundary diagnostic");
+            match mode {
+                4 => {
+                    assert_eq!(parser.field, PreviewField::Msgs);
+                    assert_eq!(parser.reason, FrameReason::MessageRecipient);
+                }
+                5 => {
+                    assert_eq!(parser.field, PreviewField::Msgs);
+                    assert_eq!(parser.reason, FrameReason::MessageValidation);
+                }
+                6 => assert_eq!(parser.field, PreviewField::PageMsgs),
+                8 => assert_eq!(parser.field, PreviewField::MessageCollections),
+                9 => {
+                    assert_eq!(parser.field, PreviewField::Msgs);
+                    assert_eq!(parser.reason, FrameReason::MessageContent);
+                }
+                10 => assert_eq!(parser.field, PreviewField::ResponseJson),
+                11 => assert_eq!(parser.field, PreviewField::EncryptedData),
+                12 => assert_eq!(parser.field, PreviewField::DecryptedJson),
+                13 => assert_eq!(parser.field, PreviewField::DecryptedEnvelope),
+                _ => unreachable!(),
+            }
+            assert!(!report.completed_previews);
+            assert_eq!(
+                report.preview_messages, 0,
+                "a malformed later chunk cannot persist a valid prefix"
+            );
+            assert_eq!(
+                sink.store.page("11", "d:12", None, 50).unwrap(),
+                vec![cached]
+            );
+            assert!(sink.store.page("11", "g:77", None, 10).unwrap().is_empty());
+            assert_eq!(
+                sink.commits, 3,
+                "only friends and the two valid group pages may commit"
+            );
+        }
+        assert!(fixture
+            .state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(path, _, _)| matches!(
+                path.as_str(),
+                "/api/social/friend/getfriends"
+                    | "/api/group/getlg/v3"
+                    | "/api/preloadconvers/get-last-msgs"
+            )));
+    }
 }
 impl DirectorySink for Sink {
     async fn apply(&mut self, batch: DirectoryBatch) -> Result<(), DirectoryFailure> {
@@ -429,6 +675,8 @@ async fn unsupported_friend_presentation_preserves_cached_identity_and_reports_p
     };
     sink.store
         .apply_directory_batch(&DirectoryBatch {
+            message_info: Vec::new(),
+            message_media: Vec::new(),
             account_id: "11".into(),
             entries: vec![DirectoryRecord {
                 remote_id: "13".into(),

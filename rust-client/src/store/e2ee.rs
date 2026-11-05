@@ -1830,6 +1830,7 @@ impl MessageStore {
             sender: owner.into(),
             text: body,
             sticker: None,
+            media: None,
             sent_at_ms: existing.or(timestamp).unwrap_or(created),
         };
         message.validate()?;
@@ -1950,6 +1951,7 @@ mod tests {
             sender: "456".into(),
             text: "secret fixture".into(),
             sticker: None,
+            media: None,
             sent_at_ms: 1000,
         }
     }
@@ -2982,7 +2984,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                4
+                6
             );
             for table in [
                 "e2ee_local_candidates",
@@ -3031,7 +3033,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                4
+                6
             );
             assert_eq!(
                 store.page("123", "d:456", None, 10).unwrap()[0].id,

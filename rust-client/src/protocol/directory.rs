@@ -356,25 +356,131 @@ mod tests {
 
 pub struct PreviewPage {
     pub messages: Vec<crate::domain::Message>,
+    pub message_info: Vec<crate::domain::MessageInfoBinding>,
+    pub message_media: Vec<crate::domain::MessageMediaBinding>,
     pub unsupported_encrypted: usize,
+}
+/// Closed HTTP/parser locations only; never stores account IDs or payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewField {
+    ResponseJson,
+    ResponseEnvelope,
+    EncryptedData,
+    DecryptedJson,
+    DecryptedEnvelope,
+    MessageCollections,
+    Msgs,
+    GroupMsgs,
+    PageMsgs,
+    EeMsgs,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewDiagnostic {
+    pub reason: super::messaging::FrameReason,
+    pub field: PreviewField,
+    pub field_type: super::messaging::FrameValueType,
+    pub field_bytes: Option<usize>,
+    pub message_kind: Option<super::messaging::FrameMessageKind>,
+}
+impl PreviewDiagnostic {
+    pub(crate) fn new(
+        reason: super::messaging::FrameReason,
+        field: PreviewField,
+        value: Option<&Value>,
+    ) -> Self {
+        Self {
+            reason,
+            field,
+            field_type: super::messaging::FrameValueType::of(value),
+            field_bytes: None,
+            message_kind: None,
+        }
+    }
+    fn from_frame(failure: super::messaging::FrameFailure, field: PreviewField) -> Self {
+        Self {
+            reason: failure.reason,
+            field,
+            field_type: failure.context.field_type.unwrap_or_default(),
+            field_bytes: failure.context.field_bytes,
+            message_kind: failure.context.message_kind,
+        }
+    }
+    fn failure(self, error: DirectoryError) -> PreviewFailure {
+        PreviewFailure {
+            error,
+            diagnostic: self,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewFailure {
+    pub error: DirectoryError,
+    pub diagnostic: PreviewDiagnostic,
+}
+/// Untrusted/offline callers retain explicit recipient checks. HTTP callers must
+/// supply the verified session capability, never a caller-chosen account ID.
+pub fn parse_previews(account: &str, data: &Value) -> Result<PreviewPage, DirectoryError> {
+    parse_previews_detailed(account, data).map_err(|failure| failure.error)
+}
+pub fn parse_previews_detailed(account: &str, data: &Value) -> Result<PreviewPage, PreviewFailure> {
+    parse_previews_inner(account, data, None)
+}
+pub fn parse_verified_previews(
+    session: &super::session::VerifiedSession,
+    data: &Value,
+) -> Result<PreviewPage, PreviewFailure> {
+    parse_previews_inner(session.account_id(), data, Some(session))
 }
 /// Preload is a read-only preview request, not a Signal queue ACK. Reuse the
 /// existing legacy codec and keep unsupported encrypted data explicitly pending.
-pub fn parse_previews(account: &str, data: &Value) -> Result<PreviewPage, DirectoryError> {
-    numeric_id(account).map_err(|_| DirectoryError::Invalid)?;
-    let mut messages = Vec::new();
-    let mut unsupported_encrypted = 0;
-    let mut recognized = false;
+fn parse_previews_inner(
+    account: &str,
+    data: &Value,
+    session: Option<&super::session::VerifiedSession>,
+) -> Result<PreviewPage, PreviewFailure> {
+    use super::messaging::{FrameReason, FrameValueType};
+    let mut diagnostic = PreviewDiagnostic::new(
+        FrameReason::BatchEnvelope,
+        PreviewField::MessageCollections,
+        Some(data),
+    );
+    numeric_id(account).map_err(|_| diagnostic.failure(DirectoryError::Invalid))?;
+    if !data.is_object() {
+        return Err(diagnostic.failure(DirectoryError::Invalid));
+    }
+    let mut messages: Vec<crate::domain::Message> = Vec::new();
+    let mut message_info: Vec<crate::domain::MessageInfoBinding> = Vec::new();
+    let mut message_media: Vec<crate::domain::MessageMediaBinding> = Vec::new();
+    let mut media_indices = std::collections::HashMap::new();
+    let mut info_indices = std::collections::HashMap::new();
+    let mut info_bytes = 0usize;
+    let mut unsupported_encrypted = 0usize;
     let mut seen = std::collections::HashMap::new();
     for field in ["msgs", "groupMsgs", "pageMsgs"] {
         let Some(array) = data.get(field) else {
             continue;
         };
-        recognized = true;
+        // getLastMessagesForPreview delegates to preProcessChatMsgs, whose
+        // optional collection gates are `field && field.length > 0`.
+        if array.is_null() {
+            continue;
+        }
+        diagnostic = PreviewDiagnostic::new(
+            FrameReason::BatchEnvelope,
+            match field {
+                "msgs" => PreviewField::Msgs,
+                "groupMsgs" => PreviewField::GroupMsgs,
+                _ => PreviewField::PageMsgs,
+            },
+            Some(array),
+        );
         let array = array
             .as_array()
-            .filter(|a| a.len() <= MAX_FRIENDS)
-            .ok_or(DirectoryError::Resource)?;
+            .ok_or_else(|| diagnostic.failure(DirectoryError::Invalid))?;
+        if array.len() > MAX_FRIENDS {
+            diagnostic.reason = FrameReason::BatchLimit;
+            return Err(diagnostic.failure(DirectoryError::Resource));
+        }
         for chunk in array.chunks(DIRECTORY_BATCH_SIZE) {
             let mut legacy = Vec::with_capacity(chunk.len());
             for message in chunk {
@@ -392,51 +498,337 @@ pub fn parse_previews(account: &str, data: &Value) -> Result<PreviewPage, Direct
             let mut batch = serde_json::Map::new();
             batch.insert(field.into(), Value::Array(legacy));
             let payload = json!({"error_code":0,"data":batch});
-            let decoded = super::messaging::incoming_messages(account, &payload).map_err(
-                |error| match error {
-                    super::messaging::WireError::Oversize => DirectoryError::Resource,
-                    _ => DirectoryError::Invalid,
+            let decoded = match session {
+                Some(session) => super::messaging::incoming_verified_preview(session, &payload),
+                None => super::messaging::incoming_messages_detailed(account, &payload),
+            }
+            .map_err(|failure| PreviewFailure {
+                error: if failure.error == super::messaging::WireError::Oversize {
+                    DirectoryError::Resource
+                } else {
+                    DirectoryError::Invalid
                 },
-            )?;
+                diagnostic: PreviewDiagnostic::from_frame(failure, diagnostic.field),
+            })?;
             for incoming in decoded {
+                diagnostic.reason = FrameReason::MessageValidation;
+                diagnostic.message_kind = Some(if incoming.info.is_some() {
+                    super::messaging::FrameMessageKind::WebchatInfo
+                } else if let Some(media) = &incoming.media {
+                    match media.kind() {
+                        crate::domain::MediaKind::Photo => {
+                            super::messaging::FrameMessageKind::Photo
+                        }
+                        crate::domain::MediaKind::WebContent => {
+                            super::messaging::FrameMessageKind::WebContent
+                        }
+                    }
+                } else if incoming.message.sticker.is_some() {
+                    super::messaging::FrameMessageKind::Sticker
+                } else if incoming.unsupported {
+                    super::messaging::FrameMessageKind::Other
+                } else {
+                    super::messaging::FrameMessageKind::Webchat
+                });
                 let key = (
                     incoming.message.thread_id.clone(),
                     incoming.message.id.clone(),
                 );
                 if let Some(previous) = seen.get(&key) {
-                    if previous != &incoming.message {
-                        return Err(DirectoryError::Invalid);
+                    let previous_info = info_indices
+                        .get(&key)
+                        .map(|index: &usize| &message_info[*index].content);
+                    let previous_media = media_indices
+                        .get(&key)
+                        .map(|index: &usize| &message_media[*index].content);
+                    if messages[*previous] != incoming.message
+                        || previous_info != incoming.info.as_ref()
+                        || previous_media != incoming.media.as_ref()
+                    {
+                        return Err(diagnostic.failure(DirectoryError::Invalid));
                     }
                     continue;
                 }
-                seen.insert(key, incoming.message.clone());
+                if let Some(content) = incoming.info {
+                    info_bytes =
+                        info_bytes
+                            .checked_add(content.as_json().len())
+                            .ok_or_else(|| {
+                                let mut d = diagnostic;
+                                d.reason = FrameReason::BatchLimit;
+                                d.failure(DirectoryError::Resource)
+                            })?;
+                    // Bound the complete response, not each individual field or
+                    // 200-message codec chunk, before emitting any sink batch.
+                    if info_bytes > crate::domain::MAX_INFO_BATCH_BYTES {
+                        diagnostic.reason = FrameReason::BatchLimit;
+                        return Err(diagnostic.failure(DirectoryError::Resource));
+                    }
+                    info_indices.insert(key.clone(), message_info.len());
+                    message_info.push(crate::domain::MessageInfoBinding {
+                        account_id: incoming.message.account_id.clone(),
+                        thread_id: incoming.message.thread_id.clone(),
+                        message_id: incoming.message.id.clone(),
+                        content,
+                    });
+                }
+                if let Some(content) = incoming.media {
+                    info_bytes =
+                        info_bytes
+                            .checked_add(content.as_json().len())
+                            .ok_or_else(|| {
+                                let mut d = diagnostic;
+                                d.reason = FrameReason::BatchLimit;
+                                d.failure(DirectoryError::Resource)
+                            })?;
+                    if info_bytes > crate::domain::MAX_INFO_BATCH_BYTES {
+                        diagnostic.reason = FrameReason::BatchLimit;
+                        return Err(diagnostic.failure(DirectoryError::Resource));
+                    }
+                    media_indices.insert(key.clone(), message_media.len());
+                    message_media.push(crate::domain::MessageMediaBinding {
+                        account_id: incoming.message.account_id.clone(),
+                        thread_id: incoming.message.thread_id.clone(),
+                        message_id: incoming.message.id.clone(),
+                        content,
+                    });
+                }
+                seen.insert(key, messages.len());
                 messages.push(incoming.message);
                 if messages.len() > MAX_FRIENDS {
-                    return Err(DirectoryError::Resource);
+                    diagnostic.reason = FrameReason::BatchLimit;
+                    return Err(diagnostic.failure(DirectoryError::Resource));
                 }
             }
         }
     }
     if let Some(array) = data.get("eeMsgs") {
-        recognized = true;
-        unsupported_encrypted += array
-            .as_array()
-            .filter(|a| a.len() <= MAX_FRIENDS)
-            .ok_or(DirectoryError::Resource)?
-            .len();
+        diagnostic = PreviewDiagnostic::new(
+            FrameReason::BatchEnvelope,
+            PreviewField::EeMsgs,
+            Some(array),
+        );
+        if !array.is_null() {
+            let array = array
+                .as_array()
+                .ok_or_else(|| diagnostic.failure(DirectoryError::Invalid))?;
+            unsupported_encrypted = unsupported_encrypted
+                .checked_add(array.len())
+                .ok_or_else(|| diagnostic.failure(DirectoryError::Resource))?;
+        }
     }
-    if !recognized || unsupported_encrypted > MAX_FRIENDS {
-        return Err(DirectoryError::Invalid);
+    if unsupported_encrypted > MAX_FRIENDS {
+        diagnostic.reason = FrameReason::BatchLimit;
+        diagnostic.field_type = FrameValueType::Array;
+        return Err(diagnostic.failure(DirectoryError::Resource));
     }
     Ok(PreviewPage {
         messages,
+        message_info,
+        message_media,
         unsupported_encrypted,
     })
 }
 
 #[cfg(test)]
 mod preview_tests {
+    #[test]
+    fn verified_http_previews_match_original_caller_and_peer_routing() {
+        use crate::{
+            profile::Profile,
+            protocol::{bootstrap::ServerConfig, session::synthetic_session},
+        };
+        let scratch = std::env::temp_dir().join(format!(
+            "zalo-preview-parser-{}",
+            crate::domain::local_message_id().unwrap()
+        ));
+        let profile = std::sync::Arc::new(Profile::at_root(&scratch, "synthetic").unwrap());
+        let session = synthetic_session(
+            profile.clone(),
+            ServerConfig::parse(&serde_json::json!({})).unwrap(),
+        );
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/directory/previews.json"))
+                .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let page = super::parse_verified_previews(&session, &case["data"]).unwrap();
+            let actual: Vec<_> = page
+                .messages
+                .iter()
+                .map(|message| message.thread_id.as_str())
+                .collect();
+            let expected: Vec<_> = case["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|thread| thread.as_str().unwrap())
+                .collect();
+            assert_eq!(actual, expected, "{}", case["name"]);
+            assert!(page
+                .messages
+                .iter()
+                .all(|message| message.account_id == "11"));
+            for media in page.message_media {
+                assert!(page
+                    .messages
+                    .iter()
+                    .any(|message| message.account_id == media.account_id
+                        && message.thread_id == media.thread_id
+                        && message.id == media.message_id
+                        && message.media.as_ref() == Some(media.content.descriptor())));
+            }
+        }
+        let peer = &fixture["cases"][3]["data"];
+        let strict = super::parse_previews_detailed("11", peer).err().unwrap();
+        assert_eq!(
+            strict.diagnostic.reason,
+            crate::protocol::messaging::FrameReason::MessageScope
+        );
+        assert_eq!(
+            strict.diagnostic.message_kind,
+            Some(crate::protocol::messaging::FrameMessageKind::Photo)
+        );
+        drop(session);
+        drop(profile);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn preview_rejections_keep_closed_collection_field_type_and_message_kind() {
+        use super::*;
+        use crate::protocol::messaging::{FrameMessageKind, FrameReason, FrameValueType};
+        let malformed = parse_previews_detailed("11", &serde_json::json!({"pageMsgs":{}}))
+            .err()
+            .unwrap();
+        assert_eq!(malformed.error, DirectoryError::Invalid);
+        assert_eq!(
+            (
+                malformed.diagnostic.field,
+                malformed.diagnostic.reason,
+                malformed.diagnostic.field_type
+            ),
+            (
+                PreviewField::PageMsgs,
+                FrameReason::BatchEnvelope,
+                FrameValueType::Object
+            )
+        );
+        let row = serde_json::json!({"msgType":"chat.photo","uidFrom":"22","idTo":"11","msgId":"841","ts":1700000000000_i64,"content":null});
+        let malformed = parse_previews_detailed("11", &serde_json::json!({"groupMsgs":[row]}))
+            .err()
+            .unwrap();
+        assert_eq!(
+            (
+                malformed.diagnostic.field,
+                malformed.diagnostic.reason,
+                malformed.diagnostic.field_type,
+                malformed.diagnostic.message_kind
+            ),
+            (
+                PreviewField::GroupMsgs,
+                FrameReason::MessageContent,
+                FrameValueType::Null,
+                Some(FrameMessageKind::Photo)
+            )
+        );
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(false),
+        ] {
+            assert_eq!(
+                parse_previews_detailed("11", &value)
+                    .err()
+                    .unwrap()
+                    .diagnostic
+                    .field,
+                PreviewField::MessageCollections
+            );
+        }
+    }
+    #[test]
+    fn source_optional_null_collections_are_empty_but_wrong_types_fail() {
+        let empty = super::parse_previews(
+            "11",
+            &serde_json::json!({"msgs":null,"groupMsgs":null,"pageMsgs":null,"eeMsgs":null}),
+        )
+        .unwrap();
+        assert!(
+            empty.messages.is_empty()
+                && empty.message_info.is_empty()
+                && empty.message_media.is_empty()
+        );
+        for field in ["msgs", "groupMsgs", "pageMsgs", "eeMsgs"] {
+            for invalid in [
+                serde_json::json!({}),
+                serde_json::json!(false),
+                serde_json::json!(""),
+            ] {
+                assert!(super::parse_previews("11", &serde_json::json!({field:invalid})).is_err());
+            }
+        }
+    }
     use super::*;
+    #[test]
+    fn info_previews_preserve_metadata_and_reject_metadata_only_duplicate_conflicts() {
+        let content = json!({"action":"msginfo.actionlist","title":"Thông báo nhóm",
+            "params":json!({"msg":{"vi":"Đã cập nhật nhóm"},"unknown":[1,{"future":true}]}).to_string()});
+        let message = json!({"msgId":"501","msgType":"webchat","uidFrom":"22","idTo":"11",
+            "ts":1700000000000_i64,"content":content});
+        let page = parse_previews(
+            "11",
+            &json!({"msgs":[message.clone()],"pageMsgs":[message.clone()]}),
+        )
+        .unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.message_info.len(), 1);
+        let info = &page.message_info[0];
+        assert_eq!(
+            (
+                info.account_id.as_str(),
+                info.thread_id.as_str(),
+                info.message_id.as_str()
+            ),
+            ("11", "d:22", "501")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(info.content.as_json()).unwrap(),
+            content
+        );
+        let mut conflict = message.clone();
+        conflict["content"]["future"] = json!({"changed":true});
+        assert!(matches!(
+            parse_previews("11", &json!({"msgs":[message],"pageMsgs":[conflict]})),
+            Err(DirectoryError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn info_preview_budget_covers_fields_and_codec_chunks_before_any_sink_batch() {
+        let content = json!({"action":"msginfo.actionlist","title":"Thông báo",
+            "future":"x".repeat(crate::domain::MAX_INFO_BATCH_BYTES / 2)});
+        let first = json!({"msgId":"501","msgType":"webchat","uidFrom":"22","idTo":"11",
+            "ts":1700000000000_i64,"content":content});
+        let mut second = first.clone();
+        second["msgId"] = json!("502");
+        assert!(matches!(
+            parse_previews(
+                "11",
+                &json!({"msgs":[first.clone()],"pageMsgs":[second.clone()]})
+            ),
+            Err(DirectoryError::Resource)
+        ));
+        let mut chunked = vec![first];
+        for index in 1..DIRECTORY_BATCH_SIZE {
+            chunked.push(json!({"msgId":(1000+index).to_string(),"msgType":"webchat","uidFrom":"22","idTo":"11",
+                "ts":1700000000000_i64,"content":"plain"}));
+        }
+        chunked.push(second);
+        assert!(matches!(
+            parse_previews("11", &json!({"msgs":chunked})),
+            Err(DirectoryError::Resource)
+        ));
+    }
     #[test]
     fn previews_use_real_ids_timestamps_dedup_and_never_accept_unrelated_or_encrypted_content() {
         let mut records = Vec::new();
@@ -463,7 +855,10 @@ mod preview_tests {
             .iter()
             .any(|m| m.text.contains("ciphertext")));
         assert!(parse_previews("22",&json!({"msgs":[{"msgId":"1","msgType":"webchat","uidFrom":"12","idTo":"11","ts":1,"content":"other account"}]})).is_err());
-        assert!(parse_previews("11", &json!({"unknown":[]})).is_err());
+        assert!(parse_previews("11", &json!({"unknown":[]}))
+            .unwrap()
+            .messages
+            .is_empty());
         let group=parse_previews("11",&json!({"groupMsgs":[{"msgId":"1","msgType":"webchat","uidFrom":"12","idTo":"12","ts":1,"content":"group"}]})).unwrap();
         assert_eq!(group.messages[0].thread_id, "g:12");
     }

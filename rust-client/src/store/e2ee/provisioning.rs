@@ -901,6 +901,7 @@ mod tests {
                 sender: "456".into(),
                 text: "Synthetic retained history".into(),
                 sticker: None,
+                media: None,
                 sent_at_ms: 1000,
             }])
             .unwrap();

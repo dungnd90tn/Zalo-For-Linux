@@ -1418,6 +1418,7 @@ async fn legacy_missing_client_type_requires_approval_without_network_or_any_dis
                 sender: "12".into(),
                 text: "Preserved history".into(),
                 sticker: None,
+                media: None,
                 sent_at_ms: 1,
             }])
             .unwrap();

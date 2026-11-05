@@ -8,6 +8,28 @@ use zalo_rust::{
     profile::Profile,
 };
 
+// Keep this identity aligned with linux/zalo-linux-rust-preview.desktop.in.
+const APPLICATION_ID: &str = "zalo-linux-rust-preview";
+const APPLICATION_ICON: &[u8] = include_bytes!("../../pc-dist/favicon-512x512.png");
+
+fn application_icon() -> Result<eframe::egui::IconData> {
+    // A trusted, compile-time asset decoded once before the window/event loop.
+    // Check its declared size before handing it to the existing PNG decoder.
+    if APPLICATION_ICON.len() > 64 * 1024
+        || APPLICATION_ICON.get(..8) != Some(b"\x89PNG\r\n\x1a\n")
+        || APPLICATION_ICON.get(12..16) != Some(b"IHDR")
+        || APPLICATION_ICON.get(16..24) != Some(&[0, 0, 2, 0, 0, 0, 2, 0])
+    {
+        bail!("Bundled Zalo application icon has invalid dimensions or format");
+    }
+    let icon = eframe::icon_data::from_png_bytes(APPLICATION_ICON)
+        .map_err(|_| anyhow::anyhow!("Bundled Zalo application icon could not be decoded"))?;
+    if icon.width != 512 || icon.height != 512 || icon.rgba.len() != 512 * 512 * 4 {
+        bail!("Bundled Zalo application icon has invalid pixel data");
+    }
+    Ok(icon)
+}
+
 #[derive(Debug, Default)]
 struct Cli {
     help: bool,
@@ -201,7 +223,8 @@ fn main() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Zalo Linux — Rust Preview")
-            .with_app_id("zalo-linux-rust-preview")
+            .with_app_id(APPLICATION_ID)
+            .with_icon(application_icon()?)
             .with_inner_size([1024.0, 720.0])
             .with_min_inner_size([640.0, 480.0]),
         ..Default::default()
@@ -270,6 +293,15 @@ mod tests {
     use super::*;
     fn parse(args: &[&str]) -> Result<Cli> {
         Cli::parse(args.iter().map(|s| s.to_string()))
+    }
+    #[test]
+    fn bundled_application_icon_has_original_rgba_pixels_and_desktop_identity() {
+        let icon = application_icon().unwrap();
+        assert_eq!((icon.width, icon.height), (512, 512));
+        assert_eq!(&icon.rgba[..4], &[0, 0, 0, 0]);
+        assert!(icon.rgba.as_chunks::<4>().0.contains(&[0, 104, 255, 255]));
+        assert!(include_str!("../linux/zalo-linux-rust-preview.desktop.in")
+            .contains(&format!("StartupWMClass={APPLICATION_ID}")));
     }
     #[test]
     fn invalid_or_ambiguous_cli_is_rejected() {

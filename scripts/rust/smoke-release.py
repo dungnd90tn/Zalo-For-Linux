@@ -52,7 +52,7 @@ def main():
         require(results[0]["messages_loaded"] == results[1]["messages_loaded"] == 2, "restart duplicated or lost seeded messages")
         data = root / "release-smoke/data"
         with sqlite3.connect(f"file:{data / 'messages.sqlite3'}?mode=ro", uri=True) as conn:
-            require(conn.execute("PRAGMA user_version").fetchone()[0] == 4, "release did not initialize the compatible schema-four database")
+            require(conn.execute("PRAGMA user_version").fetchone()[0] == 6, "release did not initialize the compatible schema-six database")
             count, accounts = conn.execute("SELECT count(*), count(DISTINCT account_id) FROM messages").fetchone()
             threads = conn.execute("SELECT count(*) FROM conversations").fetchone()[0]
             originals = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()
@@ -84,7 +84,7 @@ def main():
         slots = list(log_path.parent.iterdir())
         require(1 <= len(slots) <= 4 and all(path.name in {"native.log", "native.log.1", "native.log.2", "native.log.3"} for path in slots), "unexpected diagnostic rotation files")
         events = []
-        allowed_fields = {"ts_ms", "kind", "stage", "reason", "http_status", "server_code", "server_code_out_of_range", "bytes", "command", "command_id", "subcommand", "encryption", "error_code_type", "data_type", "build"}
+        allowed_fields = {"ts_ms", "kind", "stage", "reason", "http_status", "server_code", "server_code_out_of_range", "bytes", "command", "command_id", "subcommand", "encryption", "error_code_type", "data_type", "field_type", "field_bytes", "message_kind", "storage_operation", "storage_failure", "sqlite_code", "storage_mismatch_mask", "directory_stage", "directory_category", "preview_field", "build"}
         for path in slots:
             require(path.is_file() and not path.is_symlink() and (path.stat().st_mode & 0o777) == 0o600, "diagnostic slot is not a private regular file")
             require(path.stat().st_size <= 256 * 1024, "diagnostic slot exceeds rotation budget")
@@ -111,7 +111,7 @@ def main():
         require(json.loads(unavailable.stdout)["network_used"] is False, "unavailable logging prevented local operation")
         require("Diagnostic log unavailable: private path or I/O failure. Intended log: " + str(log_path) in unavailable.stderr, "unavailable logging did not report its fixed warning and intended path")
         require(log_path.parent.read_bytes() == sentinel and sentinel.decode() not in unavailable.stderr, "logger fallback exposed or changed the obstructing path contents")
-        print(json.dumps({"binary_bytes": binary.stat().st_size, "live_features_compiled": args.expect_live, "informational_commands_no_writes": True, "diagnostic_log_path_absolute": True, "diagnostic_lifecycle_and_build_identity": True, "diagnostic_files_private_and_bounded": True, "diagnostic_failure_keeps_local_app_usable": True, "schema_version": 4, "restart_idempotent": True, "seeded_messages": count, "conversations": threads, "legacy_upgrade_preserved_originals_and_local_history": True, "external_lock_refused": True, "profile_permissions_private": True, "network_used": False}))
+        print(json.dumps({"binary_bytes": binary.stat().st_size, "live_features_compiled": args.expect_live, "informational_commands_no_writes": True, "diagnostic_log_path_absolute": True, "diagnostic_lifecycle_and_build_identity": True, "diagnostic_files_private_and_bounded": True, "diagnostic_failure_keeps_local_app_usable": True, "schema_version": 6, "restart_idempotent": True, "seeded_messages": count, "conversations": threads, "legacy_upgrade_preserved_originals_and_local_history": True, "external_lock_refused": True, "profile_permissions_private": True, "network_used": False}))
 
 
 if __name__ == "__main__":

@@ -2,7 +2,9 @@
 //! Signal/E2EE commands are never downgraded to these legacy endpoints.
 use super::client::ClientType;
 use crate::domain::{
-    canonical_plain_text, Message, StickerDescriptor, MAX_STICKER_ID, MAX_TEXT_BYTES,
+    canonical_plain_text, InfoContentError, InfoMessageContent, MediaContentError, MediaKind,
+    MediaMessageContent, Message, StickerDescriptor, MAX_INFO_BATCH_BYTES, MAX_STICKER_ID,
+    MAX_TEXT_BYTES,
 };
 use aes::cipher::consts::U16;
 use aes_gcm::{
@@ -15,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Read;
 use url::Url;
+
+use crate::domain::info;
 
 pub const MAX_FRAME: usize = 1024 * 1024;
 pub const MAX_INFLATED: usize = 4 * 1024 * 1024;
@@ -198,6 +202,25 @@ pub enum FrameReason {
     InnerEnvelope,
     PlaintextAuth,
     QueueCommands,
+    BatchEnvelope,
+    BatchLimit,
+    MessageTypeField,
+    MessageSender,
+    MessageRecipient,
+    MessageScope,
+    MessageTimestamp,
+    MessageId,
+    MessageContent,
+    MessageValidation,
+    MessageClientId,
+    QueueStatus,
+    QueueKey,
+    QueueEvicted,
+    QueueCursor,
+    QueueMore,
+    QueueContinuation,
+    QueueProgress,
+    QueuePageLimit,
 }
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum FrameValueType {
@@ -212,7 +235,7 @@ pub enum FrameValueType {
     Array,
 }
 impl FrameValueType {
-    fn of(value: Option<&Value>) -> Self {
+    pub(crate) fn of(value: Option<&Value>) -> Self {
         match value {
             None => Self::Absent,
             Some(Value::Null) => Self::Null,
@@ -225,6 +248,16 @@ impl FrameValueType {
         }
     }
 }
+/// Recognized source message families, never an arbitrary peer-provided label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameMessageKind {
+    Webchat,
+    WebchatInfo,
+    Photo,
+    WebContent,
+    Sticker,
+    Other,
+}
 /// Structural data only. Never retains arbitrary JSON, URLs, keys or messages.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FrameContext {
@@ -234,6 +267,9 @@ pub struct FrameContext {
     pub bytes: usize,
     pub status_type: FrameValueType,
     pub data_type: FrameValueType,
+    pub field_type: Option<FrameValueType>,
+    pub field_bytes: Option<usize>,
+    pub message_kind: Option<FrameMessageKind>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameFailure {
@@ -264,6 +300,23 @@ pub struct FrameDecoder {
 impl FrameDecoder {
     pub fn authenticated(&self) -> bool {
         self.authenticated
+    }
+    /// Decode a receive batch belonging to this authenticated socket. Callers
+    /// must also bind their worker/account to the session that opened it.
+    /// `idTo` is not a universal recipient-account field in the PC protocol:
+    /// incoming direct queues select the conversation by nonzero `uidFrom`.
+    pub(crate) fn incoming_messages(
+        &self,
+        account: &str,
+        payload: &Value,
+    ) -> Result<Vec<Incoming>, FrameFailure> {
+        if !self.authenticated {
+            return Err(FrameFailure::new(
+                WireError::Authentication,
+                FrameReason::MessageScope,
+            ));
+        }
+        incoming_with_scope(account, payload, IncomingScope::AuthenticatedQueue)
     }
     pub fn decode(&mut self, bytes: &[u8]) -> Result<DecodedFrame, WireError> {
         self.decode_detailed(bytes).map_err(|failure| failure.error)
@@ -489,6 +542,8 @@ pub fn id_string(v: &Value) -> Result<String, WireError> {
 pub struct Incoming {
     pub message: Message,
     pub client_id: Option<String>,
+    pub info: Option<InfoMessageContent>,
+    pub media: Option<MediaMessageContent>,
     pub unsupported: bool,
 }
 // Stickers carry a catalog address, never an image URL. Unknown/malformed media
@@ -523,13 +578,68 @@ fn sticker_descriptor(message: &Value) -> Option<StickerDescriptor> {
 }
 /// Actual legacy webchat text and bounded chat.sticker catalog metadata only.
 pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>, WireError> {
+    incoming_messages_detailed(account, payload).map_err(|failure| failure.error)
+}
+/// HTTP previews are authenticated with the same verified account capability as
+/// their encrypted request/response, and use the original source-peer routing.
+/// No caller-supplied account string can opt into this routing contract.
+pub(super) fn incoming_verified_preview(
+    session: &super::session::VerifiedSession,
+    payload: &Value,
+) -> Result<Vec<Incoming>, FrameFailure> {
+    incoming_with_scope(
+        session.account_id(),
+        payload,
+        IncomingScope::AuthenticatedQueue,
+    )
+}
+/// Reports only the fixed field that failed, never its value or identifiers.
+pub fn incoming_messages_detailed(
+    account: &str,
+    payload: &Value,
+) -> Result<Vec<Incoming>, FrameFailure> {
+    incoming_with_scope(account, payload, IncomingScope::RecipientChecked)
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IncomingScope {
+    RecipientChecked,
+    AuthenticatedQueue,
+}
+fn incoming_with_scope(
+    account: &str,
+    payload: &Value,
+    scope: IncomingScope,
+) -> Result<Vec<Incoming>, FrameFailure> {
+    let mut reason = FrameReason::BatchEnvelope;
+    let mut context = FrameContext {
+        status_type: FrameValueType::of(payload.get("error_code")),
+        data_type: FrameValueType::of(payload.get("data")),
+        ..Default::default()
+    };
+    incoming_with_reason(account, payload, scope, &mut reason, &mut context).map_err(|error| {
+        FrameFailure {
+            error,
+            reason,
+            context,
+        }
+    })
+}
+fn incoming_with_reason(
+    account: &str,
+    payload: &Value,
+    scope: IncomingScope,
+    reason: &mut FrameReason,
+    context: &mut FrameContext,
+) -> Result<Vec<Incoming>, WireError> {
     numeric_id(account)?;
     service_code(payload)?;
+    context.field_type = Some(FrameValueType::of(payload.get("data")));
     let data = payload
         .get("data")
         .and_then(Value::as_object)
         .ok_or(WireError::Invalid)?;
     let mut result = Vec::new();
+    let mut info_bytes = 0usize;
     for (field, kind) in [
         ("msgs", ThreadKind::Direct),
         ("groupMsgs", ThreadKind::Group),
@@ -538,11 +648,25 @@ pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>
         let Some(array) = data.get(field) else {
             continue;
         };
+        // Original queue handlers gate optional arrays with `field && field.length`.
+        // Null is an empty optional collection, not a malformed message to drop.
+        if array.is_null() {
+            continue;
+        }
+        *reason = FrameReason::BatchEnvelope;
+        context.message_kind = None;
+        context.field_bytes = None;
+        context.field_type = Some(FrameValueType::of(Some(array)));
         let array = array.as_array().ok_or(WireError::Invalid)?;
         if array.len() + result.len() > MAX_BATCH {
+            *reason = FrameReason::BatchLimit;
             return Err(WireError::Oversize);
         }
         for v in array {
+            context.message_kind = None;
+            context.field_bytes = None;
+            *reason = FrameReason::MessageTypeField;
+            context.field_type = Some(FrameValueType::of(v.get("msgType")));
             let message_type = v
                 .get("msgType")
                 .and_then(Value::as_str)
@@ -555,21 +679,47 @@ pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>
             {
                 return Err(WireError::Invalid);
             }
+            context.message_kind = Some(match message_type {
+                "webchat"
+                    if v.pointer("/content/action").and_then(Value::as_str)
+                        == Some("msginfo.actionlist") =>
+                {
+                    FrameMessageKind::WebchatInfo
+                }
+                "webchat" => FrameMessageKind::Webchat,
+                "chat.sticker" => FrameMessageKind::Sticker,
+                "chat.photo" => FrameMessageKind::Photo,
+                "chat.webcontent" => FrameMessageKind::WebContent,
+                _ => FrameMessageKind::Other,
+            });
             let sticker = sticker_descriptor(v);
-            let unsupported = message_type != "webchat" && sticker.is_none();
+
+            *reason = FrameReason::MessageSender;
+            context.field_type = Some(FrameValueType::of(v.get("uidFrom")));
             let raw_sender = v.get("uidFrom").ok_or(WireError::Invalid)?;
             let sender = if raw_sender.as_str() == Some("0") || raw_sender.as_u64() == Some(0) {
                 account.to_owned()
             } else {
                 id_string(raw_sender)?
             };
+            *reason = FrameReason::MessageRecipient;
+            context.field_type = Some(FrameValueType::of(v.get("idTo")));
             let raw_to = v.get("idTo").ok_or(WireError::Invalid)?;
             let to = if raw_to.as_str() == Some("0") || raw_to.as_u64() == Some(0) {
                 account.to_owned()
             } else {
                 id_string(raw_to)?
             };
-            if kind == ThreadKind::Direct && sender != account && to != account {
+            *reason = FrameReason::MessageScope;
+            // Untrusted batches must explicitly name their recipient. The
+            // authenticated PC queue instead uses uidFrom as the direct peer,
+            // and idTo may carry a different conversation/event destination.
+            // Runtime checks the socket's session account before this path.
+            if scope == IncomingScope::RecipientChecked
+                && kind == ThreadKind::Direct
+                && sender != account
+                && to != account
+            {
                 return Err(WireError::Invalid);
             }
             let peer = if kind == ThreadKind::Group || sender == account {
@@ -578,18 +728,83 @@ pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>
                 sender.clone()
             };
             let thread = Target::new(kind, &peer)?.thread_id();
+            *reason = FrameReason::MessageTimestamp;
+            context.field_type = Some(FrameValueType::of(v.get("ts")));
             let ts = v.get("ts").ok_or(WireError::Invalid)?;
             let ts = if let Some(s) = ts.as_str() {
                 s.parse().map_err(|_| WireError::Invalid)?
             } else {
                 ts.as_i64().ok_or(WireError::Invalid)?
             };
+            if ts < 0 {
+                return Err(WireError::Invalid);
+            }
+            *reason = FrameReason::MessageId;
+            context.field_type = Some(FrameValueType::of(v.get("msgId")));
+            let id = id_string(v.get("msgId").ok_or(WireError::Invalid)?)?;
+            *reason = FrameReason::MessageContent;
+            context.field_type = Some(FrameValueType::of(v.get("content")));
+            context.field_bytes = v
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|text| text.len().min(MAX_TEXT_BYTES + 1));
+            let info = if context.message_kind == Some(FrameMessageKind::WebchatInfo)
+                && v.get("e2eeExt").is_none()
+            {
+                let content = InfoMessageContent::new(v.get("content").ok_or(WireError::Invalid)?)
+                    .map_err(|error| match error {
+                        InfoContentError::Invalid => WireError::Invalid,
+                        InfoContentError::Oversize => WireError::Oversize,
+                    })?;
+                info_bytes = info_bytes
+                    .checked_add(content.as_json().len())
+                    .ok_or(WireError::Oversize)?;
+                if info_bytes > MAX_INFO_BATCH_BYTES {
+                    *reason = FrameReason::BatchLimit;
+                    return Err(WireError::Oversize);
+                }
+                Some(content)
+            } else {
+                None
+            };
+            let media = if let Some(kind) = MediaKind::from_wire(message_type) {
+                // Encrypted messages cannot be projected into the legacy media path.
+                if v.get("e2eeExt").is_some()
+                    || ["isE2EE", "isE2ee", "e2ee"].iter().any(|key| {
+                        v.get(key).is_some_and(|value| {
+                            !matches!(value, Value::Null | Value::Bool(false))
+                                && value.as_u64() != Some(0)
+                        })
+                    })
+                {
+                    return Err(WireError::Unsupported);
+                }
+                let content =
+                    MediaMessageContent::new(kind, v.get("content").ok_or(WireError::Invalid)?)
+                        .map_err(|error| match error {
+                            MediaContentError::Invalid => WireError::Invalid,
+                            MediaContentError::Oversize => WireError::Oversize,
+                        })?;
+                info_bytes = info_bytes
+                    .checked_add(content.as_json().len())
+                    .ok_or(WireError::Oversize)?;
+                if info_bytes > MAX_INFO_BATCH_BYTES {
+                    *reason = FrameReason::BatchLimit;
+                    return Err(WireError::Oversize);
+                }
+                Some(content)
+            } else {
+                None
+            };
+            let unsupported = message_type != "webchat" && sticker.is_none() && media.is_none();
             let message = Message {
                 account_id: account.into(),
                 thread_id: thread,
-                id: id_string(v.get("msgId").ok_or(WireError::Invalid)?)?,
+                id,
                 sender,
-                text: if message_type != "webchat" {
+                text: if info.is_some() {
+                    info::presentation(account, v.get("content").ok_or(WireError::Invalid)?)
+                } else if message_type != "webchat" {
                     format!("[Tin nhắn {message_type} chưa được hỗ trợ]")
                 } else {
                     v.get("content")
@@ -598,13 +813,32 @@ pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>
                         .into()
                 },
                 sticker,
+                media: media.as_ref().map(|content| content.descriptor().clone()),
                 sent_at_ms: ts,
             };
+            *reason = FrameReason::MessageValidation;
             message.validate().map_err(|_| WireError::Invalid)?;
-            let client_id = v.get("cliMsgId").map(id_string).transpose()?;
+            context.field_bytes = None;
+            *reason = FrameReason::MessageClientId;
+            context.field_type = Some(FrameValueType::of(v.get("cliMsgId")));
+            // cliMsgId is an optional correlation hint. The PC transform stringifies
+            // it independently from server msgId. Zero/null carry no usable
+            // client-generated correlation. Never treat these sentinels
+            // as an outbox identity; durable server binding remains authoritative.
+            let client_id = match v.get("cliMsgId") {
+                None | Some(Value::Null) => None,
+                Some(Value::Number(n)) if n.as_u64() == Some(0) => None,
+                Some(Value::String(s)) if s == "0" => None,
+                Some(value) => Some(id_string(value)?),
+            };
+            // An information event is never an acknowledgement of a reserved
+            // plain-text send, even when its server-supplied cliMsgId matches.
+            let client_id = client_id.filter(|_| info.is_none() && media.is_none());
             result.push(Incoming {
                 message,
                 client_id,
+                info,
+                media,
                 unsupported,
             });
         }
@@ -727,6 +961,310 @@ mod tests {
     }
     fn frame(cmd: u16, value: Value) -> Vec<u8> {
         encode_frame(cmd, 0, &value).unwrap()
+    }
+    fn incoming_fixture() -> Value {
+        json!({"error_code":0,"data":{"msgs":[{
+            "uidFrom":"22","idTo":"11","msgId":"811","cliMsgId":"1760000000001",
+            "ts":"1760000000001","msgType":"webchat","content":"synthetic text"
+        }]}})
+    }
+    #[test]
+    fn source_media_retains_full_metadata_without_plaintext_ack_or_scope_downgrade() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/messaging/media.json"))
+                .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut payload = incoming_fixture();
+            let message = &mut payload["data"]["msgs"][0];
+            message["msgType"] = case["kind"].clone();
+            message["content"] = case["content"].clone();
+            let mut parsed = incoming_messages("11", &payload).unwrap();
+            let incoming = parsed.pop().unwrap();
+            assert!(
+                !incoming.unsupported && incoming.client_id.is_none() && incoming.info.is_none()
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(incoming.media.as_ref().unwrap().as_json()).unwrap(),
+                case["content"]
+            );
+            assert_eq!(
+                incoming.message.media.as_ref(),
+                Some(incoming.media.as_ref().unwrap().descriptor())
+            );
+            assert_eq!(
+                incoming.message.text,
+                incoming.media.unwrap().kind().legacy_placeholder()
+            );
+            payload["data"]["msgs"][0]["idTo"] = json!("33");
+            assert_eq!(
+                incoming_messages_detailed("11", &payload)
+                    .unwrap_err()
+                    .reason,
+                FrameReason::MessageScope
+            );
+            for marker in ["e2eeExt", "isE2EE", "isE2ee", "e2ee"] {
+                let mut encrypted = payload.clone();
+                encrypted["data"]["msgs"][0]["idTo"] = json!("11");
+                encrypted["data"]["msgs"][0][marker] = json!(true);
+                assert_eq!(
+                    incoming_messages("11", &encrypted).unwrap_err(),
+                    WireError::Unsupported
+                );
+            }
+            payload["data"]["msgs"][0]["idTo"] = json!("11");
+            let valid = payload["data"]["msgs"][0].clone();
+            payload["data"]["msgs"][0]["content"] = Value::Null;
+            payload["data"]["msgs"]
+                .as_array_mut()
+                .unwrap()
+                .insert(0, valid);
+            assert_eq!(
+                incoming_messages_detailed("11", &payload)
+                    .unwrap_err()
+                    .reason,
+                FrameReason::MessageContent
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_queue_routes_source_peers_without_trusting_recipient_account_hint() {
+        for field in ["msgs", "pageMsgs"] {
+            for message_type in ["webchat", "chat.recommended"] {
+                let mut payload = incoming_fixture();
+                let mut message = payload["data"]["msgs"][0].clone();
+                message["idTo"] = json!("33");
+                message["msgType"] = json!(message_type);
+                payload["data"] = json!({field:[message]});
+                assert_eq!(
+                    incoming_messages_detailed("11", &payload)
+                        .unwrap_err()
+                        .reason,
+                    FrameReason::MessageScope
+                );
+                assert_eq!(
+                    FrameDecoder::default()
+                        .incoming_messages("11", &payload)
+                        .unwrap_err()
+                        .error,
+                    WireError::Authentication
+                );
+                let received = authenticated().incoming_messages("11", &payload).unwrap();
+                assert_eq!(received.len(), 1);
+                assert_eq!(received[0].message.account_id, "11");
+                assert_eq!(received[0].message.thread_id, "d:22");
+                assert_eq!(received[0].message.sender, "22");
+                assert_eq!(received[0].message.id, "811");
+                assert_eq!(received[0].unsupported, message_type != "webchat");
+            }
+        }
+        for (sender, recipient, expected_sender, expected_thread) in [
+            ("22", "0", "22", "d:22"),
+            ("0", "33", "11", "d:33"),
+            ("11", "33", "11", "d:33"),
+            ("0", "0", "11", "d:11"),
+        ] {
+            let mut payload = incoming_fixture();
+            payload["data"]["msgs"][0]["uidFrom"] = json!(sender);
+            payload["data"]["msgs"][0]["idTo"] = json!(recipient);
+            let received = authenticated().incoming_messages("11", &payload).unwrap();
+            assert_eq!(received[0].message.sender, expected_sender);
+            assert_eq!(received[0].message.thread_id, expected_thread);
+        }
+        let mut payload = incoming_fixture();
+        let message = payload["data"]["msgs"][0].clone();
+        payload["data"] = json!({"groupMsgs":[message]});
+        payload["data"]["groupMsgs"][0]["idTo"] = json!("33");
+        assert_eq!(
+            authenticated().incoming_messages("11", &payload).unwrap()[0]
+                .message
+                .thread_id,
+            "g:33"
+        );
+        for field in ["uidFrom", "idTo", "msgId"] {
+            let mut payload = incoming_fixture();
+            payload["data"]["msgs"][0][field] = json!("untrusted_identity");
+            assert!(authenticated().incoming_messages("11", &payload).is_err());
+        }
+        // A payload parsed without an authenticated socket cannot reassign data
+        // from another account merely by supplying a different parser account.
+        assert_eq!(
+            incoming_messages_detailed("33", &incoming_fixture())
+                .unwrap_err()
+                .reason,
+            FrameReason::MessageScope
+        );
+    }
+    #[test]
+    fn recognized_group_info_retains_full_content_and_cannot_acknowledge_plaintext() {
+        let fixtures: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/messaging/info.json")).unwrap();
+        for case in fixtures["cases"].as_array().unwrap() {
+            let mut message = incoming_fixture()["data"]["msgs"][0].clone();
+            message["idTo"] = json!("33");
+            message["content"] = case["content"].clone();
+            let payload = json!({"error_code":0,"data":{"groupMsgs":[message]}});
+            let result = authenticated().incoming_messages("11", &payload).unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].message.thread_id, "g:33");
+            assert_eq!(result[0].message.text, case["text"].as_str().unwrap());
+            assert_eq!(result[0].message.sender, "22");
+            assert!(!result[0].unsupported);
+            assert_eq!(result[0].client_id, None);
+            assert_eq!(
+                serde_json::from_str::<Value>(result[0].info.as_ref().unwrap().as_json()).unwrap(),
+                case["content"]
+            );
+        }
+        let mut message = incoming_fixture()["data"]["msgs"][0].clone();
+        message["content"] = json!({"action":"msginfo.actionlist","title":"Thông báo"});
+        message["e2eeExt"] = json!({"cipher":"not-plaintext"});
+        let payload = json!({"error_code":0,"data":{"msgs":[message]}});
+        assert_eq!(
+            authenticated()
+                .incoming_messages("11", &payload)
+                .unwrap_err()
+                .reason,
+            FrameReason::MessageContent
+        );
+    }
+    #[test]
+    fn information_content_and_batch_payload_limits_fail_before_any_partial_batch() {
+        let mut message = incoming_fixture()["data"]["msgs"][0].clone();
+        message["content"] = json!({"action":"msginfo.actionlist","title":"Thông báo",
+            "unknown":"x".repeat(crate::domain::MAX_INFO_CONTENT_BYTES)});
+        let payload = json!({"error_code":0,"data":{"msgs":[message.clone()]}});
+        let failure = authenticated()
+            .incoming_messages("11", &payload)
+            .unwrap_err();
+        assert_eq!(failure.error, WireError::Oversize);
+        assert_eq!(failure.reason, FrameReason::MessageContent);
+        message["content"]["unknown"] = json!("x".repeat(MAX_INFO_BATCH_BYTES / 2));
+        let payload = json!({"error_code":0,"data":{"msgs":[message.clone(),message]}});
+        let failure = authenticated()
+            .incoming_messages("11", &payload)
+            .unwrap_err();
+        assert_eq!(failure.error, WireError::Oversize);
+        assert_eq!(failure.reason, FrameReason::BatchLimit);
+    }
+    #[test]
+    fn optional_client_correlations_and_null_arrays_preserve_messages_and_identity() {
+        for sender in ["11", "22"] {
+            for client_id in [
+                None,
+                Some(Value::Null),
+                Some(json!(0)),
+                Some(json!("0")),
+                Some(json!("1760000000001")),
+            ] {
+                let mut payload = incoming_fixture();
+                let message = &mut payload["data"]["msgs"][0];
+                message["uidFrom"] = json!(sender);
+                message["idTo"] = json!(if sender == "11" { "22" } else { "11" });
+                if let Some(value) = &client_id {
+                    message["cliMsgId"] = value.clone();
+                } else {
+                    message.as_object_mut().unwrap().remove("cliMsgId");
+                }
+                payload["data"]["groupMsgs"] = Value::Null;
+                payload["data"]["pageMsgs"] = Value::Null;
+                let messages = incoming_messages_detailed("11", &payload).unwrap();
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].message.sender, sender);
+                assert_eq!(messages[0].message.id, "811");
+                assert_eq!(messages[0].message.thread_id, "d:22");
+                assert_eq!(messages[0].message.text, "synthetic text");
+                assert_eq!(
+                    messages[0].client_id.as_deref(),
+                    if client_id == Some(json!("1760000000001")) {
+                        Some("1760000000001")
+                    } else {
+                        None
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn detailed_incoming_rejections_identify_the_field_without_retaining_peer_data() {
+        let cases = [
+            (
+                "msgType",
+                json!({"private_type":"secret"}),
+                FrameReason::MessageTypeField,
+            ),
+            (
+                "uidFrom",
+                json!("private_sender"),
+                FrameReason::MessageSender,
+            ),
+            (
+                "idTo",
+                json!("private_recipient"),
+                FrameReason::MessageRecipient,
+            ),
+            ("idTo", json!("33"), FrameReason::MessageScope),
+            (
+                "ts",
+                json!("private_timestamp"),
+                FrameReason::MessageTimestamp,
+            ),
+            ("msgId", json!(0), FrameReason::MessageId),
+            (
+                "content",
+                json!({"action":"unknown.action","private_body":"secret"}),
+                FrameReason::MessageContent,
+            ),
+            (
+                "content",
+                json!("x".repeat(MAX_TEXT_BYTES + 1)),
+                FrameReason::MessageValidation,
+            ),
+            (
+                "cliMsgId",
+                json!({"private_correlation":"secret"}),
+                FrameReason::MessageClientId,
+            ),
+        ];
+        for (field, value, reason) in cases {
+            let mut payload = incoming_fixture();
+            payload["data"]["msgs"][0][field] = value;
+            let failure = incoming_messages_detailed("11", &payload).unwrap_err();
+            assert_eq!(failure.reason, reason);
+            assert_eq!(failure.error, WireError::Invalid);
+            if reason == FrameReason::MessageContent {
+                assert_eq!(failure.context.field_type, Some(FrameValueType::Object));
+                assert_eq!(
+                    failure.context.message_kind,
+                    Some(FrameMessageKind::Webchat)
+                );
+                assert_eq!(failure.context.field_bytes, None);
+            } else if reason == FrameReason::MessageValidation {
+                assert_eq!(failure.context.field_type, Some(FrameValueType::String));
+                assert_eq!(
+                    failure.context.message_kind,
+                    Some(FrameMessageKind::Webchat)
+                );
+                assert_eq!(failure.context.field_bytes, Some(MAX_TEXT_BYTES + 1));
+            }
+            assert!(!format!("{failure:?}").contains("private_"));
+            assert!(!format!("{failure}").contains("secret"));
+        }
+        for field in ["uidFrom", "idTo", "msgId"] {
+            for value in [Value::Null, json!({}), json!("private_identity")] {
+                let mut payload = incoming_fixture();
+                payload["data"]["msgs"][0][field] = value;
+                assert!(incoming_messages_detailed("11", &payload).is_err());
+            }
+        }
+        let mut payload = incoming_fixture();
+        payload["data"]["groupMsgs"] = json!({"private_batch":"secret"});
+        assert_eq!(
+            incoming_messages_detailed("11", &payload)
+                .unwrap_err()
+                .reason,
+            FrameReason::BatchEnvelope
+        );
     }
     #[test]
     fn socket_aes_gcm_matches_independent_node_16_byte_iv_aad_and_zlib_fixture() {

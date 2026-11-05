@@ -1,12 +1,16 @@
 # Native UI and existing Zalo theme
 
-The Rust view uses egui, with the existing repository's **Light** theme. It does
+The Rust view uses egui with the repository's **Light/Dark** palettes, **System**
+selection and source-backed **Custom** overlays. It does
 not load a WebView, redesign the theme, or use ctdozlite UI code or assets.
 
-The source of truth is the `:root,:root .light` declaration and the matching
+The source of truth is the `:root`, `.light`, `.dark` declarations and the matching
 component selectors in
 `pc-dist/default-login-startup-main-startup.e08d0d44f38873747a6b.css`.
-`src/ui/visuals.rs` maps these existing values into native colors:
+`src/theme.rs` resolves semantic roles against the generated original token
+catalog; `src/ui/visuals.rs` paints components. Full source coverage, registry
+verification and component states are tracked in
+[UI_ASSET_INVENTORY.md](UI_ASSET_INVENTORY.md). These are example **Light** values:
 
 | Existing token | Native value |
 | --- | --- |
@@ -27,14 +31,36 @@ Native layout follows the same rail/list/chat structure: 56 px navigation rows,
 selection, and 68 px chat header. Small windows collapse the list behind back
 navigation, preserving the selected recipient and drafts.
 
-The existing `pc-dist/fonts/Zalo-Segoe-UI.dc1a7d868a0b3a0e2daa8b36567e9ea9.ttf`
-and `zalo-font.7f2d95cebfac22d16e486bfd1716c591.ttf` are embedded directly from
-their repository paths. Icon codepoints match the corresponding `.fa-*` CSS
-declarations. These assets retain their existing provenance; no replacement font
-or decorative artwork was added. Fonts are initialized once, without frame-time
-file reads.
+Existing Segoe UI regular/Semibold/Bold and the Zalo/Screencap icon TTFs are
+embedded directly from `pc-dist/fonts/`. All 1,034 terminal pseudo-element
+classes/aliases in the generated registry are verified against their original
+font cmaps; the 15 semantic controls resolve through this registry. Font assets
+retain their repository provenance. Font setup happens once, with no frame-time
+file reads or eager glyph rasterization.
 
-Only synthetic contacts use generated initials. Unavailable live actions remain
-disabled. The composer explicitly saves locally, using the real SQLite worker;
-Ctrl+Enter saves and plain Enter inserts a newline. Light theme mapping does not
-yet implement persisted Dark/System/Custom selection from the Electron profile.
+Open appearance settings from the bottom rail gear or login-screen gear. Four
+modes are persisted independently in the native profile's `config/theme.json` by
+a bounded worker, without reading Electron preferences. Custom inherits Light;
+System follows the signal reported by egui/winit and falls back to Light when
+absent; not every Linux desktop/native Wayland path has been validated.
+Color overrides use original token names. Two-stop linear gradients are actually
+painted for `--surface-background`, `--layer-background-navbar-normal` and
+`--layer-background`; other gradient/layout tokens remain inspectable source
+facts. Reset restores inheritance. Token editing and the searchable, paged icon
+registry are optional Advanced sections, closed initially.
+
+Custom-painted controls explicitly handle hover, press, selection, disabled and
+keyboard focus. Navigation focus uses its contrasting original foreground;
+standard controls use source border/interaction roles. QR background/image tint
+remain white intentionally. Avatar accent and on-color text roles are resolved
+through the active palette rather than hardcoded Light colors.
+
+Avatars currently use generated initials for both cached live names and synthetic
+contacts; profile photos are not downloaded. Unknown live senders use a neutral
+label/avatar, and group titles are never member names. Unavailable live actions
+remain disabled. The demo composer saves only locally; live text sends require a
+verified session and supported conversation capability. Ctrl+Enter submits when
+eligible and outside IME composition; plain Enter inserts a newline. Media
+upload, sticker sending/animation and production E2EE remain unsupported. Current
+flows and agent acceptance rules are documented in
+[UI_DESIGN.md](UI_DESIGN.md).

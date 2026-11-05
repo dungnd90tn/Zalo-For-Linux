@@ -34,6 +34,7 @@ pub enum Kind {
 pub enum Stage {
     InputMethod,
     StickerAssets,
+    MediaAssets,
     Startup,
     Shutdown,
     Profile,
@@ -91,6 +92,25 @@ pub enum Reason {
     InnerEnvelope,
     PlaintextAuth,
     QueueCommands,
+    BatchEnvelope,
+    BatchLimit,
+    MessageTypeField,
+    MessageSender,
+    MessageRecipient,
+    MessageScope,
+    MessageTimestamp,
+    MessageId,
+    MessageContent,
+    MessageValidation,
+    MessageClientId,
+    QueueStatus,
+    QueueKey,
+    QueueEvicted,
+    QueueCursor,
+    QueueMore,
+    QueueContinuation,
+    QueueProgress,
+    QueuePageLimit,
     Io,
 }
 #[derive(Clone, Copy, Serialize)]
@@ -104,6 +124,17 @@ pub enum ValueType {
     Boolean,
     Object,
     Array,
+}
+/// Source-recognized categories only; no peer-controlled type or action strings.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    Webchat,
+    WebchatInfo,
+    Photo,
+    WebContent,
+    Sticker,
+    Other,
 }
 /// Unknown command IDs are collapsed, never printed as uncontrolled identifiers.
 #[derive(Clone, Copy, Serialize)]
@@ -161,8 +192,53 @@ pub enum StorageFailure {
     Sqlite,
     Other,
 }
+/// Partial directory synchronization is independent of the socket connection.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryStage {
+    Friends,
+    Groups,
+    Previews,
+    Storage,
+    Synchronization,
+}
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryCategory {
+    Unavailable,
+    Network,
+    Timeout,
+    Http,
+    Server,
+    Crypto,
+    Schema,
+    Resource,
+    Cancelled,
+    Storage,
+}
+/// Fixed HTTP preview boundaries only, never response keys or message contents.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewField {
+    ResponseJson,
+    ResponseEnvelope,
+    EncryptedData,
+    DecryptedJson,
+    DecryptedEnvelope,
+    MessageCollections,
+    Msgs,
+    GroupMsgs,
+    PageMsgs,
+    EeMsgs,
+}
 #[derive(Clone, Copy, Serialize)]
 pub struct Event {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_field: Option<PreviewField>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory_stage: Option<DirectoryStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory_category: Option<DirectoryCategory>,
     #[serde(skip_serializing_if = "Option::is_none")]
     storage_operation: Option<StorageOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,12 +268,21 @@ pub struct Event {
     error_code_type: Option<ValueType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data_type: Option<ValueType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field_type: Option<ValueType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_kind: Option<MessageKind>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     server_code_out_of_range: bool,
 }
 impl Event {
     pub fn new(kind: Kind, stage: Stage, reason: Reason) -> Self {
         Self {
+            preview_field: None,
+            directory_stage: None,
+            directory_category: None,
             storage_operation: None,
             storage_failure: None,
             sqlite_code: None,
@@ -214,8 +299,20 @@ impl Event {
             encryption: None,
             error_code_type: None,
             data_type: None,
+            field_type: None,
+            field_bytes: None,
+            message_kind: None,
             server_code_out_of_range: false,
         }
+    }
+    pub fn directory(mut self, stage: DirectoryStage, category: DirectoryCategory) -> Self {
+        self.directory_stage = Some(stage);
+        self.directory_category = Some(category);
+        self
+    }
+    pub fn preview_field(mut self, field: Option<PreviewField>) -> Self {
+        self.preview_field = field;
+        self
     }
     pub fn storage(
         mut self,
@@ -259,6 +356,19 @@ impl Event {
     pub fn envelope_types(mut self, error_code: ValueType, data: ValueType) -> Self {
         self.error_code_type = Some(error_code);
         self.data_type = Some(data);
+        self
+    }
+    pub fn field_type(mut self, value: Option<ValueType>) -> Self {
+        self.field_type = value;
+        self
+    }
+    /// Only the failing text field's bounded byte count; never its contents.
+    pub fn field_bytes(mut self, value: Option<usize>) -> Self {
+        self.field_bytes = value.map(|bytes| bytes.min(crate::domain::MAX_TEXT_BYTES + 1));
+        self
+    }
+    pub fn message_kind(mut self, value: Option<MessageKind>) -> Self {
+        self.message_kind = value;
         self
     }
 }
@@ -691,6 +801,199 @@ mod tests {
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_err());
+    }
+    #[test]
+    fn incoming_and_queue_rejections_are_recorded_without_debug_logging_or_payloads() {
+        let root = scratch();
+        let logger = Logger::spawn(&root, false, FILE_LIMIT).unwrap();
+        let reasons = [
+            (Reason::BatchEnvelope, "batch_envelope"),
+            (Reason::BatchLimit, "batch_limit"),
+            (Reason::MessageTypeField, "message_type_field"),
+            (Reason::MessageSender, "message_sender"),
+            (Reason::MessageRecipient, "message_recipient"),
+            (Reason::MessageScope, "message_scope"),
+            (Reason::MessageTimestamp, "message_timestamp"),
+            (Reason::MessageId, "message_id"),
+            (Reason::MessageContent, "message_content"),
+            (Reason::MessageValidation, "message_validation"),
+            (Reason::MessageClientId, "message_client_id"),
+            (Reason::QueueStatus, "queue_status"),
+            (Reason::QueueKey, "queue_key"),
+            (Reason::QueueEvicted, "queue_evicted"),
+            (Reason::QueueCursor, "queue_cursor"),
+            (Reason::QueueMore, "queue_more"),
+            (Reason::QueueContinuation, "queue_continuation"),
+            (Reason::QueueProgress, "queue_progress"),
+            (Reason::QueuePageLimit, "queue_page_limit"),
+        ];
+        for (reason, _) in reasons {
+            logger.record(
+                Event::new(Kind::Failure, Stage::Synchronization, reason).frame(510, 0, None),
+            );
+        }
+        let path = logger.path().to_owned();
+        drop(logger);
+        let lines: Vec<serde_json::Value> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), reasons.len() + 1);
+        for (event, (_, name)) in lines.iter().zip(reasons) {
+            assert_eq!(event["reason"], name);
+            assert_eq!(event["kind"], "failure");
+            assert_eq!(event["stage"], "synchronization");
+            assert_eq!(event["command_id"], 510);
+            assert_eq!(event["subcommand"], 0);
+            assert!(event.as_object().unwrap().keys().all(|key| matches!(
+                key.as_str(),
+                "ts_ms" | "kind" | "stage" | "reason" | "command" | "command_id" | "subcommand"
+            )));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn preview_boundaries_are_closed_optional_and_logged_without_debug_or_payloads() {
+        let root = scratch();
+        let logger = Logger::spawn(&root, false, FILE_LIMIT).unwrap();
+        let fields = [
+            (PreviewField::ResponseJson, "response_json"),
+            (PreviewField::ResponseEnvelope, "response_envelope"),
+            (PreviewField::EncryptedData, "encrypted_data"),
+            (PreviewField::DecryptedJson, "decrypted_json"),
+            (PreviewField::DecryptedEnvelope, "decrypted_envelope"),
+            (PreviewField::MessageCollections, "message_collections"),
+            (PreviewField::Msgs, "msgs"),
+            (PreviewField::GroupMsgs, "group_msgs"),
+            (PreviewField::PageMsgs, "page_msgs"),
+            (PreviewField::EeMsgs, "ee_msgs"),
+        ];
+        for (field, _) in fields {
+            let event = Event::new(Kind::Failure, Stage::Synchronization, Reason::MessageScope)
+                .directory(DirectoryStage::Previews, DirectoryCategory::Schema)
+                .preview_field(Some(field))
+                .field_type(Some(ValueType::String))
+                .field_bytes(Some(usize::MAX))
+                .message_kind(Some(MessageKind::Photo));
+            let cleared = serde_json::to_value(event.preview_field(None)).unwrap();
+            assert!(cleared.get("preview_field").is_none());
+            logger.record(event);
+        }
+        let path = logger.path().to_owned();
+        drop(logger);
+        let lines: Vec<serde_json::Value> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), fields.len() + 1);
+        for (value, (_, expected)) in lines.iter().zip(fields) {
+            assert_eq!(value["preview_field"], expected);
+            assert_eq!(value["reason"], "message_scope");
+            assert_eq!(value["directory_stage"], "previews");
+            assert_eq!(value["directory_category"], "schema");
+            assert_eq!(value["field_bytes"], crate::domain::MAX_TEXT_BYTES + 1);
+            assert_eq!(value["message_kind"], "photo");
+            assert!(value.as_object().unwrap().keys().all(|key| matches!(
+                key.as_str(),
+                "ts_ms"
+                    | "kind"
+                    | "stage"
+                    | "reason"
+                    | "directory_stage"
+                    | "directory_category"
+                    | "preview_field"
+                    | "field_type"
+                    | "field_bytes"
+                    | "message_kind"
+            )));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn partial_directory_context_is_closed_structural_and_optional() {
+        let plain = serde_json::to_value(Event::new(
+            Kind::Failure,
+            Stage::Synchronization,
+            Reason::Invalid,
+        ))
+        .unwrap();
+        assert!(plain.get("directory_stage").is_none());
+        assert!(plain.get("directory_category").is_none());
+        for (stage, expected_stage) in [
+            (DirectoryStage::Friends, "friends"),
+            (DirectoryStage::Groups, "groups"),
+            (DirectoryStage::Previews, "previews"),
+            (DirectoryStage::Storage, "storage"),
+            (DirectoryStage::Synchronization, "synchronization"),
+        ] {
+            for (category, expected_category) in [
+                (DirectoryCategory::Unavailable, "unavailable"),
+                (DirectoryCategory::Network, "network"),
+                (DirectoryCategory::Timeout, "timeout"),
+                (DirectoryCategory::Http, "http"),
+                (DirectoryCategory::Server, "server"),
+                (DirectoryCategory::Crypto, "crypto"),
+                (DirectoryCategory::Schema, "schema"),
+                (DirectoryCategory::Resource, "resource"),
+                (DirectoryCategory::Cancelled, "cancelled"),
+                (DirectoryCategory::Storage, "storage"),
+            ] {
+                let value = serde_json::to_value(
+                    Event::new(Kind::Failure, Stage::Synchronization, Reason::Invalid)
+                        .directory(stage, category),
+                )
+                .unwrap();
+                assert_eq!(value["directory_stage"], expected_stage);
+                assert_eq!(value["directory_category"], expected_category);
+                assert!(value.as_object().unwrap().keys().all(|key| matches!(
+                    key.as_str(),
+                    "kind" | "stage" | "reason" | "directory_stage" | "directory_category"
+                )));
+            }
+        }
+    }
+    #[test]
+    fn rejected_field_context_is_closed_bounded_and_optional() {
+        for (kind, name) in [
+            (MessageKind::Webchat, "webchat"),
+            (MessageKind::WebchatInfo, "webchat_info"),
+            (MessageKind::Photo, "photo"),
+            (MessageKind::WebContent, "web_content"),
+            (MessageKind::Sticker, "sticker"),
+            (MessageKind::Other, "other"),
+        ] {
+            for (count, bounded) in [
+                (0, 0),
+                (17, 17),
+                (usize::MAX, crate::domain::MAX_TEXT_BYTES + 1),
+            ] {
+                let event = Event::new(
+                    Kind::Failure,
+                    Stage::Synchronization,
+                    Reason::MessageContent,
+                )
+                .field_type(Some(ValueType::Object))
+                .message_kind(Some(kind))
+                .field_bytes(Some(count));
+                let value = serde_json::to_value(event).unwrap();
+                assert_eq!(value["field_type"], "object");
+                assert_eq!(value["message_kind"], name);
+                assert_eq!(value["field_bytes"], bounded);
+                assert!(value.as_object().unwrap().keys().all(|key| matches!(
+                    key.as_str(),
+                    "kind" | "stage" | "reason" | "field_type" | "field_bytes" | "message_kind"
+                )));
+                let cleared = serde_json::to_value(
+                    event.field_type(None).message_kind(None).field_bytes(None),
+                )
+                .unwrap();
+                for field in ["field_type", "field_bytes", "message_kind"] {
+                    assert!(cleared.get(field).is_none());
+                }
+            }
+        }
     }
     #[test]
     fn event_api_has_no_freeform_payload_and_suppresses_unrecognized_numeric_values() {

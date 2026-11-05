@@ -180,11 +180,12 @@ impl DirectoryView {
         }
     }
     fn show(&mut self, ui: &mut egui::Ui, selected: Option<&str>) -> Option<Action> {
+        let colors = crate::theme::palette(ui.ctx());
         let mut action = None;
         ui.spacing_mut().item_spacing.y = 8.0;
         egui::Frame::none().inner_margin(egui::Margin::symmetric(14.0, 12.0)).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Danh bạ").strong().size(18.0));
+                ui.label(RichText::new("Danh bạ").family(egui::FontFamily::Name("Zalo Semibold".into())).size(18.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add_enabled(!self.syncing, egui::Button::new("Cập nhật").small()).on_hover_text("Cập nhật liên hệ, nhóm và các bản xem trước từ Zalo; không phụ thuộc kết nối nhận tin.").clicked() { action = Some(Action::Refresh); }
                 });
@@ -196,12 +197,12 @@ impl DirectoryView {
             });
             let response = ui.add(egui::TextEdit::singleline(&mut self.search).id_source("directory_search").hint_text(if self.is_group { "Tìm tên nhóm" } else { "Tìm tên trong danh bạ" }).char_limit(128).desired_width(f32::INFINITY));
             if response.changed() { self.reset_query(ui.ctx()); }
-            ui.label(RichText::new("Danh bạ đã lưu trên thiết bị").size(10.5).color(visuals::MUTED));
+            ui.label(RichText::new("Danh bạ đã lưu trên thiết bị").size(10.5).color(colors.text_secondary));
             if !self.summary.is_empty() {
-                ui.add(egui::Label::new(RichText::new(&self.summary).size(10.5).color(visuals::MUTED)).wrap()).on_hover_text(&self.detail);
+                ui.add(egui::Label::new(RichText::new(&self.summary).size(10.5).color(colors.text_secondary)).wrap()).on_hover_text(&self.detail);
             }
             if let Some(error) = &self.error {
-                ui.add(egui::Label::new(RichText::new(error).size(11.0).color(visuals::INK)).wrap());
+                ui.add(egui::Label::new(RichText::new(error).size(11.0).color(colors.error)).wrap());
                 if ui.small_button("Thử lại").clicked() { action = Some(Action::Retry); }
             }
         });
@@ -238,17 +239,20 @@ impl DirectoryView {
                         },
                     );
                     let is_selected = selected == Some(entry.thread_id().as_str());
-                    if is_selected || response.hovered() {
+                    if is_selected || response.hovered() || response.is_pointer_button_down_on() {
                         ui.painter().rect_filled(
                             rect,
                             0.0,
-                            if is_selected {
-                                visuals::PALE_BLUE
+                            if response.is_pointer_button_down_on() {
+                                colors.pressed
+                            } else if is_selected {
+                                colors.selected
                             } else {
-                                visuals::HOVER
+                                colors.hover
                             },
                         );
                     }
+                    visuals::focus_outline(ui, &response, rect, 0.0);
                     visuals::avatar(
                         ui,
                         egui::Rect::from_center_size(
@@ -266,7 +270,7 @@ impl DirectoryView {
                         egui::Label::new(
                             RichText::new(&entry.display_name)
                                 .size(14.0)
-                                .color(visuals::INK),
+                                .color(colors.text_primary),
                         )
                         .truncate(),
                     );
@@ -282,7 +286,11 @@ impl DirectoryView {
                     } else {
                         "Liên hệ đã lưu".into()
                     };
-                    text.label(RichText::new(subtitle).size(11.0).color(visuals::MUTED));
+                    text.label(
+                        RichText::new(subtitle)
+                            .size(11.0)
+                            .color(colors.text_secondary),
+                    );
                     if response.clicked() && (!self.pending || !self.block_rows) {
                         action = Some(Action::Open(entry.clone()));
                     }
@@ -310,7 +318,7 @@ impl DirectoryView {
                             if self.is_group { "nhóm" } else { "liên hệ" }
                         ))
                         .size(10.5)
-                        .color(visuals::MUTED),
+                        .color(colors.text_secondary),
                     );
                     if ui
                         .add_enabled(

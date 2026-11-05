@@ -1,0 +1,142 @@
+{
+  "provenance": "Exact original getLastMessagesForPreview HTTP caller, preProcessChatMsgs and toConvId; synthetic plaintext/decrypt boundary, no network or account data",
+  "cases": [
+    {
+      "name": "empty_object",
+      "data": {},
+      "threads": []
+    },
+    {
+      "name": "control_only",
+      "data": {
+        "clearUnreads": [
+          {
+            "idTo": "22",
+            "lastMsgId": "841"
+          }
+        ]
+      },
+      "threads": []
+    },
+    {
+      "name": "nullable_collections",
+      "data": {
+        "msgs": null,
+        "groupMsgs": null,
+        "pageMsgs": null,
+        "eeMsgs": null
+      },
+      "threads": []
+    },
+    {
+      "name": "peer_addressed_direct",
+      "data": {
+        "msgs": [
+          {
+            "msgId": "841",
+            "uidFrom": "22",
+            "idTo": "33",
+            "msgType": "chat.photo",
+            "ts": 1700000000000,
+            "content": {
+              "title": "Ảnh",
+              "href": "https://f12-zpcloud.zdn.vn/synthetic.jpg"
+            }
+          }
+        ]
+      },
+      "threads": [
+        "d:22"
+      ]
+    },
+    {
+      "name": "peer_addressed_page",
+      "data": {
+        "pageMsgs": [
+          {
+            "msgId": "841",
+            "uidFrom": "44",
+            "idTo": "55",
+            "msgType": "chat.webcontent",
+            "ts": 1700000000000,
+            "content": {
+              "params": {
+                "customMsg": {
+                  "msg": {
+                    "vi": "Thông báo dịch vụ"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "threads": [
+        "d:44"
+      ]
+    },
+    {
+      "name": "self_sentinel",
+      "data": {
+        "msgs": [
+          {
+            "msgId": "841",
+            "uidFrom": "0",
+            "idTo": "22",
+            "msgType": "webchat",
+            "ts": 1700000000000,
+            "content": "synthetic"
+          }
+        ]
+      },
+      "threads": [
+        "d:22"
+      ]
+    },
+    {
+      "name": "group",
+      "data": {
+        "groupMsgs": [
+          {
+            "msgId": "841",
+            "uidFrom": "22",
+            "idTo": "90",
+            "msgType": "webchat",
+            "ts": 1700000000000,
+            "content": "synthetic"
+          }
+        ]
+      },
+      "threads": [
+        "g:90"
+      ]
+    },
+    {
+      "name": "same_thread_both_peer_destinations",
+      "data": {
+        "msgs": [
+          {
+            "msgId": "841",
+            "uidFrom": "22",
+            "idTo": "33",
+            "msgType": "webchat",
+            "ts": 1700000000000,
+            "content": "synthetic"
+          },
+          {
+            "msgId": "842",
+            "uidFrom": "22",
+            "idTo": "44",
+            "msgType": "webchat",
+            "ts": 1700000000000,
+            "content": "synthetic"
+          }
+        ]
+      },
+      "threads": [
+        "d:22",
+        "d:22"
+      ]
+    }
+  ]
+}

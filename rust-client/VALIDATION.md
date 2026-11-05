@@ -44,7 +44,7 @@ The user confirmed QR login and saved Resume reaching Online. After an earlier s
 
 Normal profile runs, including headless demos, use a background logger with a 256-event queue and four 256 KiB JSONL slots at `<profile-cache>/diagnostics/native.log{,.1,.2,.3}`. The directory is owner-only (0700), files are 0600 and symbolic/hard links are rejected. `--debug-log` enables additional structural metadata; failures and lifecycle events are always enabled. Events contain fixed categories, bounded numeric metadata and executable identity, excluding payloads, credentials, URLs and account/message identifiers.
 
-`--doctor --profile rust-live` reports `diagnostic_log_path` as an absolute path without creating a profile or log; include the launch's custom profile flags when applicable. Smoke checks inspect actual lifecycle records, executable SHA-256, file permissions/size limits and schema-four storage. Unit tests cover queue saturation, rotation, preexisting unsafe/oversized files and structural redaction. A demo GUI check must additionally confirm graceful shutdown/log flushing and zero Internet connections. Automatic live startup is tested with synthetic loopback transport, never a real-account QR. Logs support diagnosis; they do not prove production interoperability.
+`--doctor --profile rust-live` reports `diagnostic_log_path` as an absolute path without creating a profile or log; include the launch's custom profile flags when applicable. Smoke checks inspect actual lifecycle records, executable SHA-256, file permissions/size limits and schema-six storage. Unit tests cover queue saturation, rotation, preexisting unsafe/oversized files and structural redaction. A demo GUI check must additionally confirm graceful shutdown/log flushing and zero Internet connections. Automatic live startup is tested with synthetic loopback transport, never a real-account QR. Logs support diagnosis; they do not prove production interoperability.
 
 ## Existing sessions and handshake evidence
 
@@ -56,7 +56,7 @@ Live requests use the source-verified Linux desktop client type 24. New auth rec
 
 `node rust-client/tests/fixtures/messaging/post_auth_oracle.cjs` independently checks 18 original control/API/encrypted-message cases. The runtime regression `actual_runtime_survives_three_source_pongs_then_sends_via_layered_563_and_logs_invalid_message` uses actual loopback TLS/WSS and controlled time: three PONG/PING_ACTIVE cycles, later encrypted receive, layered capability reply and HTTPS send/ACK, then malformed input without a queue ACK. It verifies the real failure reaches default-mode JSONL with structural fields and no fixture payload/credential markers.
 
-Schema-four storage is additive. Default tests preserve schema-two/three messages, outbox, cursors and directory metadata across migration; optional `signal-store` tests convert bounded typed snapshots/deltas. Dependency checks ensure this DTO feature does not enable QuickJS, libsignal-core or networking. Passing these tests does not enable production E2EE; see [STORE_E2EE.md](STORE_E2EE.md).
+Schema-six storage is additive and preserves the earlier schema-two/three/four/five migrations. Default tests retain messages, outbox, cursors, directory metadata and sticker/information sidecars; v4→v5 and v5→v6 tests add full information/media content without replacing those rows. Optional `signal-store` tests convert bounded typed snapshots/deltas. Dependency checks ensure this DTO feature does not enable QuickJS, libsignal-core or networking. Passing these tests does not enable production E2EE; see [STORE_E2EE.md](STORE_E2EE.md). A pre-v6 executable backup cannot reopen a migrated profile and does not provide a database downgrade path.
 
 ## Unreleased Signal preparation checks
 
@@ -113,6 +113,14 @@ Actual isolated startup GUI uses the same constructor with a cfg(test) loopback 
 
 The new LIVE-only release is **15,929,104 bytes**, SHA-256 `c29e1e6c071106808269ed55b2b882d618eac092b670c5d021893bf77899986a`. Its informational/no-write and synthetic demo release smoke passed, including private bounded diagnostics, schema four, process locking, restart and additive legacy upgrade. No production live startup was executed for QA. Previous d14 is retained at `/tmp/zalo-autologin-storage-previous-d14`.
 
+## Sender names (2026-11-02)
+
+`ZALO_UI_FIXTURE_SENDERS=direct|group` selects the ignored native fixture's synthetic cached-contact cases. The actual SQLite actor resolves names; no network name service is substituted. Wide/compact screenshots verify the same name/initials in message bubbles and existing titles, a long Vietnamese label bounded inside the bubble, and neutral unknown-user fallback. Those fixtures deliberately have no service endpoints and report Offline; close exits 0 with zero Internet connections. IDs and self-message alignment stay unchanged.
+
+The frozen checkpoint passed 137 default Rust, five adapter, seven Python and 328 all-feature tests, with two opt-in tests ignored. Formatting, strict default/all-feature/all-target Clippy and default/live/DTO graph guards passed. Regressions cover indexed bounded/account-scoped user lookup, group-ID collisions, rename during an in-flight lookup, stale page/account/thread replies, 50-sender pages, negative caching and unchanged history after rename/reopen. These results verify local cached labels, not production directory completeness or avatar downloading.
+
+The sender-name LIVE artifact is **15,968,272 bytes**, SHA-256 `6c294dc134b3a74f98a5cd77883e841efec56386e0b67f599d4fb8598ccdd832`. Actual release smoke passed informational/no-write and synthetic demo checks without launching live startup; the prior c29e executable is preserved at `/tmp/zalo-displayname-previous-c29e`.
+
 ## Directory milestone checks
 
 `cargo test --locked --offline --all-features directory` covers the directory parser, isolated TLS/Node cipher oracle, SQLite cache and UI reducers. Optional native-window QA runs the ignored `ui::live::tests::signed_in_offline_native_window_fixture` with an isolated X11 display and `ZALO_UI_FIXTURE_DIRECTORY=1`. It creates a temporary synthetic account with 107 contacts, one group and two cached histories; it is absent from production binaries. Verify 100-row next/back pages, whole-cache Vietnamese search, named open, per-recipient drafts, compact navigation and close. Empty-endpoint diagnostics are expected; no network credentials or production endpoints are supplied.
@@ -135,11 +143,241 @@ Use the same machine, account, history volume, display, network, and equivalent 
 
 Review `src/`, manifest, build scripts, and tracked assets against authorship boundaries. Do not vendor `ctdozlite` source, assets or licenses. The native UI intentionally reuses existing repository Zalo CSS/theme facts, Segoe UI and icon fonts; verify every embedded asset's source path and hash. Live builds intentionally embed the repository's pinned trust WASM and recheck its SHA-256 before instantiation; no external binary is downloaded. Independently authored fixture JSON may be embedded in tests. The explicitly vendored `egui-winit` 0.29.1 adapter retains its MIT/Apache licenses and exact archive/upstream provenance in `vendor/egui-winit/LINUX_IME_PATCH.md`. Other registry dependencies retain their own metadata and licenses. Record actual inventory results; text searches alone cannot prove authorship.
 
-The final font inventory is unchanged from `pc-dist/fonts/`:
+The native renderer embeds these five existing `pc-dist/fonts/` files; the complete source inventory additionally records formats that native rendering does not embed:
 
 | Existing asset | Bytes | SHA-256 |
 | --- | --- | --- |
 | `Zalo-Segoe-UI.dc1a7d868a0b3a0e2daa8b36567e9ea9.ttf` | 297,496 | `64dadf29976acf817f128f8aefc9a762039097c6c090d9c66a301e5e41610158` |
 | `zalo-font.7f2d95cebfac22d16e486bfd1716c591.ttf` | 252,732 | `9a7758f970b8908411351cf7b3c46f62daae05a83dd4f721e5fbc1881102408d` |
+| `zalo-pc-screencap.26b46cc0d8549b2db2c3314913a3b308.ttf` | 2,732 | `6a64ee957cb572cf536dfadf42f3ea92cb04bff1339783acfbbba0690be665ab` |
+| `Zalo-Segoe-UI-Semibold.8de26695631b05cf79e17378f6d1f134.ttf` | 300,840 | `bb84cebe71072fe700e9ddaec061375e3b97c25bf9f50216e8234413708aa451` |
+| `Zalo-Segoe-UI-Bold.18b859523696ff3330adac79b99ef554.ttf` | 303,812 | `0905dc1c76a9f9accffeee85ee4ac02728d477c73663990922914fa0293ee6d8` |
 
 Theme selectors, layout facts and icon mappings are recorded in [UI_THEME.md](UI_THEME.md). Authentication acceptance must additionally follow [AUTH_SESSION_CONTRACT.md](AUTH_SESSION_CONTRACT.md); offline cryptographic success does not activate a session.
+
+
+## Theme, catalog and Linux icon checks (2026-11-02)
+
+The latest theme/icon snapshot passed `check.sh`: **154 default Rust**, **five adapter** and **19 Python tests**, whole formatting/default strict Clippy, dependency guards and displayless CLI checks. The complete all-feature suite passed **346 tests**, with two opt-in tests ignored. Final settings-only polish passed focused pointer controls at wide/compact sizes plus final strict all-feature/all-target Clippy. Run both reproducibility checks after changing original assets, palette bindings or the generator:
+
+```sh
+python3 scripts/rust/inventory-ui-assets.py --check
+python3 scripts/rust/generate-ui-catalog.py --check
+```
+
+The runtime catalog preserves 758 source tokens and 1,034 original Zalo/Screencap glyph aliases with verified font cmaps; existing widgets consume 29 semantic roles/32 source tokens. Custom saves unbound catalog tokens without claiming a visual change. Preference tests verify private files, bounded asynchronous I/O, load/edit races, immediate-close persistence, CAS conflicts and bounded lock contention. Queue/catalog/RGBA limits do not measure total process RAM or VRAM.
+
+Synthetic X11 windows verify Light/Dark, both injected OS signals for System, Custom token and gradient rendering, original glyph galleries, bounded advanced settings and wide/compact layouts. Actual release demo button selection wrote Dark to a 0600 profile theme file; normal close exited 0, released the lock, reopened the same synthetic profile and made zero Internet connections. System screenshots use a cfg(test) raw toolkit signal; native Wayland/desktop theme-change behavior remains unverified. Production IME translation is unchanged; five retained adapter regressions pass.
+
+The actual release's `_NET_WM_ICON` is 512×512, RGBA SHA-256 `0ad413509c7122c1d508b9b6ce31425387c9468189422622c55d2ce644f63503`, exactly matching the existing PNG decoded pixels. Its source PNG SHA-256 is `a91651455f5090100dcb3b824c68e4dc8ec8229855c97fbd60f03594cc8362ab`. Actual `WM_CLASS`, desktop stem, StartupWMClass and hicolor icon name agree on `zalo-linux-rust-preview`. The staged entry passes desktop-file validation; five installer tests cover real inert GLib launch quoting, exact icons, dry-run, Electron preservation and unsafe targets. Final user-XDG installation also completed successfully: the executable and both icon hashes were independently compared with their sources, desktop identity/Exec fields were checked, and desktop validation/cache refresh succeeded. No app was launched by installation. Native Wayland dock grouping is not claimed.
+
+Historical theme/icon LIVE artifact: **17,027,920 bytes**, SHA-256 `1d07f96c73751ddf450e8a658576de0dd910ed915ea0e082d5d8c7f551241ef3`. Release smoke passed without launching automatic live startup. Previous 6c remains `/tmp/zalo-theme-icon-previous-6c`; current review screenshots and exact icon-property evidence are recorded in [MIGRATION_STATUS.md](MIGRATION_STATUS.md). No real account or private profile data was used by QA.
+
+## Receive-schema regression checks (2026-11-04)
+
+The user reported another `Synchronization/Protocol` pause. The previous generic
+record lacks the rejected field, so it cannot establish the private payload's
+cause. The new parser reports fixed message/batch/queue reasons and optional
+closed field type/message kind/bounded text-byte metadata. Ordinary logs retain
+these failures without `--debug-log`; neither contents nor identifiers are logged.
+
+An actual loopback TLS/WSS regression covers ten cases: nullable optional
+collections/client correlations; positive terminal continuation; null/numeric-zero/
+string-zero terminal sentinels; the same invalid continuations while `more` is
+true; malformed terminal objects; and mixed pages with an invalid sender or
+client-ID object. Valid rows commit before publication. Rejected pages retain the
+previous cursor and cached rows, publish no valid prefix, request no next page,
+keep the local actor usable, and trigger no automatic send replay or poison
+reconnect. Another account remains isolated. Existing repeated-cursor, failed
+SQLite commit and page-budget regressions remain enabled.
+
+Final gates passed **156 default Rust tests** (153 library + three CLI), **five
+IME adapter tests**, **19 Python tests** and **351 all-feature tests** (336
+library + three CLI + eight coordinator + four provisioning), with two opt-in
+checks ignored and zero failures. Whole-crate formatting, strict default and
+all-target/all-feature Clippy, feature dependency guards and both deterministic
+asset/catalog checks passed. No UI/input behavior changed, so existing visual/IME
+acceptance boundaries remain unchanged. These synthetic tests do not prove the
+specific live account's failure is resolved; rich `webchat` objects remain
+unsupported and fail closed with `MessageContent`. See the newest artifact in
+[MIGRATION_STATUS.md](MIGRATION_STATUS.md).
+
+The historical receive-schema LIVE build is **17,035,792 bytes**, SHA-256
+`fb0bdebac34094c79c821d6cf6e72ff0a68b290627feba7afa646d9da38cd5b7`.
+Disposable release smoke passed without starting automatic live login: schema
+four, 19 synthetic messages/six threads, additive legacy restart, private bounded
+logs and executable identity, locking and informational no-write behavior.
+Doctor confirms login/messaging compiled and authenticated/network-started false.
+Previous 1d07 remains `/tmp/zalo-sync-protocol-previous-1d07`. Original-source AUTH
+and post-AUTH Node oracles also passed; no public QR/account request or real
+history database was used by QA.
+
+The coordinator also refreshed the existing managed user-XDG launcher with this
+artifact and independently compared the installed executable SHA-256. Desktop
+identity and original icons are retained. Real-account acceptance is pending the
+user reopening **Zalo Native** and the coordinator inspecting only sanitized logs.
+
+## Authenticated queue routing regression (2026-11-04)
+
+After reopening fb0b, the user's sanitized diagnostic identified
+`message_scope`, command 510/subcommand 1, with a string field and closed `other`
+message kind. The old generic parser assumed a direct packet's recipient must be
+the local account. Original preprocessing/default consumers instead select the
+non-self sender as the direct peer in authenticated legacy queues, including
+peer-addressed `msgs`/`pageMsgs`. This observation identifies the failing parser
+boundary without exposing the message subtype, identities or contents.
+
+The corrected path requires an authenticated decoder and a connection account
+bound from `VerifiedSession` matching the event account. Every stored message
+still belongs to that local account; numeric identifiers, group/direct separation,
+batch/cursor atomicity and the generic untrusted parser's recipient checks remain
+strict. No Signal parser or control-operation behavior changed.
+
+The original-source routing oracle executes preprocessing and the consumer key
+expression for eight cases. Real loopback `510_1` fixtures verify peer-addressed
+text and existing unsupported-media placeholders, page messages, self echoes,
+numeric group/direct collisions, successful continuation, and account isolation.
+A mixed next page with a malformed recipient commits no prefix, retains cursor
+100 and cached history, and sends no further pull/replay. Separate tests reject
+unauthenticated decoders and mismatched event accounts before storage or events.
+
+Final checks passed **156 default Rust**, **five IME adapter**, **19 Python** and
+**354 all-feature tests** (339 library + three CLI + eight coordinator + four
+provisioning), with two opt-in checks ignored and zero failures. Formatting,
+strict default/all-target/all-feature Clippy, feature guards and the AUTH/post-AUTH/routing source
+oracles passed. The optional Signal TLS fixture only gained the required existing
+session-account argument in its test constructor. Live acceptance remains pending
+the user reopening the final artifact recorded in [MIGRATION_STATUS.md](MIGRATION_STATUS.md).
+
+Final routing LIVE release: **17,036,880 bytes**, SHA-256
+`11291eb0ab9628354ce4845d42cb94a14db931c5360432378f9f19b7f2f30ec0`.
+Locked offline build and disposable smoke passed schema four, synthetic
+19-message/six-thread restart, additive legacy preservation, private bounded
+diagnostics and executable identity, locking and informational no-write checks.
+Doctor reports login/messaging compiled and authenticated/network-started false;
+Signal remains inactive in LIVE. The previous fb0b executable is retained at
+`/tmp/zalo-scope-protocol-previous-fb0b`. No real account/network login or history
+database was used by QA.
+
+The coordinator independently verified and installed this routing release in the
+managed user-XDG **Zalo Native** launcher, with an exact installed executable
+hash comparison. Existing desktop identity/icons remain unchanged. User restart
+and subsequent sanitized-log acceptance are pending.
+
+## Lossless information-message checkpoint (2026-11-04)
+
+The user's 11291 retry passed the earlier routing boundary, committed many
+received messages, then reported command **511/subcommand 1**, `message_content`,
+object field and closed `webchat_info` kind. The corrected exact format is
+`webchat` / `msginfo.actionlist`. QA used only synthetic source-shaped objects;
+no private message contents or history database were read.
+
+The parser produces readable Vietnamese template/name/title text while retaining
+the entire content in a bounded immutable sidecar. Original params strings,
+actions and unknown nested fields survive receive, preview, replay and restart.
+Marker indexing bounds projection work without repeatedly rescanning a large
+template. Information events cannot acknowledge outgoing text intents. Native
+rendering is read-only: it does not execute actions or fetch their URLs/images.
+
+The actual `511_1` TLS/WSS regressions check durable content before publication,
+identical replay, changed action data with an identical visible label, whole-page
+rollback and retained cursors. A sidecar SQL trigger failure rolls back the plain
+prefix too, retains local actor access and succeeds once after explicit reconnect.
+Real encrypted HTTPS previews traverse `DirectoryFetcher` and the existing
+SQLite actor in both preview/socket orders; 203 records cross the 200-message
+chunk boundary, with direct/group info messages sharing one ID but distinct full
+content. Scoped bindings never flatten or cross-link metadata, and previews
+neither advance socket cursors nor acknowledge queues.
+
+Default/store regressions verify additive v4→v5 migration preserves history,
+outbox, sticker metadata and cursors; deepest accepted JSON round-trips after
+restart and the next depth is rejected. Byte limits apply both per item and to
+the complete batch/preview response, not independently to each chunk. Changed
+raw content and plain/rich type collisions remain strict atomic conflicts.
+
+Final gates passed **165 default Rust** (162 library + three CLI), **five IME
+adapter**, **19 Python** and **374 all-feature tests** (359 library + three CLI +
+eight coordinator + four provisioning), with two opt-in checks ignored. Whole
+formatting, strict default/all-target/all-feature Clippy, dependency guards and
+both deterministic asset/catalog checks passed. Original-source oracles passed:
+nine info previews, eight routing cases, five positive/four rejected AUTH formats,
+three rejected queue schemas and 18 post-AUTH cases.
+
+Actual isolated native X11 windows displayed “Bạn đã thêm Đặng Minh vào nhóm”
+through the real parser/store/page path at **1200×780 and 640×480**, including the
+sidebar preview and existing contact names. Images:
+`/tmp/zalo-rust-gui-check/info-readable-wide.png` and
+`/tmp/zalo-rust-gui-check/info-readable-compact.png`. Both were visually reviewed;
+normal close exited 0 and strace found zero Internet connects. The fixture's
+Offline/ConfigurationUnsupported banner is intentional because it has no
+endpoints. UI production/input code is unchanged; Wayland and real-account
+acceptance remain separate. See [MIGRATION_STATUS.md](MIGRATION_STATUS.md) for the
+final artifact and pending user retry.
+
+Final LIVE release: **17,120,176 bytes**, SHA-256
+`1e3dc2544b035165215da5c3ac8ae136aa15ad0523ae03df7ed24d246e0fde9a`.
+Locked offline build and disposable release smoke passed schema five, synthetic
+19-message/six-thread restart, additive legacy preservation, private bounded
+diagnostics/executable identity, locking and informational no-write checks, with
+no network use or automatic live startup. Doctor confirms login/messaging
+compiled and authenticated/network-started false; Signal remains inactive in
+LIVE. Previous 11291 is retained at `/tmp/zalo-rich-protocol-previous-11291` and
+cannot reopen a schema-five profile; it is not a database downgrade path.
+
+The coordinator refreshed the actual managed user-XDG **Zalo Native** launcher
+and independently verified the installed executable's exact SHA-256, size and
+0755 mode, plus the desktop command/icon identity. No app was launched or user
+profile edited by installation. The user subsequently confirmed Online on that build; complete synchronization and later media acceptance remain separate.
+
+
+## Photo/OA media and schema-six checkpoint (2026-11-04)
+
+The source-backed media contract and its limits are in [PROTOCOL_MEDIA.md](PROTOCOL_MEDIA.md).
+Final default checks passed **182 Rust** (179 library + three CLI), **five IME**
+and **19 Python** tests. Complete optional-feature tests passed **404** (389 library,
+three CLI, eight coordinator, four provisioning), with two opt-in checks ignored.
+Final focused media tests passed **29/29**; formatting, strict default/all-target/
+all-feature Clippy, dependency isolation and both generated-asset checks passed.
+Original-source media/info/routing/AUTH/post-AUTH Node oracles passed; the media
+oracle also executes the original nullable HTTP collection path.
+
+Private TLS regressions cover 205 HTTP previews crossing chunk boundaries in both
+socket arrival orders, scoped same-ID collisions, complete unknown metadata after
+restart, unchanged legacy bodies/outbox with cursor 900, immutable raw conflicts,
+and whole-page SQL rollback/local-actor access/explicit retry. Store tests retain
+prior information/sticker/history/cursor/outbox data through v5→v6. Rich messages
+cannot correlate to outgoing text. Codec/cache tests include real PNG/JPEG/WebP/JXL,
+malformed/oversize/budget cases, no-progress guards, ancillary-box exclusion,
+stale results, upload/cache budgets, global decoder serialization, cancellation
+and closed-worker recovery. URL normalization expansion is bounded separately
+from source URL length, retaining full raw data when a projection URL is withheld.
+
+Reproduce native synthetic windows using the LIVE library test executable:
+`ZALO_UI_FIXTURE_MEDIA=photo|webcontent|opaque|failure|mixed` selects the content
+and `ZALO_UI_FIXTURE_THEME=light|dark` selects appearance for
+`ui::live::tests::signed_in_offline_native_window_fixture` (`--ignored --exact`).
+Use only the private Xvfb fixture workflow; this fixture has synthetic data,
+predecoded JXL pixels/fixed failures and prevents asset networking. Reviewed
+1200×780/640×480 images and whole-lifetime traces are under
+`/tmp/zalo-rust-gui-check/media-*`. Photo/card content, compact scrolling, cached
+viewer, explicit retry, unavailable state and opaque-template explanation were
+checked. Every fixture closed with exit 0 and zero Internet connects; its TLS
+fault banner is intentional, not production evidence. Browser links were not
+launched. Earlier actual x-unikey evidence remains unchanged; Wayland is unverified.
+
+Final locked offline LIVE release is **20,295,296 bytes**, SHA-256
+`55bc767268b045b469d8de94548dfb28bbd3914d86d9715104538584b44092bd`.
+Disposable release smoke passes schema six, 19 messages/six threads, additive
+restart/legacy preservation, private bounded diagnostics/build identity, locking
+and informational no-write checks with `network_used=false`. Doctor confirms
+compiled login/messaging and no authentication/network startup. The 1e3dc2 backup
+at `/tmp/zalo-cards-previous-1e3dc2` cannot reopen a schema-six database; it is not
+a database downgrade path. Logs use `/tmp/zalo-cards-final-*.log`; full artifact
+and production acceptance details are in [MIGRATION_STATUS.md](MIGRATION_STATUS.md).
+The user confirmed Online on the prior 1e3dc2 build; this media candidate still
+requires real photo/OA acceptance, and no complete-sync claim is made.
+
+The coordinator then independently verified and installed the exact candidate in
+the managed user-XDG Zalo Native launcher (same SHA-256/size, 0755 mode, correct
+`Exec --live` and icon/window identity). No app/profile/account launch accompanied
+installation. Real media acceptance remains pending the user's retry.

@@ -3,10 +3,16 @@
 mod delivery;
 #[cfg(feature = "messaging")]
 mod directory;
+#[cfg(feature = "messaging")]
+mod hydration;
 #[cfg(feature = "live-login")]
 mod live;
 #[cfg(feature = "live-login")]
 mod login;
+#[cfg(feature = "messaging")]
+mod media;
+mod senders;
+mod settings;
 #[cfg(feature = "messaging")]
 mod stickers;
 mod visuals;
@@ -14,14 +20,9 @@ mod visuals;
 use crate::app::{Command, DraftBook, Event, Model, Worker, EVENTS_PER_FRAME};
 use crate::domain::{fold_search, Conversation, Message};
 use crate::profile::Profile;
-use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke,
-};
+use eframe::egui::{self, pos2, vec2, Align, Align2, FontId, Layout, RichText, Sense, Stroke};
 use std::sync::Arc;
-use visuals::{
-    avatar, divider, icon, icon_button, Icon, BLUE, CANVAS, HOVER, INK, LINE, MUTED, NAV_BLUE,
-    NAV_SELECTED, PALE_BLUE, PLACEHOLDER,
-};
+use visuals::{avatar, divider, icon, icon_button, Icon};
 
 pub struct NativeApp {
     worker: Option<Worker>,
@@ -32,6 +33,11 @@ pub struct NativeApp {
     search_folded: String,
     compact_list: bool,
     details: bool,
+    settings_open: bool,
+    theme: crate::theme::ThemeController,
+    settings: settings::Settings,
+    #[cfg(test)]
+    fixture_system_theme: Option<egui::Theme>,
     focus_composer: bool,
     latest_page: bool,
     ime_composing: bool,
@@ -48,6 +54,12 @@ impl NativeApp {
         demo: bool,
     ) -> anyhow::Result<Self> {
         visuals::install(&cc.egui_ctx);
+        let repaint = cc.egui_ctx.clone();
+        let mut theme = crate::theme::ThemeController::new(
+            profile.paths.config_dir.clone(),
+            Arc::new(move || repaint.request_repaint()),
+        )?;
+        theme.poll(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
         let worker = if demo {
             Some(Worker::demo(
@@ -70,6 +82,11 @@ impl NativeApp {
             search_folded: String::new(),
             compact_list: false,
             details: false,
+            settings_open: false,
+            theme,
+            settings: settings::Settings::default(),
+            #[cfg(test)]
+            fixture_system_theme: None,
             focus_composer: false,
             latest_page: true,
             ime_composing: false,
@@ -337,11 +354,18 @@ impl NativeApp {
     }
 
     fn navigation(&mut self, ctx: &egui::Context, compact: bool) {
+        let colors = crate::theme::palette(ctx);
         egui::SidePanel::left("navigation")
             .exact_width(64.0)
             .resizable(false)
-            .frame(egui::Frame::none().fill(NAV_BLUE))
+            .frame(egui::Frame::none().fill(colors.nav_background))
             .show(ctx, |ui| {
+                visuals::background(
+                    ui,
+                    ui.max_rect(),
+                    "--layer-background-navbar-normal",
+                    colors.nav_background,
+                );
                 ui.add_space(21.0);
                 let (rect, _) = ui.allocate_exact_size(vec2(64.0, 44.0), Sense::hover());
                 avatar(
@@ -382,19 +406,27 @@ impl NativeApp {
                             ui.allocate_exact_size(vec2(64.0, 56.0), Sense::click())
                         })
                         .inner;
-                    if selected {
-                        ui.painter().rect_filled(rect, 0.0, NAV_SELECTED);
+                    if selected || response.hovered() || response.is_pointer_button_down_on() {
+                        let fill = if response.is_pointer_button_down_on() {
+                            colors.nav_pressed
+                        } else if selected {
+                            colors.nav_selected
+                        } else {
+                            colors.nav_hover
+                        };
+                        ui.painter().rect_filled(rect, 0.0, fill);
                     }
                     icon(
                         ui,
                         egui::Rect::from_center_size(rect.center(), vec2(24.0, 24.0)),
                         kind,
-                        if selected {
-                            Color32::WHITE
+                        if enabled {
+                            colors.nav_text
                         } else {
-                            Color32::from_white_alpha(180)
+                            colors.nav_text_disabled
                         },
                     );
+                    visuals::nav_focus_outline(ui, &response, rect);
                     if enabled && response.clicked() {
                         match kind {
                             Icon::Contacts => {
@@ -424,31 +456,69 @@ impl NativeApp {
                     |ui| {
                         let (rect, response) =
                             ui.allocate_exact_size(vec2(64.0, 46.0), Sense::click());
+                        if self.details
+                            || response.hovered()
+                            || response.is_pointer_button_down_on()
+                        {
+                            ui.painter().rect_filled(
+                                rect,
+                                0.0,
+                                if response.is_pointer_button_down_on() {
+                                    colors.nav_pressed
+                                } else if self.details {
+                                    colors.nav_selected
+                                } else {
+                                    colors.nav_hover
+                                },
+                            );
+                        }
                         icon(
                             ui,
                             egui::Rect::from_center_size(rect.center(), vec2(23.0, 23.0)),
                             Icon::Info,
-                            Color32::WHITE,
+                            colors.nav_text,
                         );
+                        visuals::nav_focus_outline(ui, &response, rect);
                         if response.clicked() {
                             self.details = !self.details;
                         }
                         response.on_hover_text("Thông tin bản xem trước");
                         let (rect, response) =
-                            ui.allocate_exact_size(vec2(64.0, 46.0), Sense::hover());
+                            ui.allocate_exact_size(vec2(64.0, 46.0), Sense::click());
+                        if self.settings_open
+                            || response.hovered()
+                            || response.is_pointer_button_down_on()
+                        {
+                            ui.painter().rect_filled(
+                                rect,
+                                0.0,
+                                if response.is_pointer_button_down_on() {
+                                    colors.nav_pressed
+                                } else if self.settings_open {
+                                    colors.nav_selected
+                                } else {
+                                    colors.nav_hover
+                                },
+                            );
+                        }
                         icon(
                             ui,
                             egui::Rect::from_center_size(rect.center(), vec2(23.0, 23.0)),
                             Icon::Settings,
-                            Color32::from_white_alpha(180),
+                            colors.nav_text,
                         );
-                        response.on_hover_text("Cài đặt · chưa hỗ trợ trong bản xem trước");
+                        visuals::nav_focus_outline(ui, &response, rect);
+                        if response.clicked() {
+                            self.settings_open = !self.settings_open;
+                        }
+                        response.on_hover_text("Cài đặt giao diện");
                     },
                 );
             });
     }
 
     fn conversations(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let colors = crate::theme::palette(ui.ctx());
         let width = ui.available_width();
         egui::Frame::none()
             .inner_margin(egui::Margin::symmetric(16.0, 16.0))
@@ -456,7 +526,7 @@ impl NativeApp {
                 ui.horizontal(|ui| {
                     let search_width = (ui.available_width() - 40.0).max(100.0);
                     egui::Frame::none()
-                        .fill(CANVAS)
+                        .fill(colors.canvas)
                         .rounding(5.0)
                         .inner_margin(egui::Margin::symmetric(9.0, 3.0))
                         .show(ui, |ui| {
@@ -464,7 +534,7 @@ impl NativeApp {
                             ui.horizontal(|ui| {
                                 let (rect, _) =
                                     ui.allocate_exact_size(vec2(16.0, 26.0), Sense::hover());
-                                icon(ui, rect, Icon::Search, INK);
+                                icon(ui, rect, Icon::Search, colors.text_primary);
                                 let response = ui.add_sized(
                                     [ui.available_width(), 26.0],
                                     egui::TextEdit::singleline(&mut self.search)
@@ -507,7 +577,12 @@ impl NativeApp {
                 });
                 ui.add_space(13.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Tất cả").color(BLUE).strong().size(13.0));
+                    ui.label(
+                        RichText::new("Tất cả")
+                            .color(colors.primary)
+                            .family(egui::FontFamily::Name("Zalo Semibold".into()))
+                            .size(13.0),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!(
@@ -515,7 +590,7 @@ impl NativeApp {
                                 self.model.conversations.len(),
                                 if self.demo { " demo" } else { "" }
                             ))
-                            .color(MUTED)
+                            .color(colors.text_secondary)
                             .size(11.0),
                         );
                     });
@@ -553,9 +628,15 @@ impl NativeApp {
                 if matches == 0 {
                     ui.add_space(42.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Không tìm thấy hội thoại").color(MUTED));
+                        ui.label(
+                            RichText::new("Không tìm thấy hội thoại").color(colors.text_secondary),
+                        );
                         ui.add_space(5.0);
-                        ui.label(RichText::new("Thử một tên khác.").size(12.0).color(MUTED));
+                        ui.label(
+                            RichText::new("Thử một tên khác.")
+                                .size(12.0)
+                                .color(colors.text_secondary),
+                        );
                     });
                 }
             });
@@ -567,7 +648,7 @@ impl NativeApp {
         let rect = ui.max_rect();
         let footer =
             egui::Rect::from_min_max(pos2(rect.left(), rect.bottom() - 55.0), rect.right_bottom());
-        ui.painter().rect_filled(footer, 0.0, Color32::WHITE);
+        visuals::background(ui, footer, "--layer-background", colors.surface);
         divider(ui, footer.left_top(), footer.right_top());
         #[cfg(feature = "live-login")]
         if self.live_account_footer(ui, footer) {
@@ -577,7 +658,7 @@ impl NativeApp {
             ui,
             egui::Rect::from_min_size(footer.min + vec2(16.0, 17.0), vec2(18.0, 18.0)),
             Icon::Shield,
-            MUTED,
+            colors.text_secondary,
         );
         ui.painter().text(
             footer.min + vec2(43.0, 20.0),
@@ -590,13 +671,14 @@ impl NativeApp {
                 "Bản xem trước · chưa đăng nhập"
             },
             FontId::proportional(10.5),
-            MUTED,
+            colors.text_secondary,
         );
     }
 
     fn chat_header(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let colors = crate::theme::palette(ui.ctx());
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 68.0), Sense::hover());
-        ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+        visuals::background(ui, rect, "--layer-background", colors.surface);
         divider(ui, rect.left_bottom(), rect.right_bottom());
         let actions_width = if rect.width() < 490.0 { 42.0 } else { 140.0 };
         let mut left = rect.left() + 20.0;
@@ -606,7 +688,19 @@ impl NativeApp {
                 vec2(28.0, 32.0),
             );
             let response = ui.interact(back, ui.id().with("back_to_threads"), Sense::click());
-            icon(ui, back.shrink(4.0), Icon::Back, MUTED);
+            if response.hovered() || response.is_pointer_button_down_on() {
+                ui.painter().rect_filled(
+                    back,
+                    4.0,
+                    if response.is_pointer_button_down_on() {
+                        colors.pressed
+                    } else {
+                        colors.hover
+                    },
+                );
+            }
+            icon(ui, back.shrink(4.0), Icon::Back, colors.text_secondary);
+            visuals::focus_outline(ui, &response, back, 4.0);
             if response.clicked() {
                 self.compact_list = true;
             }
@@ -634,7 +728,14 @@ impl NativeApp {
                 pos2(rect.right() - actions_width - 10.0, rect.bottom() - 10.0),
             )),
             |ui| {
-                ui.add(egui::Label::new(RichText::new(title).size(18.0).strong()).truncate());
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(title)
+                            .size(18.0)
+                            .family(egui::FontFamily::Name("Zalo Semibold".into())),
+                    )
+                    .truncate(),
+                );
                 ui.add_space(1.0);
                 ui.label(
                     RichText::new(if self.demo {
@@ -642,7 +743,7 @@ impl NativeApp {
                     } else {
                         self.connection_label()
                     })
-                    .color(MUTED)
+                    .color(colors.text_secondary)
                     .size(10.5),
                 );
             },
@@ -680,9 +781,10 @@ impl NativeApp {
     }
 
     fn composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, height: f32) {
+        let colors = crate::theme::palette(ctx);
         let enabled = (self.demo || self.is_signed_in()) && self.model.selected.is_some();
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-        ui.painter().rect_filled(rect, 0.0, Color32::WHITE);
+        visuals::background(ui, rect, "--layer-background", colors.surface);
         divider(ui, rect.left_top(), rect.right_top());
         let mut send = false;
         let ime_active = self.ime_composing
@@ -723,7 +825,7 @@ impl NativeApp {
                                 self.connection_label()
                             })
                             .size(9.0)
-                            .color(MUTED),
+                            .color(colors.text_secondary),
                         );
                     });
                 });
@@ -798,19 +900,28 @@ impl NativeApp {
                         ui.interact(send_rect, ui.id().with("send_local"), Sense::click())
                     })
                     .inner;
-                ui.painter()
-                    .rect_filled(send_rect, 8.0, if can_send { BLUE } else { CANVAS });
+                let send_fill = if !can_send {
+                    colors.button_primary_disabled
+                } else if response.is_pointer_button_down_on() {
+                    colors.button_primary_pressed
+                } else if response.hovered() {
+                    colors.button_primary_hover
+                } else {
+                    colors.primary
+                };
+                ui.painter().rect_filled(send_rect, 8.0, send_fill);
                 ui.painter().text(
                     send_rect.center(),
                     Align2::CENTER_CENTER,
                     if self.demo { "Lưu" } else { "Gửi" },
                     FontId::proportional(13.0),
                     if can_send {
-                        Color32::WHITE
+                        colors.button_primary_text
                     } else {
-                        PLACEHOLDER
+                        colors.text_placeholder
                     },
                 );
+                visuals::focus_outline(ui, &response, send_rect, 8.0);
                 if response.clicked() {
                     send = true;
                 }
@@ -829,7 +940,7 @@ impl NativeApp {
                             "Ctrl+Enter để gửi · Enter để xuống dòng"
                         },
                         FontId::proportional(9.5),
-                        MUTED,
+                        colors.text_secondary,
                     );
                 }
             },
@@ -840,6 +951,8 @@ impl NativeApp {
     }
 
     fn chat(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool) {
+        let colors = crate::theme::palette(ctx);
+        visuals::background(ui, ui.max_rect(), "--surface-background", colors.canvas);
         ui.spacing_mut().item_spacing.y = 0.0;
         self.chat_header(ui, compact);
         let composer_height = if ui.available_height() < 340.0 {
@@ -850,7 +963,7 @@ impl NativeApp {
         let timeline_height = (ui.available_height() - composer_height - 29.0).max(60.0);
         let timeline_rect =
             egui::Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), timeline_height));
-        ui.painter().rect_filled(timeline_rect, 0.0, CANVAS);
+
         ui.allocate_ui_with_layout(
             vec2(ui.available_width(), timeline_height),
             Layout::top_down(Align::Min),
@@ -890,7 +1003,7 @@ impl NativeApp {
                                             self.connection_label()
                                         })
                                         .size(10.0)
-                                        .color(MUTED),
+                                        .color(colors.text_secondary),
                                     );
                                     ui.add_space(12.0);
                                     if self.model.has_older
@@ -917,6 +1030,9 @@ impl NativeApp {
                                     }
                                 });
                                 let own_account = self.account_id().map(str::to_owned);
+                                let own_name = self.account_label().to_owned();
+                                #[cfg(feature="messaging")]
+                                if let (Some(state),Some(account),Some(thread))=(&mut self.live,own_account.as_deref(),self.model.selected.as_deref()) {state.media.scope(account,thread,self.model.generation);}
                                 let mut previous_day = None;
                                 for message in &self.model.messages {
                                     let day = local_parts(message.sent_at_ms)
@@ -928,10 +1044,23 @@ impl NativeApp {
                                         previous_day = day;
                                     }
                                     #[cfg(feature = "messaging")]
-                                    let sticker_cache = self.live.as_mut().and_then(|state| state.account.as_ref().map(|_| &mut state.stickers));
-                                    message_bubble(ui, message, compact, own_account.as_deref(),
+                                    let resolved=self.live.as_ref().and_then(|state|state.account.as_ref().and_then(|account|state.sender_names.get(&account.id,self.model.generation,&message.thread_id,&message.sender)));
+                                    #[cfg(not(feature = "messaging"))]
+                                    let resolved=None;
+                                    let sender=senders::label(message,own_account.as_deref(),Some(&own_name),self.model.conversations.iter().find(|thread|thread.id==message.thread_id),resolved);
+                                    // Own the small label before independently borrowing the texture cache.
+                                    let sender_name=sender.name.to_owned();let sender_avatar=sender.avatar.to_owned();
+                                    #[cfg(feature = "messaging")]
+                                    let (sticker_cache,media_cache) = match self.live.as_mut() {
+                                        Some(state) if state.account.is_some() => (Some(&mut state.stickers),Some(&mut state.media)),
+                                        _ => (None,None),
+                                    };
+                                    message_bubble(ui, message, compact, own_account.as_deref(), &sender_name,&sender_avatar,
                                         #[cfg(feature = "messaging")]
                                         sticker_cache,
+                                        #[cfg(feature = "messaging")]
+                                        media_cache,
+                                        self.model.generation,
                                     );
                                     ui.add_space(13.0);
                                 }
@@ -939,7 +1068,7 @@ impl NativeApp {
                                 if self.is_signed_in() && self.model.selected.is_none() {
                                     ui.add_space(18.0);
                                     ui.vertical_centered(|ui| {
-                                        ui.label(RichText::new("Chưa có hội thoại trên thiết bị này").strong());
+                                        ui.label(RichText::new("Chưa có hội thoại trên thiết bị này").family(egui::FontFamily::Name("Zalo Semibold".into())));
                                         ui.add_space(8.0);
                                         ui.label("Chọn Danh bạ để mở liên hệ hoặc nhóm đã đồng bộ. Lịch sử cũ có thể chưa được nhập.");
                                         ui.add_space(10.0);
@@ -959,7 +1088,7 @@ impl NativeApp {
                                     ui.vertical_centered(|ui| {
                                         ui.label(
                                             RichText::new("Bắt đầu một cuộc trò chuyện")
-                                                .color(MUTED),
+                                                .color(colors.text_secondary),
                                         );
                                     });
                                 }
@@ -978,7 +1107,7 @@ impl NativeApp {
         );
         let (status_rect, _) =
             ui.allocate_exact_size(vec2(ui.available_width(), 29.0), Sense::hover());
-        ui.painter().rect_filled(status_rect, 0.0, CANVAS);
+
         let status = if self.model.status.is_empty() {
             if self.model.pending {
                 "Đang mở hội thoại…"
@@ -998,14 +1127,22 @@ impl NativeApp {
             ui,
             egui::UiBuilder::new().max_rect(status_rect.shrink2(vec2(20.0, 4.0))),
             |ui| {
-                ui.add(egui::Label::new(RichText::new(status).size(10.0).color(MUTED)).truncate())
-                    .on_hover_text(status);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(status)
+                            .size(10.0)
+                            .color(colors.text_secondary),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(status);
             },
         );
         self.composer(ui, ctx, composer_height);
     }
 
     fn workspace(&mut self, ctx: &egui::Context) {
+        let colors = crate::theme::palette(ctx);
         let compact = ctx.screen_rect().width() < 940.0;
         self.navigation(ctx, compact);
         #[cfg(feature = "messaging")]
@@ -1017,12 +1154,18 @@ impl NativeApp {
         if compact && show_directory {
             #[cfg(feature = "messaging")]
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(Color32::WHITE))
-                .show(ctx, |ui| self.directory_panel(ui));
+                .frame(egui::Frame::none().fill(colors.surface))
+                .show(ctx, |ui| {
+                    visuals::background(ui, ui.max_rect(), "--layer-background", colors.surface);
+                    self.directory_panel(ui);
+                });
         } else if compact && self.compact_list {
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(Color32::WHITE))
-                .show(ctx, |ui| self.conversations(ui, true));
+                .frame(egui::Frame::none().fill(colors.surface))
+                .show(ctx, |ui| {
+                    visuals::background(ui, ui.max_rect(), "--layer-background", colors.surface);
+                    self.conversations(ui, true);
+                });
         } else {
             if !compact {
                 egui::SidePanel::left("conversations")
@@ -1031,10 +1174,16 @@ impl NativeApp {
                     .resizable(true)
                     .frame(
                         egui::Frame::none()
-                            .fill(Color32::WHITE)
-                            .stroke(Stroke::new(1.0_f32, LINE)),
+                            .fill(colors.surface)
+                            .stroke(Stroke::new(1.0_f32, colors.border)),
                     )
                     .show(ctx, |ui| {
+                        visuals::background(
+                            ui,
+                            ui.max_rect(),
+                            "--layer-background",
+                            colors.surface,
+                        );
                         #[cfg(feature = "messaging")]
                         if show_directory {
                             self.directory_panel(ui);
@@ -1044,7 +1193,7 @@ impl NativeApp {
                     });
             }
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(CANVAS))
+                .frame(egui::Frame::none().fill(colors.canvas))
                 .show(ctx, |ui| self.chat(ui, ctx, compact));
         }
         if self.details {
@@ -1052,18 +1201,23 @@ impl NativeApp {
         }
         #[cfg(feature = "live-login")]
         self.live_dialogs(ctx);
+        #[cfg(feature = "messaging")]
+        if let Some(state) = &mut self.live {
+            media::viewer(ctx, &mut state.media);
+        }
     }
 
     fn welcome(&self, ui: &mut egui::Ui) {
+        let colors = crate::theme::palette(ui.ctx());
         ui.add_space(42.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("Không gian trò chuyện của bạn").size(24.0).strong());
+            ui.label(RichText::new("Không gian trò chuyện của bạn").size(24.0).family(egui::FontFamily::Name("Zalo Semibold".into())));
             ui.add_space(12.0);
-            ui.label(RichText::new("Giao diện native, được xây dựng bằng Rust.").color(MUTED));
+            ui.label(RichText::new("Giao diện native, được xây dựng bằng Rust.").color(colors.text_secondary));
             ui.add_space(25.0);
-            egui::Frame::none().fill(Color32::WHITE).rounding(12.0).inner_margin(22.0).show(ui, |ui| {
+            egui::Frame::none().fill(colors.surface).rounding(12.0).inner_margin(22.0).show(ui, |ui| {
                 ui.set_max_width(390.0);
-                ui.label(RichText::new("Bản xem trước đang được phát triển").strong());
+                ui.label(RichText::new("Bản xem trước đang được phát triển").family(egui::FontFamily::Name("Zalo Semibold".into())));
                 ui.add_space(10.0);
                 ui.label("Đăng nhập và gửi nhận Zalo chưa được bật. Chạy với --demo để trải nghiệm các hội thoại minh họa và lưu tin nhắn cục bộ.");
             });
@@ -1071,11 +1225,12 @@ impl NativeApp {
     }
 
     fn information(&mut self, ctx: &egui::Context) {
+        let colors = crate::theme::palette(ctx);
         let mut open = self.details;
         egui::Window::new("Thông tin bản xem trước").open(&mut open).collapsible(false).resizable(false)
             .default_width(370.0).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
                 ui.add_space(8.0);
-                ui.label(RichText::new("Zalo Native · Rust").size(20.0).strong());
+                ui.label(RichText::new("Zalo Native · Rust").size(20.0).family(egui::FontFamily::Name("Zalo Semibold".into())));
                 ui.add_space(12.0);
                 #[cfg(feature = "live-login")]
                 if self.live_information(ui) { return; }
@@ -1085,7 +1240,7 @@ impl NativeApp {
                 ui.add_space(10.0);
                 ui.label("Đang phát triển: đăng nhập, gửi nhận thật, gọi điện, ảnh và tệp. Các nút tương ứng được vô hiệu hóa.");
                 ui.add_space(12.0);
-                ui.label(RichText::new("Dữ liệu của ứng dụng Electron được giữ riêng.").size(11.0).color(MUTED));
+                ui.label(RichText::new("Dữ liệu của ứng dụng Electron được giữ riêng.").size(11.0).color(colors.text_secondary));
                 ui.add_space(8.0);
             });
         self.details = open;
@@ -1094,7 +1249,16 @@ impl NativeApp {
 
 impl eframe::App for NativeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(test)]
+        if let Some(theme) = self.fixture_system_theme {
+            ctx.input_mut(|input| input.raw.system_theme = Some(theme));
+        }
+        self.theme.poll(ctx);
         self.poll_events(ctx);
+        if self.settings_open {
+            self.settings
+                .show(ctx, &mut self.settings_open, &mut self.theme);
+        }
         #[cfg(feature = "live-login")]
         {
             self.poll_live(ctx);
@@ -1133,14 +1297,22 @@ fn conversation_row(
     selected: bool,
     account: Option<&str>,
 ) -> egui::Response {
+    let colors = crate::theme::palette(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(vec2(width, 79.0), Sense::click());
-    if selected || response.hovered() {
+    if selected || response.hovered() || response.is_pointer_button_down_on() {
         ui.painter().rect_filled(
             rect.shrink2(vec2(8.0, 4.0)),
             6.0,
-            if selected { PALE_BLUE } else { HOVER },
+            if response.is_pointer_button_down_on() {
+                colors.pressed
+            } else if selected {
+                colors.selected
+            } else {
+                colors.hover
+            },
         );
     }
+    visuals::focus_outline(ui, &response, rect.shrink2(vec2(8.0, 4.0)), 6.0);
     let photo = egui::Rect::from_min_size(rect.min + vec2(17.0, 14.0), vec2(48.0, 48.0));
     avatar(ui, photo, title);
     let content =
@@ -1154,7 +1326,14 @@ fn conversation_row(
                 vec2(content.width() - 40.0, 23.0),
             )),
             |ui| {
-                ui.add(egui::Label::new(RichText::new(title).size(13.0).strong()).truncate());
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(title)
+                            .size(13.0)
+                            .family(egui::FontFamily::Name("Zalo Semibold".into())),
+                    )
+                    .truncate(),
+                );
             },
         );
         ui.painter().text(
@@ -1162,7 +1341,7 @@ fn conversation_row(
             Align2::RIGHT_TOP,
             clock_label(thread.last_message_at_ms),
             FontId::proportional(9.5),
-            MUTED,
+            colors.text_secondary,
         );
         let preview = if thread.last_text.is_empty() {
             "Chưa có tin nhắn".into()
@@ -1182,7 +1361,7 @@ fn conversation_row(
                     egui::Label::new(
                         RichText::new(preview.replace(['\n', '\r'], " "))
                             .size(11.5)
-                            .color(MUTED),
+                            .color(colors.text_secondary),
                     )
                     .truncate(),
                 );
@@ -1193,16 +1372,17 @@ fn conversation_row(
 }
 
 fn date_separator(ui: &mut egui::Ui, milliseconds: i64) {
+    let colors = crate::theme::palette(ui.ctx());
     let text = date_label(milliseconds);
     let galley = ui
         .painter()
-        .layout_no_wrap(text, FontId::proportional(13.0), Color32::WHITE);
+        .layout_no_wrap(text, FontId::proportional(13.0), colors.date_text);
     let (row, _) = ui.allocate_exact_size(
         vec2(ui.available_width(), galley.size().y + 5.0),
         Sense::hover(),
     );
     let pill = egui::Rect::from_center_size(row.center(), galley.size() + vec2(20.0, 5.0));
-    let line = Stroke::new(1.0_f32, Color32::from_black_alpha(51));
+    let line = Stroke::new(1.0_f32, colors.date_background);
     ui.painter().line_segment(
         [
             pos2(row.left() + 30.0, row.center().y),
@@ -1217,23 +1397,28 @@ fn date_separator(ui: &mut egui::Ui, milliseconds: i64) {
         ],
         line,
     );
+    ui.painter().rect_filled(pill, 10.0, colors.date_background);
     ui.painter()
-        .rect_filled(pill, 10.0, Color32::from_black_alpha(51));
-    ui.painter()
-        .galley(pill.min + vec2(10.0, 2.0), galley, Color32::WHITE);
+        .galley(pill.min + vec2(10.0, 2.0), galley, colors.date_text);
 }
 
 fn is_own_sender(sender: &str, account: Option<&str>) -> bool {
     account.map_or_else(|| sender == "You (local demo)", |account| sender == account)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn message_bubble(
     ui: &mut egui::Ui,
     message: &Message,
     compact: bool,
     account: Option<&str>,
+    sender_name: &str,
+    sender_avatar: &str,
     #[cfg(feature = "messaging")] sticker_cache: Option<&mut stickers::StickerCache>,
+    #[cfg(feature = "messaging")] media_cache: Option<&mut media::MediaCache>,
+    generation: u64,
 ) {
+    let colors = crate::theme::palette(ui.ctx());
     let own = is_own_sender(&message.sender, account);
     let max_bubble = (ui.available_width() * if compact { 0.82 } else { 0.76 }).min(490.0);
     ui.with_layout(
@@ -1245,19 +1430,15 @@ fn message_bubble(
         |ui| {
             if !own {
                 let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-                avatar(
-                    ui,
-                    rect,
-                    if message.sender == "Demo guide" {
-                        "Hướng dẫn"
-                    } else {
-                        &message.sender
-                    },
-                );
+                avatar(ui, rect, sender_avatar);
             }
             egui::Frame::none()
-                .fill(if own { PALE_BLUE } else { Color32::WHITE })
-                .stroke(Stroke::new(0.65_f32, LINE))
+                .fill(if own {
+                    colors.bubble_own
+                } else {
+                    colors.bubble_incoming
+                })
+                .stroke(Stroke::new(0.65_f32, colors.border))
                 .rounding(8.0)
                 .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                 .show(ui, |ui| {
@@ -1265,17 +1446,25 @@ fn message_bubble(
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 5.0;
                         if !own {
-                            ui.label(
-                                RichText::new(if message.sender == "Demo guide" {
-                                    "Hướng dẫn demo"
-                                } else {
-                                    &message.sender
-                                })
-                                .size(10.5)
-                                .color(MUTED),
-                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(sender_name)
+                                        .size(10.5)
+                                        .color(colors.text_secondary),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(sender_name);
                         }
-                        if let Some(sticker) = &message.sticker {
+                        if message.media.is_some() {
+                            #[cfg(feature = "messaging")]
+                            media::show(ui, message, generation, media_cache, max_bubble);
+                            #[cfg(not(feature = "messaging"))]
+                            {
+                                let _ = generation;
+                                ui.add(egui::Label::new(message.preview_text()).wrap());
+                            }
+                        } else if let Some(sticker) = &message.sticker {
                             #[cfg(feature = "messaging")]
                             let rendered = match sticker_cache {
                                 Some(cache)
@@ -1315,7 +1504,9 @@ fn message_bubble(
                         } else {
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(&message.text).size(14.0).color(INK),
+                                    RichText::new(&message.text)
+                                        .size(14.0)
+                                        .color(colors.text_primary),
                                 )
                                 .wrap(),
                             );
@@ -1324,12 +1515,12 @@ fn message_bubble(
                             ui.label(
                                 RichText::new(clock_label(message.sent_at_ms))
                                     .size(9.0)
-                                    .color(MUTED),
+                                    .color(colors.text_secondary),
                             );
                             if own {
                                 let (rect, _) =
                                     ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
-                                icon(ui, rect, Icon::Check, MUTED);
+                                icon(ui, rect, Icon::Check, colors.text_secondary);
                                 ui.label(
                                     RichText::new(if account.is_some() {
                                         "Zalo đã nhận"
@@ -1337,7 +1528,7 @@ fn message_bubble(
                                         "Đã lưu trên máy"
                                     })
                                     .size(9.0)
-                                    .color(MUTED),
+                                    .color(colors.text_secondary),
                                 );
                             }
                         });
@@ -1348,8 +1539,9 @@ fn message_bubble(
 }
 
 fn sticker_placeholder(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let colors = crate::theme::palette(ui.ctx());
     egui::Frame::none()
-        .fill(PALE_BLUE)
+        .fill(colors.selected)
         .rounding(8.0)
         .inner_margin(12.0)
         .show(ui, |ui| {
@@ -1358,8 +1550,11 @@ fn sticker_placeholder(ui: &mut egui::Ui, label: &str) -> egui::Response {
             ui.vertical_centered(|ui| {
                 ui.add_space(25.0);
                 let (rect, _) = ui.allocate_exact_size(vec2(25.0, 25.0), Sense::hover());
-                icon(ui, rect, Icon::Smile, MUTED);
-                ui.add(egui::Label::new(RichText::new(label).size(11.0).color(MUTED)).wrap());
+                icon(ui, rect, Icon::Smile, colors.text_secondary);
+                ui.add(
+                    egui::Label::new(RichText::new(label).size(11.0).color(colors.text_secondary))
+                        .wrap(),
+                );
             });
         })
         .response

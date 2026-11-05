@@ -99,6 +99,7 @@ mod tests {
             sender: "22".into(),
             text: LEGACY_STICKER_PLACEHOLDER.into(),
             sticker,
+            media: None,
             sent_at_ms: 1000,
         }
     }

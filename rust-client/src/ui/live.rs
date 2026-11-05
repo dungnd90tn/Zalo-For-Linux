@@ -29,6 +29,10 @@ pub(super) struct LiveState {
     pub login: LoginView,
     pub account: Option<Account>,
     #[cfg(feature = "messaging")]
+    pub sender_names: super::senders::Names,
+    #[cfg(feature = "messaging")]
+    hydration: super::hydration::Hydration,
+    #[cfg(feature = "messaging")]
     pub worker: Option<LiveWorker>,
     #[cfg(feature = "messaging")]
     session: Option<Arc<crate::protocol::session::VerifiedSession>>,
@@ -44,6 +48,8 @@ pub(super) struct LiveState {
     pub directory: super::directory::DirectoryView,
     #[cfg(feature = "messaging")]
     pub stickers: super::stickers::StickerCache,
+    #[cfg(feature = "messaging")]
+    pub media: super::media::MediaCache,
     #[cfg(feature = "messaging")]
     pub review_dialog: bool,
     #[cfg(feature = "messaging")]
@@ -74,6 +80,10 @@ impl LiveState {
             login: LoginView::default(),
             account: None,
             #[cfg(feature = "messaging")]
+            sender_names: Default::default(),
+            #[cfg(feature = "messaging")]
+            hydration: Default::default(),
+            #[cfg(feature = "messaging")]
             worker: None,
             #[cfg(feature = "messaging")]
             session: None,
@@ -89,6 +99,8 @@ impl LiveState {
             directory: Default::default(),
             #[cfg(feature = "messaging")]
             stickers: Default::default(),
+            #[cfg(feature = "messaging")]
+            media: Default::default(),
             #[cfg(feature = "messaging")]
             review_dialog: false,
             #[cfg(feature = "messaging")]
@@ -195,6 +207,8 @@ impl LiveState {
         }
         self.delivery.interrupted();
         self.directory.worker_closed();
+        self.sender_names.worker_closed();
+        self.hydration.worker_closed();
         if self.connection != LiveConnection::Expired {
             self.connection = LiveConnection::Offline;
         }
@@ -231,6 +245,7 @@ impl LiveState {
 impl NativeApp {
     #[cfg(feature = "messaging")]
     pub(super) fn live_connection_notice(&mut self, ctx: &egui::Context) {
+        let colors = crate::theme::palette(ctx);
         let Some(state) = &mut self.live else {
             return;
         };
@@ -242,7 +257,7 @@ impl NativeApp {
             .min_height(90.0)
             .frame(
                 egui::Frame::none()
-                    .fill(super::visuals::PALE_BLUE)
+                    .fill(colors.selected)
                     .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
             )
             .show(ctx, |ui| {
@@ -283,7 +298,10 @@ impl NativeApp {
         let Some(account) = &state.account else {
             return false;
         };
-        ui.label(egui::RichText::new(&account.name).strong());
+        ui.label(
+            egui::RichText::new(&account.name)
+                .family(egui::FontFamily::Name("Zalo Semibold".into())),
+        );
         ui.label(format!("ID Zalo: {}", account.id));
         ui.label(state.connection_label());
         ui.add_space(10.0);
@@ -300,6 +318,7 @@ impl NativeApp {
     }
 
     pub(super) fn live_account_footer(&mut self, ui: &mut egui::Ui, rect: egui::Rect) -> bool {
+        let colors = crate::theme::palette(ui.ctx());
         let Some(state) = self.live.as_mut() else {
             return false;
         };
@@ -327,7 +346,7 @@ impl NativeApp {
                 ui.label(
                     egui::RichText::new(state.connection_label())
                         .size(10.0)
-                        .color(super::visuals::MUTED),
+                        .color(colors.text_secondary),
                 );
             });
             if ui.small_button("Đăng xuất").clicked() {
@@ -380,6 +399,7 @@ impl NativeApp {
     }
 
     pub(super) fn show_login(&mut self, ctx: &egui::Context) -> bool {
+        let colors = crate::theme::palette(ctx);
         let Some(state) = self.live.as_mut() else {
             return false;
         };
@@ -387,8 +407,21 @@ impl NativeApp {
             return false;
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::WHITE))
+            .frame(egui::Frame::none().fill(colors.surface))
             .show(ctx, |ui| {
+                super::visuals::background(ui, ui.max_rect(), "--layer-background", colors.surface);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if super::visuals::icon_button(
+                        ui,
+                        super::visuals::Icon::Settings,
+                        "Cài đặt giao diện",
+                        true,
+                    )
+                    .clicked()
+                    {
+                        self.settings_open = true;
+                    }
+                });
                 if let Some(action) = state.login.show(ui, true) {
                     state.action(action);
                 }
@@ -400,6 +433,16 @@ impl NativeApp {
         let Some(mut state) = self.live.take() else {
             return;
         };
+        #[cfg(feature = "messaging")]
+        if let Some(account) = state.account.as_ref() {
+            state.sender_names.sync_scope(&account.id, &self.model, ctx);
+            state.hydration.sync_scope(&account.id, &self.model, ctx);
+            if let Some(thread) = self.model.selected.as_deref() {
+                state
+                    .media
+                    .scope(&account.id, thread, self.model.generation);
+            }
+        }
         let deadline = Instant::now() + Duration::from_millis(3);
         let mut remaining = EVENTS_PER_FRAME;
         while remaining > 0 && Instant::now() < deadline {
@@ -456,6 +499,9 @@ impl NativeApp {
                     {
                         state.directory = Default::default();
                         state.stickers = Default::default();
+                        state.media = Default::default();
+                        state.sender_names = Default::default();
+                        state.hydration = Default::default();
                         state.session = Some(session);
                         state.ensure_worker(self._profile.clone());
                     }
@@ -475,6 +521,9 @@ impl NativeApp {
                         state.delivery = Default::default();
                         state.directory = Default::default();
                         state.stickers = Default::default();
+                        state.media = Default::default();
+                        state.sender_names = Default::default();
+                        state.hydration = Default::default();
                         state.review_dialog = false;
                     }
                     self.model = Model::default();
@@ -503,6 +552,22 @@ impl NativeApp {
             if event.account_id() != account_id {
                 continue;
             }
+            state.sender_names.apply(&event, &account_id, &self.model);
+            state
+                .hydration
+                .apply(&event, &account_id, &mut self.model, ctx);
+            if matches!(&event, LiveEvent::DirectoryChanged { .. }) {
+                state.hydration.invalidate(&account_id, &self.model, ctx);
+            }
+            let refresh_senders = matches!(
+                &event,
+                LiveEvent::Page { .. }
+                    | LiveEvent::Received { .. }
+                    | LiveEvent::Sent { .. }
+                    | LiveEvent::DirectoryChanged { .. }
+                    | LiveEvent::Ready { .. }
+            );
+            let force_names = matches!(&event, LiveEvent::DirectoryChanged { .. });
             state.directory.apply(&event, &account_id, ctx);
             state.observe_status(&event);
             match &event {
@@ -533,7 +598,11 @@ impl NativeApp {
                 _ => None,
             };
             self.drafts.apply_live(&event, &account_id);
-            self.model.apply_live(event, &account_id, self.latest_page);
+            if self.model.apply_live(event, &account_id, self.latest_page) && refresh_senders {
+                state
+                    .sender_names
+                    .prepare(&account_id, &self.model, force_names, ctx);
+            }
             if let Some(thread) = opened {
                 let _ = self.drafts.select(&thread);
                 if let Some(worker) = &state.worker {
@@ -564,6 +633,15 @@ impl NativeApp {
             }
         }
         #[cfg(feature = "messaging")]
+        state.sender_names.poll(state.worker.as_ref(), ctx);
+        #[cfg(feature = "messaging")]
+        {
+            if let Some(account) = state.account.as_ref() {
+                state.hydration.sync_scope(&account.id, &self.model, ctx);
+            }
+            state.hydration.poll(state.worker.as_ref(), ctx);
+        }
+        #[cfg(feature = "messaging")]
         if state
             .worker
             .as_ref()
@@ -573,6 +651,8 @@ impl NativeApp {
         }
         #[cfg(feature = "messaging")]
         state.stickers.poll(ctx, deadline, &mut remaining);
+        #[cfg(feature = "messaging")]
+        state.media.poll(ctx, deadline, &mut remaining);
         if !state.controller.events.is_empty() {
             ctx.request_repaint();
         }
@@ -615,6 +695,9 @@ impl NativeApp {
                             state.delivery = Default::default();
                             state.directory = Default::default();
                             state.stickers = Default::default();
+                            state.media = Default::default();
+                            state.sender_names = Default::default();
+                            state.hydration = Default::default();
                             state.review_dialog = false;
                         }
                         self.model = Model::default();
@@ -679,6 +762,7 @@ fn show_target_dialog(
     latest: &mut bool,
     ctx: &egui::Context,
 ) -> bool {
+    let colors = crate::theme::palette(ctx);
     let mut accepted = false;
     let mut open = state.open_dialog;
     let mut requested = false;
@@ -718,7 +802,7 @@ fn show_target_dialog(
                 ui.label(
                     egui::RichText::new("ID chỉ gồm chữ số và không bắt đầu bằng 0.")
                         .size(11.0)
-                        .color(super::visuals::MUTED),
+                        .color(colors.text_secondary),
                 );
             }
             if ui
@@ -785,7 +869,7 @@ fn recovery_controls(
     worker_alive: bool,
     reason: Option<&str>,
 ) -> Option<RecoveryAction> {
-    use super::visuals::{INK, MUTED};
+    let colors = crate::theme::palette(ui.ctx());
     let mut action = None;
     let active = matches!(
         connection,
@@ -804,11 +888,11 @@ fn recovery_controls(
             "Ngoại tuyến · vẫn có thể đọc tin đã lưu và soạn bản nháp"
         })
         .size(12.0)
-        .strong()
-        .color(INK),
+        .family(egui::FontFamily::Name("Zalo Semibold".into()))
+        .color(colors.text_primary),
     );
     if let Some(reason) = reason {
-        ui.add(egui::Label::new(egui::RichText::new(reason).size(11.0).color(MUTED)).wrap());
+        ui.add(egui::Label::new(egui::RichText::new(reason).size(11.0).color(colors.error)).wrap());
     }
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -882,6 +966,14 @@ mod tests {
                 search_folded: String::new(),
                 compact_list: false,
                 details: false,
+                settings_open: false,
+                theme: crate::theme::ThemeController::new(
+                    profile.paths.config_dir.clone(),
+                    Arc::new(|| {}),
+                )
+                .unwrap(),
+                settings: super::super::settings::Settings::default(),
+                fixture_system_theme: None,
                 focus_composer: false,
                 latest_page: true,
                 ime_composing: false,
@@ -1014,8 +1106,61 @@ mod tests {
     }
 
     #[test]
+    fn theme_switch_keeps_selected_draft_and_editor_scope_in_wide_and_compact_views() {
+        use crate::theme::ThemeMode;
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        app.model.selected = Some("d:22".into());
+        app.drafts.select("d:22").unwrap();
+        app.drafts.active.text = "Tiếng Việt đang soạn\nDòng thứ hai".into();
+        let expected = app.drafts.active.text.clone();
+        for mode in [
+            ThemeMode::Light,
+            ThemeMode::Dark,
+            ThemeMode::System,
+            ThemeMode::Custom,
+        ] {
+            app.theme.set_mode(mode);
+            if mode == ThemeMode::Custom {
+                app.theme.set_override("--text-primary", "#6F3FCF").unwrap();
+            }
+            for width in [640.0, 1200.0] {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 480.0),
+                        )),
+                        system_theme: Some(egui::Theme::Dark),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.theme.poll(ctx);
+                        app.workspace(ctx);
+                    },
+                );
+                assert_eq!(app.drafts.active.text, expected);
+                assert_eq!(app.model.selected.as_deref(), Some("d:22"));
+                assert!(!app.live_can_send());
+                assert!(text_rect(&output, &expected).is_some());
+                let palette = crate::theme::palette(&ctx);
+                assert_eq!(
+                    palette.dark,
+                    matches!(mode, ThemeMode::Dark | ThemeMode::System)
+                );
+                if mode == ThemeMode::Custom {
+                    assert_eq!(palette.text_primary, egui::Color32::from_rgb(111, 63, 207));
+                }
+            }
+        }
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn offline_recovery_buttons_respond_to_pointer_clicks() {
         let ctx = egui::Context::default();
+        super::super::visuals::install(&ctx);
         for (label, expected) in [
             ("Kết nối lại", RecoveryAction::Retry),
             ("Mở hội thoại", RecoveryAction::Open),
@@ -1135,6 +1280,7 @@ mod tests {
         let thread = "d:22";
         let original = crate::domain::Message {
             sticker: None,
+            media: None,
             account_id: "11".into(),
             thread_id: thread.into(),
             id: "501".into(),
@@ -1189,6 +1335,8 @@ mod tests {
                 .unwrap();
         store
             .apply_directory_batch(&DirectoryBatch {
+                message_info: Vec::new(),
+                message_media: Vec::new(),
                 account_id: "11".into(),
                 entries: vec![entry.clone()],
                 messages: vec![],
@@ -1245,6 +1393,7 @@ mod tests {
                 app.live.as_mut().unwrap().connection = connection;
                 let message = crate::domain::Message {
                     sticker: None,
+                    media: None,
                     account_id: "11".into(),
                     thread_id: "d:22".into(),
                     id: "incoming-1".into(),
@@ -1507,7 +1656,14 @@ mod tests {
         let sticker = std::env::var_os("ZALO_UI_FIXTURE_STICKER").is_some();
         let online = std::env::var_os("ZALO_UI_FIXTURE_ONLINE").is_some();
         let directory = std::env::var_os("ZALO_UI_FIXTURE_DIRECTORY").is_some();
-        let cached = sticker || directory || std::env::var_os("ZALO_UI_FIXTURE_CACHED").is_some();
+        let sender_mode = std::env::var("ZALO_UI_FIXTURE_SENDERS").ok();
+        let info_mode = std::env::var_os("ZALO_UI_FIXTURE_INFO").is_some();
+        let media_mode = std::env::var("ZALO_UI_FIXTURE_MEDIA").ok();
+        let cached = media_mode.is_some()
+            || sticker
+            || directory
+            || sender_mode.is_some()
+            || std::env::var_os("ZALO_UI_FIXTURE_CACHED").is_some();
         let root = Arc::new(std::sync::Mutex::new(None));
         let cleanup = root.clone();
         eframe::run_native(
@@ -1537,7 +1693,10 @@ mod tests {
                             LoginController::startup_fixture(profile, repaint, &mode)
                         },
                     )
-                    .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                    .map(|mut app| {
+                        fixture_theme(&mut app, &cc.egui_ctx);
+                        Box::new(app) as Box<dyn eframe::App>
+                    })
                     .map_err(Into::into);
                 }
                 let (mut app, path) = fixture(&cc.egui_ctx);
@@ -1554,6 +1713,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, (thread, sender, text))| crate::domain::Message {
                         sticker: None,
+                        media: None,
                         account_id: "11".into(),
                         thread_id: thread.into(),
                         id: format!("fixture-{}", i + 1),
@@ -1626,6 +1786,7 @@ mod tests {
                             sender: "22".into(),
                             text: LEGACY_STICKER_PLACEHOLDER.into(),
                             sticker: Some(sticker),
+                            media: None,
                             sent_at_ms: 1700000010000 + i as i64,
                         })
                         .collect();
@@ -1692,6 +1853,8 @@ mod tests {
                     .unwrap();
                     store
                         .apply_directory_batch(&DirectoryBatch {
+                            message_info: Vec::new(),
+                            message_media: Vec::new(),
                             account_id: "11".into(),
                             entries,
                             messages: vec![],
@@ -1701,6 +1864,149 @@ mod tests {
                     app.model.conversations = store.conversations("11", 200).unwrap();
                     app.activate_directory(&cc.egui_ctx);
                 }
+                if let Some(mode) = sender_mode.as_deref() {
+                    use crate::{
+                        domain::Message,
+                        store::directory::{DirectoryBatch, DirectoryRecord},
+                    };
+                    let thread = if mode == "group" { "g:90" } else { "d:22" };
+                    let entries = [
+                        ("22", "Đặng Minh".to_owned(), false),
+                        ("33", "Nguyễn Thị Ánh Hồng ".repeat(12), false),
+                        ("90", "Nhóm dự án kiểm thử".to_owned(), true),
+                    ]
+                    .into_iter()
+                    .map(|(id, name, is_group)| DirectoryRecord {
+                        remote_id: id.into(),
+                        is_group,
+                        display_name: name,
+                        avatar_url: None,
+                        is_friend: if is_group { None } else { Some(true) },
+                        is_blocked: None,
+                        member_count: if is_group { Some(4) } else { None },
+                    })
+                    .collect();
+                    let messages: Vec<_> = if mode == "group" {
+                        vec![
+                            ("22", "Tin nhắn từ người đã có trong danh bạ"),
+                            ("33", "Tên dài vẫn nằm trong bong bóng tin nhắn"),
+                            ("44", "Người chưa có tên trong danh bạ"),
+                        ]
+                    } else {
+                        vec![("22", "Tin nhắn trực tiếp hiển thị đúng tên liên hệ")]
+                    }
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (sender, text))| Message {
+                        account_id: "11".into(),
+                        thread_id: thread.into(),
+                        id: format!("sender-fixture-{i}"),
+                        sender: sender.into(),
+                        text: text.into(),
+                        sticker: None,
+                        media: None,
+                        sent_at_ms: 1700000000200 + i as i64,
+                    })
+                    .collect();
+                    let mut store = crate::store::MessageStore::open(
+                        &app._profile.paths.data_dir.join("messages.sqlite"),
+                    )
+                    .unwrap();
+                    store
+                        .apply_directory_batch(&DirectoryBatch {
+                            message_info: Vec::new(),
+                            message_media: Vec::new(),
+                            account_id: "11".into(),
+                            entries,
+                            messages: vec![],
+                            observed_at_ms: 1700000000300,
+                        })
+                        .unwrap();
+                    store.insert_batch(&messages).unwrap();
+                    app.model.conversations = store.conversations("11", 200).unwrap();
+                    app.model.selected = Some(thread.into());
+                    app.model.messages = messages;
+                    app.drafts.select(thread).unwrap();
+                    drop(store);
+                    app.live
+                        .as_mut()
+                        .unwrap()
+                        .ensure_worker(app._profile.clone());
+                }
+                if info_mode {
+                    use crate::store::directory::{DirectoryBatch, DirectoryRecord};
+                    let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+                        "../../tests/fixtures/messaging/info.json"
+                    ))
+                    .unwrap();
+                    let case = fixtures["cases"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|case| case["name"] == "self_and_named_member")
+                        .unwrap();
+                    let payload = serde_json::json!({"error_code":0,"data":{"groupMsgs":[{
+                        "uidFrom":"22","idTo":"90","msgId":"843","ts":"1700000000200",
+                        "msgType":"webchat","content":case["content"]
+                    }]}});
+                    let incoming =
+                        crate::protocol::messaging::incoming_messages("11", &payload).unwrap();
+                    assert_eq!(incoming[0].message.text, case["text"].as_str().unwrap());
+                    let messages: Vec<_> = incoming
+                        .into_iter()
+                        .map(|incoming| (incoming.message, incoming.client_id, incoming.info))
+                        .collect();
+                    let entries = [
+                        ("22", "Đặng Minh", false),
+                        ("90", "Nhóm kiểm thử thông báo", true),
+                    ]
+                    .into_iter()
+                    .map(|(id, name, is_group)| DirectoryRecord {
+                        remote_id: id.into(),
+                        is_group,
+                        display_name: name.into(),
+                        avatar_url: None,
+                        is_friend: if is_group { None } else { Some(true) },
+                        is_blocked: None,
+                        member_count: if is_group { Some(4) } else { None },
+                    })
+                    .collect();
+                    let mut store = crate::store::MessageStore::open(
+                        &app._profile.paths.data_dir.join("messages.sqlite"),
+                    )
+                    .unwrap();
+                    store
+                        .apply_directory_batch(&DirectoryBatch {
+                            message_info: Vec::new(),
+                            message_media: Vec::new(),
+                            account_id: "11".into(),
+                            entries,
+                            messages: vec![],
+                            observed_at_ms: 1700000000300,
+                        })
+                        .unwrap();
+                    store
+                        .receive_batch_with_info("11", &messages, Some(("511_1", "100")))
+                        .unwrap();
+                    let retained = store.message_info("11", "g:90", "843").unwrap().unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(retained.as_json()).unwrap(),
+                        case["content"]
+                    );
+                    app.model.conversations = store.conversations("11", 200).unwrap();
+                    app.model.selected = Some("g:90".into());
+                    app.model.messages = store.page("11", "g:90", None, 50).unwrap();
+                    app.drafts.select("g:90").unwrap();
+                    drop(store);
+                    app.live
+                        .as_mut()
+                        .unwrap()
+                        .ensure_worker(app._profile.clone());
+                }
+                if let Some(mode) = media_mode.as_deref() {
+                    fixture_media(&mut app, &cc.egui_ctx, mode);
+                }
+                fixture_theme(&mut app, &cc.egui_ctx);
                 Ok(Box::new(app))
             }),
         )
@@ -1708,5 +2014,121 @@ mod tests {
         if let Some(path) = cleanup.lock().unwrap().take() {
             let _ = std::fs::remove_dir_all(path);
         };
+    }
+
+    fn fixture_media(app: &mut NativeApp, ctx: &egui::Context, mode: &str) {
+        use crate::domain::{MediaDescriptor, MediaKind, MediaMessageContent, Message};
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/messaging/media.json"))
+                .unwrap();
+        let content = |name: &str| {
+            cases["cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap()["content"]
+                .clone()
+        };
+        let sources = match mode {
+            "webcontent" => vec![(MediaKind::WebContent, content("webcontent_object"), false)],
+            "opaque" => vec![(
+                MediaKind::WebContent,
+                serde_json::json!({"params":{"item":{"bundle_data":"{\"remote\":true}"}}}),
+                false,
+            )],
+            "failure" => vec![(MediaKind::Photo, content("photo_object"), true)],
+            "mixed" => vec![
+                (MediaKind::Photo, content("photo_object"), false),
+                (MediaKind::WebContent, content("webcontent_object"), false),
+            ],
+            _ => vec![(MediaKind::Photo, content("photo_object"), false)],
+        };
+        let records: Vec<_> = sources
+            .into_iter()
+            .enumerate()
+            .map(|(i, (kind, source, failed))| {
+                let content = MediaMessageContent::new(kind, &source).unwrap();
+                let message = Message {
+                    account_id: "11".into(),
+                    thread_id: "d:22".into(),
+                    id: format!("fixture-media-{i}"),
+                    sender: "22".into(),
+                    text: kind.legacy_placeholder().into(),
+                    sent_at_ms: 1700000000500 + i as i64,
+                    sticker: None,
+                    media: Some(content.descriptor().clone()),
+                };
+                (message, content, failed)
+            })
+            .collect();
+        let mut store =
+            crate::store::MessageStore::open(&app._profile.paths.data_dir.join("messages.sqlite"))
+                .unwrap();
+        let messages: Vec<_> = records
+            .iter()
+            .map(|(m, content, _)| (m.clone(), None, None, Some(content.clone())))
+            .collect();
+        store
+            .receive_batch_with_media("11", &messages, None)
+            .unwrap();
+        app.model.conversations = store.conversations("11", 200).unwrap();
+        app.model.selected = Some("d:22".into());
+        app.model.messages = store.page("11", "d:22", None, 50).unwrap();
+        app.drafts.select("d:22").unwrap();
+        app.compact_list = false;
+        let (width, height, rgba) = std::thread::spawn(|| {
+            crate::app::media::decode_fixture(include_bytes!(
+                "../../tests/fixtures/media/photo.jxl"
+            ))
+            .unwrap()
+        })
+        .join()
+        .unwrap();
+        let state = app.live.as_mut().unwrap();
+        for (message, _, failed) in records {
+            let url = match message.media.as_ref().unwrap() {
+                MediaDescriptor::Photo(p) => p.thumbnail_url.as_ref().or(p.original_url.as_ref()),
+                MediaDescriptor::WebContent(c) => c.image_url.as_ref(),
+            };
+            if let Some(url) = url {
+                let key = crate::app::media::MediaKey {
+                    account_id: "11".into(),
+                    thread_id: "d:22".into(),
+                    message_id: message.id,
+                    url: url.clone(),
+                };
+                if failed {
+                    state.media.seed_failure(key, app.model.generation);
+                } else {
+                    state
+                        .media
+                        .seed(ctx, key, app.model.generation, width, height, rgba.clone());
+                }
+            }
+        }
+    }
+
+    fn fixture_theme(app: &mut NativeApp, ctx: &egui::Context) {
+        use crate::theme::ThemeMode;
+        let mode = match std::env::var("ZALO_UI_FIXTURE_THEME").as_deref() {
+            Ok("dark") => ThemeMode::Dark,
+            Ok("system") => ThemeMode::System,
+            Ok("custom") => ThemeMode::Custom,
+            _ => ThemeMode::Light,
+        };
+        app.theme.set_mode(mode);
+        app.fixture_system_theme = match std::env::var("ZALO_UI_FIXTURE_SYSTEM_THEME").as_deref() {
+            Ok("dark") => Some(egui::Theme::Dark),
+            Ok("light") => Some(egui::Theme::Light),
+            _ => None,
+        };
+        if mode == ThemeMode::Custom {
+            app.theme
+                .set_override("--layer-background-navbar-normal", "#6F3FCF")
+                .unwrap();
+        }
+        app.theme.poll(ctx);
+        app.settings_open = std::env::var_os("ZALO_UI_FIXTURE_SETTINGS").is_some();
     }
 }

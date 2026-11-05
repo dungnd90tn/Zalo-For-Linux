@@ -40,6 +40,7 @@ pub struct DirectoryFailure {
     pub category: DirectoryCategory,
     pub http_status: Option<u16>,
     pub server_code: Option<i64>,
+    pub parser: Option<wire::PreviewDiagnostic>,
 }
 impl std::fmt::Display for DirectoryFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,7 +61,23 @@ fn failure(stage: DirectoryStage, category: DirectoryCategory) -> DirectoryFailu
         category,
         http_status: None,
         server_code: None,
+        parser: None,
     }
+}
+fn schema_failure(
+    stage: DirectoryStage,
+    field: wire::PreviewField,
+    reason: crate::protocol::messaging::FrameReason,
+    value: Option<&Value>,
+) -> DirectoryFailure {
+    let mut error = failure(stage, DirectoryCategory::Schema);
+    error.parser = Some(wire::PreviewDiagnostic::new(reason, field, value));
+    error
+}
+fn preview_failure(error: wire::PreviewFailure) -> DirectoryFailure {
+    let mut failure = wire_failure(DirectoryStage::Previews, error.error);
+    failure.parser = Some(error.diagnostic);
+    failure
 }
 fn wire_failure(stage: DirectoryStage, error: wire::DirectoryError) -> DirectoryFailure {
     match error {
@@ -71,8 +88,14 @@ fn wire_failure(stage: DirectoryStage, error: wire::DirectoryError) -> Directory
             category: DirectoryCategory::Server,
             http_status: None,
             server_code: Some(code),
+            parser: None,
         },
-        wire::DirectoryError::Invalid => failure(stage, DirectoryCategory::Schema),
+        wire::DirectoryError::Invalid => schema_failure(
+            stage,
+            wire::PreviewField::MessageCollections,
+            crate::protocol::messaging::FrameReason::BatchEnvelope,
+            None,
+        ),
     }
 }
 /// The runtime implements this using its existing bounded Database actor. A sink
@@ -130,8 +153,14 @@ impl DirectoryFetcher {
             .get(request.service.name())
             .and_then(|list| list.first())
             .ok_or_else(|| failure(stage, DirectoryCategory::Unavailable))?;
-        let plaintext = serde_json::to_vec(&request.parameters)
-            .map_err(|_| failure(stage, DirectoryCategory::Schema))?;
+        let plaintext = serde_json::to_vec(&request.parameters).map_err(|_| {
+            schema_failure(
+                stage,
+                wire::PreviewField::EncryptedData,
+                crate::protocol::messaging::FrameReason::OuterData,
+                Some(&request.parameters),
+            )
+        })?;
         let encrypted = session
             .encrypt_payload(&plaintext)
             .map_err(|_| failure(stage, DirectoryCategory::Crypto))?;
@@ -163,6 +192,7 @@ impl DirectoryFetcher {
                 category: DirectoryCategory::Http,
                 http_status: Some(response.status().as_u16()),
                 server_code: None,
+                parser: None,
             });
         }
         let headers = response.headers();
@@ -205,21 +235,36 @@ impl DirectoryFetcher {
                 tokio::task::yield_now().await;
             }
         }
-        let outer: Value =
-            serde_json::from_slice(&body).map_err(|_| failure(stage, DirectoryCategory::Schema))?;
-        drop(body);
-        let encrypted = envelope_data(outer, stage)?;
-        let plaintext = session
-            .decrypt_directory_payload(
-                encrypted
-                    .as_str()
-                    .ok_or_else(|| failure(stage, DirectoryCategory::Schema))?,
+        let outer: Value = serde_json::from_slice(&body).map_err(|_| {
+            schema_failure(
+                stage,
+                wire::PreviewField::ResponseJson,
+                crate::protocol::messaging::FrameReason::OuterJson,
+                None,
             )
+        })?;
+        drop(body);
+        let encrypted = envelope_data(outer, stage, false)?;
+        let plaintext = session
+            .decrypt_directory_payload(encrypted.as_str().ok_or_else(|| {
+                schema_failure(
+                    stage,
+                    wire::PreviewField::EncryptedData,
+                    crate::protocol::messaging::FrameReason::OuterData,
+                    Some(&encrypted),
+                )
+            })?)
             .map_err(|_| failure(stage, DirectoryCategory::Crypto))?;
         drop(encrypted);
-        let inner: Value = serde_json::from_slice(&plaintext)
-            .map_err(|_| failure(stage, DirectoryCategory::Schema))?;
-        envelope_data(inner, stage)
+        let inner: Value = serde_json::from_slice(&plaintext).map_err(|_| {
+            schema_failure(
+                stage,
+                wire::PreviewField::DecryptedJson,
+                crate::protocol::messaging::FrameReason::InnerJson,
+                None,
+            )
+        })?;
+        envelope_data(inner, stage, true)
     }
     pub async fn synchronize<S: DirectorySink>(
         &self,
@@ -339,19 +384,15 @@ impl DirectoryFetcher {
             let data = self
                 .fetch(session, request, DirectoryStage::Previews)
                 .await?;
-            let previews = wire::parse_previews(session.account_id(), &data)
-                .map_err(|e| wire_failure(DirectoryStage::Previews, e))?;
+            let previews =
+                wire::parse_verified_previews(session, &data).map_err(preview_failure)?;
             let count = previews.messages.len();
-            for messages in previews.messages.chunks(wire::DIRECTORY_BATCH_SIZE) {
-                sink.apply(DirectoryBatch {
-                    account_id: session.account_id().into(),
-                    entries: Vec::new(),
-                    messages: messages.to_vec(),
-                    observed_at_ms,
-                })
-                .await?;
+            let unsupported = previews.unsupported_encrypted;
+            let batches = preview_batches(session.account_id(), previews, observed_at_ms)?;
+            for batch in batches {
+                sink.apply(batch).await?;
             }
-            Ok::<(usize, usize), DirectoryFailure>((count, previews.unsupported_encrypted))
+            Ok::<(usize, usize), DirectoryFailure>((count, unsupported))
         }
         .await;
         match previews {
@@ -365,24 +406,180 @@ impl DirectoryFetcher {
         report
     }
 }
-fn envelope_data(mut value: Value, stage: DirectoryStage) -> Result<Value, DirectoryFailure> {
+/// Match full scoped identities before any sink call, then move metadata with
+/// its owning message chunk. Neither rich content nor message bodies are cloned.
+fn preview_batches(
+    account: &str,
+    page: wire::PreviewPage,
+    observed_at_ms: i64,
+) -> Result<Vec<DirectoryBatch>, DirectoryFailure> {
+    let invalid = || {
+        let mut error = schema_failure(
+            DirectoryStage::Previews,
+            wire::PreviewField::MessageCollections,
+            crate::protocol::messaging::FrameReason::MessageValidation,
+            None,
+        );
+        if let Some(parser) = &mut error.parser {
+            parser.field_type = crate::protocol::messaging::FrameValueType::Array;
+        }
+        error
+    };
+    let mut metadata = std::collections::BTreeMap::new();
+    let mut info_bytes = 0usize;
+    for info in page.message_info {
+        if info.account_id != account {
+            return Err(invalid());
+        }
+        info_bytes = info_bytes
+            .checked_add(info.content.as_json().len())
+            .ok_or_else(|| failure(DirectoryStage::Previews, DirectoryCategory::Resource))?;
+        if info_bytes > crate::domain::MAX_INFO_BATCH_BYTES {
+            return Err(failure(
+                DirectoryStage::Previews,
+                DirectoryCategory::Resource,
+            ));
+        }
+        let key = (
+            info.account_id.clone(),
+            info.thread_id.clone(),
+            info.message_id.clone(),
+        );
+        if metadata.insert(key, info).is_some() {
+            return Err(invalid());
+        }
+    }
+    let mut media_metadata = std::collections::BTreeMap::new();
+    for media in page.message_media {
+        if media.account_id != account {
+            return Err(invalid());
+        }
+        info_bytes = info_bytes
+            .checked_add(media.content.as_json().len())
+            .ok_or_else(|| failure(DirectoryStage::Previews, DirectoryCategory::Resource))?;
+        if info_bytes > crate::domain::MAX_INFO_BATCH_BYTES {
+            return Err(failure(
+                DirectoryStage::Previews,
+                DirectoryCategory::Resource,
+            ));
+        }
+        let key = (
+            media.account_id.clone(),
+            media.thread_id.clone(),
+            media.message_id.clone(),
+        );
+        if metadata.contains_key(&key) || media_metadata.insert(key, media).is_some() {
+            return Err(invalid());
+        }
+    }
+    let mut identities = std::collections::HashSet::new();
+    for message in &page.messages {
+        let key = (
+            message.account_id.clone(),
+            message.thread_id.clone(),
+            message.id.clone(),
+        );
+        if message.account_id != account
+            || message.validate().is_err()
+            || !identities.insert((message.thread_id.clone(), message.id.clone()))
+            || message.media.as_ref()
+                != media_metadata
+                    .get(&key)
+                    .map(|binding| binding.content.descriptor())
+            || metadata
+                .get(&key)
+                .is_some_and(|_| message.sticker.is_some() || message.media.is_some())
+        {
+            return Err(invalid());
+        }
+    }
+    let mut messages = page.messages.into_iter();
+    let mut batches = Vec::new();
+    loop {
+        let messages: Vec<_> = messages.by_ref().take(wire::DIRECTORY_BATCH_SIZE).collect();
+        if messages.is_empty() {
+            break;
+        }
+        let mut message_info = Vec::new();
+        let mut message_media = Vec::new();
+        for message in &messages {
+            let key = (
+                message.account_id.clone(),
+                message.thread_id.clone(),
+                message.id.clone(),
+            );
+            if let Some(media) = media_metadata.remove(&key) {
+                message_media.push(media);
+            }
+            if let Some(info) = metadata.remove(&key) {
+                message_info.push(info);
+            }
+        }
+        batches.push(DirectoryBatch {
+            account_id: account.into(),
+            entries: Vec::new(),
+            messages,
+            message_info,
+            message_media,
+            observed_at_ms,
+        });
+    }
+    if !metadata.is_empty() || !media_metadata.is_empty() {
+        return Err(invalid());
+    }
+    Ok(batches)
+}
+fn envelope_data(
+    mut value: Value,
+    stage: DirectoryStage,
+    decrypted: bool,
+) -> Result<Value, DirectoryFailure> {
+    use crate::protocol::messaging::FrameReason;
+    let field = if decrypted {
+        wire::PreviewField::DecryptedEnvelope
+    } else {
+        wire::PreviewField::ResponseEnvelope
+    };
+    let reason = if decrypted {
+        FrameReason::InnerEnvelope
+    } else {
+        FrameReason::OuterEnvelope
+    };
+    if !value.is_object() {
+        return Err(schema_failure(stage, field, reason, Some(&value)));
+    }
     let code = value
         .get("error_code")
         .and_then(Value::as_i64)
-        .ok_or_else(|| failure(stage, DirectoryCategory::Schema))?;
+        .ok_or_else(|| schema_failure(stage, field, reason, value.get("error_code")))?;
     if code != 0 {
         return Err(DirectoryFailure {
             stage,
             category: DirectoryCategory::Server,
             http_status: None,
             server_code: Some(code),
+            parser: None,
         });
     }
-    value
-        .get_mut("data")
-        .map(Value::take)
-        .ok_or_else(|| failure(stage, DirectoryCategory::Schema))
+    if value.get("data").is_none() {
+        return Err(schema_failure(
+            stage,
+            if decrypted {
+                wire::PreviewField::MessageCollections
+            } else {
+                wire::PreviewField::EncryptedData
+            },
+            if decrypted {
+                FrameReason::BatchEnvelope
+            } else {
+                FrameReason::OuterData
+            },
+            None,
+        ));
+    }
+    Ok(value.get_mut("data").expect("checked data").take())
 }
+
 async fn apply_entries<S: DirectorySink>(
     sink: &mut S,
     session: &VerifiedSession,
@@ -407,6 +604,8 @@ async fn apply_entries<S: DirectorySink>(
             account_id: session.account_id().into(),
             entries: entries.to_vec(),
             messages: Vec::new(),
+            message_info: Vec::new(),
+            message_media: Vec::new(),
             observed_at_ms,
         })
         .await?;

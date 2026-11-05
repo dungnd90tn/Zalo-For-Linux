@@ -35,6 +35,10 @@ enum Reply {
     ControlHeartbeats,
     OfflinePages,
     OfflineCycle,
+    NullableReceive(u8),
+    PeerRouting(bool),
+    InfoPages(bool),
+    MediaPages(bool),
     UpgradeForbidden,
     DesktopHeaders,
     UpgradeStall,
@@ -196,6 +200,7 @@ impl Fixture {
         .await
         .unwrap();
         Connection {
+            account: "11".into(),
             socket,
             decoder: FrameDecoder::default(),
             queues: Default::default(),
@@ -331,7 +336,7 @@ fn serve(
             let _ = ws.read();
             return;
         }
-        let auth = json!({"error_code":0,"data":{"qCmds":if matches!(reply,Reply::Runtime|Reply::Stickers|Reply::RuntimeStall|Reply::DirectoryStall|Reply::ControlHeartbeats){json!([{"cmd":510,"subCmd":0},{"cmd":511,"subCmd":0}])}else{json!([{"cmd":510,"subCmd":0}])}}});
+        let auth = json!({"error_code":0,"data":{"qCmds":if matches!(reply,Reply::InfoPages(_)|Reply::MediaPages(_)){json!([{"cmd":511,"subCmd":1}])}else if matches!(reply,Reply::PeerRouting(_)){json!([{"cmd":510,"subCmd":1}])}else if matches!(reply,Reply::Runtime|Reply::Stickers|Reply::RuntimeStall|Reply::DirectoryStall|Reply::ControlHeartbeats){json!([{"cmd":510,"subCmd":0},{"cmd":511,"subCmd":0}])}else{json!([{"cmd":510,"subCmd":0}])}}});
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         z.write_all(&serde_json::to_vec(&auth).unwrap()).unwrap();
         let auth_frame = if matches!(reply, Reply::ControlHeartbeats) {
@@ -371,6 +376,89 @@ fn serve(
                     let cmd = u16::from_le_bytes([bytes[1], bytes[2]]);
                     state.observed_commands.lock().unwrap().push(cmd);
                     let data: Value = serde_json::from_slice(&bytes[4..]).unwrap();
+                    if let Reply::InfoPages(conflict) = reply {
+                        assert_eq!((cmd, bytes[3]), (511, 1));
+                        let first = data["first"].as_bool().unwrap();
+                        let last_id = data["lastId"].as_u64().unwrap();
+                        assert_eq!(last_id, if first { 1 } else { 100 });
+                        state.socket_requests.lock().unwrap().push((cmd, last_id));
+                        let bytes = wire::encode_frame(511, 1, &json!({"error_code":0,"encrypt":0,"data":information_batch(first, conflict)})).unwrap();
+                        ws.send(tungstenite::Message::Binary(bytes.clone()))
+                            .unwrap();
+                        if !first && !conflict {
+                            ws.send(tungstenite::Message::Binary(bytes)).unwrap();
+                        }
+                    }
+                    if let Reply::MediaPages(conflict) = reply {
+                        assert_eq!((cmd, bytes[3]), (511, 1));
+                        let first = data["first"].as_bool().unwrap();
+                        let last_id = data["lastId"].as_u64().unwrap();
+                        assert_eq!(last_id, if first { 1 } else { 100 });
+                        state.socket_requests.lock().unwrap().push((cmd, last_id));
+                        let bytes = wire::encode_frame(511, 1, &json!({"error_code":0,"encrypt":0,"data":media_batch(first, conflict)})).unwrap();
+                        ws.send(tungstenite::Message::Binary(bytes.clone()))
+                            .unwrap();
+                        if !first && !conflict {
+                            ws.send(tungstenite::Message::Binary(bytes)).unwrap();
+                        }
+                    }
+                    if let Reply::PeerRouting(invalid) = reply {
+                        assert_eq!((cmd, bytes[3]), (510, 1));
+                        let first = data["first"].as_bool().unwrap();
+                        let last_id = data["lastId"].as_u64().unwrap();
+                        assert_eq!(last_id, if first { 1 } else { 100 });
+                        state.socket_requests.lock().unwrap().push((cmd, last_id));
+                        ws.send(tungstenite::Message::Binary(wire::encode_frame(510, 1, &json!({"error_code":0,"encrypt":0,"data":peer_addressed_batch(first, invalid)})).unwrap())).unwrap();
+                    }
+                    if cmd == 510 {
+                        if let Reply::NullableReceive(malformed) = reply {
+                            let last_id = data["lastId"].as_u64().unwrap();
+                            let first = data["first"].as_bool().unwrap();
+                            assert_eq!(last_id, if first { 1 } else { 100 });
+                            state.socket_requests.lock().unwrap().push((cmd, last_id));
+                            let mut messages = if first {
+                                json!([
+                                    {"uidFrom":"22","idTo":"11","msgId":"821","cliMsgId":0,"ts":"1760000000001","msgType":"webchat","content":"nullable-one"},
+                                    {"uidFrom":"22","idTo":"11","msgId":"822","cliMsgId":null,"ts":"1760000000002","msgType":"webchat","content":"nullable-two"}
+                                ])
+                            } else {
+                                json!([
+                                    {"uidFrom":"22","idTo":"11","msgId":"823","cliMsgId":"0","ts":"1760000000003","msgType":"webchat","content":"nullable-three"}
+                                ])
+                            };
+                            if !first && [1, 2].contains(&malformed) {
+                                let mut invalid = json!({"uidFrom":"22","idTo":"11","msgId":"824","cliMsgId":"1760000000004","ts":"1760000000004","msgType":"webchat","content":"must-not-partially-commit"});
+                                if malformed == 1 {
+                                    invalid["cliMsgId"] =
+                                        json!({"private-fixture":"never-log-this"});
+                                } else {
+                                    invalid["uidFrom"] = json!("not-a-user");
+                                }
+                                messages.as_array_mut().unwrap().push(invalid);
+                            }
+                            let continuation = if first {
+                                json!("100")
+                            } else {
+                                match malformed {
+                                    3 | 6 => Value::Null,
+                                    4 | 7 => json!(0),
+                                    5 | 8 => json!("0"),
+                                    9 => json!({"private-cursor":"never-log-this"}),
+                                    _ => json!("200"),
+                                }
+                            };
+                            let payload = json!({"error_code":0,"data":{"msgs":messages,"groupMsgs":null,"pageMsgs":null,"more":first||[1,2,6,7,8].contains(&malformed),"lastActionId":continuation}});
+                            ws.send(tungstenite::Message::Binary(
+                                wire::encode_frame(
+                                    510,
+                                    0,
+                                    &json!({"error_code":0,"encrypt":0,"data":payload}),
+                                )
+                                .unwrap(),
+                            ))
+                            .unwrap();
+                        }
+                    }
                     if cmd == 510 && matches!(reply, Reply::OfflinePages | Reply::OfflineCycle) {
                         let last_id = data["lastId"].as_u64().unwrap();
                         state.socket_requests.lock().unwrap().push((cmd, last_id));
@@ -568,7 +656,32 @@ fn serve(
             }
             _ => {
                 assert_eq!(parameters["threadIdLocalMsgId"], "{}");
-                json!({"msgs":[{"uidFrom":"22","idTo":"11","msgId":"910","ts":"1760000000020","msgType":"webchat","content":"recent preview"}]})
+                if matches!(reply, Reply::MediaPages(_)) {
+                    let mut data = media_batch(true, false)["data"].clone();
+                    let mut direct = Vec::new();
+                    for (id, kind) in [("841", "chat.photo"), ("843", "chat.webcontent")] {
+                        let mut content = media_content(kind, false);
+                        content["unknownOuter"]["threadVariant"] = json!("direct");
+                        direct.push(json!({"uidFrom":"22","idTo":"33","msgId":id,"ts":"1760000000002","msgType":kind,"content":content}));
+                    }
+                    direct.extend((9000..9200).map(|id| json!({"uidFrom":"22","idTo":"11","msgId":id.to_string(),"ts":"1760000000001","msgType":"webchat","content":"bounded-media-preview-chunk"})));
+                    data["msgs"] = json!(direct);
+                    data["pageMsgs"] = Value::Null;
+                    data["eeMsgs"] = Value::Null;
+                    data
+                } else if matches!(reply, Reply::InfoPages(_)) {
+                    let mut data = information_batch(true, false)["data"].clone();
+                    let mut content = information_content();
+                    content["unknownOuter"]["threadVariant"] = json!("direct");
+                    let mut direct = vec![
+                        json!({"uidFrom":"22","idTo":"11","msgId":"841","ts":"1760000000002","msgType":"webchat","content":content}),
+                    ];
+                    direct.extend((9000..9200).map(|id| json!({"uidFrom":"22","idTo":"11","msgId":id.to_string(),"ts":"1760000000001","msgType":"webchat","content":"bounded-preview-chunk-fixture"})));
+                    data["msgs"] = json!(direct);
+                    data
+                } else {
+                    json!({"msgs":[{"uidFrom":"22","idTo":"11","msgId":"910","ts":"1760000000020","msgType":"webchat","content":"recent preview"}]})
+                }
             }
         };
         let inner = json!({"error_code":0,"data":data});
@@ -648,6 +761,70 @@ fn serve(
     .unwrap();
     stream.write_all(&response).unwrap();
     let _ = stream.flush();
+}
+
+fn peer_addressed_batch(first: bool, invalid: bool) -> Value {
+    if first {
+        json!({"error_code":0,"data":{"more":true,"lastActionId":"100","msgs":[
+            {"uidFrom":"22","idTo":"33","msgId":"831","cliMsgId":null,"ts":"1760000000001","msgType":"chat.photo","content":{"description":"private-photo-fixture"}},
+            {"uidFrom":"0","idTo":"22","msgId":"832","cliMsgId":0,"ts":"1760000000002","msgType":"webchat","content":"own-sentinel-fixture"}
+        ],"groupMsgs":[
+            {"uidFrom":"33","idTo":"22","msgId":"833","ts":"1760000000003","msgType":"webchat","content":"group-fixture"}
+        ],"pageMsgs":[
+            {"uidFrom":"44","idTo":"55","msgId":"834","ts":"1760000000004","msgType":"webchat","content":"page-fixture"}
+        ]}})
+    } else {
+        let mut payload = json!({"error_code":0,"data":{"more":false,"lastActionId":"200","msgs":[
+            {"uidFrom":"22","idTo":"33","msgId":"835","ts":"1760000000005","msgType":"webchat","content":"second-peer-fixture"}
+        ]}});
+        if invalid {
+            payload["data"]["msgs"].as_array_mut().unwrap().push(json!(
+                {"uidFrom":"22","idTo":"bad-recipient","msgId":"836","ts":"1760000000006","msgType":"webchat","content":"must-not-commit-prefix"}
+            ));
+        }
+        payload
+    }
+}
+
+fn media_content(kind: &str, changed: bool) -> Value {
+    let params = if kind == "chat.photo" {
+        json!({"width":640,"height":480,"hd":"https://photo-talk.zadn.vn/synthetic-hd.jpg","unknownInner":[null,true,{"retain":"full"}]})
+    } else {
+        json!({"customMsg":{"msg":{"vi":"Thông báo đơn hàng tổng hợp"}},"pcItem":{"bundle_data":{"template":"opaque-remote-template","unknown":[1,true,null]},"data_url":"https://fixture.invalid/never-fetch-template.js"},"unknownInner":{"keep":"full"}})
+    };
+    json!({"title":"Nội dung tổng hợp","description":"Mô tả tiếng Việt","thumb":"https://photo-talk.zadn.vn/synthetic-thumb.jpg","href":"https://photo-talk.zadn.vn/synthetic.jpg","params":serde_json::to_string(&params).unwrap(),"unknownOuter":{"revision":if changed{2}else{1},"mustRetain":[7,false,{"key":"private-synthetic-value"}]}})
+}
+fn media_batch(first: bool, conflict: bool) -> Value {
+    let photo = json!({"uidFrom":"33","idTo":"22","msgId":"841","ts":"1760000000002","msgType":"chat.photo","content":media_content("chat.photo",!first && conflict)});
+    let card = json!({"uidFrom":"33","idTo":"22","msgId":"843","ts":"1760000000002","msgType":"chat.webcontent","content":media_content("chat.webcontent",false)});
+    let plain = json!({"uidFrom":"44","idTo":"22","msgId":if first{"840"}else{"842"},"ts":if first{"1760000000001"}else{"1760000000003"},"msgType":"webchat","content":if first{"plain-before-media"}else{"plain-after-media"}});
+    json!({"error_code":0,"data":{"more":first,"lastActionId":if first{"100"}else{"200"},"groupMsgs":[plain,photo,card]}})
+}
+
+fn information_content() -> Value {
+    json!({
+        "action":"msginfo.actionlist",
+        "title":"Tiêu đề dự phòng",
+        "params":serde_json::to_string(&json!({
+            "msg":{"vi":"%1$s đã tham gia nhóm","en":"%1$s joined the group"},
+            "highLightsV2":[{"type":0,"uid":"33","dpn":"Nguyễn An","ignoreNickname":true}],
+            "actions":[{"actionType":"action.open.url","actionLabel":"Xem","actionData":"https://fixture.invalid/private-action"}],
+            "unknownInner":{"list":[1,true,null,{"value":"private-rich-fixture"}]}
+        })).unwrap(),
+        "unknownOuter":{"mustRetain":[7,false,"outer"]}
+    })
+}
+
+fn information_batch(first: bool, conflict: bool) -> Value {
+    let mut content = information_content();
+    if !first && conflict {
+        let mut params: Value = serde_json::from_str(content["params"].as_str().unwrap()).unwrap();
+        params["actions"][0]["actionData"] = json!("https://fixture.invalid/changed-action");
+        content["params"] = json!(serde_json::to_string(&params).unwrap());
+    }
+    let info = json!({"uidFrom":"33","idTo":"22","msgId":"841","ts":"1760000000002","msgType":"webchat","content":content});
+    let plain = json!({"uidFrom":"44","idTo":"22","msgId":if first{"840"}else{"842"},"ts":if first{"1760000000001"}else{"1760000000003"},"msgType":"webchat","content":if first{"plain-before-info"}else{"plain-after-info"}});
+    json!({"error_code":0,"data":{"more":first,"lastActionId":if first{"100"}else{"200"},"groupMsgs":[plain,info]}})
 }
 
 #[tokio::test]
@@ -1112,6 +1289,1216 @@ async fn actual_runtime_cancels_when_received_event_backpressure_blocks_the_live
 }
 
 #[tokio::test]
+async fn info_preview_and_socket_orders_keep_identical_full_metadata_without_ack_or_type_conflict()
+{
+    for preview_first in [false, true] {
+        let f = Fixture::new(Reply::InfoPages(false));
+        let db = Database::open(f.profile.clone(), "11".into())
+            .await
+            .unwrap();
+        let (updates, _revision) = watch::channel(0);
+        let mut sink = RuntimeDirectorySink {
+            account: "11".into(),
+            db: db.handle().unwrap(),
+            updates,
+        };
+        let fetcher = DirectoryFetcher::with_client(f.client());
+        let session = f.directory_session(false);
+        let (_cancel, cancel) = watch::channel(false);
+        let (tx, mut events) = mpsc::channel(4);
+        let output = Events {
+            account: "11".into(),
+            tx,
+            repaint: Arc::new(|| {}),
+        };
+        let mut socket = f.connection().await;
+        if preview_first {
+            let report = fetcher
+                .synchronize(&session, &mut sink, cancel.clone())
+                .await
+                .unwrap();
+            assert!(report.failures.is_empty(), "{report:?}");
+            assert!(report.completed_previews);
+            assert_eq!(report.preview_messages, 203);
+            assert_eq!(
+                db.call(|store| store.receive_cursor("11", "511_1"))
+                    .await
+                    .unwrap(),
+                "1",
+                "preview does not acknowledge a queue"
+            );
+            assert!(f.state.socket_requests.lock().unwrap().is_empty());
+        }
+        let auth = socket.next().await.unwrap().unwrap();
+        socket.process(auth, &db, &output).await.unwrap();
+        let first = socket.next().await.unwrap().unwrap();
+        socket.process(first, &db, &output).await.unwrap();
+        if !preview_first {
+            let report = fetcher
+                .synchronize(&session, &mut sink, cancel)
+                .await
+                .unwrap();
+            assert!(report.failures.is_empty(), "{report:?}");
+            assert!(report.completed_previews);
+            assert_eq!(report.preview_messages, 203);
+            assert_eq!(
+                db.call(|store| store.receive_cursor("11", "511_1"))
+                    .await
+                    .unwrap(),
+                "100",
+                "preview cannot advance the socket cursor"
+            );
+        }
+        let second = socket.next().await.unwrap().unwrap();
+        socket.process(second, &db, &output).await.unwrap();
+        let duplicate = socket.next().await.unwrap().unwrap();
+        socket.process(duplicate, &db, &output).await.unwrap();
+        let mut published = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, LiveEvent::Received { .. }) {
+                published += 1;
+            }
+        }
+        assert_eq!(published, if preview_first { 1 } else { 3 });
+        assert_eq!(
+            f.state.socket_requests.lock().unwrap().as_slice(),
+            [(511, 1), (511, 100)]
+        );
+        assert_eq!(f.state.http_sends.load(Ordering::SeqCst), 0);
+        drop(socket);
+        drop(sink);
+        drop(db);
+        let store = MessageStore::open(&f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+        assert_eq!(store.page("11", "g:22", None, 10).unwrap().len(), 3);
+        let retained = store.message_info("11", "g:22", "841").unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(retained.as_json()).unwrap(),
+            information_content()
+        );
+        assert_eq!(store.receive_cursor("11", "511_1").unwrap(), "200");
+        let direct = store.message_info("11", "d:22", "841").unwrap().unwrap();
+        let mut expected_direct = information_content();
+        expected_direct["unknownOuter"]["threadVariant"] = json!("direct");
+        assert_eq!(
+            serde_json::from_str::<Value>(direct.as_json()).unwrap(),
+            expected_direct,
+            "bindings sharing a message ID must stay in their own chunk/thread"
+        );
+        assert!(store.message_info("33", "g:22", "841").unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn media_preview_and_socket_orders_preserve_complete_metadata_across_chunks_and_restart() {
+    for preview_first in [false, true] {
+        let f = Fixture::new(Reply::MediaPages(false));
+        let db = Database::open(f.profile.clone(), "11".into())
+            .await
+            .unwrap();
+        let (updates, _revision) = watch::channel(0);
+        let mut sink = RuntimeDirectorySink {
+            account: "11".into(),
+            db: db.handle().unwrap(),
+            updates,
+        };
+        let fetcher = DirectoryFetcher::with_client(f.client());
+        let session = f.directory_session(false);
+        let (_cancel, cancel) = watch::channel(false);
+        let (tx, mut events) = mpsc::channel(8);
+        let output = Events {
+            account: "11".into(),
+            tx,
+            repaint: Arc::new(|| {}),
+        };
+        let mut socket = f.connection().await;
+        if preview_first {
+            let report = fetcher
+                .synchronize(&session, &mut sink, cancel.clone())
+                .await
+                .unwrap();
+            assert!(report.failures.is_empty(), "{report:?}");
+            assert!(report.completed_previews);
+            assert_eq!(report.preview_messages, 205);
+            assert_eq!(
+                db.call(|store| store.receive_cursor("11", "511_1"))
+                    .await
+                    .unwrap(),
+                "1",
+                "preview does not acknowledge a queue"
+            );
+            assert!(f.state.socket_requests.lock().unwrap().is_empty());
+        }
+        let auth = socket.next().await.unwrap().unwrap();
+        socket.process(auth, &db, &output).await.unwrap();
+        let first = socket.next().await.unwrap().unwrap();
+        socket.process(first, &db, &output).await.unwrap();
+        if !preview_first {
+            let report = fetcher
+                .synchronize(&session, &mut sink, cancel)
+                .await
+                .unwrap();
+            assert!(report.failures.is_empty(), "{report:?}");
+            assert!(report.completed_previews);
+            assert_eq!(report.preview_messages, 205);
+            assert_eq!(
+                db.call(|store| store.receive_cursor("11", "511_1"))
+                    .await
+                    .unwrap(),
+                "100",
+                "preview cannot advance the socket cursor"
+            );
+        }
+        let second = socket.next().await.unwrap().unwrap();
+        socket.process(second, &db, &output).await.unwrap();
+        let duplicate = socket.next().await.unwrap().unwrap();
+        socket.process(duplicate, &db, &output).await.unwrap();
+        let mut published = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, LiveEvent::Received { .. }) {
+                published += 1;
+            }
+        }
+        assert_eq!(published, if preview_first { 1 } else { 4 });
+        assert_eq!(
+            f.state.socket_requests.lock().unwrap().as_slice(),
+            [(511, 1), (511, 100)]
+        );
+        assert_eq!(f.state.http_sends.load(Ordering::SeqCst), 0);
+        drop(socket);
+        drop(sink);
+        drop(db);
+        let store = MessageStore::open(&f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+        assert_eq!(store.page("11", "g:22", None, 10).unwrap().len(), 4);
+        for (id, kind) in [("841", "chat.photo"), ("843", "chat.webcontent")] {
+            let retained = store.message_media("11", "g:22", id).unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(retained.as_json()).unwrap(),
+                media_content(kind, false)
+            );
+            let direct = store.message_media("11", "d:22", id).unwrap().unwrap();
+            let mut expected_direct = media_content(kind, false);
+            expected_direct["unknownOuter"]["threadVariant"] = json!("direct");
+            assert_eq!(
+                serde_json::from_str::<Value>(direct.as_json()).unwrap(),
+                expected_direct,
+                "same IDs in different chunks must retain their own account/thread binding"
+            );
+            let page = store.page("11", "g:22", None, 10).unwrap();
+            let message = page.iter().find(|message| message.id == id).unwrap();
+            assert_eq!(message.media.as_ref(), Some(retained.descriptor()));
+            assert!(store.message_media("33", "g:22", id).unwrap().is_none());
+        }
+        assert_eq!(store.receive_cursor("11", "511_1").unwrap(), "200");
+        assert!(store.message_media("33", "g:22", "841").unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn http_media_refresh_enriches_durable_legacy_placeholders_without_rewinding_cursor_or_outbox(
+) {
+    let f = Fixture::new(Reply::MediaPages(false));
+    let db = Database::open(f.profile.clone(), "11".into())
+        .await
+        .unwrap();
+    let original = wire::incoming_messages("11", &media_batch(true, false)).unwrap();
+    let legacy: Vec<_> = original
+        .into_iter()
+        .filter(|row| row.media.is_some())
+        .map(|mut row| {
+            row.message.media = None;
+            (row.message, None)
+        })
+        .collect();
+    db.call(move |store| {
+        store.receive_batch("11", &legacy, Some(("511_1", "900")))?;
+        store.prepare_outgoing("11", "d:22", "Unrelated unsent draft", 1760000000004)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let path = f.profile.paths.data_dir.join("messages.sqlite");
+    let observer =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let legacy_rows = |connection: &rusqlite::Connection| {
+        connection.prepare("SELECT message_id,sender,body,sent_at_ms FROM messages WHERE account_id='11' AND thread_id='g:22' ORDER BY message_id").unwrap()
+            .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,i64>(3)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    };
+    let outbox = |connection: &rusqlite::Connection| {
+        connection
+            .prepare("SELECT client_id,body,state,server_id FROM outgoing ORDER BY client_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let old_rows = legacy_rows(&observer);
+    let old_outbox = outbox(&observer);
+    // The open pane keeps its existing IDs/range. Its refresh request does not
+    // select a conversation or ask for the newest history page.
+    let (tx, mut refreshed) = mpsc::channel(4);
+    let events = Events {
+        account: "11".into(),
+        tx,
+        repaint: Arc::new(|| {}),
+    };
+    let mut connection = None;
+    let session = f.session();
+    let client = f.client();
+    handle_command(
+        LiveCommand::RefreshMessages {
+            generation: 71,
+            thread: "g:22".into(),
+            message_ids: vec!["841".into(), "843".into()],
+        },
+        &mut connection,
+        &db,
+        &events,
+        &session,
+        &client,
+    )
+    .await
+    .unwrap();
+    let old_pane = match refreshed.recv().await.unwrap() {
+        LiveEvent::MessagesRefreshed {
+            generation: 71,
+            account_id,
+            thread,
+            messages,
+        } => {
+            assert_eq!((account_id.as_str(), thread.as_str()), ("11", "g:22"));
+            assert_eq!(messages.len(), 2);
+            assert!(messages.iter().all(|message| message.media.is_none()));
+            messages
+        }
+        other => panic!("unexpected refresh event {other:?}"),
+    };
+    let (updates, _) = watch::channel(0);
+    let mut sink = RuntimeDirectorySink {
+        account: "11".into(),
+        db: db.handle().unwrap(),
+        updates,
+    };
+    let (_stop, cancel) = watch::channel(false);
+    let report = DirectoryFetcher::with_client(f.client())
+        .synchronize(&f.directory_session(false), &mut sink, cancel)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{report:?}");
+    assert!(report.completed_previews);
+    handle_command(
+        LiveCommand::RefreshMessages {
+            generation: 72,
+            thread: "g:22".into(),
+            message_ids: vec!["841".into(), "843".into()],
+        },
+        &mut connection,
+        &db,
+        &events,
+        &session,
+        &client,
+    )
+    .await
+    .unwrap();
+    match refreshed.recv().await.unwrap() {
+        LiveEvent::MessagesRefreshed {
+            generation: 72,
+            account_id,
+            thread,
+            messages,
+        } => {
+            assert_eq!((account_id.as_str(), thread.as_str()), ("11", "g:22"));
+            assert_eq!(messages.len(), old_pane.len());
+            for message in messages {
+                let previous = old_pane.iter().find(|old| old.id == message.id).unwrap();
+                let mut identity = message.clone();
+                identity.media = None;
+                assert_eq!(
+                    &identity, previous,
+                    "rehydration changes only the bounded media projection"
+                );
+                assert!(message.media.is_some());
+            }
+        }
+        other => panic!("unexpected post-directory refresh event {other:?}"),
+    }
+    assert!(
+        connection.is_none(),
+        "pane refresh is an indexed local read, not a transport reconnect"
+    );
+    let after = legacy_rows(&observer);
+    for row in &old_rows {
+        assert!(
+            after.contains(row),
+            "legacy body/sender/timestamp must remain unchanged"
+        );
+    }
+    assert_eq!(outbox(&observer), old_outbox);
+    assert_eq!(
+        db.call(|store| store.receive_cursor("11", "511_1"))
+            .await
+            .unwrap(),
+        "900"
+    );
+    assert!(f.state.socket_requests.lock().unwrap().is_empty());
+    assert_eq!(f.state.http_sends.load(Ordering::SeqCst), 0);
+    drop(sink);
+    drop(db);
+    drop(observer);
+    let mut store = MessageStore::open(&path).unwrap();
+    for (id, kind) in [("841", "chat.photo"), ("843", "chat.webcontent")] {
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                store
+                    .message_media("11", "g:22", id)
+                    .unwrap()
+                    .unwrap()
+                    .as_json()
+            )
+            .unwrap(),
+            media_content(kind, false)
+        );
+        assert!(store
+            .page("11", "g:22", None, 10)
+            .unwrap()
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap()
+            .media
+            .is_some());
+    }
+    let replay: Vec<_> = wire::incoming_messages("11", &media_batch(true, false))
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.message, row.client_id, row.info, row.media))
+        .collect();
+    assert!(store
+        .receive_batch_with_media("11", &replay, Some(("511_1", "100")))
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.receive_cursor("11", "511_1").unwrap(), "900");
+}
+
+#[tokio::test]
+async fn actual_socket_media_raw_conflict_rolls_back_entire_following_page_and_cursor() {
+    let f = Fixture::new(Reply::MediaPages(true));
+    let db = Database::open(f.profile.clone(), "11".into())
+        .await
+        .unwrap();
+    let (tx, mut events) = mpsc::channel(4);
+    let output = Events {
+        account: "11".into(),
+        tx,
+        repaint: Arc::new(|| {}),
+    };
+    let mut socket = f.connection().await;
+    let auth = socket.next().await.unwrap().unwrap();
+    socket.process(auth, &db, &output).await.unwrap();
+    let first = socket.next().await.unwrap().unwrap();
+    socket.process(first, &db, &output).await.unwrap();
+    let second = socket.next().await.unwrap().unwrap();
+    assert!(socket.process(second, &db, &output).await.is_err());
+    let mut published = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, LiveEvent::Received { .. }) {
+            published += 1;
+        }
+    }
+    assert_eq!(published, 3);
+    assert_eq!(
+        f.state.socket_requests.lock().unwrap().as_slice(),
+        [(511, 1), (511, 100)]
+    );
+    drop(socket);
+    drop(db);
+    let store = MessageStore::open(&f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+    assert_eq!(store.receive_cursor("11", "511_1").unwrap(), "100");
+    assert_eq!(store.page("11", "g:22", None, 10).unwrap().len(), 3);
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            store
+                .message_media("11", "g:22", "841")
+                .unwrap()
+                .unwrap()
+                .as_json()
+        )
+        .unwrap(),
+        media_content("chat.photo", false)
+    );
+    assert_eq!(f.state.http_sends.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn directory_runtime_mapping_records_precise_preview_failure_without_private_payload() {
+    use crate::protocol::directory::{parse_previews_detailed, PreviewDiagnostic, PreviewField};
+    let root = std::env::temp_dir().join(format!(
+        "preview-log-{}",
+        crate::domain::local_message_id().unwrap()
+    ));
+    crate::profile::create_private_dir(&root).unwrap();
+    let logger = crate::diagnostics::Logger::isolated_for_test(&root, false).unwrap();
+    let raw = json!({"msgs":[{"msgType":"chat.photo","uidFrom":"22","idTo":"11","msgId":"731","ts":1700000000000_i64,"content":[{"private":"https://private.invalid/token"}]}]});
+    let parser = parse_previews_detailed("11", &raw)
+        .err()
+        .unwrap()
+        .diagnostic;
+    for diagnostic in [
+        parser,
+        PreviewDiagnostic {
+            reason: wire::FrameReason::OuterJson,
+            field: PreviewField::ResponseJson,
+            field_type: wire::FrameValueType::Absent,
+            field_bytes: None,
+            message_kind: None,
+        },
+    ] {
+        logger.record(directory_failure_event(&DirectoryFailure {
+            stage: DirectoryStage::Previews,
+            category: DirectoryCategory::Schema,
+            http_status: None,
+            server_code: None,
+            parser: Some(diagnostic),
+        }));
+    }
+    let path = logger.path().to_owned();
+    drop(logger);
+    let text = fs::read_to_string(path).unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["preview_field"], "msgs");
+    assert_eq!(lines[0]["reason"], "message_content");
+    assert_eq!(lines[0]["field_type"], "array");
+    assert_eq!(lines[0]["message_kind"], "photo");
+    assert_eq!(lines[1]["preview_field"], "response_json");
+    assert_eq!(lines[1]["reason"], "outer_json");
+    assert!(lines[1].get("message_kind").is_none());
+    for event in lines.iter().take(2) {
+        assert_eq!(event["directory_stage"], "previews");
+        assert_eq!(event["directory_category"], "schema");
+        assert!(event.as_object().unwrap().keys().all(|key| matches!(
+            key.as_str(),
+            "ts_ms"
+                | "kind"
+                | "stage"
+                | "reason"
+                | "directory_stage"
+                | "directory_category"
+                | "preview_field"
+                | "field_type"
+                | "message_kind"
+        )));
+    }
+    assert!(!text.contains("private.invalid") && !text.contains("token"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn info_batches_commit_full_content_before_publish_and_reject_changed_action_data_atomically()
+{
+    for conflict in [false, true] {
+        let f = Fixture::new(Reply::InfoPages(conflict));
+        let (commands, rx) = mpsc::channel(16);
+        let (tx, mut events) = mpsc::channel(4);
+        let (_stop, cancel) = watch::channel(false);
+        let task = tokio::spawn(run_with_transports(
+            f.profile.clone(),
+            f.session(),
+            rx,
+            tx,
+            Arc::new(|| {}),
+            cancel,
+            f.transports(),
+        ));
+        let mut received = Vec::new();
+        let mut rejected = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    LiveEvent::Received { message, .. } => {
+                        assert_eq!(message.account_id, "11");
+                        if message.id == "841" {
+                            assert_eq!(message.text, "Nguyễn An đã tham gia nhóm");
+                            let db = rusqlite::Connection::open_with_flags(f.profile.paths.data_dir.join("messages.sqlite"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+                            let metadata: String = db.query_row("SELECT metadata FROM message_info WHERE account_id='11' AND thread_id='g:22' AND message_id='841'", [], |row| row.get(0)).unwrap();
+                            assert_eq!(serde_json::from_str::<Value>(&metadata).unwrap(), information_content(), "entire structure must commit before UI publication");
+                        }
+                        received.push(message.id);
+                        if !conflict && received.len() == 3 { break; }
+                    }
+                    LiveEvent::Diagnostic { diagnostic, .. } => {
+                        assert!(conflict, "valid info event must not pause messaging");
+                        assert_eq!(diagnostic.category, LiveCategory::Storage);
+                        rejected = true;
+                    }
+                    LiveEvent::Connection { state: LiveConnection::Offline, .. } if rejected => break,
+                    LiveEvent::Fault { error, .. } => panic!("local actor stopped: {error}"),
+                    _ => {}
+                }
+            }
+        }).await.unwrap();
+        commands
+            .send(LiveCommand::Load {
+                generation: 94,
+                thread: "g:22".into(),
+                before: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    LiveEvent::Received { .. } => {
+                        panic!("info replay must not duplicate publication")
+                    }
+                    LiveEvent::Page {
+                        generation: 94,
+                        messages,
+                        ..
+                    } => {
+                        assert_eq!(messages.len(), if conflict { 2 } else { 3 });
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        commands.send(LiveCommand::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.len(), if conflict { 2 } else { 3 });
+        assert_eq!(
+            f.state.socket_requests.lock().unwrap().as_slice(),
+            [(511, 1), (511, 100)]
+        );
+        assert_eq!(f.state.upgrades.load(Ordering::SeqCst), 1);
+        assert_eq!(f.state.http_sends.load(Ordering::SeqCst), 0);
+        let request_paths: Vec<_> = f
+            .state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.split('?').next().unwrap().to_owned())
+            .collect();
+        assert!(
+            request_paths.len() <= 1
+                && request_paths
+                    .iter()
+                    .all(|path| path == "/api/group/getlg/v3"),
+            "only the normal group-directory bootstrap may make HTTPS requests: {request_paths:?}"
+        );
+        assert!(
+            !request_paths
+                .iter()
+                .any(|path| path.contains("private-action") || path.contains("changed-action")),
+            "stored action URLs must never execute"
+        );
+        for _ in 0..2 {
+            let store =
+                MessageStore::open(&f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+            let info = store.message_info("11", "g:22", "841").unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(info.as_json()).unwrap(),
+                information_content()
+            );
+            assert_eq!(
+                store.receive_cursor("11", "511_1").unwrap(),
+                if conflict { "100" } else { "200" }
+            );
+            assert_eq!(
+                store.page("11", "g:22", None, 10).unwrap().len(),
+                if conflict { 2 } else { 3 }
+            );
+            assert!(store.message_info("11", "d:22", "841").unwrap().is_none());
+            assert!(store.message_info("33", "g:22", "841").unwrap().is_none());
+            assert!(store.page("33", "g:22", None, 10).unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_info_sidecar_write_keeps_batch_cursor_and_actor_then_explicit_retry_succeeds() {
+    let f = Fixture::new(Reply::InfoPages(false));
+    let path = f.profile.paths.data_dir.join("messages.sqlite");
+    drop(MessageStore::open(&path).unwrap());
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    sql.execute_batch("CREATE TRIGGER fail_info BEFORE INSERT ON message_info BEGIN SELECT RAISE(ABORT,'private-rich-storage-fixture'); END;").unwrap();
+    let (commands, rx) = mpsc::channel(16);
+    let (tx, mut events) = mpsc::channel(4);
+    let (_stop, cancel) = watch::channel(false);
+    let task = tokio::spawn(run_with_transports(
+        f.profile.clone(),
+        f.session(),
+        rx,
+        tx,
+        Arc::new(|| {}),
+        cancel,
+        f.transports(),
+    ));
+    let mut failed = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap() {
+                LiveEvent::Received { .. } => {
+                    panic!("sidecar failure must roll back the entire message batch")
+                }
+                LiveEvent::Diagnostic { diagnostic, .. }
+                    if diagnostic.category == LiveCategory::Storage =>
+                {
+                    failed = true
+                }
+                LiveEvent::Connection {
+                    state: LiveConnection::Offline,
+                    ..
+                } if failed => break,
+                LiveEvent::Fault { error, .. } => panic!("local actor stopped: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.state.socket_requests.lock().unwrap().as_slice(),
+        [(511, 1)]
+    );
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM messages", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM message_info", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    commands
+        .send(LiveCommand::Load {
+            generation: 95,
+            thread: "g:22".into(),
+            before: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let LiveEvent::Page {
+                generation: 95,
+                messages,
+                ..
+            } = events.recv().await.unwrap()
+            {
+                assert!(messages.is_empty());
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let store = MessageStore::open(&path).unwrap();
+    assert_eq!(store.receive_cursor("11", "511_1").unwrap(), "1");
+    drop(store);
+    sql.execute_batch("DROP TRIGGER fail_info").unwrap();
+    commands.send(LiveCommand::Reconnect).await.unwrap();
+    let mut received = 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while received < 3 {
+            match events.recv().await.unwrap() {
+                LiveEvent::Received { message, .. } => {
+                    if message.id == "841" {
+                        assert_eq!(message.text, "Nguyễn An đã tham gia nhóm");
+                    }
+                    received += 1;
+                }
+                LiveEvent::Diagnostic { diagnostic, .. } => panic!("retry failed: {diagnostic}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    commands.send(LiveCommand::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        f.state.socket_requests.lock().unwrap().as_slice(),
+        [(511, 1), (511, 1), (511, 100)]
+    );
+    assert_eq!(f.state.upgrades.load(Ordering::SeqCst), 2);
+    assert_eq!(f.state.http_sends.load(Ordering::SeqCst), 0);
+    let store = MessageStore::open(&path).unwrap();
+    assert_eq!(store.page("11", "g:22", None, 10).unwrap().len(), 3);
+    assert_eq!(store.receive_cursor("11", "511_1").unwrap(), "200");
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            store
+                .message_info("11", "g:22", "841")
+                .unwrap()
+                .unwrap()
+                .as_json()
+        )
+        .unwrap(),
+        information_content()
+    );
+}
+
+#[tokio::test]
+async fn failed_media_sidecar_write_keeps_batch_cursor_and_actor_then_explicit_retry_succeeds() {
+    let f = Fixture::new(Reply::MediaPages(false));
+    let path = f.profile.paths.data_dir.join("messages.sqlite");
+    drop(MessageStore::open(&path).unwrap());
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    sql.execute_batch("CREATE TRIGGER fail_media BEFORE INSERT ON message_media BEGIN SELECT RAISE(ABORT,'private-rich-storage-fixture'); END;").unwrap();
+    let (commands, rx) = mpsc::channel(16);
+    let (tx, mut events) = mpsc::channel(4);
+    let (_stop, cancel) = watch::channel(false);
+    let task = tokio::spawn(run_with_transports(
+        f.profile.clone(),
+        f.session(),
+        rx,
+        tx,
+        Arc::new(|| {}),
+        cancel,
+        f.transports(),
+    ));
+    let mut failed = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap() {
+                LiveEvent::Received { .. } => {
+                    panic!("sidecar failure must roll back the entire message batch")
+                }
+                LiveEvent::Diagnostic { diagnostic, .. }
+                    if diagnostic.category == LiveCategory::Storage =>
+                {
+                    failed = true
+                }
+                LiveEvent::Connection {
+                    state: LiveConnection::Offline,
+                    ..
+                } if failed => break,
+                LiveEvent::Fault { error, .. } => panic!("local actor stopped: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.state.socket_requests.lock().unwrap().as_slice(),
+        [(511, 1)]
+    );
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM messages", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM message_media", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    commands
+        .send(LiveCommand::Load {
+            generation: 95,
+            thread: "g:22".into(),
+            before: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let LiveEvent::Page {
+                generation: 95,
+                messages,
+                ..
+            } = events.recv().await.unwrap()
+            {
+                assert!(messages.is_empty());
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let store = MessageStore::open(&path).unwrap();
+    assert_eq!(store.receive_cursor("11", "511_1").unwrap(), "1");
+    drop(store);
+    sql.execute_batch("DROP TRIGGER fail_media").unwrap();
+    commands.send(LiveCommand::Reconnect).await.unwrap();
+    let mut received = 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while received < 4 {
+            match events.recv().await.unwrap() {
+                LiveEvent::Received { message, .. } => {
+                    if message.id == "841" {
+                        assert!(matches!(message.media.as_ref(), Some(crate::domain::MediaDescriptor::Photo(_))));
+                    }
+                    if let Some(descriptor) = &message.media {
+                        let raw: String = sql.query_row(
+                            "SELECT metadata FROM message_media WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
+                            rusqlite::params![message.account_id,message.thread_id,message.id],
+                            |row|row.get(0),
+                        ).unwrap();
+                        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap(),media_content(descriptor.kind().as_str(),false),
+                            "complete raw content must be durable before publishing a media snapshot");
+                    }
+                    received += 1;
+                }
+                LiveEvent::Diagnostic { diagnostic, .. } => panic!("retry failed: {diagnostic}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    commands.send(LiveCommand::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        f.state.socket_requests.lock().unwrap().as_slice(),
+        [(511, 1), (511, 1), (511, 100)]
+    );
+    assert_eq!(f.state.upgrades.load(Ordering::SeqCst), 2);
+    assert_eq!(f.state.http_sends.load(Ordering::SeqCst), 0);
+    let store = MessageStore::open(&path).unwrap();
+    assert_eq!(store.page("11", "g:22", None, 10).unwrap().len(), 4);
+    assert_eq!(store.receive_cursor("11", "511_1").unwrap(), "200");
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            store
+                .message_media("11", "g:22", "841")
+                .unwrap()
+                .unwrap()
+                .as_json()
+        )
+        .unwrap(),
+        media_content("chat.photo", false)
+    );
+}
+
+#[tokio::test]
+async fn authenticated_subqueue_routes_peer_addresses_without_crossing_accounts_or_partial_commit()
+{
+    for invalid in [false, true] {
+        let f = Fixture::new(Reply::PeerRouting(invalid));
+        let (commands, rx) = mpsc::channel(16);
+        let (tx, mut events) = mpsc::channel(4);
+        let (_stop, cancel) = watch::channel(false);
+        let task = tokio::spawn(run_with_transports(
+            f.profile.clone(),
+            f.session(),
+            rx,
+            tx,
+            Arc::new(|| {}),
+            cancel,
+            f.transports(),
+        ));
+        let mut received = Vec::new();
+        let mut rejected = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    LiveEvent::Received { message, .. } => {
+                        assert_eq!(message.account_id, "11");
+                        received.push(message);
+                        if !invalid && received.len() == 5 {
+                            break;
+                        }
+                    }
+                    LiveEvent::Diagnostic { diagnostic, .. } => {
+                        assert!(
+                            invalid,
+                            "valid peer addresses must not reject synchronization"
+                        );
+                        assert_eq!(
+                            diagnostic.parser_reason,
+                            Some(wire::FrameReason::MessageRecipient)
+                        );
+                        assert_eq!(diagnostic.stage, LiveStage::Synchronization);
+                        rejected = true;
+                    }
+                    LiveEvent::Connection {
+                        state: LiveConnection::Offline,
+                        ..
+                    } if rejected => break,
+                    LiveEvent::Fault { error, .. } => panic!("local actor stopped: {error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let direct = received.iter().find(|m| m.id == "831").unwrap();
+        assert_eq!((&*direct.thread_id, &*direct.sender), ("d:22", "22"));
+        assert_eq!(direct.text, "[Tin nhắn chat.photo chưa được hỗ trợ]");
+        assert!(!direct.text.contains("private-photo"));
+        let own = received.iter().find(|m| m.id == "832").unwrap();
+        assert_eq!((&*own.thread_id, &*own.sender), ("d:22", "11"));
+        let group = received.iter().find(|m| m.id == "833").unwrap();
+        assert_eq!((&*group.thread_id, &*group.sender), ("g:22", "33"));
+        let page = received.iter().find(|m| m.id == "834").unwrap();
+        assert_eq!((&*page.thread_id, &*page.sender), ("d:44", "44"));
+        if invalid {
+            assert_eq!(received.len(), 4);
+            commands
+                .send(LiveCommand::Load {
+                    generation: 92,
+                    thread: "d:22".into(),
+                    before: None,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let LiveEvent::Page {
+                        generation: 92,
+                        messages,
+                        ..
+                    } = events.recv().await.unwrap()
+                    {
+                        assert_eq!(messages.len(), 2);
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        commands.send(LiveCommand::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            f.state.socket_requests.lock().unwrap().as_slice(),
+            [(510, 1), (510, 100)]
+        );
+        assert_eq!(f.state.upgrades.load(Ordering::SeqCst), 1);
+        assert_eq!(f.state.http_sends.load(Ordering::SeqCst), 0);
+        let store = MessageStore::open(&f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+        assert_eq!(
+            store.receive_cursor("11", "510_1").unwrap(),
+            if invalid { "100" } else { "200" }
+        );
+        assert_eq!(
+            store.page("11", "d:22", None, 10).unwrap().len(),
+            if invalid { 2 } else { 3 }
+        );
+        assert_eq!(store.page("11", "g:22", None, 10).unwrap().len(), 1);
+        assert_eq!(store.page("11", "d:44", None, 10).unwrap().len(), 1);
+        for account in ["12", "22", "33", "44", "55"] {
+            assert!(store.conversations(account, 10).unwrap().is_empty());
+            assert_eq!(store.receive_cursor(account, "510_1").unwrap(), "1");
+        }
+    }
+}
+
+#[tokio::test]
+async fn connection_account_and_authenticated_decoder_gate_peer_routing_before_storage() {
+    let f = Fixture::new(Reply::Normal);
+    let db = Database::open(f.profile.clone(), "11".into())
+        .await
+        .unwrap();
+    let (tx, mut received) = mpsc::channel(4);
+    let mut events = Events {
+        account: "11".into(),
+        tx,
+        repaint: Arc::new(|| {}),
+    };
+    let mut connection = f.connection().await;
+    for authenticated in [false, true] {
+        if authenticated {
+            connection.next().await.unwrap();
+            assert!(connection.decoder.authenticated());
+            events.account = "12".into();
+        }
+        let error = connection
+            .process(
+                DecodedFrame {
+                    cmd: 510,
+                    sub_cmd: 1,
+                    payload: peer_addressed_batch(true, false),
+                },
+                &db,
+                &events,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<wire::FrameFailure>().unwrap().reason,
+            wire::FrameReason::MessageScope
+        );
+        assert!(received.try_recv().is_err());
+        assert!(f.state.socket_requests.lock().unwrap().is_empty());
+        assert_eq!(
+            db.call(|store| store.receive_cursor("11", "510_1"))
+                .await
+                .unwrap(),
+            "1"
+        );
+        for account in ["11", "12"] {
+            assert!(db
+                .call(move |store| store.conversations(account, 10))
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+    drop(connection);
+}
+
+#[tokio::test]
+async fn actual_runtime_accepts_nullable_optional_fields_but_rejects_invalid_identity_atomically() {
+    for malformed in 0..=9 {
+        let accepted = malformed == 0 || [3, 4, 5].contains(&malformed);
+        let f = Fixture::new(Reply::NullableReceive(malformed));
+        let (commands, rx) = mpsc::channel(16);
+        let (tx, mut events) = mpsc::channel(4);
+        let (_stop, cancel) = watch::channel(false);
+        let task = tokio::spawn(run_with_transports(
+            f.profile.clone(),
+            f.session(),
+            rx,
+            tx,
+            Arc::new(|| {}),
+            cancel,
+            f.transports(),
+        ));
+        let mut received = Vec::new();
+        let mut failure = None;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    LiveEvent::Received { message, .. } => {
+                        received.push(message.id);
+                        if accepted && received.len() == 3 {
+                            break;
+                        }
+                    }
+                    LiveEvent::Diagnostic { diagnostic, .. } => {
+                        assert!(!accepted, "valid optional fields must remain online");
+                        assert_eq!(diagnostic.stage, LiveStage::Synchronization);
+                        assert_eq!(diagnostic.category, LiveCategory::Protocol);
+                        assert_eq!(
+                            diagnostic.parser_reason,
+                            Some(match malformed {
+                                1 => wire::FrameReason::MessageClientId,
+                                2 => wire::FrameReason::MessageSender,
+                                _ => wire::FrameReason::QueueContinuation,
+                            })
+                        );
+                        failure = Some(diagnostic);
+                    }
+                    LiveEvent::Connection {
+                        state: LiveConnection::Offline,
+                        ..
+                    } if failure.is_some() => break,
+                    LiveEvent::Fault { error, .. } => {
+                        panic!("protocol error must preserve local actor: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            received,
+            if accepted {
+                vec!["821", "822", "823"]
+            } else {
+                vec!["821", "822"]
+            }
+        );
+        if !accepted {
+            assert!(!task.is_finished());
+            commands
+                .send(LiveCommand::Load {
+                    generation: 91,
+                    thread: "d:22".into(),
+                    before: None,
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let LiveEvent::Page {
+                        generation: 91,
+                        messages,
+                        ..
+                    } = events.recv().await.unwrap()
+                    {
+                        assert_eq!(
+                            messages.len(),
+                            2,
+                            "the valid prefix of a rejected page must not commit"
+                        );
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        commands.send(LiveCommand::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            f.state.socket_requests.lock().unwrap().as_slice(),
+            [(510, 1), (510, 100)],
+            "no cursor ACK/continuation for rejected page"
+        );
+        assert_eq!(
+            f.state.upgrades.load(Ordering::SeqCst),
+            1,
+            "no automatic poison reconnect"
+        );
+        assert_eq!(
+            f.state.http_sends.load(Ordering::SeqCst),
+            0,
+            "receive recovery must not replay sends"
+        );
+        let store = MessageStore::open(&f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+        assert_eq!(
+            store.receive_cursor("11", "510_0").unwrap(),
+            if malformed == 0 { "200" } else { "100" }
+        );
+        assert_eq!(
+            store.page("11", "d:22", None, 10).unwrap().len(),
+            if accepted { 3 } else { 2 }
+        );
+        assert_eq!(store.receive_cursor("12", "510_0").unwrap(), "1");
+        assert!(store.page("12", "d:22", None, 10).unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn actual_runtime_offline_pages_use_last_action_id_without_queue_status_after_durable_insert()
 {
     let f = Fixture::new(Reply::OfflinePages);
@@ -1282,9 +2669,11 @@ async fn offline_page_budget_rejects_excess_pages_before_persistence_or_next_req
         },
     );
     let result=connection.process(DecodedFrame{cmd:510,sub_cmd:0,payload:json!({"error_code":0,"data":{"more":true,"lastActionId":"100","msgs":[]}})},&db,&events).await;
+    let error = result.unwrap_err();
+    assert_eq!(wire_error(&error), Some(&WireError::Oversize));
     assert_eq!(
-        result.unwrap_err().downcast_ref::<WireError>(),
-        Some(&WireError::Oversize)
+        error.downcast_ref::<wire::FrameFailure>().unwrap().reason,
+        wire::FrameReason::QueuePageLimit
     );
     assert_eq!(
         db.call(|s| s.receive_cursor("11", "510_0")).await.unwrap(),
@@ -1510,6 +2899,7 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
             sender: "22".into(),
             text: "cached before the failed connection".into(),
             sticker: None,
+            media: None,
             sent_at_ms: 1,
         };
         {
@@ -1932,6 +3322,8 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
         updates: directory.updates_tx.clone(),
     };
     sink.apply(DirectoryBatch {
+        message_info: Vec::new(),
+        message_media: Vec::new(),
         account_id: "11".into(),
         entries: vec![DirectoryRecord {
             remote_id: "22".into(),
@@ -1955,6 +3347,7 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
         sender: "33".into(),
         text: "arrived after the directory commit".into(),
         sticker: None,
+        media: None,
         sent_at_ms: 100,
     };
     let stored = message.clone();
@@ -2379,6 +3772,100 @@ async fn actual_runtime_survives_three_source_pongs_then_sends_via_layered_563_a
             "logs cannot retain fixture payloads or credentials"
         )
     }
+}
+
+#[tokio::test]
+async fn sender_name_commands_use_the_existing_actor_and_echo_only_the_requested_scope() {
+    let f = Fixture::new(Reply::Normal);
+    let db = Database::open(f.profile.clone(), "11".into())
+        .await
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel(4);
+    let events = Events {
+        account: "11".into(),
+        tx,
+        repaint: Arc::new(|| {}),
+    };
+    let session = f.session();
+    let client = f.client();
+    let mut connection = None;
+    for (generation, name) in [(41, "Nguyễn Hà"), (42, "Nguyễn Hà mới")] {
+        let record = crate::store::directory::DirectoryRecord {
+            remote_id: "22".into(),
+            is_group: false,
+            display_name: name.into(),
+            avatar_url: None,
+            is_friend: Some(true),
+            is_blocked: None,
+            member_count: None,
+        };
+        let mut group = record.clone();
+        group.is_group = true;
+        group.display_name = "Không được lấy tên nhóm cho thành viên".into();
+        let mut foreign = record.clone();
+        foreign.display_name = "Tên tài khoản khác".into();
+        db.call(move |store| {
+            store.apply_directory_batch(&DirectoryBatch {
+                message_info: Vec::new(),
+                message_media: Vec::new(),
+                account_id: "11".into(),
+                entries: vec![record, group],
+                messages: vec![],
+                observed_at_ms: generation as i64,
+            })?;
+            store.apply_directory_batch(&DirectoryBatch {
+                message_info: Vec::new(),
+                message_media: Vec::new(),
+                account_id: "33".into(),
+                entries: vec![foreign],
+                messages: vec![],
+                observed_at_ms: generation as i64,
+            })?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        handle_command(
+            LiveCommand::ResolveSenders {
+                generation,
+                thread: "g:22".into(),
+                sender_ids: vec!["22".into(), "99".into()],
+            },
+            &mut connection,
+            &db,
+            &events,
+            &session,
+            &client,
+        )
+        .await
+        .unwrap();
+        match rx.recv().await.unwrap() {
+            LiveEvent::SenderNames {
+                account_id,
+                generation: actual,
+                thread,
+                names,
+            } => {
+                assert_eq!(account_id, "11");
+                assert_eq!(actual, generation);
+                assert_eq!(thread, "g:22");
+                assert_eq!(
+                    names,
+                    vec![SenderName {
+                        sender_id: "22".into(),
+                        display_name: name.into()
+                    }]
+                );
+            }
+            other => panic!("Unexpected sender-name reply {other:?}"),
+        }
+    }
+    assert!(connection.is_none());
+    assert!(
+        f.state.requests.lock().unwrap().is_empty(),
+        "name resolution must not fetch remote profiles"
+    );
+    assert_eq!(f.state.upgrades.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

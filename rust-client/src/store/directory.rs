@@ -1,12 +1,21 @@
 //! Account-scoped directory metadata applied by the existing SQLite owner only.
-use super::{insert_validated, MessageStore};
-use crate::domain::{fold_search, validate_id, Message, MAX_PAGE_SIZE};
+use super::{insert_validated_with_media, MessageStore};
+use crate::domain::{
+    fold_search, validate_id, Message, MessageInfoBinding, MessageMediaBinding,
+    MAX_INFO_BATCH_BYTES, MAX_PAGE_SIZE,
+};
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub const DIRECTORY_LIMIT: usize = 200;
 pub const MAX_DIRECTORY_ROWS: usize = 30_000;
+pub const MAX_SENDER_NAMES: usize = 64;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderName {
+    pub sender_id: String,
+    pub display_name: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryCursor {
     pub name: String,
@@ -61,6 +70,8 @@ pub struct DirectoryBatch {
     pub account_id: String,
     pub entries: Vec<DirectoryRecord>,
     pub messages: Vec<Message>,
+    pub message_info: Vec<MessageInfoBinding>,
+    pub message_media: Vec<MessageMediaBinding>,
     pub observed_at_ms: i64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +91,40 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
     Ok(())
 }
 impl MessageStore {
+    /// Resolve only the requested user identities via the account/thread primary
+    /// key. Group records with the same remote ID never name a message sender.
+    pub fn sender_names(&self, account: &str, sender_ids: &[String]) -> Result<Vec<SenderName>> {
+        validate_id(account)?;
+        if sender_ids.len() > MAX_SENDER_NAMES {
+            bail!("Sender-name request exceeds its resource limit");
+        }
+        for sender in sender_ids {
+            validate_id(sender)?;
+        }
+        let mut seen = HashSet::with_capacity(sender_ids.len());
+        let mut names = Vec::with_capacity(sender_ids.len());
+        let mut query=self.conn.prepare_cached("SELECT CASE WHEN length(CAST(display_name AS BLOB))<=512 THEN display_name ELSE NULL END FROM directory_entries WHERE account_id=?1 AND thread_id=?2 AND remote_id=?3 AND is_group=0")?;
+        for sender in sender_ids {
+            if !seen.insert(sender) {
+                continue;
+            }
+            let name: Option<Option<String>> = query
+                .query_row(params![account, format!("d:{sender}"), sender], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if let Some(display_name) = name
+                .flatten()
+                .filter(|name| !name.trim().is_empty() && !name.chars().any(char::is_control))
+            {
+                names.push(SenderName {
+                    sender_id: sender.clone(),
+                    display_name,
+                });
+            }
+        }
+        Ok(names)
+    }
     /// Metadata and messages commit together. A conflict rolls back both; partial
     /// network snapshots never delete cached contacts, groups, messages or outbox.
     pub fn apply_directory_batch(&mut self, batch: &DirectoryBatch) -> Result<DirectoryCommit> {
@@ -87,6 +132,8 @@ impl MessageStore {
         if batch.observed_at_ms < 1
             || batch.entries.len() > DIRECTORY_LIMIT
             || batch.messages.len() > MAX_PAGE_SIZE
+            || batch.message_info.len() > MAX_PAGE_SIZE
+            || batch.message_media.len() > MAX_PAGE_SIZE
         {
             bail!("Directory batch exceeds its resource limit");
         }
@@ -97,12 +144,51 @@ impl MessageStore {
                 bail!("Duplicate directory identity in one batch");
             }
         }
+        let mut message_keys = HashMap::with_capacity(batch.messages.len());
         for message in &batch.messages {
             message.validate()?;
             if message.account_id != batch.account_id {
                 bail!("Directory message belongs to another account");
             }
             touched.insert(message.thread_id.clone());
+            message_keys.insert((message.thread_id.as_str(), message.id.as_str()), message);
+        }
+        let mut infos = HashMap::with_capacity(batch.message_info.len());
+        let mut info_bytes = 0usize;
+        for info in &batch.message_info {
+            validate_id(&info.account_id)?;
+            validate_id(&info.thread_id)?;
+            validate_id(&info.message_id)?;
+            let key = (info.thread_id.as_str(), info.message_id.as_str());
+            info_bytes = info_bytes.saturating_add(info.content.as_json().len());
+            if info.account_id != batch.account_id
+                || info_bytes > MAX_INFO_BATCH_BYTES
+                || infos.insert(key, &info.content).is_some()
+                || !message_keys
+                    .get(&key)
+                    .is_some_and(|message| message.sticker.is_none() && message.media.is_none())
+            {
+                bail!("Invalid directory message metadata binding");
+            }
+        }
+        let mut media_map = HashMap::with_capacity(batch.message_media.len());
+        for media in &batch.message_media {
+            validate_id(&media.account_id)?;
+            validate_id(&media.thread_id)?;
+            validate_id(&media.message_id)?;
+            let key = (media.thread_id.as_str(), media.message_id.as_str());
+            info_bytes = info_bytes.saturating_add(media.content.as_json().len());
+            if media.account_id != batch.account_id
+                || info_bytes > MAX_INFO_BATCH_BYTES
+                || media_map.insert(key, &media.content).is_some()
+                || infos.contains_key(&key)
+                || !message_keys.get(&key).is_some_and(|message| {
+                    message.sticker.is_none()
+                        && message.media.as_ref() == Some(media.content.descriptor())
+                })
+            {
+                bail!("Invalid directory media metadata binding");
+            }
         }
         let tx = self.conn.transaction()?;
         let count: usize = tx.query_row(
@@ -144,7 +230,20 @@ impl MessageStore {
                 ])?;
             }
         }
-        let inserted_messages = insert_validated(&tx, &batch.messages)?;
+        let inserted_messages = insert_validated_with_media(
+            &tx,
+            batch.messages.iter().map(|message| {
+                (
+                    message,
+                    infos
+                        .get(&(message.thread_id.as_str(), message.id.as_str()))
+                        .copied(),
+                    media_map
+                        .get(&(message.thread_id.as_str(), message.id.as_str()))
+                        .copied(),
+                )
+            }),
+        )?;
         {
             let mut rename = tx.prepare_cached("UPDATE conversations SET title=(SELECT display_name FROM directory_entries d WHERE d.account_id=?1 AND d.thread_id=?2)
                 WHERE account_id=?1 AND thread_id=?2 AND EXISTS(SELECT 1 FROM directory_entries d WHERE d.account_id=?1 AND d.thread_id=?2)")?;
@@ -220,6 +319,98 @@ impl MessageStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sender_names_are_bounded_account_scoped_user_records_not_group_titles() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let mut user = entry("Nguyễn Hà");
+        let mut group = user.clone();
+        group.is_group = true;
+        group.display_name = "Nhóm có cùng ID".into();
+        store
+            .apply_directory_batch(&DirectoryBatch {
+                account_id: "11".into(),
+                entries: vec![user.clone(), group],
+                messages: vec![],
+                message_info: vec![],
+                message_media: vec![],
+                observed_at_ms: 1,
+            })
+            .unwrap();
+        user.display_name = "Tên tài khoản khác".into();
+        store
+            .apply_directory_batch(&DirectoryBatch {
+                account_id: "33".into(),
+                entries: vec![user],
+                messages: vec![],
+                message_info: vec![],
+                message_media: vec![],
+                observed_at_ms: 1,
+            })
+            .unwrap();
+        let ids = vec!["12".into(), "12".into(), "99".into()];
+        assert_eq!(
+            store.sender_names("11", &ids).unwrap(),
+            vec![SenderName {
+                sender_id: "12".into(),
+                display_name: "Nguyễn Hà".into()
+            }]
+        );
+        assert_eq!(
+            store.sender_names("33", &ids).unwrap()[0].display_name,
+            "Tên tài khoản khác"
+        );
+        assert!(store.sender_names("44", &ids).unwrap().is_empty());
+        assert!(store
+            .sender_names("11", &vec!["12".into(); MAX_SENDER_NAMES + 1])
+            .is_err());
+        for bad in ["", "\n", &"x".repeat(257)] {
+            assert!(store.sender_names("11", &[bad.into()]).is_err());
+        }
+        let plan:Vec<String>=store.conn.prepare("EXPLAIN QUERY PLAN SELECT display_name FROM directory_entries WHERE account_id=?1 AND thread_id=?2 AND remote_id=?3 AND is_group=0").unwrap().query_map(params!["11","d:12","12"],|row|row.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(plan
+            .iter()
+            .any(|row| row.contains("SEARCH") && row.contains("account_id=? AND thread_id=?")));
+        assert!(!plan.iter().any(|row| row.contains("SCAN")));
+    }
+    #[test]
+    fn sender_rename_and_restart_leave_message_identity_and_keyset_history_unchanged() {
+        let path = std::env::temp_dir().join(format!(
+            "zalo-sender-names-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        {
+            let mut store = MessageStore::open(&path).unwrap();
+            store.apply_directory_batch(&batch("11", "Tên cũ")).unwrap();
+            let before = store.page("11", "d:12", None, 10).unwrap();
+            assert_eq!(
+                store.sender_names("11", &["12".into()]).unwrap()[0].display_name,
+                "Tên cũ"
+            );
+            let mut rename = batch("11", "Tên mới");
+            rename.observed_at_ms += 1;
+            store.apply_directory_batch(&rename).unwrap();
+            assert_eq!(
+                store.sender_names("11", &["12".into()]).unwrap()[0].display_name,
+                "Tên mới"
+            );
+            assert_eq!(store.page("11", "d:12", None, 10).unwrap(), before);
+            let cursor = before[0].cursor();
+            assert!(store
+                .page("11", "d:12", Some(&cursor), 10)
+                .unwrap()
+                .is_empty());
+        }
+        {
+            let store = MessageStore::open(&path).unwrap();
+            assert_eq!(
+                store.sender_names("11", &["12".into()]).unwrap()[0].display_name,
+                "Tên mới"
+            );
+            assert!(store.sender_names("33", &["12".into()]).unwrap().is_empty());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
     fn entry(name: &str) -> DirectoryRecord {
         DirectoryRecord {
             remote_id: "12".into(),
@@ -239,6 +430,7 @@ mod tests {
             sender: "12".into(),
             text: text.into(),
             sticker: None,
+            media: None,
             sent_at_ms: 100,
         }
     }
@@ -247,8 +439,125 @@ mod tests {
             account_id: account.into(),
             entries: vec![entry(name)],
             messages: vec![message(account, "501", "actual synthetic preview")],
+            message_info: vec![],
+            message_media: vec![],
             observed_at_ms: 1000,
         }
+    }
+
+    fn info_batch(name: &str) -> DirectoryBatch {
+        let mut batch = batch("11", name);
+        let message = &batch.messages[0];
+        batch.message_info.push(MessageInfoBinding {
+            account_id:message.account_id.clone(),thread_id:message.thread_id.clone(),message_id:message.id.clone(),
+            content:crate::domain::InfoMessageContent::new(&serde_json::json!({"action":"msginfo.actionlist","unknown":{"Actions":[{"actionId":7}]},"params":"{\"msg\":{\"vi\":\"Thông tin nhóm\"}}"})).unwrap(),
+        });
+        batch
+    }
+
+    #[test]
+    fn directory_info_and_socket_replay_in_both_orders_without_type_conversion() {
+        for preview_first in [true, false] {
+            let mut store = MessageStore::in_memory().unwrap();
+            let preview = info_batch("Retained contact name");
+            let m = preview.messages[0].clone();
+            let info = preview.message_info[0].content.clone();
+            if preview_first {
+                assert_eq!(
+                    store
+                        .apply_directory_batch(&preview)
+                        .unwrap()
+                        .inserted_messages,
+                    1
+                );
+                assert!(store
+                    .receive_batch_with_info(
+                        "11",
+                        &[(m.clone(), None, Some(info.clone()))],
+                        Some(("510_1", "100"))
+                    )
+                    .unwrap()
+                    .is_empty());
+            } else {
+                assert_eq!(
+                    store
+                        .receive_batch_with_info(
+                            "11",
+                            &[(m.clone(), None, Some(info.clone()))],
+                            Some(("510_1", "100"))
+                        )
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    store
+                        .apply_directory_batch(&preview)
+                        .unwrap()
+                        .inserted_messages,
+                    0
+                );
+            }
+            assert_eq!(
+                store.message_info("11", &m.thread_id, &m.id).unwrap(),
+                Some(info)
+            );
+            assert_eq!(
+                store.page("11", &m.thread_id, None, 10).unwrap(),
+                vec![m.clone()]
+            );
+            let mut conflict = info_batch("Must roll back rename");
+            conflict.message_info[0].content=crate::domain::InfoMessageContent::new(&serde_json::json!({"action":"msginfo.actionlist","unknown":{"Actions":[{"actionId":8}]}})).unwrap();
+            assert!(store.apply_directory_batch(&conflict).is_err());
+            assert_eq!(
+                store
+                    .directory_record("11", &m.thread_id)
+                    .unwrap()
+                    .unwrap()
+                    .display_name,
+                "Retained contact name"
+            );
+            assert_eq!(store.receive_cursor("11", "510_1").unwrap(), "100");
+        }
+    }
+
+    #[test]
+    fn directory_info_binding_validation_and_sql_failure_preserve_all_rows() {
+        let mut store = MessageStore::in_memory().unwrap();
+        for invalid in 0..4 {
+            let mut preview = info_batch("Must not persist");
+            match invalid {
+                0 => preview.message_info[0].account_id = "33".into(),
+                1 => preview.message_info[0].thread_id = "g:12".into(),
+                2 => preview.message_info[0].message_id = "unrelated".into(),
+                _ => preview.message_info.push(preview.message_info[0].clone()),
+            }
+            assert!(store.apply_directory_batch(&preview).is_err());
+            assert!(store
+                .directory_page("11", false, "", None, 10)
+                .unwrap()
+                .is_empty());
+            assert!(store.conversations("11", 10).unwrap().is_empty());
+        }
+        store.conn.execute_batch("CREATE TRIGGER reject_directory_info BEFORE INSERT ON message_info BEGIN SELECT RAISE(ABORT,'synthetic info failure'); END;").unwrap();
+        let preview = info_batch("Must be atomic");
+        assert!(store.apply_directory_batch(&preview).is_err());
+        assert!(store
+            .directory_page("11", false, "", None, 10)
+            .unwrap()
+            .is_empty());
+        assert!(store.conversations("11", 10).unwrap().is_empty());
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_directory_info")
+            .unwrap();
+        assert_eq!(
+            store
+                .apply_directory_batch(&preview)
+                .unwrap()
+                .inserted_messages,
+            1
+        );
     }
     #[test]
     fn scoped_metadata_replays_and_titles_preserve_existing_messages_and_outbox() {
@@ -396,6 +705,8 @@ mod tests {
                     account_id: "11".into(),
                     entries: chunk.to_vec(),
                     messages: vec![],
+                    message_info: vec![],
+                    message_media: vec![],
                     observed_at_ms: 100,
                 })
                 .unwrap();
@@ -407,6 +718,8 @@ mod tests {
                 account_id: "11".into(),
                 entries: vec![record.clone()],
                 messages: vec![],
+                message_info: vec![],
+                message_media: vec![],
                 observed_at_ms: 101,
             })
             .unwrap();
@@ -430,6 +743,8 @@ mod tests {
                 account_id: "11".into(),
                 entries: vec![partial],
                 messages: vec![],
+                message_info: vec![],
+                message_media: vec![],
                 observed_at_ms: 102,
             })
             .unwrap();
@@ -454,7 +769,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            4
+            6
         );
         assert_eq!(
             store.page("11", "d:12", None, 10).unwrap()[0].text,

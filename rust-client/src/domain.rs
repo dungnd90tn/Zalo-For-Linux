@@ -3,12 +3,123 @@ use anyhow::{bail, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod info;
+pub mod media;
+pub use media::{
+    CardButton, CardRow, MediaContentError, MediaDescriptor, MediaKind, MediaMessageContent,
+    MessageMediaBinding, PhotoDescriptor, WebContentDescriptor, MAX_MEDIA_DESCRIPTOR_BYTES,
+};
+
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 200;
 pub const MAX_PREVIEW_CHARS: usize = 256;
 pub const MAX_STICKER_ID: u64 = 9_007_199_254_740_991;
 pub const LEGACY_STICKER_PLACEHOLDER: &str = "[Tin nhắn chat.sticker chưa được hỗ trợ]";
 pub const STICKER_PREVIEW: &str = "[Nhãn dán]";
+pub const MAX_INFO_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_INFO_BATCH_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_INFO_DEPTH: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfoContentError {
+    Invalid,
+    Oversize,
+}
+impl std::fmt::Display for InfoContentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Invalid => "Invalid info message content",
+            Self::Oversize => "Info message content exceeds limit",
+        })
+    }
+}
+impl std::error::Error for InfoContentError {}
+
+/// Complete source-backed webchat info content, kept off the rendering thread.
+/// Unknown fields and the original nested `params` string are retained. The
+/// presentation text lives separately in Message and cannot replace this data.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InfoMessageContent(String);
+
+/// Full scope accompanies metadata across preview pagination/chunking so that
+/// it cannot be accidentally attached to a different message or account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageInfoBinding {
+    pub account_id: String,
+    pub thread_id: String,
+    pub message_id: String,
+    pub content: InfoMessageContent,
+}
+
+impl std::fmt::Debug for InfoMessageContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InfoMessageContent")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
+impl InfoMessageContent {
+    pub fn new(content: &serde_json::Value) -> std::result::Result<Self, InfoContentError> {
+        if !content.is_object()
+            || content.get("action").and_then(serde_json::Value::as_str)
+                != Some("msginfo.actionlist")
+        {
+            return Err(InfoContentError::Invalid);
+        }
+        canonical_content_json(content).map(Self)
+    }
+
+    pub fn as_json(&self) -> &str {
+        &self.0
+    }
+}
+
+fn canonical_content_json(
+    content: &serde_json::Value,
+) -> std::result::Result<String, InfoContentError> {
+    fn check_depth(
+        value: &serde_json::Value,
+        depth: usize,
+    ) -> std::result::Result<(), InfoContentError> {
+        // serde_json starts with 128 and refuses the container that would
+        // decrement it to zero. Scalars do not consume recursion depth.
+        if depth >= MAX_INFO_DEPTH - 1 && (value.is_array() || value.is_object()) {
+            return Err(InfoContentError::Oversize);
+        }
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    check_depth(value, depth + 1)?;
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    check_depth(value, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    check_depth(content, 0)?;
+    struct BoundedWriter(Vec<u8>);
+    impl std::io::Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_INFO_CONTENT_BYTES.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("Info message exceeds limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = BoundedWriter(Vec::new());
+    serde_json::to_writer(&mut output, content).map_err(|_| InfoContentError::Oversize)?;
+    String::from_utf8(output.0).map_err(|_| InfoContentError::Invalid)
+}
 
 /// Plain-text composer sends use ECMAScript String.trim in the original PC
 /// client (_sendPlainText). This deliberately differs from Rust's Unicode trim:
@@ -52,6 +163,8 @@ pub struct Message {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticker: Option<StickerDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaDescriptor>,
     pub sent_at_ms: i64,
 }
 
@@ -61,6 +174,12 @@ impl Message {
         validate_id(&self.thread_id)?;
         validate_id(&self.id)?;
         validate_id(&self.sender)?;
+        if let Some(media) = &self.media {
+            media.validate()?;
+            if self.sticker.is_some() || self.text != media.kind().legacy_placeholder() {
+                bail!("Media metadata requires its source fallback text")
+            }
+        }
         if let Some(sticker) = &self.sticker {
             sticker.validate()?;
             if self.text != LEGACY_STICKER_PLACEHOLDER {
@@ -74,7 +193,9 @@ impl Message {
     }
 
     pub fn preview_text(&self) -> &str {
-        if self.sticker.is_some() {
+        if let Some(media) = &self.media {
+            media.preview_text()
+        } else if self.sticker.is_some() {
             STICKER_PREVIEW
         } else {
             &self.text
@@ -182,6 +303,7 @@ mod tests {
             sender: "s".into(),
             text: "hello".into(),
             sticker: None,
+            media: None,
             sent_at_ms: 1,
         };
         assert!(m.validate().is_ok());

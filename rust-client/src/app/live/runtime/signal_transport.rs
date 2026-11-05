@@ -1029,7 +1029,7 @@ mod tls_tests {
             )
             .await
             .unwrap();
-            Connection::connected(socket)
+            Connection::connected(socket, session.account_id())
         }
     }
     impl Drop for Fixture {

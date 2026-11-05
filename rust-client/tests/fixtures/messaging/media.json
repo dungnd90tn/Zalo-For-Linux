@@ -1,0 +1,104 @@
+{
+  "provenance": "Exact original photo _normalizeMessageJSON (identity transcode) and ZInstant V1 reader/getPreviewMsgZNS; synthetic read-only payloads, no remote templates",
+  "cases": [
+    {
+      "name": "photo_string",
+      "kind": "chat.photo",
+      "content": {
+        "title": "Ảnh minh họa",
+        "description": "Ảnh gửi trong nhóm",
+        "href": "https://f12-zpcloud.zdn.vn/synthetic-normal.jpg",
+        "thumb": "https://f12-zpcloud.zdn.vn/synthetic-thumb.jpg",
+        "params": "{\"hd\":\"https://f12-zpcloud.zdn.vn/synthetic-hd.jpg?sig=one%2Btwo\",\"width\":\"640\",\"height\":480,\"unknown\":{\"retained\":true}}",
+        "unknown": [
+          "full",
+          "content"
+        ]
+      },
+      "expected": {
+        "title": "Ảnh minh họa",
+        "caption": "Ảnh gửi trong nhóm",
+        "thumbnail_url": "https://f12-zpcloud.zdn.vn/synthetic-thumb.jpg",
+        "original_url": "https://f12-zpcloud.zdn.vn/synthetic-hd.jpg?sig=one%2Btwo",
+        "width": 640,
+        "height": 480
+      }
+    },
+    {
+      "name": "photo_object",
+      "kind": "chat.photo",
+      "content": {
+        "title": "Ảnh minh họa",
+        "description": "Ảnh gửi trong nhóm",
+        "href": "https://f12-zpcloud.zdn.vn/synthetic-normal.jpg",
+        "thumb": "https://f12-zpcloud.zdn.vn/synthetic-thumb.jpg",
+        "params": {
+          "hd": "https://f12-zpcloud.zdn.vn/synthetic-hd.jpg?sig=one%2Btwo",
+          "width": "640",
+          "height": 480,
+          "unknown": {
+            "retained": true
+          }
+        },
+        "unknown": [
+          "full",
+          "content"
+        ]
+      },
+      "expected": {
+        "title": "Ảnh minh họa",
+        "caption": "Ảnh gửi trong nhóm",
+        "thumbnail_url": "https://f12-zpcloud.zdn.vn/synthetic-thumb.jpg",
+        "original_url": "https://f12-zpcloud.zdn.vn/synthetic-hd.jpg?sig=one%2Btwo",
+        "width": 640,
+        "height": 480
+      }
+    },
+    {
+      "name": "webcontent_string",
+      "kind": "chat.webcontent",
+      "content": {
+        "title": "Thông báo đơn hàng",
+        "description": "Thông tin từ tài khoản dịch vụ",
+        "thumb": "https://f14-zpcloud.zdn.vn/synthetic-card.jpg",
+        "params": "{\"customMsg\":{\"msg\":{\"vi\":\"Đơn hàng đã được giao thành công\",\"en\":\"Delivered\"}},\"item\":{\"bundle_data\":\"{\\\"remoteTemplateSpecific\\\":{\\\"orderId\\\":\\\"synthetic\\\"}}\"},\"pcItem\":{\"layoutPC\":3},\"unknown\":{\"preserved\":true}}"
+      },
+      "expected": {
+        "title": "Đơn hàng đã được giao thành công",
+        "description": "Thông tin từ tài khoản dịch vụ",
+        "image_url": "https://f14-zpcloud.zdn.vn/synthetic-card.jpg"
+      }
+    },
+    {
+      "name": "webcontent_object",
+      "kind": "chat.webcontent",
+      "content": {
+        "title": "Thông báo đơn hàng",
+        "description": "Thông tin từ tài khoản dịch vụ",
+        "thumb": "https://f14-zpcloud.zdn.vn/synthetic-card.jpg",
+        "params": {
+          "customMsg": {
+            "msg": {
+              "vi": "Đơn hàng đã được giao thành công",
+              "en": "Delivered"
+            }
+          },
+          "item": {
+            "bundle_data": "{\"remoteTemplateSpecific\":{\"orderId\":\"synthetic\"}}"
+          },
+          "pcItem": {
+            "layoutPC": 3
+          },
+          "unknown": {
+            "preserved": true
+          }
+        }
+      },
+      "expected": {
+        "title": "Đơn hàng đã được giao thành công",
+        "description": "Thông tin từ tài khoản dịch vụ",
+        "image_url": "https://f14-zpcloud.zdn.vn/synthetic-card.jpg"
+      }
+    }
+  ]
+}

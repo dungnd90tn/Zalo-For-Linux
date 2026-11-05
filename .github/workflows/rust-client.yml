@@ -2,9 +2,9 @@ name: Rust client preview
 
 on:
   push:
-    paths: ['rust-client/**', 'scripts/rust/**', '.github/workflows/rust-client.yml']
+    paths: ['rust-client/**', 'scripts/rust/**', 'pc-dist/*.css', 'pc-dist/fonts/**', 'pc-dist/favicon-*.png', 'pc-dist/compact-app-pc.*.js', '.github/workflows/rust-client.yml']
   pull_request:
-    paths: ['rust-client/**', 'scripts/rust/**', '.github/workflows/rust-client.yml']
+    paths: ['rust-client/**', 'scripts/rust/**', 'pc-dist/*.css', 'pc-dist/fonts/**', 'pc-dist/favicon-*.png', 'pc-dist/compact-app-pc.*.js', '.github/workflows/rust-client.yml']
 
 permissions:
   contents: read
@@ -18,7 +18,11 @@ jobs:
         working-directory: rust-client
         run: rustup show active-toolchain
       - name: Install Linux build libraries
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev openssl nodejs
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev libgl1-mesa-dev openssl nodejs desktop-file-utils
+      - name: Check complete source theme/icon inventory for drift
+        run: |
+          python3 scripts/rust/inventory-ui-assets.py --check
+          python3 scripts/rust/generate-ui-catalog.py --check
       - name: Fetch pinned dependencies
         working-directory: rust-client
         run: cargo fetch --locked --manifest-path Cargo.toml

@@ -1,7 +1,7 @@
 //! SQLite storage owned by one background thread. All pages have a fixed upper bound.
 use crate::domain::{
-    canonical_plain_text, validate_id, Conversation, Cursor, Message, MAX_PAGE_SIZE,
-    MAX_PREVIEW_CHARS,
+    canonical_plain_text, validate_id, Conversation, Cursor, InfoMessageContent,
+    MediaMessageContent, Message, MAX_INFO_BATCH_BYTES, MAX_PAGE_SIZE, MAX_PREVIEW_CHARS,
 };
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -9,6 +9,19 @@ use std::path::Path;
 pub mod directory;
 pub mod e2ee;
 pub mod message_content;
+mod message_info;
+mod message_media;
+
+pub const MAX_REFRESH_MESSAGES: usize = 50;
+
+/// One received message with optional outbox hint and complete rich sidecars.
+/// The immutable metadata commits with its message and receive cursor.
+pub type ReceivedMedia = (
+    Message,
+    Option<String>,
+    Option<InfoMessageContent>,
+    Option<MediaMessageContent>,
+);
 
 /// Closed, payload-free storage diagnostics. Never log an arbitrary error chain:
 /// database driver messages can include SQL or data from a failing trigger.
@@ -83,18 +96,20 @@ const CURSOR_PAGE_SQL: &str =
     WHERE m.account_id=?1 AND m.thread_id=?2 AND (m.sent_at_ms,m.message_id)<(?3,?4)
     ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?5";
 const CONVERSATIONS_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
-    CASE WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),'') END,COALESCE(m.sender,'') FROM conversations c
+    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),'') END,COALESCE(m.sender,'') FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
     LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
+    LEFT JOIN message_media media ON media.account_id=m.account_id AND media.thread_id=m.thread_id AND media.message_id=m.message_id
     WHERE c.account_id=?1 ORDER BY c.last_message_at_ms DESC,c.thread_id LIMIT ?2";
 const CONVERSATION_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
-    CASE WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),'') END,COALESCE(m.sender,'') FROM conversations c
+    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),'') END,COALESCE(m.sender,'') FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
     LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
+    LEFT JOIN message_media media ON media.account_id=m.account_id AND media.thread_id=m.thread_id AND media.message_id=m.message_id
     WHERE c.account_id=?1 AND c.thread_id=?2";
 fn conversation_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
     Ok(Conversation {
@@ -106,6 +121,29 @@ fn conversation_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
     })
 }
 fn insert_validated(conn: &Connection, messages: &[Message]) -> Result<usize> {
+    insert_validated_with_info(conn, messages.iter().map(|message| (message, None)))
+}
+fn insert_validated_with_info<'a>(
+    conn: &Connection,
+    messages: impl IntoIterator<Item = (&'a Message, Option<&'a InfoMessageContent>)>,
+) -> Result<usize> {
+    insert_validated_with_media(
+        conn,
+        messages
+            .into_iter()
+            .map(|(message, info)| (message, info, None)),
+    )
+}
+fn insert_validated_with_media<'a>(
+    conn: &Connection,
+    messages: impl IntoIterator<
+        Item = (
+            &'a Message,
+            Option<&'a InfoMessageContent>,
+            Option<&'a MediaMessageContent>,
+        ),
+    >,
+) -> Result<usize> {
     let mut inserted = 0;
     {
         let mut thread = conn.prepare_cached(
@@ -121,7 +159,12 @@ fn insert_validated(conn: &Connection, messages: &[Message]) -> Result<usize> {
             "INSERT INTO messages(account_id,thread_id,message_id,sender,body,sent_at_ms)
                 VALUES (?1,?2,?3,?4,?5,?6)",
         )?;
-        for m in messages {
+        for (m, info, media) in messages {
+            if (info.is_some() && (media.is_some() || m.media.is_some()))
+                || (m.sticker.is_some() && media.is_some())
+            {
+                bail!(FailureReason::Validation);
+            }
             let previous: Option<(String, String, i64)> = existing
                 .query_row(params![m.account_id, m.thread_id, m.id], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -132,6 +175,8 @@ fn insert_validated(conn: &Connection, messages: &[Message]) -> Result<usize> {
                     bail!(FailureReason::ConflictingMessage);
                 }
                 message_content::persist(conn, m, true)?;
+                message_info::persist(conn, m, info, true)?;
+                message_media::persist(conn, m, media, true)?;
                 continue;
             }
             thread.execute(params![m.account_id, m.thread_id, m.sent_at_ms])?;
@@ -144,6 +189,8 @@ fn insert_validated(conn: &Connection, messages: &[Message]) -> Result<usize> {
                 m.sent_at_ms
             ])?;
             message_content::persist(conn, m, false)?;
+            message_info::persist(conn, m, info, false)?;
+            message_media::persist(conn, m, media, false)?;
         }
     }
     Ok(inserted)
@@ -164,7 +211,7 @@ impl MessageStore {
     fn initialize(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 4 {
+        if version > 6 {
             bail!("Database was created by a newer client");
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
@@ -193,7 +240,9 @@ impl MessageStore {
         directory::initialize(&conn)?;
         e2ee::initialize(&conn)?;
         message_content::initialize(&conn)?;
-        conn.execute_batch("PRAGMA user_version=4; COMMIT;")?;
+        message_info::initialize(&conn)?;
+        message_media::initialize(&conn)?;
+        conn.execute_batch("PRAGMA user_version=6; COMMIT;")?;
         Ok(Self { conn })
     }
 
@@ -376,6 +425,7 @@ impl MessageStore {
             sender: account.into(),
             text,
             sticker: None,
+            media: None,
             sent_at_ms: existing_ts.or(timestamp).unwrap_or(created),
         };
         message.validate()?;
@@ -396,13 +446,79 @@ impl MessageStore {
         messages: &[(Message, Option<String>)],
         cursor: Option<(&str, &str)>,
     ) -> Result<Vec<(Message, Conversation)>> {
+        self.receive_batch_inner(
+            account,
+            messages
+                .iter()
+                .map(|(message, client)| (message, client, None, None)),
+            messages.len(),
+            cursor,
+        )
+    }
+
+    /// Full info content is immutable and commits in the very same transaction
+    /// as its text projection, outbox updates, and durable replay cursor.
+    pub fn receive_batch_with_info(
+        &mut self,
+        account: &str,
+        messages: &[(Message, Option<String>, Option<InfoMessageContent>)],
+        cursor: Option<(&str, &str)>,
+    ) -> Result<Vec<(Message, Conversation)>> {
+        self.receive_batch_inner(
+            account,
+            messages
+                .iter()
+                .map(|(message, client, info)| (message, client, info.as_ref(), None)),
+            messages.len(),
+            cursor,
+        )
+    }
+
+    pub fn receive_batch_with_media(
+        &mut self,
+        account: &str,
+        messages: &[ReceivedMedia],
+        cursor: Option<(&str, &str)>,
+    ) -> Result<Vec<(Message, Conversation)>> {
+        self.receive_batch_inner(
+            account,
+            messages
+                .iter()
+                .map(|(m, c, i, media)| (m, c, i.as_ref(), media.as_ref())),
+            messages.len(),
+            cursor,
+        )
+    }
+
+    fn receive_batch_inner<'a>(
+        &mut self,
+        account: &str,
+        messages: impl Iterator<
+                Item = (
+                    &'a Message,
+                    &'a Option<String>,
+                    Option<&'a InfoMessageContent>,
+                    Option<&'a MediaMessageContent>,
+                ),
+            > + Clone,
+        message_count: usize,
+        cursor: Option<(&str, &str)>,
+    ) -> Result<Vec<(Message, Conversation)>> {
         validate_id(account).map_err(|_| FailureReason::Validation)?;
-        if messages.len() > MAX_PAGE_SIZE {
+        if message_count > MAX_PAGE_SIZE {
             bail!(FailureReason::Validation);
         }
-        for (m, _) in messages {
+        let mut info_bytes = 0usize;
+        for (m, _, info, media) in messages.clone() {
             m.validate().map_err(|_| FailureReason::Validation)?;
-            if m.account_id != account {
+            info_bytes = info_bytes.saturating_add(info.map_or(0, |info| info.as_json().len()));
+            info_bytes = info_bytes.saturating_add(media.map_or(0, |media| media.as_json().len()));
+            if m.account_id != account
+                || (info.is_some() && m.sticker.is_some())
+                || (info.is_some() && (media.is_some() || m.media.is_some()))
+                || (media.is_some() && m.sticker.is_some())
+                || info_bytes > MAX_INFO_BATCH_BYTES
+            {
                 bail!(FailureReason::Validation);
             }
         }
@@ -415,10 +531,17 @@ impl MessageStore {
             }
         }
         let tx = self.conn.transaction()?;
-        let mut result = Vec::with_capacity(messages.len());
-        for (m, client_id) in messages {
+        let mut result = Vec::with_capacity(message_count);
+        for (m, client_id, info, media) in messages {
             let mut adjusted = 0;
-            if m.sender == account {
+            // System/info events can carry source cliMsgId values but are not
+            // acknowledgements of the user's plain-text send intent.
+            if m.sender == account
+                && info.is_none()
+                && media.is_none()
+                && m.media.is_none()
+                && m.sticker.is_none()
+            {
                 let explicit: Option<(String, String, String, Option<String>)> = client_id
                     .as_ref()
                     .map(|client_id| {
@@ -460,7 +583,7 @@ impl MessageStore {
                     let mismatch = OutgoingMismatchFields {
                         thread: thread != m.thread_id,
                         body: body != m.text && !repair_body,
-                        content_type: m.sticker.is_some(),
+                        content_type: m.sticker.is_some() || info.is_some(),
                     };
                     if mismatch.mask() != 0 {
                         return Err(
@@ -490,17 +613,20 @@ impl MessageStore {
                 }
             }
             let sticker_enriched = m.sticker.is_some() && message_content::load(&tx, m)?.is_none();
-            let inserted = insert_validated(&tx, std::slice::from_ref(m))?;
+            let media_enriched = media.is_some() && !message_media::exists(&tx, m)?;
+            let inserted = insert_validated_with_media(&tx, std::iter::once((m, info, media)))?;
             if adjusted > 0 {
                 tx.execute("UPDATE conversations SET last_message_at_ms=(SELECT MAX(sent_at_ms) FROM messages WHERE account_id=?1 AND thread_id=?2) WHERE account_id=?1 AND thread_id=?2",params![account,m.thread_id])?;
             }
-            if inserted > 0 || adjusted > 0 || sticker_enriched {
+            if inserted > 0 || adjusted > 0 || sticker_enriched || media_enriched {
                 let c = tx.query_row(
                     CONVERSATION_SQL,
                     params![account, m.thread_id, MAX_PREVIEW_CHARS as i64],
                     conversation_row,
                 )?;
-                result.push((m.clone(), c));
+                let mut hydrated = m.clone();
+                hydrated.media = message_media::projection(&tx, m)?;
+                result.push((hydrated, c));
             }
         }
         if let Some((queue, id)) = cursor {
@@ -509,6 +635,84 @@ impl MessageStore {
         tx.commit()?;
         Ok(result)
     }
+
+    /// Explicit bounded worker-side access; pages never load full rich payloads.
+    pub fn message_info(
+        &self,
+        account: &str,
+        thread: &str,
+        id: &str,
+    ) -> Result<Option<InfoMessageContent>> {
+        validate_id(account).map_err(|_| FailureReason::Validation)?;
+        validate_id(thread).map_err(|_| FailureReason::Validation)?;
+        validate_id(id).map_err(|_| FailureReason::Validation)?;
+        message_info::load(&self.conn, account, thread, id)
+    }
+
+    /// Full private content is fetched explicitly by the SQLite owner; normal
+    /// history snapshots only hydrate its bounded presentation projection.
+    pub fn message_media(
+        &self,
+        account: &str,
+        thread: &str,
+        id: &str,
+    ) -> Result<Option<MediaMessageContent>> {
+        validate_id(account).map_err(|_| FailureReason::Validation)?;
+        validate_id(thread).map_err(|_| FailureReason::Validation)?;
+        validate_id(id).map_err(|_| FailureReason::Validation)?;
+        message_media::load(&self.conn, account, thread, id)
+    }
+    /// Rehydrate only the caller's bounded displayed IDs. Missing rows never
+    /// imply deletion; no chronological page or private raw sidecar is loaded.
+    pub fn refresh_messages(
+        &self,
+        account: &str,
+        thread: &str,
+        message_ids: &[String],
+    ) -> Result<Vec<Message>> {
+        validate_id(account).map_err(|_| FailureReason::Validation)?;
+        validate_id(thread).map_err(|_| FailureReason::Validation)?;
+        if message_ids.len() > MAX_REFRESH_MESSAGES {
+            bail!(FailureReason::Validation);
+        }
+        let mut unique = std::collections::HashSet::with_capacity(message_ids.len());
+        for id in message_ids {
+            validate_id(id).map_err(|_| FailureReason::Validation)?;
+            if !unique.insert(id) {
+                bail!(FailureReason::Validation);
+            }
+        }
+        let mut statement=self.conn.prepare_cached("SELECT m.account_id,m.thread_id,m.message_id,m.sender,m.body,m.sent_at_ms,
+            CASE WHEN length(CAST(content.metadata AS BLOB))<=256 THEN content.metadata ELSE NULL END FROM messages m
+            LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
+            WHERE m.account_id=?1 AND m.thread_id=?2 AND m.message_id=?3")?;
+        let mut result = Vec::with_capacity(message_ids.len());
+        for id in message_ids {
+            let message = statement
+                .query_row(params![account, thread, id], |row| {
+                    Ok(Message {
+                        account_id: row.get(0)?,
+                        thread_id: row.get(1)?,
+                        id: row.get(2)?,
+                        sender: row.get(3)?,
+                        text: row.get(4)?,
+                        sent_at_ms: row.get(5)?,
+                        sticker: message_content::decode(row.get(6)?),
+                        media: None,
+                    })
+                })
+                .optional()?;
+            if let Some(mut message) = message {
+                message.media = message_media::projection(&self.conn, &message)?;
+                message
+                    .validate()
+                    .map_err(|_| FailureReason::ConflictingMetadata)?;
+                result.push(message);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn receive_cursor(&self, account: &str, queue: &str) -> Result<String> {
         validate_id(account)?;
         validate_id(queue)?;
@@ -576,6 +780,7 @@ impl MessageStore {
                 sender: r.get(3)?,
                 text: r.get(4)?,
                 sticker: message_content::decode(r.get(6)?),
+                media: None,
                 sent_at_ms: r.get(5)?,
             })
         };
@@ -594,6 +799,12 @@ impl MessageStore {
             let mapped = stmt.query_map(params![account, thread, limit as i64], row)?;
             mapped.collect::<rusqlite::Result<_>>()?
         };
+        for message in &mut result {
+            message.media = message_media::projection(&self.conn, message)?;
+            message
+                .validate()
+                .map_err(|_| FailureReason::ConflictingMetadata)?;
+        }
         result.reverse();
         Ok(result)
     }
@@ -638,6 +849,7 @@ mod tests {
             sender: "A".into(),
             text: format!("Message {id}"),
             sticker: None,
+            media: None,
             sent_at_ms: ts,
         }
     }
@@ -845,6 +1057,7 @@ mod live_storage_tests {
             sender: "11".into(),
             text: "hello".into(),
             sticker: None,
+            media: None,
             sent_at_ms: ts,
         }
     }
@@ -1050,7 +1263,7 @@ mod live_storage_tests {
                 .unwrap_err();
             let expected = match variant {
                 0 => FailureReason::Sqlite,
-                4 | 7 => FailureReason::ConflictingMessage,
+                4 | 5 | 7 => FailureReason::ConflictingMessage,
                 8 => FailureReason::ConflictingMetadata,
                 _ => FailureReason::OutgoingMismatch,
             };
@@ -1063,9 +1276,6 @@ mod live_storage_tests {
                 assert!((1..=7).contains(&mask));
                 if variant == 3 {
                     assert_eq!(mask, 1);
-                }
-                if variant == 5 {
-                    assert_eq!(mask, 6);
                 }
             }
             let body: String = s

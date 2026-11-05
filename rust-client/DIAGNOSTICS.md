@@ -25,6 +25,24 @@ accept raw error strings, URLs, cookies, QR material, account/message IDs, keys 
 message bodies. Unknown numeric server codes outside the diagnostic range are
 marked explicitly rather than confused with an absent error code.
 
+Receive processing also reports closed field/batch reasons, such as
+`message_client_id`, `message_content`, `message_sender`, `queue_continuation`
+and `queue_progress`. Optional `field_type` describes the rejected JSON type;
+`field_bytes` is a text byte count capped at 65,537. `message_kind` is restricted
+to `webchat`, `webchat_info`, `photo`, `web_content`, `sticker` or `other`. These fields identify a parser
+boundary without retaining the field value, arbitrary message type or content.
+They are recorded for failures even without `--debug-log`. A prior generic
+`synchronization/invalid` record cannot establish which field failed.
+
+Partial directory failures include closed `directory_stage` labels (`friends`,
+`groups`, `previews`, `storage`, `synchronization`) and `directory_category`
+labels (`unavailable`, `network`, `timeout`, `http`, `server`, `crypto`, `schema`,
+`resource`, `cancelled`, `storage`). Such a failure can leave the authenticated
+socket Online while one directory stage remains incomplete; it does not by
+itself prove an offline connection or identify the private rejected payload.
+Media download/decode failures use the separate `media_assets` stage with fixed
+reasons and bounded status/byte fields, never a URL or raw codec error.
+
 The startup record identifies the actual executable by package version, feature
 bits, byte size, modification time and SHA-256. Feature bits are network=1,
 live-login=2, messaging=4 and signal-store=8. Hashing runs on the log writer thread.

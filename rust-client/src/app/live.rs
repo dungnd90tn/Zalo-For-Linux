@@ -2,7 +2,7 @@
 use super::SubmitError;
 pub use crate::app::directory::{DirectoryFailure, DirectoryReport};
 pub use crate::protocol::messaging::ThreadKind;
-pub use crate::store::directory::{DirectoryCursor, DirectoryRecord};
+pub use crate::store::directory::{DirectoryCursor, DirectoryRecord, SenderName, MAX_SENDER_NAMES};
 use crate::{
     domain::{Conversation, Cursor, Message, MAX_TEXT_BYTES},
     profile::Profile,
@@ -100,6 +100,16 @@ impl std::fmt::Display for LiveDiagnostic {
 #[derive(Debug)]
 pub enum LiveCommand {
     Reconnect,
+    RefreshMessages {
+        generation: u64,
+        thread: String,
+        message_ids: Vec<String>,
+    },
+    ResolveSenders {
+        generation: u64,
+        thread: String,
+        sender_ids: Vec<String>,
+    },
     Directory {
         generation: u64,
         is_group: bool,
@@ -129,6 +139,23 @@ pub enum LiveCommand {
 }
 #[derive(Debug)]
 pub enum LiveEvent {
+    MessagesRefreshed {
+        account_id: String,
+        generation: u64,
+        thread: String,
+        messages: Vec<Message>,
+    },
+    MessagesRefreshFailed {
+        account_id: String,
+        generation: u64,
+        thread: String,
+    },
+    SenderNames {
+        account_id: String,
+        generation: u64,
+        thread: String,
+        names: Vec<SenderName>,
+    },
     DirectoryPage {
         account_id: String,
         generation: u64,
@@ -212,7 +239,10 @@ pub enum LiveEvent {
 impl LiveEvent {
     pub fn account_id(&self) -> &str {
         match self {
-            Self::DirectoryPage { account_id, .. }
+            Self::MessagesRefreshed { account_id, .. }
+            | Self::MessagesRefreshFailed { account_id, .. }
+            | Self::SenderNames { account_id, .. }
+            | Self::DirectoryPage { account_id, .. }
             | Self::DirectoryStatus { account_id, .. }
             | Self::DirectoryChanged { account_id, .. }
             | Self::DirectoryFailed { account_id, .. }
@@ -280,6 +310,26 @@ impl LiveWorker {
     pub fn submit(&self, command: LiveCommand) -> std::result::Result<(), SubmitError> {
         use crate::protocol::messaging::Target;
         let valid = match &command {
+            LiveCommand::RefreshMessages {
+                thread,
+                message_ids,
+                ..
+            } => {
+                Target::from_thread(thread).is_ok()
+                    && message_ids.len() <= crate::store::MAX_REFRESH_MESSAGES
+                    && message_ids
+                        .iter()
+                        .all(|id| crate::domain::validate_id(id).is_ok())
+            }
+            LiveCommand::ResolveSenders {
+                thread, sender_ids, ..
+            } => {
+                Target::from_thread(thread).is_ok()
+                    && sender_ids.len() <= MAX_SENDER_NAMES
+                    && sender_ids
+                        .iter()
+                        .all(|sender| crate::domain::validate_id(sender).is_ok())
+            }
             LiveCommand::Directory {
                 is_group,
                 query,
@@ -545,7 +595,10 @@ impl super::Model {
                 self.status = diagnostic.to_string();
                 true
             }
-            LiveEvent::DirectoryPage { .. }
+            LiveEvent::MessagesRefreshed { .. }
+            | LiveEvent::MessagesRefreshFailed { .. }
+            | LiveEvent::SenderNames { .. }
+            | LiveEvent::DirectoryPage { .. }
             | LiveEvent::DirectoryStatus { .. }
             | LiveEvent::DirectoryFailed { .. } => false,
             LiveEvent::Fault { error, .. } => {
@@ -611,6 +664,7 @@ mod tests {
             sender: "11".into(),
             text: "hello".into(),
             sticker: None,
+            media: None,
             sent_at_ms: 20,
         }
     }

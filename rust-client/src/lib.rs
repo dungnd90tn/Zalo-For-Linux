@@ -8,4 +8,5 @@ pub mod profile;
 pub mod protocol;
 pub mod reconnect;
 pub mod store;
+pub mod theme;
 pub mod ui;

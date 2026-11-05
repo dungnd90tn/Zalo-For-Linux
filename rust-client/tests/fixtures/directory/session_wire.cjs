@@ -9,10 +9,10 @@ if (process.argv[2] === 'decrypt') {
     const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
     const bytes = Buffer.concat([decipher.update(input, 'base64'), decipher.final()]);
     process.stdout.write(bytes);
-} else if (process.argv[2] === 'encrypt') {
-    const data = JSON.parse(input);
+} else if (process.argv[2] === 'encrypt' || process.argv[2] === 'encrypt-plaintext') {
+    const plaintext = process.argv[2] === 'encrypt-plaintext' ? input : JSON.stringify({error_code: 0, data: JSON.parse(input)});
     const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
-    const ciphertext = Buffer.concat([cipher.update(JSON.stringify({error_code: 0, data})), cipher.final()]);
+    const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
     process.stdout.write(JSON.stringify({error_code: 0, data: ciphertext.toString('base64')}));
 } else {
     throw new Error('Expected explicit synthetic fixture mode');

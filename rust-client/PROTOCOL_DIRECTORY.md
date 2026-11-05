@@ -22,4 +22,29 @@ SQLite schema version 3 adds metadata and normalized search columns without dele
 
 Recent-preview loading is not full-history migration or cross-device/cloud synchronization. Legacy message IDs, timestamps, account routing and deduplication reuse the existing codec. Unsupported encrypted previews remain explicitly pending and do not consume or acknowledge a Signal queue. Older cloud/mobile history, permissioned group history and E2EE still require their own independently verified contracts and acceptance.
 
-The modules are linked. `cargo test --locked --offline --all-features directory` passed 25 targeted tests at this checkpoint (protocol, real SQLite, real loopback TLS plus UI). TLS fixtures use a separate Node `crypto` oracle for AES-CBC request decoding and encrypted responses, never production sessions. Coverage includes multi-page groups, named cached conversations, repeat deduplication, cross-account isolation, version-2 migration, capacity rollback, partial names, full-cache Vietnamese search, >2 MiB metadata, redirects/size limits, cancellation and sink backpressure. Runtime actor integration has its own acceptance checks; no real-account directory or history acceptance has been performed.
+Authenticated HTTP previews now use `parse_verified_previews(&VerifiedSession, data)`.
+The exact original `getLastMessagesForPreview` caller delegates to the same peer-key
+preprocessor/consumer as authenticated queues: non-self `uidFrom` selects a direct
+peer even when `idTo` names another participant. The immutable local account comes
+from the verified session, never either payload participant. Generic
+`parse_previews` and message parsing retain strict recipient-membership checks.
+Group/self/page routing and numeric identities remain validated. Empty or
+control-only objects produce an empty message list, as in the original; missing/null
+buckets are optional, while scalar data or malformed non-null buckets still fail.
+The offline `tests/fixtures/directory/previews_oracle.cjs` executes the exact
+original HTTP caller, preprocessor and conversation-ID expression for eight cases.
+
+All preview schema failures preserve closed HTTP/parser boundaries through the
+runtime logger, including JSON/envelope phases, collection, reason, type and
+recognized message kind. They never retain payloads, URLs or participant IDs.
+Fifteen HTTP/error boundaries are not inferred from a generic old log: the current
+fourteen-case independently encrypted TLS regression checks representative source
+shapes, malformed later chunks, duplicates, unsupported/encrypted messages and
+outer/decrypted JSON/envelope rejection. Every failed preview retains cached rows,
+outbox and cursor 900; successful unrelated directory stages remain usable.
+
+Structured `webchat` / `msginfo.actionlist` previews carry the full source content alongside the readable projection. `MessageInfoBinding` keys include account, thread and message ID, so a shared numeric message ID in direct/group conversations cannot cross-link metadata. Parsing compares both projected text and complete content on duplicate IDs. The entire response's metadata is limited to 4 MiB; all bindings are validated and distributed before sink writes, then move with their owning 200-message chunk into one atomic directory/message/sidecar transaction. Schema five adds the separate `message_info` table while retaining earlier data. Preview-first and socket-first arrival remain idempotent; changed raw content conflicts even when the display label matches. Previews never advance socket cursors or acknowledge queues. An actual loopback HTTP→directory actor→WSS regression covers both arrival orders, 203 previews crossing a chunk boundary and direct/group messages sharing an ID. See [structured message contracts](PROTOCOL_MESSAGING.md#structured-information-messages).
+
+Schema six extends the same full-scope binding/chunk rules to photo/OA `message_media`, with one combined 4 MiB information/media budget. All message projections and metadata bindings are checked before the first chunk reaches the sink. Actual HTTP→actor→WSS tests cover both orders for 205 previews with shared direct/group IDs, complete unknown content after restart, and exact legacy-placeholder enrichment while retaining cursor 900, original message tuples and outbox. Source-backed missing/null optional collections are empty; malformed non-null values still reject the response. See [media contracts](PROTOCOL_MEDIA.md). Closed directory stage/category diagnostics distinguish nonfatal partial discovery from socket disconnection.
+
+The modules are linked. `cargo test --locked --offline --all-features directory` passed 25 targeted tests at the earlier directory checkpoint (protocol, real SQLite, real loopback TLS plus UI). TLS fixtures use a separate Node `crypto` oracle for AES-CBC request decoding and encrypted responses, never production sessions. Coverage includes multi-page groups, named cached conversations, repeat deduplication, cross-account isolation, version-2 migration, capacity rollback, partial names, full-cache Vietnamese search, >2 MiB metadata, redirects/size limits, cancellation and sink backpressure. Runtime actor integration has its own acceptance checks; no real-account directory or history acceptance has been performed.

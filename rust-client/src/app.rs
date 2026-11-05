@@ -3,6 +3,8 @@
 pub mod directory;
 #[cfg(feature = "messaging")]
 pub mod live;
+#[cfg(feature = "messaging")]
+pub mod media;
 #[cfg(feature = "live-login")]
 pub mod stickers;
 
@@ -232,9 +234,9 @@ impl Drop for Worker {
 
 pub fn seed_demo(store: &mut MessageStore) -> Result<()> {
     let messages=[
-        Message{account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-1".into(),sender:"Demo guide".into(),text:"Offline native client. These messages are synthetic and stay in this demo profile.".into(),sticker:None,sent_at_ms:1_700_000_000_000},
-        Message{account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-2".into(),sender:"Demo guide".into(),text:"Try writing a message. The button stores it locally; it does not send to Zalo.".into(),sticker:None,sent_at_ms:1_700_000_000_001},
-        Message{account_id:DEMO_ACCOUNT.into(),thread_id:"architecture".into(),id:"demo-3".into(),sender:"Demo guide".into(),text:"The UI uses bounded queues. SQLite runs on a dedicated worker, and conversation pages use indexed cursors.".into(),sticker:None,sent_at_ms:1_700_000_000_002},
+        Message{account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-1".into(),sender:"Demo guide".into(),text:"Offline native client. These messages are synthetic and stay in this demo profile.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_000},
+        Message{account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-2".into(),sender:"Demo guide".into(),text:"Try writing a message. The button stores it locally; it does not send to Zalo.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_001},
+        Message{account_id:DEMO_ACCOUNT.into(),thread_id:"architecture".into(),id:"demo-3".into(),sender:"Demo guide".into(),text:"The UI uses bounded queues. SQLite runs on a dedicated worker, and conversation pages use indexed cursors.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_002},
     ];
     store.insert_batch(&messages)?;
     store.set_title(DEMO_ACCOUNT, "welcome", "Getting started")?;
@@ -277,6 +279,7 @@ pub fn seed_demo(store: &mut MessageStore) -> Result<()> {
                 sender: sender.into(),
                 text: text.into(),
                 sticker: None,
+                media: None,
                 sent_at_ms: start + index as i64 * 60_000,
             });
         }
@@ -305,6 +308,7 @@ fn store_demo_message(
         sender: "You (local demo)".into(),
         text: text.into(),
         sticker: None,
+        media: None,
         sent_at_ms,
     })?;
     Ok((id, conversation))

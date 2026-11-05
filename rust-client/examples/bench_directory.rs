@@ -56,6 +56,8 @@ fn main() -> Result<()> {
     let mut replay_us = Vec::new();
     for start in (0..count).step_by(DIRECTORY_LIMIT) {
         let batch = DirectoryBatch {
+            message_info: Vec::new(),
+            message_media: Vec::new(),
             account_id: "0".into(),
             entries: (start..(start + DIRECTORY_LIMIT).min(count))
                 .map(|i| record(i, count))
@@ -116,6 +118,8 @@ fn main() -> Result<()> {
     let cap_refused = if count == MAX_DIRECTORY_ROWS {
         let extra = record(count, count + 1);
         let batch = DirectoryBatch {
+            message_info: Vec::new(),
+            message_media: Vec::new(),
             account_id: "0".into(),
             entries: vec![extra.clone()],
             messages: vec![],

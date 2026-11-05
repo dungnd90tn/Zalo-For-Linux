@@ -1,5 +1,5 @@
 //! Native login presentation. Authentication decisions and image decoding belong to the worker.
-use super::visuals::{self, Icon, BLUE, HOVER, INK, LINE, MUTED};
+use super::visuals::{self, Icon};
 use eframe::egui::{self, vec2, Align, Color32, FontId, Layout, RichText, Sense};
 
 const MAX_QR_SIDE: usize = 1024;
@@ -120,6 +120,7 @@ impl LoginView {
     }
 
     fn show_column(&self, outer: &mut egui::Ui, enabled: bool) -> Option<Action> {
+        let colors = crate::theme::palette(outer.ctx());
         let mut action = None;
         let compact = outer.available_height() < 600.0;
         let width = outer.available_width().min(410.0);
@@ -140,36 +141,36 @@ impl LoginView {
         ui.label(
             RichText::new("Zalo")
                 .size(if compact { 30.0 } else { 40.0 })
-                .color(BLUE)
-                .strong(),
+                .color(colors.primary)
+                .family(egui::FontFamily::Name("Zalo Bold".into())),
         );
         if !compact {
             ui.add_space(5.0);
             ui.label(
                 RichText::new("Đăng nhập Zalo trên máy tính")
                     .size(18.0)
-                    .color(INK),
+                    .color(colors.text_primary),
             );
         }
         ui.add_space(if compact { 12.0 } else { 26.0 });
         let (tabs, _) = ui.allocate_exact_size(vec2(width, 36.0), Sense::hover());
         ui.painter().line_segment(
             [tabs.left_bottom(), tabs.right_bottom()],
-            egui::Stroke::new(1.0_f32, LINE),
+            egui::Stroke::new(1.0_f32, colors.border),
         );
         ui.painter().text(
             tabs.left_center() + vec2(55.0, 0.0),
             egui::Align2::CENTER_CENTER,
             "VỚI MÃ QR",
             FontId::proportional(13.0),
-            BLUE,
+            colors.primary,
         );
         ui.painter().line_segment(
             [
                 tabs.left_bottom() + vec2(12.0, 0.0),
                 tabs.left_bottom() + vec2(135.0, 0.0),
             ],
-            egui::Stroke::new(2.0_f32, BLUE),
+            egui::Stroke::new(2.0_f32, colors.primary),
         );
         let phone = ui.interact(
             egui::Rect::from_min_max(tabs.center_top(), tabs.right_bottom()),
@@ -181,7 +182,7 @@ impl LoginView {
             egui::Align2::CENTER_CENTER,
             "VỚI SỐ ĐIỆN THOẠI",
             FontId::proportional(12.0),
-            MUTED,
+            colors.text_secondary,
         );
         phone.on_hover_text("Đăng nhập bằng số điện thoại chưa được hỗ trợ trong client native.");
         ui.add_space(if compact { 12.0 } else { 20.0 });
@@ -202,7 +203,7 @@ impl LoginView {
             );
         } else {
             ui.painter()
-                .rect_stroke(qr_rect, 4.0, egui::Stroke::new(1.0_f32, LINE));
+                .rect_stroke(qr_rect, 4.0, egui::Stroke::new(1.0_f32, colors.border));
             let busy = matches!(
                 self.phase,
                 Phase::CreatingQr | Phase::Restoring | Phase::VerifyingTrust | Phase::Bootstrapping
@@ -211,7 +212,7 @@ impl LoginView {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(
                     egui::Rect::from_center_size(qr_rect.center(), vec2(28.0, 28.0)),
                 ));
-                child.add(egui::Spinner::new().size(26.0).color(BLUE));
+                child.add(egui::Spinner::new().size(26.0).color(colors.primary));
             } else {
                 visuals::icon(
                     ui,
@@ -221,7 +222,7 @@ impl LoginView {
                     } else {
                         Icon::Shield
                     },
-                    MUTED,
+                    colors.text_secondary,
                 );
             }
         }
@@ -261,39 +262,32 @@ impl LoginView {
             ),
             Phase::Failed => ("Chưa thể đăng nhập", "Bạn có thể tạo mã mới và thử lại."),
         };
-        ui.label(RichText::new(title).size(14.0).strong());
+        ui.label(
+            RichText::new(title)
+                .size(14.0)
+                .family(egui::FontFamily::Name("Zalo Semibold".into())),
+        );
         ui.add_space(3.0);
-        ui.label(RichText::new(hint).size(12.0).color(MUTED));
+        ui.label(RichText::new(hint).size(12.0).color(colors.text_secondary));
         if let Some(error) = &self.error {
             ui.add_space(7.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(error)
-                        .size(12.0)
-                        .color(Color32::from_rgb(195, 24, 24)),
-                )
-                .wrap(),
-            );
+            ui.add(egui::Label::new(RichText::new(error).size(12.0).color(colors.error)).wrap());
         }
         ui.add_space(if compact { 10.0 } else { 18.0 });
         if matches!(self.phase, Phase::SignedOut | Phase::Failed) {
-            if ui
-                .add_enabled(
-                    enabled,
-                    egui::Button::new(
-                        RichText::new(if self.retry_restore {
-                            "Thử lại phiên đã lưu"
-                        } else if self.phase == Phase::Failed {
-                            "Tạo mã QR mới"
-                        } else {
-                            "Đăng nhập bằng mã QR"
-                        })
-                        .color(Color32::WHITE),
-                    )
-                    .fill(BLUE)
-                    .min_size(vec2(240.0, 36.0)),
-                )
-                .clicked()
+            if visuals::primary_button(
+                ui,
+                enabled,
+                if self.retry_restore {
+                    "Thử lại phiên đã lưu"
+                } else if self.phase == Phase::Failed {
+                    "Tạo mã QR mới"
+                } else {
+                    "Đăng nhập bằng mã QR"
+                },
+                vec2(240.0, 36.0),
+            )
+            .clicked()
             {
                 action = Some(if self.startup_attempt {
                     Action::Resume
@@ -306,7 +300,8 @@ impl LoginView {
                 && ui
                     .add_enabled(
                         enabled,
-                        egui::Button::new(RichText::new("Tạo mã QR mới").color(BLUE)).frame(false),
+                        egui::Button::new(RichText::new("Tạo mã QR mới").color(colors.primary))
+                            .frame(false),
                     )
                     .clicked()
             {
@@ -316,7 +311,7 @@ impl LoginView {
             ui.horizontal(|ui| {
                 if self.phase == Phase::WaitingForScan
                     && ui
-                        .add_enabled(enabled, egui::Button::new("Tạo mã mới").fill(HOVER))
+                        .add_enabled(enabled, egui::Button::new("Tạo mã mới"))
                         .clicked()
                 {
                     action = Some(Action::Begin);
@@ -334,7 +329,7 @@ impl LoginView {
             ui.label(
                 RichText::new("Chạy client với --live để bật đăng nhập. Bản demo dùng --demo.")
                     .size(11.0)
-                    .color(MUTED),
+                    .color(colors.text_secondary),
             );
         }
         outer.set_min_height(column.min_rect().height());

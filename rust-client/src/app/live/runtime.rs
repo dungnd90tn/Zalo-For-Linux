@@ -34,6 +34,7 @@ fn outgoing_mismatch_diagnostics_report_only_closed_field_flags() {
         sender: "11".into(),
         text: "synthetic changed private body".into(),
         sticker: None,
+        media: None,
         sent_at_ms: 1001,
     };
     let error = store
@@ -189,8 +190,69 @@ fn diagnostic(error: &anyhow::Error, stage: LiveStage) -> LiveDiagnostic {
     record_failure(result, frame_failure.map(|failure| failure.context));
     result
 }
+fn diagnostic_reason(reason: wire::FrameReason) -> crate::diagnostics::Reason {
+    use crate::diagnostics::Reason;
+    match reason {
+        wire::FrameReason::MessageType => Reason::MessageType,
+        wire::FrameReason::FrameLength => Reason::FrameLength,
+        wire::FrameReason::OuterJson => Reason::OuterJson,
+        wire::FrameReason::OuterEnvelope => Reason::OuterEnvelope,
+        wire::FrameReason::AuthKey => Reason::AuthKey,
+        wire::FrameReason::EncryptionMode => Reason::EncryptionMode,
+        wire::FrameReason::OuterData => Reason::OuterData,
+        wire::FrameReason::Base64 => Reason::Base64,
+        wire::FrameReason::CipherIntegrity => Reason::CipherIntegrity,
+        wire::FrameReason::Compression => Reason::Compression,
+        wire::FrameReason::InnerJson => Reason::InnerJson,
+        wire::FrameReason::InnerEnvelope => Reason::InnerEnvelope,
+        wire::FrameReason::PlaintextAuth => Reason::PlaintextAuth,
+        wire::FrameReason::QueueCommands => Reason::QueueCommands,
+        wire::FrameReason::BatchEnvelope => Reason::BatchEnvelope,
+        wire::FrameReason::BatchLimit => Reason::BatchLimit,
+        wire::FrameReason::MessageTypeField => Reason::MessageTypeField,
+        wire::FrameReason::MessageSender => Reason::MessageSender,
+        wire::FrameReason::MessageRecipient => Reason::MessageRecipient,
+        wire::FrameReason::MessageScope => Reason::MessageScope,
+        wire::FrameReason::MessageTimestamp => Reason::MessageTimestamp,
+        wire::FrameReason::MessageId => Reason::MessageId,
+        wire::FrameReason::MessageContent => Reason::MessageContent,
+        wire::FrameReason::MessageValidation => Reason::MessageValidation,
+        wire::FrameReason::MessageClientId => Reason::MessageClientId,
+        wire::FrameReason::QueueStatus => Reason::QueueStatus,
+        wire::FrameReason::QueueKey => Reason::QueueKey,
+        wire::FrameReason::QueueEvicted => Reason::QueueEvicted,
+        wire::FrameReason::QueueCursor => Reason::QueueCursor,
+        wire::FrameReason::QueueMore => Reason::QueueMore,
+        wire::FrameReason::QueueContinuation => Reason::QueueContinuation,
+        wire::FrameReason::QueueProgress => Reason::QueueProgress,
+        wire::FrameReason::QueuePageLimit => Reason::QueuePageLimit,
+    }
+}
+fn diagnostic_value_type(value: wire::FrameValueType) -> crate::diagnostics::ValueType {
+    use crate::diagnostics::ValueType;
+    match value {
+        wire::FrameValueType::Absent => ValueType::Absent,
+        wire::FrameValueType::Null => ValueType::Null,
+        wire::FrameValueType::Integer => ValueType::Integer,
+        wire::FrameValueType::Number => ValueType::Number,
+        wire::FrameValueType::String => ValueType::String,
+        wire::FrameValueType::Boolean => ValueType::Boolean,
+        wire::FrameValueType::Object => ValueType::Object,
+        wire::FrameValueType::Array => ValueType::Array,
+    }
+}
+fn diagnostic_message_kind(value: wire::FrameMessageKind) -> crate::diagnostics::MessageKind {
+    match value {
+        wire::FrameMessageKind::Webchat => crate::diagnostics::MessageKind::Webchat,
+        wire::FrameMessageKind::WebchatInfo => crate::diagnostics::MessageKind::WebchatInfo,
+        wire::FrameMessageKind::Photo => crate::diagnostics::MessageKind::Photo,
+        wire::FrameMessageKind::WebContent => crate::diagnostics::MessageKind::WebContent,
+        wire::FrameMessageKind::Sticker => crate::diagnostics::MessageKind::Sticker,
+        wire::FrameMessageKind::Other => crate::diagnostics::MessageKind::Other,
+    }
+}
 fn record_failure(detail: LiveDiagnostic, context: Option<wire::FrameContext>) {
-    use crate::diagnostics::{record, Event, Kind, Reason, Stage, ValueType};
+    use crate::diagnostics::{record, Event, Kind, Reason, Stage};
     let stage = match detail.stage {
         LiveStage::Configuration | LiveStage::Connect => Stage::Connection,
         LiveStage::Authentication => Stage::Authentication,
@@ -201,22 +263,7 @@ fn record_failure(detail: LiveDiagnostic, context: Option<wire::FrameContext>) {
         LiveStage::Storage => Stage::Storage,
     };
     let reason = match detail.parser_reason {
-        Some(reason) => match reason {
-            wire::FrameReason::MessageType => Reason::MessageType,
-            wire::FrameReason::FrameLength => Reason::FrameLength,
-            wire::FrameReason::OuterJson => Reason::OuterJson,
-            wire::FrameReason::OuterEnvelope => Reason::OuterEnvelope,
-            wire::FrameReason::AuthKey => Reason::AuthKey,
-            wire::FrameReason::EncryptionMode => Reason::EncryptionMode,
-            wire::FrameReason::OuterData => Reason::OuterData,
-            wire::FrameReason::Base64 => Reason::Base64,
-            wire::FrameReason::CipherIntegrity => Reason::CipherIntegrity,
-            wire::FrameReason::Compression => Reason::Compression,
-            wire::FrameReason::InnerJson => Reason::InnerJson,
-            wire::FrameReason::InnerEnvelope => Reason::InnerEnvelope,
-            wire::FrameReason::PlaintextAuth => Reason::PlaintextAuth,
-            wire::FrameReason::QueueCommands => Reason::QueueCommands,
-        },
+        Some(reason) => diagnostic_reason(reason),
         None => match detail.category {
             LiveCategory::Timeout => Reason::Timeout,
             LiveCategory::Http => Reason::HttpStatus,
@@ -231,19 +278,15 @@ fn record_failure(detail: LiveDiagnostic, context: Option<wire::FrameContext>) {
         .http_status(detail.http_status)
         .server_code(detail.server_code);
     if let Some(context) = context {
-        let kind = |value| match value {
-            wire::FrameValueType::Absent => ValueType::Absent,
-            wire::FrameValueType::Null => ValueType::Null,
-            wire::FrameValueType::Integer => ValueType::Integer,
-            wire::FrameValueType::Number => ValueType::Number,
-            wire::FrameValueType::String => ValueType::String,
-            wire::FrameValueType::Boolean => ValueType::Boolean,
-            wire::FrameValueType::Object => ValueType::Object,
-            wire::FrameValueType::Array => ValueType::Array,
-        };
         event = event
             .bytes(context.bytes)
-            .envelope_types(kind(context.status_type), kind(context.data_type));
+            .envelope_types(
+                diagnostic_value_type(context.status_type),
+                diagnostic_value_type(context.data_type),
+            )
+            .field_type(context.field_type.map(diagnostic_value_type))
+            .field_bytes(context.field_bytes)
+            .message_kind(context.message_kind.map(diagnostic_message_kind));
         if let (Some(command), Some(subcommand)) = (context.command, context.subcommand) {
             event = event.frame(command, subcommand, context.encryption)
         }
@@ -258,7 +301,30 @@ fn trace(stage: crate::diagnostics::Stage, reason: crate::diagnostics::Reason) {
     ));
 }
 fn record_directory_failure(failure: &DirectoryFailure) {
-    use crate::diagnostics::{record, Event, Kind, Reason, Stage};
+    crate::diagnostics::record(directory_failure_event(failure));
+}
+fn directory_failure_event(failure: &DirectoryFailure) -> crate::diagnostics::Event {
+    use crate::diagnostics::{DirectoryCategory as LogCategory, DirectoryStage as LogStage};
+    use crate::diagnostics::{Event, Kind, Reason, Stage};
+    let stage = match failure.stage {
+        DirectoryStage::Friends => LogStage::Friends,
+        DirectoryStage::Groups => LogStage::Groups,
+        DirectoryStage::Previews => LogStage::Previews,
+        DirectoryStage::Storage => LogStage::Storage,
+        DirectoryStage::Synchronization => LogStage::Synchronization,
+    };
+    let category = match failure.category {
+        DirectoryCategory::Unavailable => LogCategory::Unavailable,
+        DirectoryCategory::Network => LogCategory::Network,
+        DirectoryCategory::Timeout => LogCategory::Timeout,
+        DirectoryCategory::Http => LogCategory::Http,
+        DirectoryCategory::Server => LogCategory::Server,
+        DirectoryCategory::Crypto => LogCategory::Crypto,
+        DirectoryCategory::Schema => LogCategory::Schema,
+        DirectoryCategory::Resource => LogCategory::Resource,
+        DirectoryCategory::Cancelled => LogCategory::Cancelled,
+        DirectoryCategory::Storage => LogCategory::Storage,
+    };
     let reason = match failure.category {
         DirectoryCategory::Unavailable => Reason::Unsupported,
         DirectoryCategory::Network => Reason::Transport,
@@ -270,11 +336,39 @@ fn record_directory_failure(failure: &DirectoryFailure) {
         DirectoryCategory::Cancelled => Reason::Cancelled,
         DirectoryCategory::Storage => Reason::Io,
     };
-    record(
-        Event::new(Kind::Failure, Stage::Synchronization, reason)
-            .http_status(failure.http_status)
-            .server_code(failure.server_code),
-    );
+    let mut event = Event::new(
+        Kind::Failure,
+        Stage::Synchronization,
+        failure
+            .parser
+            .map(|parser| diagnostic_reason(parser.reason))
+            .unwrap_or(reason),
+    )
+    .directory(stage, category)
+    .http_status(failure.http_status)
+    .server_code(failure.server_code);
+    if let Some(parser) = failure.parser {
+        use crate::diagnostics::PreviewField as LogField;
+        use crate::protocol::directory::PreviewField as WireField;
+        let field = match parser.field {
+            WireField::ResponseJson => LogField::ResponseJson,
+            WireField::ResponseEnvelope => LogField::ResponseEnvelope,
+            WireField::EncryptedData => LogField::EncryptedData,
+            WireField::DecryptedJson => LogField::DecryptedJson,
+            WireField::DecryptedEnvelope => LogField::DecryptedEnvelope,
+            WireField::MessageCollections => LogField::MessageCollections,
+            WireField::Msgs => LogField::Msgs,
+            WireField::GroupMsgs => LogField::GroupMsgs,
+            WireField::PageMsgs => LogField::PageMsgs,
+            WireField::EeMsgs => LogField::EeMsgs,
+        };
+        event = event
+            .preview_field(Some(field))
+            .field_type(Some(diagnostic_value_type(parser.field_type)))
+            .field_bytes(parser.field_bytes)
+            .message_kind(parser.message_kind.map(diagnostic_message_kind));
+    }
+    event
 }
 /// Deterministic transport failures require an explicit retry, while the local
 /// account database and command receiver remain available.
@@ -411,6 +505,7 @@ fn directory_failure(category: DirectoryCategory) -> DirectoryFailure {
         category,
         http_status: None,
         server_code: None,
+        parser: None,
     }
 }
 struct RuntimeDirectorySink {
@@ -559,6 +654,7 @@ impl DirectorySync {
                     category: DirectoryCategory::Cancelled,
                     http_status: None,
                     server_code: None,
+                    parser: None,
                 }],
                 ..Default::default()
             },
@@ -677,7 +773,7 @@ impl Transports {
             )
             .await
             .map_err(|e| NetworkFailure::socket(LiveStage::Connect, e))?;
-            return Ok(Connection::connected(socket));
+            return Ok(Connection::connected(socket, session.account_id()));
         }
         Connection::connect(session, index).await
     }
@@ -776,6 +872,8 @@ fn safe_cursor(text: &str) -> Result<u64> {
     Ok(value)
 }
 struct Connection {
+    // Fixed by VerifiedSession at connect, never by peer-provided message IDs.
+    account: String,
     socket: Socket,
     decoder: FrameDecoder,
     queues: std::collections::HashSet<(u16, u8)>,
@@ -880,10 +978,11 @@ impl Connection {
         .await
         .map_err(|_| NetworkFailure::new(LiveStage::Connect, LiveCategory::Timeout))?
         .map_err(|e| NetworkFailure::socket(LiveStage::Connect, e))?;
-        Ok(Self::connected(socket))
+        Ok(Self::connected(socket, session.account_id()))
     }
-    fn connected(socket: Socket) -> Self {
+    fn connected(socket: Socket, account: &str) -> Self {
         Self {
+            account: account.to_owned(),
             socket,
             decoder: FrameDecoder::default(),
             queues: Default::default(),
@@ -918,15 +1017,25 @@ impl Connection {
                 .await?
             }
         };
-        let numeric = safe_cursor(&id)?;
+        let failure = |error, reason| wire::FrameFailure {
+            error,
+            reason,
+            context: wire::FrameContext {
+                command: Some(cmd),
+                subcommand: Some(sub),
+                ..Default::default()
+            },
+        };
+        let numeric = safe_cursor(&id)
+            .map_err(|_| failure(WireError::Invalid, wire::FrameReason::QueueCursor))?;
         let progress = self.offline_progress.entry((cmd, sub)).or_default();
         if first {
             progress.pages = 0;
         } else if numeric <= progress.last_id {
-            return Err(WireError::Invalid.into());
+            return Err(failure(WireError::Invalid, wire::FrameReason::QueueProgress).into());
         }
         if progress.pages >= MAX_OFFLINE_PAGES {
-            return Err(WireError::Oversize.into());
+            return Err(failure(WireError::Oversize, wire::FrameReason::QueuePageLimit).into());
         }
         progress.last_id = numeric;
         progress.pages += 1;
@@ -939,6 +1048,19 @@ impl Connection {
         .await
     }
     async fn process(&mut self, frame: DecodedFrame, db: &Database, events: &Events) -> Result<()> {
+        let failure = |error, reason| wire::FrameFailure {
+            error,
+            reason,
+            context: wire::FrameContext {
+                command: Some(frame.cmd),
+                subcommand: Some(frame.sub_cmd),
+                ..Default::default()
+            },
+        };
+        let invalid = |reason| failure(WireError::Invalid, reason);
+        if self.account != events.account {
+            return Err(invalid(wire::FrameReason::MessageScope).into());
+        }
         match frame.cmd {
             1 => {
                 trace(
@@ -1012,10 +1134,17 @@ impl Connection {
                 );
             }
             501 | 521 | 510 | 511 | 534 | 570 => {
-                let parsed = wire::incoming_messages(&events.account, &frame.payload)?;
+                let parsed = self
+                    .decoder
+                    .incoming_messages(&self.account, &frame.payload)
+                    .map_err(|mut error| {
+                        error.context.command = Some(frame.cmd);
+                        error.context.subcommand = Some(frame.sub_cmd);
+                        error
+                    })?;
                 let messages: Vec<_> = parsed
                     .into_iter()
-                    .map(|i| (i.message, i.client_id))
+                    .map(|i| (i.message, i.client_id, i.info, i.media))
                     .collect();
                 let account = events.account.clone();
                 let mut cursors = Vec::new();
@@ -1023,18 +1152,33 @@ impl Connection {
                     let map = status
                         .as_object()
                         .filter(|m| m.len() <= 64)
-                        .ok_or(WireError::Invalid)?;
+                        .ok_or_else(|| invalid(wire::FrameReason::QueueStatus))?;
                     for (queue, value) in map {
-                        let (cmd, sub) = queue.split_once('_').ok_or(WireError::Invalid)?;
-                        let cmd = cmd.parse::<u16>().map_err(|_| WireError::Invalid)?;
-                        let sub = sub.parse::<u8>().map_err(|_| WireError::Invalid)?;
+                        let (cmd, sub) = queue
+                            .split_once('_')
+                            .ok_or_else(|| invalid(wire::FrameReason::QueueKey))?;
+                        let cmd = cmd
+                            .parse::<u16>()
+                            .map_err(|_| invalid(wire::FrameReason::QueueKey))?;
+                        let sub = sub
+                            .parse::<u8>()
+                            .map_err(|_| invalid(wire::FrameReason::QueueKey))?;
                         if ![510, 511].contains(&cmd) || sub > 1 {
                             continue;
                         }
                         if value.get("evict").and_then(Value::as_u64) == Some(1) {
-                            return Err(WireError::Unsupported.into());
+                            return Err(failure(
+                                WireError::Unsupported,
+                                wire::FrameReason::QueueEvicted,
+                            )
+                            .into());
                         }
-                        let id = wire::id_string(value.get("lastId").ok_or(WireError::Invalid)?)?;
+                        let id = wire::id_string(
+                            value
+                                .get("lastId")
+                                .ok_or_else(|| invalid(wire::FrameReason::QueueCursor))?,
+                        )
+                        .map_err(|error| failure(error, wire::FrameReason::QueueCursor))?;
                         cursors.push((queue.clone(), id));
                     }
                 }
@@ -1044,7 +1188,7 @@ impl Connection {
                     Some(Value::Bool(value)) => *value,
                     Some(Value::Number(value)) if value.as_u64() == Some(0) => false,
                     Some(Value::Number(value)) if value.as_u64() == Some(1) => true,
-                    _ => return Err(WireError::Invalid.into()),
+                    _ => return Err(invalid(wire::FrameReason::QueueMore).into()),
                 };
                 let current_queue = format!("{}_{}", frame.cmd, frame.sub_cmd);
                 // The PC client explicitly passes lastActionId to the next offline request.
@@ -1053,7 +1197,20 @@ impl Connection {
                     frame
                         .payload
                         .pointer("/data/lastActionId")
-                        .map(wire::id_string)
+                        // The source consumes this field for pagination only while
+                        // `more` is true. On a terminal page, null/zero means no
+                        // cursor update. Preserve the existing positive fallback
+                        // when queueStatus is absent; never persist a sentinel.
+                        .filter(|value| {
+                            more || !(value.is_null()
+                                || value.as_u64() == Some(0)
+                                || value.as_str() == Some("0"))
+                        })
+                        .map(|value| {
+                            wire::id_string(value).map_err(|error| {
+                                failure(error, wire::FrameReason::QueueContinuation)
+                            })
+                        })
                         .transpose()?
                         .or_else(|| {
                             cursors
@@ -1065,28 +1222,37 @@ impl Connection {
                     None
                 };
                 if offline_queue && more {
-                    let next = safe_cursor(continuation.as_deref().ok_or(WireError::Invalid)?)?;
+                    let next = safe_cursor(
+                        continuation
+                            .as_deref()
+                            .ok_or_else(|| invalid(wire::FrameReason::QueueContinuation))?,
+                    )
+                    .map_err(|_| invalid(wire::FrameReason::QueueContinuation))?;
                     let previous = self
                         .offline_progress
                         .get(&(frame.cmd, frame.sub_cmd))
-                        .ok_or(WireError::Invalid)?;
+                        .ok_or_else(|| invalid(wire::FrameReason::QueueProgress))?;
                     if next <= previous.last_id {
-                        return Err(WireError::Invalid.into());
+                        return Err(invalid(wire::FrameReason::QueueProgress).into());
                     }
                     if previous.pages >= MAX_OFFLINE_PAGES {
-                        return Err(WireError::Oversize.into());
+                        return Err(failure(
+                            WireError::Oversize,
+                            wire::FrameReason::QueuePageLimit,
+                        )
+                        .into());
                     }
                 }
                 if offline_queue && !cursors.iter().any(|(queue, _)| queue == &current_queue) {
                     if let Some(id) = &continuation {
-                        safe_cursor(id)?;
+                        safe_cursor(id).map_err(|_| invalid(wire::FrameReason::QueueCursor))?;
                         cursors.push((current_queue, id.clone()));
                     }
                 }
                 let cursor = cursors.first().cloned();
                 let stored = db
                     .call_with(StorageOperation::ReceiveBatch, move |s| {
-                        s.receive_batch(
+                        s.receive_batch_with_media(
                             &account,
                             &messages,
                             cursor.as_ref().map(|(q, id)| (q.as_str(), id.as_str())),
@@ -1351,6 +1517,67 @@ async fn handle_command(
             return Ok(CommandOutcome::Continue)
         }
         LiveCommand::Shutdown => return Ok(CommandOutcome::Shutdown),
+        LiveCommand::RefreshMessages {
+            generation,
+            thread,
+            message_ids,
+        } => {
+            let account = events.account.clone();
+            let requested = thread.clone();
+            let result = db
+                .call_with(StorageOperation::LoadHistory, move |store| {
+                    store.refresh_messages(&account, &requested, &message_ids)
+                })
+                .await;
+            let event = match result {
+                Ok(messages) => LiveEvent::MessagesRefreshed {
+                    account_id: events.account.clone(),
+                    generation,
+                    thread,
+                    messages,
+                },
+                Err(error) => {
+                    record_storage_failure(&error, StorageOperation::LoadHistory);
+                    LiveEvent::MessagesRefreshFailed {
+                        account_id: events.account.clone(),
+                        generation,
+                        thread,
+                    }
+                }
+            };
+            events.emit(event).await?;
+        }
+        LiveCommand::ResolveSenders {
+            generation,
+            thread,
+            sender_ids,
+        } => {
+            let account = events.account.clone();
+            let names = if Target::from_thread(&thread).is_ok() {
+                match db
+                    .call_with(StorageOperation::DirectoryRead, move |store| {
+                        store.sender_names(&account, &sender_ids)
+                    })
+                    .await
+                {
+                    Ok(names) => names,
+                    Err(error) => {
+                        record_storage_failure(&error, StorageOperation::DirectoryRead);
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            events
+                .emit(LiveEvent::SenderNames {
+                    account_id: events.account.clone(),
+                    generation,
+                    thread,
+                    names,
+                })
+                .await?;
+        }
         LiveCommand::Directory {
             generation,
             is_group,
