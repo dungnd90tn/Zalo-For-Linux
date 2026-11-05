@@ -39,6 +39,7 @@ enum Reply {
     PeerRouting(bool),
     InfoPages(bool),
     MediaPages(bool),
+    RichCards,
     UpgradeForbidden,
     DesktopHeaders,
     UpgradeStall,
@@ -336,7 +337,7 @@ fn serve(
             let _ = ws.read();
             return;
         }
-        let auth = json!({"error_code":0,"data":{"qCmds":if matches!(reply,Reply::InfoPages(_)|Reply::MediaPages(_)){json!([{"cmd":511,"subCmd":1}])}else if matches!(reply,Reply::PeerRouting(_)){json!([{"cmd":510,"subCmd":1}])}else if matches!(reply,Reply::Runtime|Reply::Stickers|Reply::RuntimeStall|Reply::DirectoryStall|Reply::ControlHeartbeats){json!([{"cmd":510,"subCmd":0},{"cmd":511,"subCmd":0}])}else{json!([{"cmd":510,"subCmd":0}])}}});
+        let auth = json!({"error_code":0,"data":{"qCmds":if matches!(reply,Reply::InfoPages(_)|Reply::MediaPages(_)|Reply::RichCards){json!([{"cmd":511,"subCmd":1}])}else if matches!(reply,Reply::PeerRouting(_)){json!([{"cmd":510,"subCmd":1}])}else if matches!(reply,Reply::Runtime|Reply::Stickers|Reply::RuntimeStall|Reply::DirectoryStall|Reply::ControlHeartbeats){json!([{"cmd":510,"subCmd":0},{"cmd":511,"subCmd":0}])}else{json!([{"cmd":510,"subCmd":0}])}}});
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         z.write_all(&serde_json::to_vec(&auth).unwrap()).unwrap();
         let auth_frame = if matches!(reply, Reply::ControlHeartbeats) {
@@ -389,13 +390,15 @@ fn serve(
                             ws.send(tungstenite::Message::Binary(bytes)).unwrap();
                         }
                     }
-                    if let Reply::MediaPages(conflict) = reply {
+                    if matches!(reply, Reply::MediaPages(_) | Reply::RichCards) {
+                        let conflict = matches!(reply, Reply::MediaPages(true));
+                        let rich = matches!(reply, Reply::RichCards);
                         assert_eq!((cmd, bytes[3]), (511, 1));
                         let first = data["first"].as_bool().unwrap();
                         let last_id = data["lastId"].as_u64().unwrap();
                         assert_eq!(last_id, if first { 1 } else { 100 });
                         state.socket_requests.lock().unwrap().push((cmd, last_id));
-                        let bytes = wire::encode_frame(511, 1, &json!({"error_code":0,"encrypt":0,"data":media_batch(first, conflict)})).unwrap();
+                        let bytes = wire::encode_frame(511, 1, &json!({"error_code":0,"encrypt":0,"data":if rich { rich_card_batch(first) } else { media_batch(first, conflict) }})).unwrap();
                         ws.send(tungstenite::Message::Binary(bytes.clone()))
                             .unwrap();
                         if !first && !conflict {
@@ -656,11 +659,25 @@ fn serve(
             }
             _ => {
                 assert_eq!(parameters["threadIdLocalMsgId"], "{}");
-                if matches!(reply, Reply::MediaPages(_)) {
-                    let mut data = media_batch(true, false)["data"].clone();
+                if matches!(reply, Reply::MediaPages(_) | Reply::RichCards) {
+                    let rich = matches!(reply, Reply::RichCards);
+                    let mut data = if rich {
+                        rich_card_batch(true)
+                    } else {
+                        media_batch(true, false)
+                    }["data"]
+                        .clone();
                     let mut direct = Vec::new();
-                    for (id, kind) in [("841", "chat.photo"), ("843", "chat.webcontent")] {
-                        let mut content = media_content(kind, false);
+                    for (id, kind) in if rich {
+                        [("841", "chat.recommended"), ("843", "group.poll")]
+                    } else {
+                        [("841", "chat.photo"), ("843", "chat.webcontent")]
+                    } {
+                        let mut content = if rich {
+                            rich_card_content(kind)
+                        } else {
+                            media_content(kind, false)
+                        };
                         content["unknownOuter"]["threadVariant"] = json!("direct");
                         direct.push(json!({"uidFrom":"22","idTo":"33","msgId":id,"ts":"1760000000002","msgType":kind,"content":content}));
                     }
@@ -784,6 +801,29 @@ fn peer_addressed_batch(first: bool, invalid: bool) -> Value {
         }
         payload
     }
+}
+
+fn rich_card_content(kind: &str) -> Value {
+    let params = if kind == "group.poll" {
+        json!({"msg":{"vi":"Bình chọn mới"},"question":"Nhóm chọn ngày nào?","isAnonymous":true,"pollId":"synthetic-poll","unknownInner":{"retained":[null,true]}})
+    } else {
+        json!({"mediaTitle":"Tiêu đề dự phòng","unknownInner":{"retained":[null,true]}})
+    };
+    json!({"action":"recommened.link","title":"Nội dung chia sẻ tổng hợp","description":"Mô tả tiếng Việt","href":"https://example.invalid/article","thumb":"https://photo-talk.zadn.vn/synthetic.jpg","params":serde_json::to_string(&params).unwrap(),"unknownOuter":{"retained":[7,false,{"full":"metadata"}]}})
+}
+fn rich_card_batch(first: bool) -> Value {
+    let mut batch = media_batch(first, false);
+    for message in batch["data"]["groupMsgs"].as_array_mut().unwrap() {
+        if let Some(kind) = match message["msgType"].as_str() {
+            Some("chat.photo") => Some("chat.recommended"),
+            Some("chat.webcontent") => Some("group.poll"),
+            _ => None,
+        } {
+            message["msgType"] = json!(kind);
+            message["content"] = rich_card_content(kind);
+        }
+    }
+    batch
 }
 
 fn media_content(kind: &str, changed: bool) -> Value {
@@ -1390,8 +1430,12 @@ async fn info_preview_and_socket_orders_keep_identical_full_metadata_without_ack
 
 #[tokio::test]
 async fn media_preview_and_socket_orders_preserve_complete_metadata_across_chunks_and_restart() {
-    for preview_first in [false, true] {
-        let f = Fixture::new(Reply::MediaPages(false));
+    for (rich, preview_first) in [(false, false), (false, true), (true, false), (true, true)] {
+        let f = Fixture::new(if rich {
+            Reply::RichCards
+        } else {
+            Reply::MediaPages(false)
+        });
         let db = Database::open(f.profile.clone(), "11".into())
             .await
             .unwrap();
@@ -1469,14 +1513,26 @@ async fn media_preview_and_socket_orders_preserve_complete_metadata_across_chunk
         drop(db);
         let store = MessageStore::open(&f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
         assert_eq!(store.page("11", "g:22", None, 10).unwrap().len(), 4);
-        for (id, kind) in [("841", "chat.photo"), ("843", "chat.webcontent")] {
+        for (id, kind) in if rich {
+            [("841", "chat.recommended"), ("843", "group.poll")]
+        } else {
+            [("841", "chat.photo"), ("843", "chat.webcontent")]
+        } {
             let retained = store.message_media("11", "g:22", id).unwrap().unwrap();
             assert_eq!(
                 serde_json::from_str::<Value>(retained.as_json()).unwrap(),
-                media_content(kind, false)
+                if rich {
+                    rich_card_content(kind)
+                } else {
+                    media_content(kind, false)
+                }
             );
             let direct = store.message_media("11", "d:22", id).unwrap().unwrap();
-            let mut expected_direct = media_content(kind, false);
+            let mut expected_direct = if rich {
+                rich_card_content(kind)
+            } else {
+                media_content(kind, false)
+            };
             expected_direct["unknownOuter"]["threadVariant"] = json!("direct");
             assert_eq!(
                 serde_json::from_str::<Value>(direct.as_json()).unwrap(),

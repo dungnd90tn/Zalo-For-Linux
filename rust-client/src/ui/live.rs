@@ -2032,6 +2032,27 @@ mod tests {
         };
         let sources = match mode {
             "webcontent" => vec![(MediaKind::WebContent, content("webcontent_object"), false)],
+            "recommended" => vec![(
+                MediaKind::Recommended,
+                serde_json::json!({
+                    "action":"recommened.link",
+                    "title":"Tài liệu chuẩn bị cho buổi họp nhóm",
+                    "description":"Bản chia sẻ kiểm thử với nội dung tiếng Việt dài, xuống dòng trong cửa sổ nhỏ.",
+                    "thumb":"https://f12-zpcloud.zdn.vn/synthetic-shared.jpg",
+                    "href":"https://example.invalid/shared"
+                }),
+                false,
+            )],
+            "poll" => vec![(
+                MediaKind::Poll,
+                serde_json::json!({"params":{
+                    "msg":{"vi":"Đã tạo bình chọn mới cho nhóm"},
+                    "question":"Mọi người muốn tổ chức buổi trao đổi kế hoạch vào thời gian nào trong tuần tới?",
+                    "isAnonymous":true,
+                    "pollId":"synthetic-poll"
+                }}),
+                false,
+            )],
             "opaque" => vec![(
                 MediaKind::WebContent,
                 serde_json::json!({"params":{"item":{"bundle_data":"{\"remote\":true}"}}}),
@@ -2044,6 +2065,7 @@ mod tests {
             ],
             _ => vec![(MediaKind::Photo, content("photo_object"), false)],
         };
+        let thread = if mode == "poll" { "g:90" } else { "d:22" };
         let records: Vec<_> = sources
             .into_iter()
             .enumerate()
@@ -2051,7 +2073,7 @@ mod tests {
                 let content = MediaMessageContent::new(kind, &source).unwrap();
                 let message = Message {
                     account_id: "11".into(),
-                    thread_id: "d:22".into(),
+                    thread_id: thread.into(),
                     id: format!("fixture-media-{i}"),
                     sender: "22".into(),
                     text: kind.legacy_placeholder().into(),
@@ -2073,9 +2095,9 @@ mod tests {
             .receive_batch_with_media("11", &messages, None)
             .unwrap();
         app.model.conversations = store.conversations("11", 200).unwrap();
-        app.model.selected = Some("d:22".into());
-        app.model.messages = store.page("11", "d:22", None, 50).unwrap();
-        app.drafts.select("d:22").unwrap();
+        app.model.selected = Some(thread.into());
+        app.model.messages = store.page("11", thread, None, 50).unwrap();
+        app.drafts.select(thread).unwrap();
         app.compact_list = false;
         let (width, height, rgba) = std::thread::spawn(|| {
             crate::app::media::decode_fixture(include_bytes!(
@@ -2089,12 +2111,15 @@ mod tests {
         for (message, _, failed) in records {
             let url = match message.media.as_ref().unwrap() {
                 MediaDescriptor::Photo(p) => p.thumbnail_url.as_ref().or(p.original_url.as_ref()),
-                MediaDescriptor::WebContent(c) => c.image_url.as_ref(),
+                MediaDescriptor::WebContent(c) | MediaDescriptor::Recommended(c) => {
+                    c.image_url.as_ref()
+                }
+                MediaDescriptor::Poll(_) => None,
             };
             if let Some(url) = url {
                 let key = crate::app::media::MediaKey {
                     account_id: "11".into(),
-                    thread_id: "d:22".into(),
+                    thread_id: thread.into(),
                     message_id: message.id,
                     url: url.clone(),
                 };

@@ -522,6 +522,10 @@ fn parse_previews_inner(
                         crate::domain::MediaKind::WebContent => {
                             super::messaging::FrameMessageKind::WebContent
                         }
+                        crate::domain::MediaKind::Recommended => {
+                            super::messaging::FrameMessageKind::Recommended
+                        }
+                        crate::domain::MediaKind::Poll => super::messaging::FrameMessageKind::Poll,
                     }
                 } else if incoming.message.sticker.is_some() {
                     super::messaging::FrameMessageKind::Sticker
@@ -632,6 +636,45 @@ fn parse_previews_inner(
 
 #[cfg(test)]
 mod preview_tests {
+    #[test]
+    fn recommended_and_poll_previews_keep_scoped_complete_sidecars() {
+        use serde_json::{json, Value};
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/messaging/rich_cards.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let message = json!({"uidFrom":"22","idTo":"11","msgId":"815","cliMsgId":"991","ts":7,"msgType":case["kind"],"content":case["content"]});
+            let page = super::parse_previews(
+                "11",
+                &json!({"msgs":[message.clone()],"groupMsgs":[message.clone()]}),
+            )
+            .unwrap();
+            assert_eq!(page.messages.len(), 2);
+            assert_eq!(page.message_media.len(), 2);
+            for (binding, message) in page.message_media.iter().zip(&page.messages) {
+                assert_eq!(binding.account_id, "11");
+                assert_eq!(binding.thread_id, message.thread_id);
+                assert_eq!(binding.message_id, message.id);
+                assert_eq!(
+                    serde_json::from_str::<Value>(binding.content.as_json()).unwrap(),
+                    case["content"]
+                );
+                assert_eq!(message.media.as_ref(), Some(binding.content.descriptor()));
+            }
+            assert_eq!(page.messages[0].thread_id, "d:22");
+            assert_eq!(page.messages[1].thread_id, "g:11");
+            let duplicate =
+                super::parse_previews("11", &json!({"msgs":[message.clone(),message.clone()]}))
+                    .unwrap();
+            assert_eq!(duplicate.messages.len(), 1);
+            assert_eq!(duplicate.message_media.len(), 1);
+            let mut conflict = message.clone();
+            conflict["content"]["unknownSourceField"] = json!(true);
+            assert!(super::parse_previews("11", &json!({"msgs":[message,conflict]})).is_err());
+        }
+    }
+
     #[test]
     fn verified_http_previews_match_original_caller_and_peer_routing() {
         use crate::{

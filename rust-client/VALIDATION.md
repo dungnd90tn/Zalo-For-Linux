@@ -381,3 +381,57 @@ The coordinator then independently verified and installed the exact candidate in
 the managed user-XDG Zalo Native launcher (same SHA-256/size, 0755 mode, correct
 `Exec --live` and icon/window identity). No app/profile/account launch accompanied
 installation. Real media acceptance remains pending the user's retry.
+
+## Shared cards, poll notices and schema-seven migration (2026-11-05)
+
+The user confirmed that photos display, while OA/shared cards still need work,
+then identified `chat.recommended` and `group.poll` placeholders. These now have
+distinct typed projections; complete source content remains immutable. Poll
+rendering covers the embedded notice/question and explicit anonymity only;
+detail/options/results retrieval and voting remain unavailable. This does not
+establish universal OA-template support.
+
+The original-reader oracle passes six recommended/poll cases; existing media
+and HTTP-preview oracles pass four/eight cases. Scoped directory/WS tests
+exercise both arrival orders, 205 previews across chunks, shared IDs in different
+threads, full raw retention, restart, queue cursors and outgoing isolation.
+All 80 storage tests, six pane-refresh regressions and 11 closed-diagnostic tests
+pass. Populated v6→v7 migration copies metadata/projection/preview bytes exactly,
+retains pending text/history/cursors/account scope and foreign-key cascades;
+failed copy leaves v6 data/table/version unchanged. Earlier v5 upgrades pass.
+
+Final default checks pass **189 Rust** (186 library + three CLI), **five IME**
+and **19 Python** tests; all-feature checks pass **424** (409 library, three CLI,
+eight coordinator and four provisioning), with two opt-in fixtures ignored.
+Focused LIVE media/recommended/poll groups pass 37/four/12 tests respectively.
+The initial sandbox loopback denial was reported; synthetic HTTPS/WSS tests ran
+only after scoped escalation approval. No actual account/history was accessed.
+
+Four approved isolated X11 sessions cover Recommended/Poll × Light/Dark at
+1200×780 and 640×480. Reviewed long Vietnamese text, original poll glyph,
+compact scrolling and per-pane drafts across resize; all closed with exit 0 and
+zero Internet connects. Evidence is under `/tmp/zalo-rust-gui-check/`:
+`{recommended,poll}-final-{light,dark}-*.png` and
+`media-{recommended,poll}-{light,dark}-{app.log,network.trace}`. Browser links
+were not launched; Wayland/real IME acceptance boundaries remain unchanged.
+
+
+Current locked offline LIVE candidate is **20,349,440 bytes**, SHA-256
+`f0263f81ec6166d384ba099ef584c2cdba765d5d9e8ad7de64eaa0238f8ba66b`.
+Strict default/all-feature/all-target Clippy passes. Disposable release smoke
+passes schema seven, 19 messages/six threads, restart/legacy preservation,
+private bounded diagnostics/build identity, locking and informational no-write
+checks with `network_used=false`. Logs use `/tmp/zalo-rich-final-*.log`.
+The previous uninstalled e9a executable at `/tmp/zalo-content-previous-e9a`
+cannot reopen schema seven. Production recommended/poll and remaining OA layouts
+still require a real retry; synthetic tests establish no full-parity claim.
+
+
+The coordinator independently verified and installed this exact candidate through
+approved scoped tooling into the managed **Zalo Native** user-XDG launcher.
+Installed SHA-256 is `f0263f81ec6166d384ba099ef584c2cdba765d5d9e8ad7de64eaa0238f8ba66b`,
+size 20,349,440 bytes and mode 0755. Desktop `Exec --live`, original icon and
+`StartupWMClass=zalo-linux-rust-preview` are correct; exactly four managed files
+were updated. Installation did not launch the app or read/change account/history
+data. Doctor reports compiled login/messaging with network startup false.
+Recommended/poll and remaining OA production acceptance await the user's restart.

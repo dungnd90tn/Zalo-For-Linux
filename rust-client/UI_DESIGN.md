@@ -57,6 +57,8 @@ Thông báo `webchat` / `msginfo.actionlist` hiển thị văn bản tiếng Vi�
 
 Ảnh nhận có thumbnail, tiêu đề/chú thích và viewer native dùng pixel đã cache; ảnh gốc chỉ mở trình duyệt khi bấm. Thẻ OA dùng preview tiếng Việt đã đối chiếu nguồn và metadata; mẫu remote chưa biết phải giải thích giới hạn, giữ toàn bộ dữ liệu, không chạy JavaScript/action. History snapshot chỉ chứa projection tối đa 16 KiB; raw content thuộc worker/SQLite. Tham chiếu [PROTOCOL_MEDIA.md](PROTOCOL_MEDIA.md) cho codec/CDN và điều kiện làm giàu placeholder cũ.
 
+`chat.recommended` dùng thẻ native đọc nội dung chia sẻ; chỉ action liên kết đã đối chiếu nguồn cho phép mở trình duyệt khi bấm. `group.poll` dùng glyph bình chọn gốc, thông báo/câu hỏi có trong tin và trạng thái ẩn danh khi nguồn có boolean rõ ràng. Chưa tải chi tiết lựa chọn/kết quả hay gửi phiếu; không tạo số liệu hoặc nút bỏ phiếu giả. Metadata mới cập nhật đúng tin trên trang đang mở, giữ thứ tự, vị trí trang và bản nháp.
+
 Tên lấy từ cache danh bạ đúng tài khoản. DM chỉ dùng tiêu đề hội thoại khi thread và người gửi khớp. Nhóm không dùng tên nhóm làm tên thành viên. Chưa biết tên thì hiện “Người gửi”, avatar `?`; không thay tên bằng ID kỹ thuật. Avatar hiện là chữ viết tắt, chưa tải ảnh hồ sơ; cùng tên dùng cùng hàm tạo avatar ở header và bubble.
 
 Tra tên dùng snapshot có scope tài khoản/trang/thread và epoch riêng. Chỉ một lookup đang chờ; cập nhật danh bạ được gộp, bỏ câu trả lời cũ và giữ nguyên tin/bản nháp. Không đổi `Message.sender`, ID hoặc điều kiện bảo mật để sửa hiển thị.

@@ -1,0 +1,107 @@
+{
+  "provenance": "Exact original _normalizeRecommendMsgSubType, shared-contact projection, contact phone reader, GroupPollInfoManager.getPollParams and poll notice renderer; synthetic offline data",
+  "cases": [
+    {
+      "name": "recommended_link_fallback",
+      "kind": "chat.recommended",
+      "content": {
+        "action": "recommened.link",
+        "title": "",
+        "description": "Mô tả liên kết",
+        "thumb": "https://f12-zpcloud.zdn.vn/card.jpg",
+        "href": "https://example.test/article",
+        "params": "{\"mediaTitle\":\"Tiêu đề dự phòng\",\"unknown\":\"retain\"}",
+        "unknown": {
+          "retained": true
+        }
+      },
+      "expected": {
+        "title": "Tiêu đề dự phòng",
+        "description": "Mô tả liên kết",
+        "image_url": "https://f12-zpcloud.zdn.vn/card.jpg",
+        "url": "https://example.test/article"
+      }
+    },
+    {
+      "name": "recommended_link_title",
+      "kind": "chat.recommended",
+      "content": {
+        "action": "recommened.link",
+        "title": "Tiêu đề nguồn",
+        "description": "Mô tả liên kết",
+        "thumb": "https://f12-zpcloud.zdn.vn/card.jpg",
+        "href": "https://example.test/article",
+        "params": "{\"mediaTitle\":\"Tiêu đề dự phòng\",\"unknown\":\"retain\"}",
+        "unknown": {
+          "retained": true
+        }
+      },
+      "expected": {
+        "title": "Tiêu đề nguồn",
+        "description": "Mô tả liên kết",
+        "image_url": "https://f12-zpcloud.zdn.vn/card.jpg",
+        "url": "https://example.test/article"
+      }
+    },
+    {
+      "name": "recommened.user",
+      "kind": "chat.recommended",
+      "content": {
+        "action": "recommened.user",
+        "title": "Tên danh thiếp",
+        "description": "{\"phone\":\"0900000000\",\"privateUnknown\":\"retain\"}",
+        "thumb": "https://f12-zpcloud.zdn.vn/contact.jpg",
+        "href": "12345",
+        "params": "23456"
+      },
+      "expected": {
+        "title": "Tên danh thiếp",
+        "description": "0900000000",
+        "image_url": "https://f12-zpcloud.zdn.vn/contact.jpg",
+        "url": null
+      }
+    },
+    {
+      "name": "recommened.vip",
+      "kind": "chat.recommended",
+      "content": {
+        "action": "recommened.vip",
+        "title": "Tên danh thiếp",
+        "description": "{\"phone\":\"0900000000\",\"privateUnknown\":\"retain\"}",
+        "thumb": "https://f12-zpcloud.zdn.vn/contact.jpg",
+        "href": "12345",
+        "params": "23456"
+      },
+      "expected": {
+        "title": "Tên danh thiếp",
+        "description": "0900000000",
+        "image_url": "https://f12-zpcloud.zdn.vn/contact.jpg",
+        "url": null
+      }
+    },
+    {
+      "name": "poll_false",
+      "kind": "group.poll",
+      "content": {
+        "params": "{\"msg\":{\"vi\":\"%1$s đã tạo bình chọn %2$s\",\"en\":\"Poll created\"},\"question\":\"Nhóm chọn ngày nào?\",\"isAnonymous\":false,\"pollId\":\"synthetic-poll\",\"unknown\":{\"retained\":true}}"
+      },
+      "expected": {
+        "title": " đã tạo bình chọn ",
+        "question": "Nhóm chọn ngày nào?",
+        "anonymous": false
+      }
+    },
+    {
+      "name": "poll_true",
+      "kind": "group.poll",
+      "content": {
+        "params": "{\"msg\":{\"vi\":\"%1$s đã tạo bình chọn %2$s\",\"en\":\"Poll created\"},\"question\":\"Nhóm chọn ngày nào?\",\"isAnonymous\":true,\"pollId\":\"synthetic-poll\",\"unknown\":{\"retained\":true}}"
+      },
+      "expected": {
+        "title": " đã tạo bình chọn ",
+        "question": "Nhóm chọn ngày nào?",
+        "anonymous": true
+      }
+    }
+  ]
+}

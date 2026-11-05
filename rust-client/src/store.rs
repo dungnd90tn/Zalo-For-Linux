@@ -211,7 +211,7 @@ impl MessageStore {
     fn initialize(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 6 {
+        if version > 7 {
             bail!("Database was created by a newer client");
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
@@ -241,8 +241,8 @@ impl MessageStore {
         e2ee::initialize(&conn)?;
         message_content::initialize(&conn)?;
         message_info::initialize(&conn)?;
-        message_media::initialize(&conn)?;
-        conn.execute_batch("PRAGMA user_version=6; COMMIT;")?;
+        message_media::initialize(&conn, version)?;
+        conn.execute_batch("PRAGMA user_version=7; COMMIT;")?;
         Ok(Self { conn })
     }
 

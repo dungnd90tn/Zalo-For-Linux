@@ -247,6 +247,8 @@ fn diagnostic_message_kind(value: wire::FrameMessageKind) -> crate::diagnostics:
         wire::FrameMessageKind::WebchatInfo => crate::diagnostics::MessageKind::WebchatInfo,
         wire::FrameMessageKind::Photo => crate::diagnostics::MessageKind::Photo,
         wire::FrameMessageKind::WebContent => crate::diagnostics::MessageKind::WebContent,
+        wire::FrameMessageKind::Recommended => crate::diagnostics::MessageKind::Recommended,
+        wire::FrameMessageKind::Poll => crate::diagnostics::MessageKind::Poll,
         wire::FrameMessageKind::Sticker => crate::diagnostics::MessageKind::Sticker,
         wire::FrameMessageKind::Other => crate::diagnostics::MessageKind::Other,
     }

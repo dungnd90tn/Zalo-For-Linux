@@ -133,6 +133,8 @@ pub enum MessageKind {
     WebchatInfo,
     Photo,
     WebContent,
+    Recommended,
+    Poll,
     Sticker,
     Other,
 }
@@ -961,6 +963,8 @@ mod tests {
             (MessageKind::WebchatInfo, "webchat_info"),
             (MessageKind::Photo, "photo"),
             (MessageKind::WebContent, "web_content"),
+            (MessageKind::Recommended, "recommended"),
+            (MessageKind::Poll, "poll"),
             (MessageKind::Sticker, "sticker"),
             (MessageKind::Other, "other"),
         ] {

@@ -49,6 +49,8 @@ impl Scope {
 fn is_media_placeholder(text: &str) -> bool {
     text == MediaKind::Photo.legacy_placeholder()
         || text == MediaKind::WebContent.legacy_placeholder()
+        || text == MediaKind::Recommended.legacy_placeholder()
+        || text == MediaKind::Poll.legacy_placeholder()
 }
 struct Flight {
     epoch: u64,
@@ -293,6 +295,66 @@ mod tests {
             thread: "d:22".into(),
             messages,
         }
+    }
+    #[test]
+    fn shared_cards_and_polls_enrich_only_the_visible_legacy_rows() {
+        let ctx = egui::Context::default();
+        let mut store = MessageStore::in_memory().unwrap();
+        let mut model = model();
+        let cases = [
+            (
+                MediaKind::Recommended,
+                serde_json::json!({
+                    "action":"recommened.link", "title":"Tài liệu được chia sẻ",
+                    "description":"Nội dung kiểm thử", "href":"https://example.invalid/shared"
+                }),
+            ),
+            (
+                MediaKind::Poll,
+                serde_json::json!({"params":{
+                    "msg":{"vi":"Đã tạo bình chọn"}, "question":"Họp lúc nào?",
+                    "isAnonymous":true, "pollId":"synthetic-poll"
+                }}),
+            ),
+        ];
+        for (message, (kind, _)) in model.messages.iter_mut().zip(&cases) {
+            message.text = kind.legacy_placeholder().into();
+        }
+        store.insert_batch(&model.messages).unwrap();
+        let original = model.messages.clone();
+        let mut hydration = Hydration::default();
+        hydration.sync_scope("11", &model, &ctx);
+        let (_, _, ids) = request(&mut hydration, &ctx);
+        assert_eq!(ids, ["old-1", "old-2"]);
+        hydration.worker_closed();
+        let records = model
+            .messages
+            .iter()
+            .zip(cases)
+            .map(|(message, (kind, source))| {
+                let content = MediaMessageContent::new(kind, &source).unwrap();
+                let mut enriched = message.clone();
+                enriched.media = Some(content.descriptor().clone());
+                (enriched, None, None, Some(content))
+            })
+            .collect::<Vec<_>>();
+        store
+            .receive_batch_with_media("11", &records, None)
+            .unwrap();
+        hydration.invalidate("11", &model, &ctx);
+        let (epoch, _, ids) = request(&mut hydration, &ctx);
+        assert!(hydration.apply(
+            &event(epoch, store.refresh_messages("11", "d:22", &ids).unwrap()),
+            "11",
+            &mut model,
+            &ctx,
+        ));
+        for (message, before) in model.messages.iter().zip(original) {
+            assert!(same_identity(message, &before));
+            assert!(message.media.is_some());
+        }
+        assert_eq!(model.generation, 7);
+        assert!(model.has_older);
     }
     #[test]
     fn late_committed_enrichment_updates_open_older_page_without_reselect_or_draft_loss() {

@@ -2,7 +2,7 @@
 mod cache;
 use crate::{
     app::media::MediaKey,
-    domain::{MediaDescriptor, Message, PhotoDescriptor, WebContentDescriptor},
+    domain::{MediaDescriptor, Message, PhotoDescriptor, PollDescriptor, WebContentDescriptor},
 };
 pub(super) use cache::MediaCache;
 use cache::{Presentation, Viewer};
@@ -24,8 +24,12 @@ pub(super) fn show(
             photo_card(ui, message, generation, photo, cache, max_width)
         }
         MediaDescriptor::WebContent(card) => {
-            web_card(ui, message, generation, card, cache, max_width)
+            web_card(ui, message, generation, card, cache, max_width, false)
         }
+        MediaDescriptor::Recommended(card) => {
+            web_card(ui, message, generation, card, cache, max_width, true)
+        }
+        MediaDescriptor::Poll(poll) => poll_card(ui, poll),
     }
 }
 fn photo_card(
@@ -93,6 +97,7 @@ fn web_card(
     card: &WebContentDescriptor,
     cache: Option<&mut MediaCache>,
     max_width: f32,
+    recommended: bool,
 ) {
     let colors = crate::theme::palette(ui.ctx());
     if let Some(url) = card.image_url.as_deref() {
@@ -163,22 +168,67 @@ fn web_card(
             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
         }
     }
-    if (card.title.is_empty() || card.title == crate::domain::media::WEBCONTENT_PREVIEW)
+    if (card.title.is_empty()
+        || card.title == crate::domain::media::WEBCONTENT_PREVIEW
+        || (recommended && card.title == crate::domain::media::RECOMMENDED_PREVIEW))
         && card.description.is_empty()
         && card.rows.is_empty()
         && card.image_url.is_none()
     {
         ui.add(
             egui::Label::new(
-                RichText::new(
-                    "Mẫu tương tác của tài khoản dịch vụ chưa được hiển thị trong ứng dụng native.",
-                )
+                RichText::new(if recommended {
+                    "Nội dung chia sẻ này chưa có bản xem trước trong ứng dụng native."
+                } else {
+                    "Mẫu tương tác của tài khoản dịch vụ chưa được hiển thị trong ứng dụng native."
+                })
                 .size(12.0)
                 .color(colors.text_secondary),
             )
             .wrap(),
         );
     }
+}
+fn poll_card(ui: &mut egui::Ui, poll: &PollDescriptor) {
+    let colors = crate::theme::palette(ui.ctx());
+    ui.horizontal_top(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+        super::visuals::source_icon(ui, rect, "fa-icon-outline-poll", colors.text_secondary);
+        ui.add(
+            egui::Label::new(
+                RichText::new(&poll.title)
+                    .family(egui::FontFamily::Name("Zalo Semibold".into()))
+                    .color(colors.text_primary),
+            )
+            .wrap(),
+        );
+    });
+    if !poll.question.is_empty() {
+        ui.add(egui::Label::new(&poll.question).wrap());
+    }
+    if let Some(anonymous) = poll.anonymous {
+        ui.label(
+            RichText::new(if anonymous {
+                "Bình chọn ẩn danh"
+            } else {
+                "Bình chọn công khai"
+            })
+            .size(12.0)
+            .color(colors.text_secondary),
+        );
+    }
+    ui.add_enabled(false, egui::Button::new("Bình chọn"))
+        .on_disabled_hover_text("Ứng dụng native chưa hỗ trợ tham gia bình chọn.");
+    ui.add(
+        egui::Label::new(
+            RichText::new(
+                "Chưa tải các lựa chọn và kết quả. Hiện chỉ xem được nội dung thông báo bình chọn.",
+            )
+            .size(12.0)
+            .color(colors.text_secondary),
+        )
+        .wrap(),
+    );
 }
 #[allow(clippy::too_many_arguments)]
 fn thumbnail(
@@ -332,6 +382,71 @@ fn external_url(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn message(media: MediaDescriptor) -> Message {
+        Message {
+            account_id: "11".into(),
+            thread_id: "g:22".into(),
+            id: "1".into(),
+            sender: "22".into(),
+            text: media.kind().legacy_placeholder().into(),
+            sent_at_ms: 1,
+            sticker: None,
+            media: Some(media),
+        }
+    }
+    #[test]
+    fn recommended_card_only_offers_explicit_external_navigation() {
+        let ctx = egui::Context::default();
+        super::super::visuals::install(&ctx);
+        let message = message(MediaDescriptor::Recommended(WebContentDescriptor {
+            title: "Liên kết được chia sẻ".into(),
+            description: "Nội dung chỉ đọc".into(),
+            image_url: None,
+            url: Some("https://example.invalid/shared".into()),
+            rows: vec![],
+            buttons: vec![],
+        }));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &message, 1, None, 300.0));
+        });
+        assert!(output.platform_output.open_url.is_none());
+    }
+    #[test]
+    fn poll_shows_embedded_facts_without_inventing_options_votes_or_anonymity() {
+        assert!(crate::theme::catalog::glyph("fa-icon-outline-poll").is_some());
+        for anonymous in [None, Some(false), Some(true)] {
+            let ctx = egui::Context::default();
+            super::super::visuals::install(&ctx);
+            let message = message(MediaDescriptor::Poll(PollDescriptor {
+                title: "Đã tạo bình chọn".into(),
+                question: "Chúng ta họp vào lúc nào?".into(),
+                anonymous,
+            }));
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, &message, 1, None, 300.0));
+            });
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Đã tạo bình chọn"));
+            assert!(text.contains("Chúng ta họp vào lúc nào?"));
+            assert!(text.contains("Chưa tải các lựa chọn và kết quả"));
+            assert_eq!(text.contains("Bình chọn ẩn danh"), anonymous == Some(true));
+            assert_eq!(
+                text.contains("Bình chọn công khai"),
+                anonymous == Some(false)
+            );
+            assert!(!text.contains("0 phiếu"));
+            assert!(!text.contains("chưa được hỗ trợ]"));
+            assert!(output.platform_output.open_url.is_none());
+        }
+    }
     #[test]
     fn readonly_card_does_not_navigate_or_execute_remote_actions() {
         let ctx = egui::Context::default();

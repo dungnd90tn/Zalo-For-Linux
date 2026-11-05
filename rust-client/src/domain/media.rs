@@ -9,24 +9,32 @@ pub const MAX_MEDIA_DESCRIPTOR_BYTES: usize = 16 * 1024;
 pub const MAX_MEDIA_URL_BYTES: usize = 4096;
 pub const PHOTO_PREVIEW: &str = "[Hình ảnh]";
 pub const WEBCONTENT_PREVIEW: &str = "[Tin nhắn Media]";
+pub const RECOMMENDED_PREVIEW: &str = "[Nội dung được chia sẻ]";
+pub const POLL_PREVIEW: &str = "[Bình chọn]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
     Photo,
     WebContent,
+    Recommended,
+    Poll,
 }
 impl MediaKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Photo => "chat.photo",
             Self::WebContent => "chat.webcontent",
+            Self::Recommended => "chat.recommended",
+            Self::Poll => "group.poll",
         }
     }
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
             "chat.photo" => Some(Self::Photo),
             "chat.webcontent" => Some(Self::WebContent),
+            "chat.recommended" => Some(Self::Recommended),
+            "group.poll" => Some(Self::Poll),
             _ => None,
         }
     }
@@ -34,6 +42,8 @@ impl MediaKind {
         match self {
             Self::Photo => "[Tin nhắn chat.photo chưa được hỗ trợ]",
             Self::WebContent => "[Tin nhắn chat.webcontent chưa được hỗ trợ]",
+            Self::Recommended => "[Tin nhắn chat.recommended chưa được hỗ trợ]",
+            Self::Poll => "[Tin nhắn group.poll chưa được hỗ trợ]",
         }
     }
 }
@@ -71,6 +81,13 @@ pub struct WebContentDescriptor {
     pub buttons: Vec<CardButton>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PollDescriptor {
+    pub title: String,
+    pub question: String,
+    pub anonymous: Option<bool>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     content = "data",
@@ -80,18 +97,29 @@ pub struct WebContentDescriptor {
 pub enum MediaDescriptor {
     Photo(PhotoDescriptor),
     WebContent(WebContentDescriptor),
+    Recommended(WebContentDescriptor),
+    Poll(PollDescriptor),
 }
 impl MediaDescriptor {
     pub fn kind(&self) -> MediaKind {
         match self {
             Self::Photo(_) => MediaKind::Photo,
             Self::WebContent(_) => MediaKind::WebContent,
+            Self::Recommended(_) => MediaKind::Recommended,
+            Self::Poll(_) => MediaKind::Poll,
         }
     }
     pub fn preview_text(&self) -> &str {
         match self {
             Self::Photo(_) => PHOTO_PREVIEW,
-            Self::WebContent(card) => &card.title,
+            Self::WebContent(card) | Self::Recommended(card) => &card.title,
+            Self::Poll(poll) => {
+                if poll.question.is_empty() {
+                    POLL_PREVIEW
+                } else {
+                    &poll.question
+                }
+            }
         }
     }
     pub fn validate(&self) -> Result<()> {
@@ -118,7 +146,7 @@ impl MediaDescriptor {
                     "Invalid photo descriptor"
                 );
             }
-            Self::WebContent(card) => {
+            Self::WebContent(card) | Self::Recommended(card) => {
                 ensure!(
                     !card.title.is_empty()
                         && text(&card.title, 1024)
@@ -136,6 +164,12 @@ impl MediaDescriptor {
                             .iter()
                             .all(|button| text(&button.label, 128) && url(&button.url)),
                     "Invalid web content descriptor"
+                );
+            }
+            Self::Poll(poll) => {
+                ensure!(
+                    !poll.title.is_empty() && text(&poll.title, 1024) && text(&poll.question, 4096),
+                    "Invalid poll descriptor"
                 );
             }
         }
@@ -188,6 +222,8 @@ impl MediaMessageContent {
         let mut descriptor = match kind {
             MediaKind::Photo => MediaDescriptor::Photo(photo(content)),
             MediaKind::WebContent => MediaDescriptor::WebContent(web_content(content)),
+            MediaKind::Recommended => MediaDescriptor::Recommended(recommended(content)),
+            MediaKind::Poll => MediaDescriptor::Poll(poll(content)),
         };
         fit_descriptor(&mut descriptor);
         descriptor
@@ -241,7 +277,7 @@ fn fit_descriptor(descriptor: &mut MediaDescriptor) {
                     photo.original_url.take().is_some()
                 }
             }
-            MediaDescriptor::WebContent(card) => {
+            MediaDescriptor::WebContent(card) | MediaDescriptor::Recommended(card) => {
                 if !card.description.is_empty() {
                     card.description.truncate(
                         card.description
@@ -250,6 +286,15 @@ fn fit_descriptor(descriptor: &mut MediaDescriptor) {
                     true
                 } else {
                     card.image_url.take().is_some()
+                }
+            }
+            MediaDescriptor::Poll(poll) => {
+                if !poll.question.is_empty() {
+                    poll.question
+                        .truncate(poll.question.floor_char_boundary(poll.question.len() / 2));
+                    true
+                } else {
+                    false
                 }
             }
         };
@@ -391,10 +436,168 @@ fn web_content(content: &Value) -> WebContentDescriptor {
     }
 }
 
+fn recommended(content: &Value) -> WebContentDescriptor {
+    // MSG_CONTACT's source action is intentionally spelled "recommened".
+    // Only the link action authorizes an explicit browser URL. Contact IDs,
+    // call identifiers and sticker-set deep links are never treated as URLs.
+    let action = content.get("action").and_then(Value::as_str).unwrap_or("");
+    let params = parsed(content.get("params")).unwrap_or(Value::Null);
+    let fallback = match action {
+        "recommened.link" => "[Liên kết]",
+        "recommened.user" | "recommened.vip" => "[Danh thiếp]",
+        "recommened.stickerset" => "[Bộ nhãn dán]",
+        "recommened.misscall" => "[Cuộc gọi nhỡ]",
+        "recommened.calling" => "[Cuộc gọi đi]",
+        "recommened.receivecall" => "[Cuộc gọi đến]",
+        "recommened.calltime" => "[Cuộc gọi]",
+        _ => RECOMMENDED_PREVIEW,
+    };
+    let mut title = bounded(content.get("title"), 1024);
+    if title.is_empty() && action == "recommened.link" {
+        title = bounded(params.get("mediaTitle"), 1024);
+    }
+    if title.is_empty() {
+        title = fallback.into();
+    }
+    let contact = matches!(action, "recommened.user" | "recommened.vip");
+    let description = if contact {
+        // The source contact text reader decodes description.phone; never
+        // display the serialized object or execute its other fields.
+        let description = parsed(content.get("description")).unwrap_or(Value::Null);
+        bounded(description.get("phone"), 4096)
+    } else {
+        bounded(content.get("description"), 4096)
+    };
+    let visual = matches!(
+        action,
+        "recommened.link" | "recommened.user" | "recommened.vip" | "recommened.stickerset"
+    );
+    WebContentDescriptor {
+        title,
+        description,
+        image_url: visual.then(|| url(content.get("thumb"))).flatten(),
+        url: (action == "recommened.link")
+            .then(|| url(content.get("href")))
+            .flatten(),
+        rows: Vec::new(),
+        buttons: Vec::new(),
+    }
+}
+
+fn poll(content: &Value) -> PollDescriptor {
+    // GroupPollInfoManager reads this embedded notice separately from fetched
+    // getPollDetail options/votes. Project only fields present in the message.
+    let params = parsed(content.get("params")).unwrap_or(Value::Null);
+    let notice = bounded(params.pointer("/msg/vi"), 1024)
+        .replacen("%1$s", "", 1)
+        .replacen("%2$s", "", 1);
+    PollDescriptor {
+        title: if notice.trim().is_empty() {
+            POLL_PREVIEW.into()
+        } else {
+            notice.trim().into()
+        },
+        question: bounded(params.get("question"), 4096),
+        anonymous: params.get("isAnonymous").and_then(Value::as_bool),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn readonly_recommended_and_poll_match_original_source_readers() {
+        let oracle: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/messaging/rich_cards.json"
+        ))
+        .unwrap();
+        for case in oracle["cases"].as_array().unwrap() {
+            let kind = MediaKind::from_wire(case["kind"].as_str().unwrap()).unwrap();
+            let content = MediaMessageContent::new(kind, &case["content"]).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(content.as_json()).unwrap(),
+                case["content"]
+            );
+            let expected = &case["expected"];
+            match content.descriptor() {
+                MediaDescriptor::Recommended(card) => {
+                    assert_eq!(card.title, expected["title"]);
+                    assert_eq!(card.description, expected["description"]);
+                    assert_eq!(card.image_url.as_deref(), expected["image_url"].as_str());
+                    assert_eq!(card.url.as_deref(), expected["url"].as_str());
+                    assert!(card.rows.is_empty() && card.buttons.is_empty());
+                }
+                MediaDescriptor::Poll(poll) => {
+                    // Removing source actor tokens leaves outer whitespace;
+                    // the native presentation trims it, not the stored raw data.
+                    assert_eq!(poll.title, expected["title"].as_str().unwrap().trim());
+                    assert_eq!(poll.question, expected["question"]);
+                    assert_eq!(poll.anonymous, expected["anonymous"].as_bool());
+                }
+                _ => panic!("Unexpected rich-card fixture kind"),
+            }
+            assert_eq!(content.kind(), kind);
+            assert_eq!(content.descriptor().kind(), kind);
+            assert!(!content
+                .descriptor()
+                .preview_text()
+                .contains("chưa được hỗ trợ"));
+            assert_eq!(
+                serde_json::from_slice::<MediaDescriptor>(
+                    &serde_json::to_vec(content.descriptor()).unwrap()
+                )
+                .unwrap(),
+                *content.descriptor()
+            );
+        }
+    }
+
+    #[test]
+    fn recommendations_never_turn_nonlink_actions_into_browser_or_asset_requests() {
+        for action in [
+            "recommened.misscall",
+            "recommened.calling",
+            "recommened.receivecall",
+            "recommened.calltime",
+            "unknown.action",
+        ] {
+            let content = json!({"action":action,"href":"https://example.test/action","thumb":"https://f12-zpcloud.zdn.vn/action.jpg","params":{"actions":[{"url":"javascript:never"}]}});
+            let media = MediaMessageContent::new(MediaKind::Recommended, &content).unwrap();
+            let MediaDescriptor::Recommended(card) = media.descriptor() else {
+                panic!()
+            };
+            assert!(!card.title.is_empty());
+            assert!(card.url.is_none() && card.image_url.is_none() && card.buttons.is_empty());
+            assert_eq!(
+                serde_json::from_str::<Value>(media.as_json()).unwrap(),
+                content
+            );
+        }
+        for params in [
+            Value::Null,
+            json!("malformed"),
+            json!({"question":true,"isAnonymous":"false","msg":{"vi":5}}),
+        ] {
+            let media =
+                MediaMessageContent::new(MediaKind::Poll, &json!({"params":params})).unwrap();
+            let MediaDescriptor::Poll(poll) = media.descriptor() else {
+                panic!()
+            };
+            assert_eq!(poll.title, POLL_PREVIEW);
+            assert!(poll.question.is_empty() && poll.anonymous.is_none());
+            assert_eq!(media.descriptor().preview_text(), POLL_PREVIEW);
+        }
+        for kind in [MediaKind::Recommended, MediaKind::Poll] {
+            let content = json!({"action":"recommened.link","title":"\"".repeat(2000),"description":"\\".repeat(5000),"href":"javascript:never","params":{"question":"\"".repeat(5000),"msg":{"vi":"\"".repeat(2000)}}});
+            let media = MediaMessageContent::new(kind, &content).unwrap();
+            media.descriptor().validate().unwrap();
+            assert!(
+                serde_json::to_vec(media.descriptor()).unwrap().len() <= MAX_MEDIA_DESCRIPTOR_BYTES
+            );
+        }
+    }
 
     #[test]
     fn rendering_matches_original_photo_normalizer_and_zinstant_reader() {
@@ -434,6 +637,7 @@ mod tests {
                     assert_eq!(card.image_url.as_deref(), expected["image_url"].as_str());
                     assert!(card.url.is_none() && card.rows.is_empty() && card.buttons.is_empty());
                 }
+                _ => panic!("Unexpected legacy fixture kind"),
             }
         }
     }
@@ -484,6 +688,7 @@ mod tests {
                 MediaDescriptor::WebContent(card) => {
                     assert!(card.image_url.is_none() && card.title == "Thông báo")
                 }
+                _ => panic!("Unexpected legacy fixture kind"),
             }
         }
     }

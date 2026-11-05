@@ -10,15 +10,25 @@ use rusqlite::{params, Connection, OptionalExtension};
 const MAX_PROJECTION_BYTES: usize = MAX_MEDIA_DESCRIPTOR_BYTES;
 const MAX_PREVIEW_BYTES: usize = 4 * MAX_PREVIEW_CHARS;
 
-pub(super) fn initialize(conn: &Connection) -> Result<()> {
+pub(super) fn initialize(conn: &Connection, version: i64) -> Result<()> {
+    // Rebuild only the v6 sidecar CHECK constraint, inside the caller's transaction.
+    // INSERT...SELECT retains the original immutable JSON and presentation bytes.
+    if version == 6 {
+        conn.execute_batch("ALTER TABLE message_media RENAME TO message_media_v6;")?;
+    }
     conn.execute_batch("CREATE TABLE IF NOT EXISTS message_media(
         account_id TEXT NOT NULL,thread_id TEXT NOT NULL,message_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK(kind IN ('chat.photo','chat.webcontent')),
+        kind TEXT NOT NULL CHECK(kind IN ('chat.photo','chat.webcontent','chat.recommended','group.poll')),
         metadata TEXT NOT NULL CHECK(length(CAST(metadata AS BLOB))<=4194304),
         projection TEXT NOT NULL CHECK(length(CAST(projection AS BLOB))<=16384),
         preview TEXT NOT NULL CHECK(length(CAST(preview AS BLOB))<=1024),
         PRIMARY KEY(account_id,thread_id,message_id),
         FOREIGN KEY(account_id,thread_id,message_id) REFERENCES messages(account_id,thread_id,message_id) ON DELETE CASCADE);")?;
+    if version == 6 {
+        conn.execute_batch("INSERT INTO message_media(account_id,thread_id,message_id,kind,metadata,projection,preview)
+            SELECT account_id,thread_id,message_id,kind,metadata,projection,preview FROM message_media_v6;
+            DROP TABLE message_media_v6;")?;
+    }
     Ok(())
 }
 
@@ -222,7 +232,12 @@ mod tests {
     }
     #[test]
     fn legacy_media_enrichment_preserves_body_and_publishes_typed_history_and_preview() {
-        for kind in [MediaKind::Photo, MediaKind::WebContent] {
+        for kind in [
+            MediaKind::Photo,
+            MediaKind::WebContent,
+            MediaKind::Recommended,
+            MediaKind::Poll,
+        ] {
             let mut store = MessageStore::in_memory().unwrap();
             let (m, content) = message(kind, "one");
             let mut legacy = m.clone();
@@ -310,6 +325,54 @@ mod tests {
             store.message_media("11", "d:22", "one").unwrap(),
             Some(original)
         );
+    }
+    #[test]
+    fn recommended_and_poll_preserve_full_raw_and_never_ack_plaintext_or_accept_conflicts() {
+        for kind in [MediaKind::Recommended, MediaKind::Poll] {
+            let mut store = MessageStore::in_memory().unwrap();
+            let (mut m, raw) = message(kind, "rich");
+            m.sender = "11".into();
+            let client = store.prepare_outgoing("11", "d:22", &m.text, 1000).unwrap();
+            store
+                .receive_batch_with_media(
+                    "11",
+                    &[(m.clone(), Some(client.to_string()), None, Some(raw.clone()))],
+                    Some(("510_1", "100")),
+                )
+                .unwrap();
+            let outgoing = || {
+                store
+                    .conn
+                    .query_row("SELECT state,server_id,body FROM outgoing", [], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })
+                    .unwrap()
+            };
+            let (state, server, body) = outgoing();
+            assert_eq!(state, "sending");
+            assert_eq!(server, None);
+            assert_eq!(body, m.text);
+            let changed = media_content(kind, 2);
+            assert_eq!(raw.descriptor(), changed.descriptor());
+            assert_ne!(raw.as_json(), changed.as_json());
+            assert!(store
+                .receive_batch_with_media(
+                    "11",
+                    &[(m.clone(), None, None, Some(changed))],
+                    Some(("510_1", "101"))
+                )
+                .is_err());
+            assert_eq!(store.receive_cursor("11", "510_1").unwrap(), "100");
+            assert_eq!(
+                store.message_media("11", "d:22", "rich").unwrap(),
+                Some(raw)
+            );
+            assert_eq!(store.page("11", "d:22", None, 10).unwrap(), vec![m]);
+        }
     }
     #[test]
     fn enrichment_never_changes_ordinary_text_sender_timestamp_or_other_sidecars() {
@@ -515,8 +578,163 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
+            7
+        );
+    }
+
+    fn downgrade_media_to_v6(conn: &Connection) {
+        conn.execute_batch("BEGIN IMMEDIATE;
+            ALTER TABLE message_media RENAME TO media_fixture;
+            CREATE TABLE message_media(
+                account_id TEXT NOT NULL,thread_id TEXT NOT NULL,message_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('chat.photo','chat.webcontent')),
+                metadata TEXT NOT NULL CHECK(length(CAST(metadata AS BLOB))<=4194304),
+                projection TEXT NOT NULL CHECK(length(CAST(projection AS BLOB))<=16384),
+                preview TEXT NOT NULL CHECK(length(CAST(preview AS BLOB))<=1024),
+                PRIMARY KEY(account_id,thread_id,message_id),
+                FOREIGN KEY(account_id,thread_id,message_id) REFERENCES messages(account_id,thread_id,message_id) ON DELETE CASCADE);
+            INSERT INTO message_media SELECT * FROM media_fixture;
+            DROP TABLE media_fixture; PRAGMA user_version=6; COMMIT;").unwrap();
+    }
+
+    fn media_rows(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        conn.prepare("SELECT account_id,thread_id,message_id,kind,metadata,projection,preview FROM message_media ORDER BY account_id,thread_id,message_id")
+            .unwrap().query_map([], |row| (0..7).map(|index| row.get(index)).collect())
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn populated_v6_upgrade_preserves_exact_sidecars_scope_and_pending_state() {
+        let mut previous = MessageStore::in_memory().unwrap();
+        let mut originals = Vec::new();
+        for (account, kind) in [("11", MediaKind::Photo), ("33", MediaKind::WebContent)] {
+            let (mut m, content) = message(kind, "shared");
+            m.account_id = account.into();
+            previous
+                .receive_batch_with_media(
+                    account,
+                    &[(m.clone(), None, None, Some(content))],
+                    Some(("510_1", "99")),
+                )
+                .unwrap();
+            originals.push(m);
+        }
+        let client = previous
+            .prepare_outgoing("11", "d:22", "preserved pending draft", 1001)
+            .unwrap();
+        downgrade_media_to_v6(&previous.conn);
+        let rows = media_rows(&previous.conn);
+        let mut store = MessageStore::initialize(previous.conn).unwrap();
+        assert_eq!(media_rows(&store.conn), rows);
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        for m in originals {
+            assert_eq!(
+                store.page(&m.account_id, "d:22", None, 10).unwrap(),
+                vec![m.clone()]
+            );
+            assert_eq!(store.receive_cursor(&m.account_id, "510_1").unwrap(), "99");
+        }
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT body FROM outgoing WHERE account_id='11' AND client_id=?1",
+                    [client.to_string()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "preserved pending draft"
+        );
+        assert!(store
+            .conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none());
+        for kind in [MediaKind::Recommended, MediaKind::Poll] {
+            let (m, raw) = message(kind, kind.as_str());
+            store
+                .receive_batch_with_media("11", &[(m.clone(), None, None, Some(raw.clone()))], None)
+                .unwrap();
+            assert_eq!(store.message_media("11", "d:22", &m.id).unwrap(), Some(raw));
+        }
+        assert!(store.delete("11", "d:22", "shared").unwrap());
+        assert!(store
+            .message_media("11", "d:22", "shared")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .message_media("33", "d:22", "shared")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn failed_v6_copy_rolls_back_schema_data_and_version() {
+        let path = std::env::temp_dir().join(format!(
+            "zalo-media-migration-{}.sqlite3",
+            crate::domain::local_message_id().unwrap()
+        ));
+        let mut previous = MessageStore::open(&path).unwrap();
+        let (m, raw) = message(MediaKind::Photo, "unchanged");
+        previous
+            .receive_batch_with_media("11", &[(m, None, None, Some(raw))], Some(("510_1", "91")))
+            .unwrap();
+        downgrade_media_to_v6(&previous.conn);
+        previous
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        previous
+            .conn
+            .execute(
+                "UPDATE message_media SET projection=?1",
+                ["x".repeat(MAX_PROJECTION_BYTES + 1)],
+            )
+            .unwrap();
+        previous
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints=OFF;")
+            .unwrap();
+        let rows = media_rows(&previous.conn);
+        drop(previous);
+        assert!(MessageStore::open(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
             6
         );
+        assert_eq!(media_rows(&conn), rows);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='message_media_v6'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT last_id FROM receive_cursors WHERE account_id='11' AND queue='510_1'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "91"
+        );
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

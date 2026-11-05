@@ -255,6 +255,8 @@ pub enum FrameMessageKind {
     WebchatInfo,
     Photo,
     WebContent,
+    Recommended,
+    Poll,
     Sticker,
     Other,
 }
@@ -690,6 +692,8 @@ fn incoming_with_reason(
                 "chat.sticker" => FrameMessageKind::Sticker,
                 "chat.photo" => FrameMessageKind::Photo,
                 "chat.webcontent" => FrameMessageKind::WebContent,
+                "chat.recommended" => FrameMessageKind::Recommended,
+                "group.poll" => FrameMessageKind::Poll,
                 _ => FrameMessageKind::Other,
             });
             let sticker = sticker_descriptor(v);
@@ -973,7 +977,16 @@ mod tests {
         let fixture: Value =
             serde_json::from_str(include_str!("../../tests/fixtures/messaging/media.json"))
                 .unwrap();
-        for case in fixture["cases"].as_array().unwrap() {
+        let cards: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/messaging/rich_cards.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(cards["cases"].as_array().unwrap())
+        {
             let mut payload = incoming_fixture();
             let message = &mut payload["data"]["msgs"][0];
             message["msgType"] = case["kind"].clone();
@@ -1035,6 +1048,10 @@ mod tests {
                 let mut message = payload["data"]["msgs"][0].clone();
                 message["idTo"] = json!("33");
                 message["msgType"] = json!(message_type);
+                if message_type == "chat.recommended" {
+                    message["content"] =
+                        json!({"action":"recommened.link","title":"Synthetic link"});
+                }
                 payload["data"] = json!({field:[message]});
                 assert_eq!(
                     incoming_messages_detailed("11", &payload)
@@ -1055,7 +1072,7 @@ mod tests {
                 assert_eq!(received[0].message.thread_id, "d:22");
                 assert_eq!(received[0].message.sender, "22");
                 assert_eq!(received[0].message.id, "811");
-                assert_eq!(received[0].unsupported, message_type != "webchat");
+                assert!(!received[0].unsupported);
             }
         }
         for (sender, recipient, expected_sender, expected_thread) in [
