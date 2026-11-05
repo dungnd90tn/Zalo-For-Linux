@@ -1,0 +1,200 @@
+{
+  "provenance": {
+    "source": "pc-dist/compact-app-pc.e08d0d44f38873747a6b.js",
+    "sha256": "bfd51b6f6abc392e5ff52ff6db9813405f1e64e00f033e7176913350e7bc9e21",
+    "method": "_sendPlainText",
+    "expression": "p.trim()"
+  },
+  "cases": [
+    {
+      "name": "boundary-U+0009",
+      "input": "\tchào\t",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+000A",
+      "input": "\nchào\n",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+000B",
+      "input": "\u000bchào\u000b",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+000C",
+      "input": "\fchào\f",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+000D",
+      "input": "\rchào\r",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+0020",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+0085",
+      "input": "chào",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+00A0",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+1680",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+180E",
+      "input": "᠎chào᠎",
+      "expected": "᠎chào᠎"
+    },
+    {
+      "name": "boundary-U+2000",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2001",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2002",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2003",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2004",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2005",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2006",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2007",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2008",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2009",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+200A",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+200B",
+      "input": "​chào​",
+      "expected": "​chào​"
+    },
+    {
+      "name": "boundary-U+2028",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2029",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+202F",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+205F",
+      "input": " chào ",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+2060",
+      "input": "⁠chào⁠",
+      "expected": "⁠chào⁠"
+    },
+    {
+      "name": "boundary-U+3000",
+      "input": "　chào　",
+      "expected": "chào"
+    },
+    {
+      "name": "boundary-U+FEFF",
+      "input": "﻿chào﻿",
+      "expected": "chào"
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "expected": ""
+    },
+    {
+      "name": "ascii-whitespace-only",
+      "input": " \t\r\n\u000b\f",
+      "expected": ""
+    },
+    {
+      "name": "telex-trailing-space",
+      "input": "tiếng Việt ",
+      "expected": "tiếng Việt"
+    },
+    {
+      "name": "composer-trailing-newline",
+      "input": "chào\n",
+      "expected": "chào"
+    },
+    {
+      "name": "mixed-boundaries",
+      "input": "﻿ \tchào\r\n  ",
+      "expected": "chào"
+    },
+    {
+      "name": "internal-spacing-and-newline",
+      "input": " a  b\n c \t",
+      "expected": "a  b\n c"
+    },
+    {
+      "name": "internal-unicode-whitespace",
+      "input": " a b﻿cd ",
+      "expected": "a b﻿cd"
+    },
+    {
+      "name": "decomposed-preserved",
+      "input": "  chào  ",
+      "expected": "chào"
+    },
+    {
+      "name": "zero-width-space-preserved",
+      "input": "​chào​",
+      "expected": "​chào​"
+    }
+  ]
+}

@@ -1,0 +1,69 @@
+{
+  "provenance": "Exact original preProcessChatMsgs and _processChatMessages default consumer key expression; synthetic identities",
+  "cases": [
+    {
+      "name": "peer_addressed_other",
+      "field": "msgs",
+      "uidFrom": "22",
+      "idTo": "33",
+      "msgType": "chat.photo",
+      "thread": "d:22"
+    },
+    {
+      "name": "peer_addressed_text",
+      "field": "msgs",
+      "uidFrom": "22",
+      "idTo": "33",
+      "msgType": "webchat",
+      "thread": "d:22"
+    },
+    {
+      "name": "page_peer_addressed",
+      "field": "pageMsgs",
+      "uidFrom": "44",
+      "idTo": "55",
+      "msgType": "webchat",
+      "thread": "d:44"
+    },
+    {
+      "name": "incoming_to_account",
+      "field": "msgs",
+      "uidFrom": "22",
+      "idTo": "11",
+      "msgType": "webchat",
+      "thread": "d:22"
+    },
+    {
+      "name": "incoming_to_zero",
+      "field": "msgs",
+      "uidFrom": "22",
+      "idTo": "0",
+      "msgType": "webchat",
+      "thread": "d:22"
+    },
+    {
+      "name": "self_sentinel",
+      "field": "msgs",
+      "uidFrom": "0",
+      "idTo": "22",
+      "msgType": "webchat",
+      "thread": "d:22"
+    },
+    {
+      "name": "self_chat",
+      "field": "msgs",
+      "uidFrom": "0",
+      "idTo": "0",
+      "msgType": "webchat",
+      "thread": "d:11"
+    },
+    {
+      "name": "group_collision",
+      "field": "groupMsgs",
+      "uidFrom": "33",
+      "idTo": "22",
+      "msgType": "webchat",
+      "thread": "g:22"
+    }
+  ]
+}

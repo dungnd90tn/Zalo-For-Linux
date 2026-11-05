@@ -1,0 +1,244 @@
+{
+  "provenance": "exact own socket raw/decrypt/decompress and subclass _onData/_onLightweightData, bundled Pako; synthetic fixed key",
+  "cases": [
+    {
+      "name": "pong_absent",
+      "frame": "AgIAAXsiZXZlbnRJZCI6MTcwMDAwMDAwMDAwMH0=",
+      "route": "pong",
+      "payload": null,
+      "hasError": false
+    },
+    {
+      "name": "active_absent",
+      "frame": "AgQAAHsiZGF0YSI6eyJyZXFJZCI6ImNtZF80IiwiYXQiOjE3MDAwMDAwMDAwMDB9fQ==",
+      "route": "lightweight",
+      "payload": {
+        "data": {
+          "reqId": "cmd_4",
+          "at": 1700000000000
+        }
+      },
+      "hasError": false
+    },
+    {
+      "name": "pong_null",
+      "frame": "AgIAAXsiZXZlbnRJZCI6MTcwMDAwMDAwMDAwMCwiZXJyb3JfY29kZSI6bnVsbH0=",
+      "route": "pong",
+      "payload": null,
+      "hasError": false
+    },
+    {
+      "name": "active_null",
+      "frame": "AgQAAHsiZGF0YSI6eyJyZXFJZCI6ImNtZF80IiwiYXQiOjE3MDAwMDAwMDAwMDB9LCJlcnJvcl9jb2RlIjpudWxsfQ==",
+      "route": "lightweight",
+      "payload": {
+        "data": {
+          "reqId": "cmd_4",
+          "at": 1700000000000
+        },
+        "error_code": null
+      },
+      "hasError": false
+    },
+    {
+      "name": "pong_0",
+      "frame": "AgIAAXsiZXZlbnRJZCI6MTcwMDAwMDAwMDAwMCwiZXJyb3JfY29kZSI6MH0=",
+      "route": "pong",
+      "payload": null,
+      "hasError": false
+    },
+    {
+      "name": "active_0",
+      "frame": "AgQAAHsiZGF0YSI6eyJyZXFJZCI6ImNtZF80IiwiYXQiOjE3MDAwMDAwMDAwMDB9LCJlcnJvcl9jb2RlIjowfQ==",
+      "route": "lightweight",
+      "payload": {
+        "data": {
+          "reqId": "cmd_4",
+          "at": 1700000000000
+        },
+        "error_code": 0
+      },
+      "hasError": false
+    },
+    {
+      "name": "personal",
+      "frame": "AvUBAHsiZXJyb3JfY29kZSI6MCwiZW5jcnlwdCI6MiwiZGF0YSI6IkFRSURCQVVHQndnSkNnc01EUTRQRUJFU0V4UVZGaGNZR1JvYkhCMGVIeUQ0RHB6VzNVeHVxcEhVVXN2Y3Z2NGdNaHNDN29DR1pYaFFJYlUlMkJ3dFY2QzdPdnBPZm5YRHNqaWUwTXElMkI3TCUyRmJVeEVldXVXdHdhUHElMkZ0NWFuZm5yaGk4SnZCTExzYUl1NlFMdUpDSGVSOFVzQVBpRU83bGZhVm56Wm9mJTJGbiUyRjBCV29GSkNySFhwUXptcXdlb215UlpIc2tnVG1IaVQxaXJVekVYRWRKejRrZDJsNW5EdVlUQWJSVkE4bXlWdzVRM0pyTnhOTzdhYWpNeVFoYTdRMjBScGJZSTdKVGJmZkVSSFFwTm82YTNLdSUyRjRnMSJ9",
+      "route": "data",
+      "payload": {
+        "error_code": 0,
+        "data": {
+          "msgs": [
+            {
+              "uidFrom": "22",
+              "idTo": "11",
+              "msgId": "903",
+              "cliMsgId": "1700000000001",
+              "ts": "1700000000001",
+              "msgType": "webchat",
+              "content": "Synthetic encrypted transport message"
+            }
+          ]
+        }
+      },
+      "hasError": false
+    },
+    {
+      "name": "group",
+      "frame": "AgkCAHsiZXJyb3JfY29kZSI6MCwiZW5jcnlwdCI6MiwiZGF0YSI6IkFRSURCQVVHQndnSkNnc01EUTRQRUJFU0V4UVZGaGNZR1JvYkhCMGVIeUQ0RHB6VzNVeHVxcEhVbEJCWG1SYmFEZFV5aFFOMnQzeDhOWmowYXppZzRvaE52anYlMkI5b2U4SUZGUWZsY1hOZ2VsRzNkcG5aU3ZBYUJUWGsybjE3Q3dNS01uZnV3SWpUMjBSOXRWIn0=",
+      "route": "data",
+      "payload": {
+        "error_code": 0,
+        "data": {
+          "groupMsgs": []
+        }
+      },
+      "hasError": false
+    },
+    {
+      "name": "control",
+      "frame": "AlkCAHsiZXJyb3JfY29kZSI6MCwiZW5jcnlwdCI6MywiZGF0YSI6IkFRSURCQVVHQndnSkNnc01EUTRQRUJFU0V4UVZGaGNZR1JvYkhCMGVIeUNjcCUyRkdrcnlNYzlmSzRXeU0lMkZqZ3c4QURzY1B5MGQyTFZzaHFiUVZtYUcya25GMGlxTVFkVVdUT2dQU1ptJTJCak1OdVp0TmF2JTJCangifQ==",
+      "route": "data",
+      "payload": {
+        "error_code": 0,
+        "data": {
+          "controls": []
+        }
+      },
+      "hasError": false
+    },
+    {
+      "name": "capability_plain",
+      "frame": "AjMCAHsiZXJyb3JfY29kZSI6MCwiZW5jcnlwdCI6MCwiZGF0YSI6IntcImVycm9yX2NvZGVcIjowLFwiZGF0YVwiOntcInJlcUlkXCI6XCJzaWduYWxfcmVxXzFcIixcImRhdGFcIjp7XCJlcnJcIjowLFwiaGFzTW9yZVwiOmZhbHNlLFwidGhyZWFkc1wiOltdLFwidWlkc1wiOltdLFwid2FpdFVpZHNcIjpbXSxcInBlbmRpbmdVaWRzXCI6W119fX0ifQ==",
+      "route": "data",
+      "payload": {
+        "error_code": 0,
+        "data": {
+          "reqId": "signal_req_1",
+          "data": {
+            "err": 0,
+            "hasMore": false,
+            "threads": [],
+            "uids": [],
+            "waitUids": [],
+            "pendingUids": []
+          }
+        }
+      },
+      "hasError": false
+    },
+    {
+      "name": "capability_gzip",
+      "frame": "AjMCAHsiZXJyb3JfY29kZSI6MCwiZW5jcnlwdCI6MSwiZGF0YSI6Ikg0c0lBQUFBQUFBQUEwV0xNUTZETUJBRS83SzFpOUQ2QnhRcHFWQmtuWElIV0xMczVHeVVBdm52V0VnTzNjN3V6Z0ZSVGVyZWlRWDJZY0JVQ1BhQXluZGtXR1MvUmdxdW9SdHd6ODI2N2h2bFo5S21MaFN5R0pSTmhUakR6aStEM2ZmMEkxK21QMzBrc285ckwycXRKMlpRb0dXSEFBQUEifQ==",
+      "route": "data",
+      "payload": {
+        "error_code": 0,
+        "data": {
+          "reqId": "signal_req_1",
+          "data": {
+            "err": 0,
+            "hasMore": false,
+            "threads": [],
+            "uids": [],
+            "waitUids": [],
+            "pendingUids": []
+          }
+        }
+      },
+      "hasError": false
+    },
+    {
+      "name": "after_heartbeat_1",
+      "frame": "AvUBAHsiZXJyb3JfY29kZSI6MCwiZW5jcnlwdCI6MiwiZGF0YSI6IkFRSURCQVVHQndnSkNnc01EUTRQRUJFU0V4UVZGaGNZR1JvYkhCMGVIeUQ0RHB6VzNVeHVxcEhVYXN2Y3Z2NGdNaHNDN29DR1pYcFFJYlUlMkJ3dFY2YUg3RHpqcktqT0ZJZkRRM3JIYnlGWTd2Z29IeEt5MWF3eEU4WUVwVURTUUJUc1JpemJwSXVyVUdwaTRNTXJFJTJCc1hyJTJGN1RXMWtmWVhuelpvaGZtSGUlMkZqeVVQUXBEd045MURrd0dJazY5OGVzUkZLekJWdHJsMWVzNiUyRnoxSjMyNDcybE1ud3FzVEFITldIanhYRDBTRkczMVJucTh3alZSTXJSYkpnMlVZRkNZWUk2NE1OOGlzdUolMkZCaEYyell3dDUzbFVlUSUzRCUzRCJ9",
+      "route": "data",
+      "payload": {
+        "error_code": 0,
+        "data": {
+          "msgs": [
+            {
+              "uidFrom": "22",
+              "idTo": "11",
+              "msgId": "903",
+              "cliMsgId": "1700000000011",
+              "ts": "1700000000001",
+              "msgType": "webchat",
+              "content": "Synthetic encrypted transport message"
+            }
+          ]
+        }
+      },
+      "hasError": false
+    },
+    {
+      "name": "after_heartbeat_2",
+      "frame": "AvUBAHsiZXJyb3JfY29kZSI6MCwiZW5jcnlwdCI6MiwiZGF0YSI6IkFRSURCQVVHQndnSkNnc01EUTRQRUJFU0V4UVZGaGNZR1JvYkhCMGVIeUQ0RHB6VzNVeHVxcEhVYXN2Y3Z2NGdNaHNDN3FDR1pXcEdoJTJGZiUyQjB2UWdhTEN2cE9mblhEb2ppZTBNcSUyQjdMSFplVVpiNEswUVlaSGUwcDVxSEh0SHRDQm5VNWhGWW5MVGlKVzU5TXNrZnZIMk96ZXFPNldPeElXTjExbzcwelZFWWYxa0hnNUk2MCUyRllKbmVRRkVGaEQ5JTJGRHJobnpFR1poY0g3QUxPYmJnbTBFdk1KaE9SaGRXTkdKdjFwdUdaV2JqeXIyNjVxWmgxRHF4JTJGbXBTWTMxbVlZSTY0UmlvSFhVdnVDR2t1MkRoeE9pTVJpUSUzRCUzRCJ9",
+      "route": "data",
+      "payload": {
+        "error_code": 0,
+        "data": {
+          "msgs": [
+            {
+              "uidFrom": "22",
+              "idTo": "11",
+              "msgId": "904",
+              "cliMsgId": "1700000000012",
+              "ts": "1700000000001",
+              "msgType": "webchat",
+              "content": "Synthetic encrypted transport message"
+            }
+          ]
+        }
+      },
+      "hasError": false
+    },
+    {
+      "name": "after_heartbeat_3",
+      "frame": "AvUBAHsiZXJyb3JfY29kZSI6MCwiZW5jcnlwdCI6MiwiZGF0YSI6IkFRSURCQVVHQndnSkNnc01EUTRQRUJFU0V4UVZGaGNZR1JvYkhCMGVIeUQ0RHB6VzNVeHVxcEhVYXN0Y3YlMkY0Z0x0cUNnWVJHWmJoc2g3WSUyQnd0VjZEVGQyTXZkODNISURsaGlTcjNhR2NBb3hDNFdNVTlVZUs4SW5LWVQxSU1RQjZxJTJCWUFxS0Npb2pUaUpDNXFpJTJGS2tKWUFUYVZFS0xwTDJNWlFhdzgwQVk1bDgyM2V3Y2hmYVRCYnZSUjRkR1U0NWt1U2Nxd0FIaDZDVnMxbm50WnBXSnclMkZuWEdXOHJrM2t5d2hZS3lEYVQxMyUyQnBJTTNRSkd4d1Y1aUF1bFZJZmFvNDY0JTJCbU1kZFElMkJEaXBhJTJGWGQ2SVQ5NVhVa1klM0QifQ==",
+      "route": "data",
+      "payload": {
+        "error_code": 0,
+        "data": {
+          "msgs": [
+            {
+              "uidFrom": "22",
+              "idTo": "11",
+              "msgId": "905",
+              "cliMsgId": "1700000000013",
+              "ts": "1700000000001",
+              "msgType": "webchat",
+              "content": "Synthetic encrypted transport message"
+            }
+          ]
+        }
+      },
+      "hasError": false
+    },
+    {
+      "name": "invalid_message_missing",
+      "frame": "AvUBAHsiZW5jcnlwdCI6MCwiZGF0YSI6IntcImVycm9yX2NvZGVcIjowLFwiZGF0YVwiOntcIm1zZ3NcIjpbe1widWlkRnJvbVwiOlwiMjJcIixcImlkVG9cIjpcIjExXCIsXCJtc2dJZFwiOlwiOTAzXCIsXCJjbGlNc2dJZFwiOlwiMTcwMDAwMDAwMDAwMVwiLFwidHNcIjpcIjE3MDAwMDAwMDAwMDFcIixcIm1zZ1R5cGVcIjpcIndlYmNoYXRcIixcImNvbnRlbnRcIjpcIlN5bnRoZXRpYyBlbmNyeXB0ZWQgdHJhbnNwb3J0IG1lc3NhZ2VcIn1dfX0ifQ==",
+      "route": "rejected",
+      "payload": null,
+      "hasError": true
+    },
+    {
+      "name": "invalid_message_null",
+      "frame": "AvUBAHsiZXJyb3JfY29kZSI6bnVsbCwiZW5jcnlwdCI6MCwiZGF0YSI6IntcImVycm9yX2NvZGVcIjowLFwiZGF0YVwiOntcIm1zZ3NcIjpbe1widWlkRnJvbVwiOlwiMjJcIixcImlkVG9cIjpcIjExXCIsXCJtc2dJZFwiOlwiOTAzXCIsXCJjbGlNc2dJZFwiOlwiMTcwMDAwMDAwMDAwMVwiLFwidHNcIjpcIjE3MDAwMDAwMDAwMDFcIixcIm1zZ1R5cGVcIjpcIndlYmNoYXRcIixcImNvbnRlbnRcIjpcIlN5bnRoZXRpYyBlbmNyeXB0ZWQgdHJhbnNwb3J0IG1lc3NhZ2VcIn1dfX0ifQ==",
+      "route": "rejected",
+      "payload": null,
+      "hasError": true
+    },
+    {
+      "name": "invalid_message_outer_error",
+      "frame": "AvUBAHsiZXJyb3JfY29kZSI6NywiZW5jcnlwdCI6MCwiZGF0YSI6IntcImVycm9yX2NvZGVcIjowLFwiZGF0YVwiOntcIm1zZ3NcIjpbe1widWlkRnJvbVwiOlwiMjJcIixcImlkVG9cIjpcIjExXCIsXCJtc2dJZFwiOlwiOTAzXCIsXCJjbGlNc2dJZFwiOlwiMTcwMDAwMDAwMDAwMVwiLFwidHNcIjpcIjE3MDAwMDAwMDAwMDFcIixcIm1zZ1R5cGVcIjpcIndlYmNoYXRcIixcImNvbnRlbnRcIjpcIlN5bnRoZXRpYyBlbmNyeXB0ZWQgdHJhbnNwb3J0IG1lc3NhZ2VcIn1dfX0ifQ==",
+      "route": "rejected",
+      "payload": null,
+      "hasError": true
+    },
+    {
+      "name": "invalid_message_inner_error",
+      "frame": "AvUBAHsiZXJyb3JfY29kZSI6MCwiZW5jcnlwdCI6MCwiZGF0YSI6IntcImVycm9yX2NvZGVcIjo3LFwiZGF0YVwiOntcIm1zZ3NcIjpbXX19In0=",
+      "route": "rejected",
+      "payload": null,
+      "hasError": true
+    }
+  ]
+}

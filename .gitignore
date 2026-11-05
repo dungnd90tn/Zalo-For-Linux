@@ -5,3 +5,6 @@ unnamed_addrs.txt
 ghidrecomp
 reverse-engineering
 *run_zcall_re.sh
+rust-client/target/
+__pycache__/
+*.pyc

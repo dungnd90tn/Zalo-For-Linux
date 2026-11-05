@@ -1,0 +1,31 @@
+[package]
+name = "zalo-signal-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+publish = false
+description = "Local embedded Zalo Signal compatibility engine candidate"
+
+[workspace]
+
+[features]
+default = []
+embedded = ["dep:rquickjs", "dep:aes", "dep:cbc", "dep:hmac", "dep:sha2", "dep:getrandom", "dep:libsignal-core", "dep:rand"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-channel = "0.3"
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std"], optional = true }
+aes = { version = "=0.8.4", optional = true }
+cbc = { version = "=0.1.2", features = ["alloc"], optional = true }
+hmac = { version = "=0.12.1", optional = true }
+sha2 = { version = "=0.10.9", optional = true }
+getrandom = { version = "=0.2.17", optional = true }
+libsignal-core = { git = "https://github.com/signalapp/libsignal", rev = "904c8dc8216073b078a5f2f5090e3da8382e6a92", optional = true }
+rand = { version = "0.9", optional = true }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

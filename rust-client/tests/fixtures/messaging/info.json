@@ -1,0 +1,158 @@
+{
+  "provenance": "Exact original getPreviewMsgInfoChat/_renderItemReplace; Vietnamese, provided display names, synthetic identities; native UTC date fallback is tested separately",
+  "cases": [
+    {
+      "name": "localized_text",
+      "content": {
+        "action": "msginfo.actionlist",
+        "title": "Thông báo nhóm",
+        "params": "{\"msg\":{\"vi\":\"Đã cập nhật thông tin nhóm\",\"en\":\"Group updated\"}}",
+        "unknownNested": {
+          "preserve": [
+            "synthetic",
+            {
+              "version": 7
+            }
+          ]
+        }
+      },
+      "text": "Đã cập nhật thông tin nhóm"
+    },
+    {
+      "name": "self_and_named_member",
+      "content": {
+        "action": "msginfo.actionlist",
+        "title": "Thông báo nhóm",
+        "params": "{\"msg\":{\"vi\":\"%1$s đã thêm %2$s vào nhóm\",\"en\":\"%1$s added %2$s\"},\"highLightsV2\":[{\"type\":0,\"uid\":\"11\",\"dpn\":\"Tên tài khoản\"},{\"type\":0,\"uid\":\"22\",\"dpn\":\"Đặng Minh\"}],\"actions\":[{\"actionType\":\"action.open.profile\",\"actionData\":\"https://invalid.example/synthetic\"}]}",
+        "unknownNested": {
+          "preserve": [
+            "synthetic",
+            {
+              "version": 7
+            }
+          ]
+        }
+      },
+      "text": "Bạn đã thêm Đặng Minh vào nhóm"
+    },
+    {
+      "name": "sequential_reordered_markers",
+      "content": {
+        "action": "msginfo.actionlist",
+        "title": "Thông báo nhóm",
+        "params": "{\"msg\":{\"vi\":\"%2$s và %1$s\"},\"highLightsV2\":[{\"type\":0,\"uid\":\"22\",\"dpn\":\"An\"},{\"type\":0,\"uid\":\"33\",\"dpn\":\"Bình\"}]}",
+        "unknownNested": {
+          "preserve": [
+            "synthetic",
+            {
+              "version": 7
+            }
+          ]
+        }
+      },
+      "text": "%2$s và An"
+    },
+    {
+      "name": "replace_one_occurrence",
+      "content": {
+        "action": "msginfo.actionlist",
+        "title": "Thông báo nhóm",
+        "params": "{\"msg\":{\"vi\":\"%1$s gọi %1$s\"},\"highLightsV2\":[{\"type\":0,\"uid\":\"11\"}]}",
+        "unknownNested": {
+          "preserve": [
+            "synthetic",
+            {
+              "version": 7
+            }
+          ]
+        }
+      },
+      "text": "Bạn gọi %1$s"
+    },
+    {
+      "name": "missing_name_retains_template",
+      "content": {
+        "action": "msginfo.actionlist",
+        "title": "Thông báo nhóm",
+        "params": "{\"msg\":{\"vi\":\"%1$s đã tham gia\"},\"highLightsV2\":[{\"type\":0,\"uid\":\"44\"}]}",
+        "unknownNested": {
+          "preserve": [
+            "synthetic",
+            {
+              "version": 7
+            }
+          ]
+        }
+      },
+      "text": "%1$s đã tham gia"
+    },
+    {
+      "name": "provided_time_label",
+      "content": {
+        "action": "msginfo.actionlist",
+        "title": "Thông báo nhóm",
+        "params": "{\"msg\":{\"vi\":\"Đã hẹn vào %1$s\"},\"highLightsV2\":[{\"type\":1,\"dpn\":\"Ngày mai\"}]}",
+        "unknownNested": {
+          "preserve": [
+            "synthetic",
+            {
+              "version": 7
+            }
+          ]
+        }
+      },
+      "text": "Đã hẹn vào Ngày mai"
+    },
+    {
+      "name": "title_fallback",
+      "content": {
+        "action": "msginfo.actionlist",
+        "title": "Nhóm đã thay đổi",
+        "params": "not-json",
+        "unknownNested": {
+          "preserve": [
+            "synthetic",
+            {
+              "version": 7
+            }
+          ]
+        }
+      },
+      "text": "Nhóm đã thay đổi"
+    },
+    {
+      "name": "missing_vi_uses_title",
+      "content": {
+        "action": "msginfo.actionlist",
+        "title": "Thông tin nhóm",
+        "params": "{\"msg\":{\"en\":\"English only\"}}",
+        "unknownNested": {
+          "preserve": [
+            "synthetic",
+            {
+              "version": 7
+            }
+          ]
+        }
+      },
+      "text": "Thông tin nhóm"
+    },
+    {
+      "name": "literal_text_and_inert_actions",
+      "content": {
+        "action": "msginfo.actionlist",
+        "title": "Thông báo nhóm",
+        "params": "{\"msg\":{\"vi\":\"%1$s <b>đã thay đổi nhóm</b>\"},\"highLightsV2\":[{\"type\":0,\"uid\":\"22\",\"dpn\":\"<script>literal</script>\"}],\"actions\":[{\"actionType\":\"action.open.outapp\",\"actionData\":\"javascript:synthetic_action\"}]}",
+        "unknownNested": {
+          "preserve": [
+            "synthetic",
+            {
+              "version": 7
+            }
+          ]
+        }
+      },
+      "text": "<script>literal</script> <b>đã thay đổi nhóm</b>"
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+// Executes source methods offline. No account, request, cookies or private data.
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+const assert = require('assert/strict');
+const source = fs.readFileSync(path.resolve(__dirname, '../../../../pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js'), 'utf8');
+const begin = source.indexOf('                    static normalizeMessageType(e) {');
+assert(begin >= 0);
+const end = source.indexOf('                    static revertMessageType(e)', begin);
+const method = source.slice(begin, end).trim().replace(/^static /, '');
+const api = vm.runInNewContext('({' + method + '})', {r:{MSG_STICKER:3,MSG_TEXT:1,MSG_UNKNOWN:-1},A:{b:'unsupported'}});
+const sticker = {id:20695,cateId:10047,type:3};
+const sendStart = source.indexOf('                _sendStickerCmd(e) {');
+const sendEnd = source.indexOf('                _sendSticker(e, t, n = null, a = !1)', sendStart);
+assert(sendStart >= 0 && sendEnd > sendStart);
+const sender = vm.runInNewContext('({' + source.slice(sendStart, sendEnd).trim() + '})', {R:{a:{Helper:{isPhotoSticker:()=>false},Config:{isEnablePhotoSticker:()=>false}}},w:{MSG_STICKER:3}});
+let content;
+sender._getConversationInfo = () => ({userId:'22'});
+sender._sendMessage = (_, type, payload) => {assert.equal(type,3); content=payload;};
+sender._clearBoxChatAndClosePopup = () => {};
+sender._sendStickerCmd(sticker);
+// Exact built-in namespace constants and factory, without assets or network.
+const constantStart=source.indexOf('        ynGT: function(e, t, n) {');
+const constantEnd=source.indexOf('        yoj5: function(e, t, n) {',constantStart);
+const constantBody=source.slice(constantStart+'        ynGT: '.length,constantEnd).trim().replace(/,$/,'');
+const constants={};const webpack={d:(target,key,get)=>Object.defineProperty(target,key,{get})};
+vm.runInNewContext('('+constantBody+')')({},constants,webpack);
+const factoryStart=source.indexOf('                _initBuiltIn() {');
+const factoryEnd=source.indexOf('                _getBuildInCate()',factoryStart);
+const factory=vm.runInNewContext('({'+source.slice(factoryStart,factoryEnd).trim()+'})',{C:constants,N:'https://stc-chat.zdn.vn/images/stickers/default/',b:()=>''});
+factory._initBuiltIn();assert.equal(constants.a,0);assert.equal(constants.m,30);
+const builtins=[factory._builtIn.stickers[0],factory._builtIn.stickers[29]].map(({id,cateId,type,stickerUrl})=>({id,catId:cateId,type,thumbnail:stickerUrl}));
+const output = {provenance:'own original normalizeMessageType and _sendStickerCmd; public synthetic metadata',type:'chat.sticker',normalized:api.normalizeMessageType('chat.sticker'),content:JSON.parse(JSON.stringify(content)),thumbnail:'https://api.zaloapp.com/api/emoticon/sticker/webpc?size=130&eid=20695',builtins};
+assert(source.includes('stickerUrl: `https://api.${Ze}/api/emoticon/sticker/webpc?size=130&eid=`'));
+const text=JSON.stringify(output,null,2)+'\n';
+if(process.argv.includes('--write')) fs.writeFileSync(path.join(__dirname,'wire.json'),text);
+else assert.equal(fs.readFileSync(path.join(__dirname,'wire.json'),'utf8'),text);
+console.log('Original sticker normalization/sender/catalog-address fixture PASS');
