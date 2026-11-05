@@ -8,6 +8,11 @@ pub(super) use cache::MediaCache;
 use cache::{Presentation, Viewer};
 use eframe::egui::{self, vec2, RichText, Sense};
 
+const THUMBNAIL_FRAME: egui::Vec2 = vec2(330.0, 240.0);
+const VIEWER_FRAME: egui::Vec2 = vec2(740.0, 540.0);
+// Bounded caption (56), three gaps (24), and two footer text rows (48).
+const VIEWER_FOOTER_HEIGHT: f32 = 128.0;
+
 pub(super) fn show(
     ui: &mut egui::Ui,
     message: &Message,
@@ -265,10 +270,13 @@ fn thumbnail(
     };
     match presentation {
         Presentation::Image(texture) => {
-            let source = texture.size_vec2();
-            let scale = (width / source.x).min(240.0 / source.y).min(1.0);
+            let size = super::visuals::fit_image(
+                texture.size_vec2(),
+                vec2(width.min(THUMBNAIL_FRAME.x), THUMBNAIL_FRAME.y),
+                ui.ctx().pixels_per_point(),
+            );
             let mut image = egui::Image::new(&texture)
-                .fit_to_exact_size(source * scale)
+                .fit_to_exact_size(size)
                 .rounding(4.0);
             if viewer.is_some() {
                 image = image.sense(Sense::click());
@@ -338,30 +346,51 @@ pub(super) fn viewer(ctx: &egui::Context, cache: &mut MediaCache) {
         .collapsible(false)
         .resizable(true)
         .default_width((ctx.screen_rect().width() - 80.0).min(780.0))
+        .default_height(
+            (ctx.screen_rect().height() - 100.0)
+                .clamp(180.0, VIEWER_FRAME.y + VIEWER_FOOTER_HEIGHT),
+        )
         .max_size((ctx.screen_rect().size() - vec2(48.0, 64.0)).max(vec2(220.0, 180.0)))
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .vscroll(true)
         .show(ctx, |ui| {
-            if let Some(texture) = texture {
-                let size = texture.size_vec2();
-                let max = vec2(
-                    ui.available_width(),
-                    (ctx.screen_rect().height() - 190.0).max(100.0),
-                );
-                let scale = (max.x / size.x).min(max.y / size.y);
-                ui.add(egui::Image::new(&texture).fit_to_exact_size(size * scale));
-            } else {
-                ui.label("Ảnh không còn trong cache. Đóng và mở lại từ hội thoại để tải lại.");
-            }
-            if !caption.is_empty() {
-                ui.add(egui::Label::new(caption).wrap());
-            }
-            ui.label(RichText::new("Bản xem trước tĩnh có giới hạn kích thước.").size(11.0));
-            if let Some(url) = original {
-                if ui.link("Mở ảnh gốc trong trình duyệt").clicked() {
-                    ctx.open_url(egui::OpenUrl::new_tab(url));
+            let frame = vec2(
+                ui.available_width().min(VIEWER_FRAME.x),
+                (ui.available_height() - VIEWER_FOOTER_HEIGHT).clamp(0.0, VIEWER_FRAME.y),
+            );
+            ui.vertical_centered(|ui| {
+                if let Some(texture) = texture {
+                    let (rect, _) = ui.allocate_exact_size(frame, Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, 4.0, crate::theme::palette(ctx).hover);
+                    let size = super::visuals::fit_image(
+                        texture.size_vec2(),
+                        frame,
+                        ctx.pixels_per_point(),
+                    );
+                    let image_rect = egui::Rect::from_center_size(rect.center(), size);
+                    egui::Image::new(&texture).paint_at(ui, image_rect);
+                } else {
+                    ui.label("Ảnh không còn trong cache. Đóng và mở lại từ hội thoại để tải lại.");
                 }
-            }
+                if !caption.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .id_salt("media_viewer_caption")
+                        .max_height(56.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(caption).wrap());
+                        });
+                }
+                ui.label(
+                    RichText::new("Bản xem trước tĩnh có giới hạn kích thước.")
+                        .size(super::visuals::TEXT_SMALL),
+                );
+                if let Some(url) = original {
+                    if ui.link("Mở ảnh gốc trong trình duyệt").clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(url));
+                    }
+                }
+            });
         });
     if !open {
         cache.viewer = None;
@@ -382,6 +411,171 @@ fn external_url(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_images_keep_logical_frames_on_maximize_and_do_not_upscale_pixels() {
+        for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+            for (pixel_width, pixel_height) in [(1024, 768), (80, 40)] {
+                for open_viewer in [false, true] {
+                    let ctx = egui::Context::default();
+                    super::super::visuals::install(&ctx);
+                    let key = MediaKey {
+                        account_id: "11".into(),
+                        thread_id: "g:22".into(),
+                        message_id: "1".into(),
+                        url: "https://example.invalid/synthetic.png".into(),
+                    };
+                    let mut cache = MediaCache::default();
+                    cache.seed(
+                        &ctx,
+                        key.clone(),
+                        1,
+                        pixel_width,
+                        pixel_height,
+                        vec![128; pixel_width as usize * pixel_height as usize * 4],
+                    );
+                    let texture_id = cache.texture(&key).unwrap().id();
+                    if open_viewer {
+                        cache.viewer = Some(Viewer {
+                            key,
+                            caption: "Chú thích tổng hợp đủ dài để cuộn riêng. ".repeat(30),
+                            original_url: Some("https://example.invalid/original.png".into()),
+                        });
+                    }
+                    let message = message(MediaDescriptor::Photo(PhotoDescriptor {
+                        title: String::new(),
+                        caption: String::new(),
+                        thumbnail_url: Some("https://example.invalid/synthetic.png".into()),
+                        original_url: None,
+                        width: Some(pixel_width),
+                        height: Some(pixel_height),
+                    }));
+                    let mut sizes = Vec::new();
+                    let mut frame_time = 0.0;
+                    for (width, height) in [
+                        (1200.0, 780.0),
+                        (1920.0, 1080.0),
+                        (1200.0, 780.0),
+                        (640.0, 480.0),
+                    ] {
+                        let mut rendered_size = None;
+                        let mut image_center = None;
+                        let mut preview_frame = None;
+                        let mut original_link = None;
+                        // Settle both the remembered rectangle and window fade-in before
+                        // checking the actual painted frame's source color and geometry.
+                        for _ in 0..3 {
+                            frame_time += 1.0;
+                            let mut input = egui::RawInput {
+                                time: Some(frame_time),
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    vec2(width, height),
+                                )),
+                                ..Default::default()
+                            };
+                            input
+                                .viewports
+                                .get_mut(&egui::ViewportId::ROOT)
+                                .unwrap()
+                                .native_pixels_per_point = Some(pixels_per_point);
+                            let output = ctx.run(input, |ctx| {
+                                if open_viewer {
+                                    viewer(ctx, &mut cache);
+                                } else {
+                                    egui::CentralPanel::default().show(ctx, |ui| {
+                                        let available_width = ui.available_width();
+                                        show(ui, &message, 1, Some(&mut cache), available_width);
+                                    });
+                                }
+                            });
+                            rendered_size =
+                                output.shapes.iter().find_map(|shape| match &shape.shape {
+                                    egui::epaint::Shape::Rect(rect)
+                                        if rect.fill_texture_id == texture_id =>
+                                    {
+                                        image_center = Some(rect.rect.center());
+                                        Some(rect.rect.size())
+                                    }
+                                    egui::epaint::Shape::Mesh(mesh)
+                                        if mesh.texture_id == texture_id =>
+                                    {
+                                        Some(mesh.calc_bounds().size())
+                                    }
+                                    _ => None,
+                                });
+                            if open_viewer {
+                                let colors = crate::theme::palette(&ctx);
+                                preview_frame =
+                                    output.shapes.iter().find_map(|shape| match &shape.shape {
+                                        egui::epaint::Shape::Rect(rect)
+                                            if rect.fill == colors.hover
+                                                && rect.rect.width() > 100.0 =>
+                                        {
+                                            Some(rect.rect)
+                                        }
+                                        _ => None,
+                                    });
+                                original_link =
+                                    output.shapes.iter().find_map(|shape| match &shape.shape {
+                                        egui::epaint::Shape::Text(text)
+                                            if text.galley.job.text
+                                                == "Mở ảnh gốc trong trình duyệt" =>
+                                        {
+                                            Some(egui::Rect::from_min_size(
+                                                text.pos,
+                                                text.galley.size(),
+                                            ))
+                                        }
+                                        _ => None,
+                                    });
+                            }
+                        }
+                        let case = format!("DPI={pixels_per_point}, source={pixel_width}x{pixel_height}, window={width}x{height}, viewer={open_viewer}");
+                        let size = rendered_size.unwrap_or_else(|| {
+                            panic!("cached image must actually be painted: {case}")
+                        });
+                        if open_viewer {
+                            let frame = preview_frame.unwrap_or_else(|| {
+                                panic!("viewer must paint a bounded preview frame: {case}")
+                            });
+                            assert!(
+                                (image_center.unwrap() - frame.center()).length() < 0.01,
+                                "image must be centered on both axes: {case}"
+                            );
+                            let link = original_link.unwrap_or_else(|| panic!("original-image action must stay visible below the caption: {case}"));
+                            assert!(
+                                link.top() >= frame.bottom(),
+                                "original-image action must follow preview frame: {case}"
+                            );
+                            assert!(
+                                link.bottom() <= height && link.right() <= width,
+                                "original-image action must fit screen: {case}, link={link:?}"
+                            );
+                        }
+                        let physical_size = size * pixels_per_point;
+                        assert!(physical_size.x <= pixel_width as f32 + 0.01);
+                        assert!(physical_size.y <= pixel_height as f32 + 0.01);
+                        assert!(
+                            (size.x / size.y - pixel_width as f32 / pixel_height as f32).abs()
+                                < 0.001
+                        );
+                        sizes.push(size);
+                    }
+                    assert!(
+                        (sizes[0] - sizes[1]).length() < 0.01,
+                        "maximizing must not enlarge cached images: DPI={pixels_per_point}, source={pixel_width}x{pixel_height}, viewer={open_viewer}, sizes={sizes:?}"
+                    );
+                    assert!(
+                        (sizes[0] - sizes[2]).length() < 0.01,
+                        "restore must recover the same frame: DPI={pixels_per_point}, source={pixel_width}x{pixel_height}, viewer={open_viewer}, sizes={sizes:?}"
+                    );
+                    assert!(sizes[3].x <= sizes[0].x + 0.01 && sizes[3].y <= sizes[0].y + 0.01);
+                }
+            }
+        }
+    }
+
     fn message(media: MediaDescriptor) -> Message {
         Message {
             account_id: "11".into(),

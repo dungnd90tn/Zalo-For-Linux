@@ -30,7 +30,7 @@ Snapshot hiện tại trong JSON:
 | Quy tắc `content` | 3.661; gồm chuỗi rỗng và nội dung trang trí, không chỉ icon |
 | Class `fa-*` liên hệ với `content` | 1.021 class; gồm alias và class trong selector ghép, không phải 1.021 glyph riêng biệt |
 | `@font-face` / tệp font | 46 khai báo / 16 tệp; không đồng nghĩa 46 font khác nhau |
-| Binding native | 29 role / 32 token nguồn; 15 icon ngữ nghĩa |
+| Binding native | 31 role / 34 token nguồn; 15 icon ngữ nghĩa |
 | Registry có thể vẽ | 1.034 glyph/alias xác minh cmap: 1.020 Zalo + 14 Screencap |
 | Tham chiếu `var()` / URL CSS | 443 tên biến / 183 lần tham chiếu URL |
 

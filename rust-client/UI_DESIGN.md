@@ -20,7 +20,7 @@ Client dùng egui/eframe native, không WebView/Electron. Không sao chép mã h
 | Tin gửi, vùng chọn / hover | `#E5F1FF` / `#F1F2F4` |
 | Viền | Đen, alpha `26/255` |
 
-Font Segoe UI regular/Semibold/Bold và hai icon font gốc khởi tạo một lần; body/button 14, small 12, heading 18 đơn vị egui. Catalog giữ toàn bộ token và 1.034 glyph/alias đã kiểm cmap; raster chỉ khi dùng. [Kiểm kê](UI_ASSET_INVENTORY.md) phân biệt nguồn đầy đủ với thành phần native.
+Font Segoe UI regular/Semibold/Bold và hai icon font gốc khởi tạo một lần; metadata 12, body/button 14, nội dung chat 15, heading 18, tiêu đề modal 16 đơn vị logic egui. Không dùng chữ phụ 9–11,5 để tiết kiệm chỗ. Catalog giữ toàn bộ token và 1.034 glyph/alias đã kiểm cmap; raster chỉ khi dùng. [Kiểm kê](UI_ASSET_INVENTORY.md) phân biệt nguồn đầy đủ với thành phần native.
 
 Cài đặt mở từ rail hoặc màn đăng nhập: Sáng/Tối/Hệ thống/Tùy chỉnh, lưu riêng trong profile bằng worker. System theo tín hiệu egui/winit; thiếu tín hiệu dùng Light, chưa xác nhận mọi desktop Linux. Custom kế thừa Light, ghi đè màu/reset; gradient hai điểm màu hỗ trợ nền chat, rail và surface. Token/editor và danh mục icon nằm trong Nâng cao, đóng mặc định; không tự bật tính năng chưa hỗ trợ.
 
@@ -29,6 +29,12 @@ Cài đặt mở từ rail hoặc màn đăng nhập: Sáng/Tối/Hệ thống/T
 Hiện tại, [ui.rs](src/ui.rs) tổ chức rail, danh sách và khung chat. Rail rộng 64; danh sách mặc định 344, kéo được trong khoảng 280–420; header chat cao 68.
 
 Dưới chiều rộng 940, danh sách/danh bạ chuyển thành màn riêng; nút quay lại giữ hội thoại và bản nháp. Cửa sổ mặc định 1024×720, tối thiểu 640×480. Composer cao 100 khi chiều cao còn lại dưới 340, ngược lại 132.
+
+Thông tin hội thoại nằm ở sidebar phải rộng 344 khi còn đủ ít nhất 360 cho chat. Khi hẹp, trang thông tin thay khung chat; quay lại giữ đúng hội thoại/bản nháp. Nội dung chỉ dùng dữ liệu đã lưu, đóng khi đổi tài khoản/thread; không dựng nút thao tác chưa được nối.
+
+Resize/maximize cùng DPI chỉ tăng vùng đọc, không nhân cỡ chữ hay chiều rộng rail/list/sidebar, chiều cao header hoặc hitbox. Ảnh/sticker giữ tỉ lệ, có giới hạn kích thước và không phóng vượt số pixel nguồn; viewer căn ảnh giữa hai chiều trong khung tối đa 740×540, chỉ thu nhỏ khi cửa sổ thiếu chỗ; chú thích cuộn riêng để liên kết ảnh gốc vẫn tới được. Khi DPI màn hình đổi, toolkit raster lại font theo mật độ pixel thật; không ép zoom/DPI toàn ứng dụng hoặc kéo giãn bitmap.
+
+Modal dùng `dialog.rs`: curtain theo token gốc, header cao 48, tiêu đề 16, glyph đóng 24 trong hitbox 30, viền bo 4, body cuộn có padding 14×16. Footer là hàng nút cao 32 cộng padding, không kéo giãn theo chiều cao cửa sổ. Khi modal mở, chặn cả pointer, phím tắt và dispatch nền; đóng modal chỉ khôi phục focus khi tài khoản/thread/generation còn khớp. Settings, mở hội thoại, đăng xuất, kiểm tra gửi và thông tin ứng dụng dùng cùng quy tắc.
 
 | Thành phần | Nơi sửa chính |
 | --- | --- |
@@ -45,7 +51,7 @@ Yêu cầu: tiêu đề dài phải rút gọn, có thể xem tên đầy đủ 
 
 Hiện tại, mở `--live` tự gửi lệnh startup đến worker. Worker đọc phiên: hợp lệ thì xác minh và mở chat; chưa có phiên thì tạo QR. Chỉ xác nhận hết hiệu lực đăng nhập hoặc yêu cầu đổi danh tính client mới chuyển sang QR mới. Lỗi mạng, HTTP, cấu hình hoặc lưu trữ giữ phiên để thử lại.
 
-Hủy/đăng xuất không tự chạy lại startup trong cửa sổ hiện tại. Generation loại bỏ kết quả cũ. Đăng nhập số điện thoại chưa hỗ trợ; tab hiện chỉ giải thích giới hạn.
+Hủy/đăng xuất không tự chạy lại startup trong cửa sổ hiện tại. Generation loại bỏ kết quả cũ. Đăng nhập số điện thoại chưa hỗ trợ; tab hiện chỉ giải thích giới hạn, giữ lần QR đang chạy và cho phép hủy. Nhóm nút dưới QR có khung hữu hạn, căn cùng trục giữa với mã QR; thao tác chuyển tab không bắt đầu một phiên xác thực khác.
 
 Trạng thái Online chỉ đến từ xác thực transport. Khi Offline, vẫn cho đọc cache, chọn liên hệ và soạn nháp. Banner phải nêu nguyên nhân an toàn, có kết nối lại/đăng xuất; không suy diễn online của từng người. Lỗi batch lưu dữ liệu tạm dừng transport, giữ lịch sử/cursor và thao tác cục bộ.
 

@@ -4,7 +4,7 @@ The Rust native implementation is authored independently. Electron remains the s
 
 The migration target is full parity with the working Linux Electron application. The evidence-based [feature inventory](FEATURE_PARITY.md) tracks current gaps and acceptance criteria; the existing preview has not met that target. The first directory/recent-preview milestone is implemented and tested in isolation; live compatibility and full history remain incomplete.
 
-The [photo and OA media checkpoint](#photo-and-oa-media-checkpoint-2026-11-04) below is the newest verified local candidate. The information-message release was confirmed Online by the user. The authenticated-routing, receive-schema, theme/icon, user-tested heartbeat/logging and earlier source-only Signal checkpoints retain their historical acceptance records; no LIVE build activates Signal.
+The [native UI contract checkpoint](#native-ui-contract-checkpoint-2026-11-05) below is the newest verified local candidate. The information-message release was confirmed Online by the user. The authenticated-routing, receive-schema, theme/icon, user-tested heartbeat/logging and earlier source-only Signal checkpoints retain their historical acceptance records; no LIVE build activates Signal.
 
 ## Completion gates
 
@@ -308,3 +308,46 @@ size 20,349,440 bytes and mode 0755. Desktop `Exec --live`, original icon and
 were updated. Installation did not launch the app or read/change account/history
 data. Doctor reports compiled login/messaging with network startup false.
 Recommended/poll and remaining OA production acceptance await the user's restart.
+
+## Native UI contract checkpoint (2026-11-05)
+
+The final locked offline LIVE candidate is **20,410,880 bytes**, SHA-256
+`a398563ad34f6f91b7074b74ad25a3303780f0833b1ec9e62f54f765e1778638`.
+Source-backed typography, fixed rail/list/header/sidebar frames, bounded shared
+modals, centered QR action groups and a centered no-upscale cached-image viewer
+are implemented. Compact information navigation, modal input isolation and scoped
+draft/focus preservation have independent regressions. No protocol, storage
+schema, credentials or Electron behavior changed in this UI checkpoint.
+
+Final checks pass **194 default Rust**, **438 all-feature**, **five IME adapter**
+and **19 Python** tests, formatting, strict default/all-feature/all-target Clippy
+and complete original catalog/inventory reproducibility. Schema-seven release
+smoke passes 19 messages/six threads, restart/legacy preservation, locking,
+private bounded diagnostics and informational no-write checks. Separate doctor
+confirms compiled login/messaging with no authentication, network startup or
+profile writes. Logs/proof use `/tmp/zalo-ui-accepted-*`.
+
+Reviewed synthetic X11 screenshots cover Light/Dark/System/Custom, login QR and
+phone information/retry, conversations/directory, recovery dialogs and compact
+navigation. Measured 1/1.25/1.5/2 DPI and constant-DPI native-window resizing to
+1920×1080 preserve frame/font roles, image source-pixel limits and drafts; full
+physical screenshots were not resized. Actual image geometry tests include large
+and small sources, centered frames and reachable links. All GUI sessions close
+normally with zero Internet connections; login fixtures use localhost TLS only.
+See [VALIDATION.md](VALIDATION.md) for exact evidence and acceptance boundaries.
+
+This improves measured legibility/layout; native Wayland font clarity remains
+unaccepted. A new isolated real x-unikey attempt failed on host graphics/inotify
+setup, so current synthetic input and adapter tests do not replace real IME
+ON/OFF acceptance. Real-account recommended/poll/OA behavior and comparative
+performance also remain unaccepted. The previous installed schema-seven build
+was archived at `/tmp/zalo-ui-guidelines-previous-f026`; no personal profile or
+account was opened during these checks.
+
+The coordinator subsequently installed and independently verified the exact
+candidate through approved scoped tooling: SHA-256
+`a398563ad34f6f91b7074b74ad25a3303780f0833b1ec9e62f54f765e1778638`,
+20,410,880 bytes and mode 0755. The managed **Zalo Native** desktop launcher uses
+the installed path with `--live`, original icon and matching window identity.
+No app/profile/account launch accompanied installation; production acceptance
+still requires the user's restart.

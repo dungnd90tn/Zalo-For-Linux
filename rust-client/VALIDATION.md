@@ -435,3 +435,68 @@ size 20,349,440 bytes and mode 0755. Desktop `Exec --live`, original icon and
 were updated. Installation did not launch the app or read/change account/history
 data. Doctor reports compiled login/messaging with network startup false.
 Recommended/poll and remaining OA production acceptance await the user's restart.
+
+## Native UI contract, typography and fixed frames (2026-11-05)
+
+The native shell now uses the original font roles (Small 12, Body 14, chat 15,
+Heading 18; modal titles 16), shared source-backed dialog chrome and scoped
+read-only conversation information. Wide information uses a 344-point right
+sidebar; compact information replaces the chat page and returns to its draft.
+QR action groups share the QR's center axis, including the actual parent login
+screen. The explanatory phone tab preserves the current QR attempt and Cancel.
+Modal footer rows are bounded; keyboard shortcuts, pointer navigation and direct
+send dispatch cannot activate the underlying composer while a modal is open.
+
+Accepted-source checks pass **194 default Rust** (191 library + three CLI),
+**five IME adapter** and **19 Python** tests; **438 all-feature tests** (423
+library, three CLI, eight coordinator and four provisioning), with two opt-in
+fixtures ignored. Formatting, strict default/all-feature/all-target Clippy,
+catalog/inventory reproducibility and six original-reader card cases pass.
+The original catalog retains 758 tokens and 1,034 glyph aliases, zero missing
+font glyphs; native palette bindings cover 31 roles/34 source tokens.
+
+Independent synthetic GUI review covers QR/retry/phone information, direct and
+group conversations, unknown/long names, directory, settings, connection faults,
+Light/Dark/System/Custom and modal recovery at 1200×780 and 640×480. Actual
+pointer/input/resize checks and regressions preserve selection, scoped drafts,
+focus restoration and modal isolation. Current screenshots and numeric sidecars
+are under `/tmp/zalo-rust-gui-check/`: `ui-contract-*`, `ui-alignment-qr-*` and
+`ui-alignment-viewer-final-*`. All sessions close normally and traces contain
+zero Internet connections; QR/retry use disposable localhost TLS fixtures.
+
+Measured isolated X11 captures use effective/native pixels-per-point 1, 1.25,
+1.5 and 2 without resizing screenshots. Native-window 1200→1920→640→1200 resize
+at constant DPI preserves font roles, 64-point rail, 344-point list/information
+sidebar, 68-point header and control hit areas. This simulates maximized geometry
+without a desktop window manager. Actual texture-paint tests additionally cover
+four DPIs, large/small source images, aspect ratio, source-pixel limits and
+centered viewer geometry. Inline/sticker caps remain 330×240/130×130; the viewer
+frame is at most 740×540, with separately scrolling captions and reachable links.
+
+This establishes legibility/layout evidence, not native Wayland blur acceptance.
+The existing font files cover the Vietnamese alphabet; no forced DPI, font
+replacement or antialiasing patch was introduced. A fresh private-home x-unikey
+attempt could not start its isolated display because of host graphics/inotify
+failures. Earlier real IME evidence remains historical; current adapter tests
+and synthetic Unicode input do not establish fresh Telex ON/OFF acceptance.
+No real account/profile was opened and no Electron performance comparison was
+made. New UI code retains existing workers, queues/cache limits and render-time
+I/O boundaries.
+
+The final locked offline LIVE artifact is **20,410,880 bytes**, SHA-256
+`a398563ad34f6f91b7074b74ad25a3303780f0833b1ec9e62f54f765e1778638`.
+Schema-seven release smoke passes 19 messages/six threads, restart/legacy
+preservation, locking, bounded private diagnostics and informational no-write
+checks with `network_used=false`. A separate disposable doctor check reports
+compiled authentication/messaging, no authenticated session/network startup and
+no profile writes. Logs/proof use `/tmp/zalo-ui-accepted-*`. The previous
+installed executable was archived at `/tmp/zalo-ui-guidelines-previous-f026`;
+both builds use schema seven. Production Wayland font clarity and real-account
+recommended/poll/OA acceptance remain separate from this synthetic checkpoint.
+
+The coordinator independently verified and installed this exact artifact through
+approved scoped tooling into **Zalo Native**: SHA-256
+`a398563ad34f6f91b7074b74ad25a3303780f0833b1ec9e62f54f765e1778638`,
+20,410,880 bytes, mode 0755. Desktop `Exec --live`, original icon and
+`StartupWMClass=zalo-linux-rust-preview` match the managed installation.
+Installation did not launch the app or open personal profile/account data.

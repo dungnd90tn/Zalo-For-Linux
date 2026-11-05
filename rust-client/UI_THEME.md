@@ -55,6 +55,14 @@ standard controls use source border/interaction roles. QR background/image tint
 remain white intentionally. Avatar accent and on-color text roles are resolved
 through the active palette rather than hardcoded Light colors.
 
+Typography uses the original Segoe assets at fixed logical roles: metadata 12,
+body/button 14, chat text 15, headings 18 and modal titles 16. Native DPI and font
+antialiasing remain toolkit controlled; resizing a window does not change these
+roles. Shared modal chrome binds `--curtain` and `--divider`, with a 48 px header,
+original close glyph and a bounded action row. Original-source inventory now
+tracks 31 palette roles/34 source tokens; all 758 tokens remain available in the
+catalog. This does not imply every source component is implemented.
+
 Avatars currently use generated initials for both cached live names and synthetic
 contacts; profile photos are not downloaded. Unknown live senders use a neutral
 label/avatar, and group titles are never member names. Unavailable live actions

@@ -246,6 +246,7 @@ impl NativeApp {
     #[cfg(feature = "messaging")]
     pub(super) fn live_connection_notice(&mut self, ctx: &egui::Context) {
         let colors = crate::theme::palette(ctx);
+        let enabled = !self.modal_blocked && !self.modal_open();
         let Some(state) = &mut self.live else {
             return;
         };
@@ -261,6 +262,9 @@ impl NativeApp {
                     .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
             )
             .show(ctx, |ui| {
+                if !enabled {
+                    ui.disable();
+                }
                 action = recovery_controls(
                     ui,
                     state.connection,
@@ -292,23 +296,26 @@ impl NativeApp {
     }
 
     pub(super) fn live_information(&mut self, ui: &mut egui::Ui) -> bool {
+        let account_label = self.account_label().to_owned();
         let Some(state) = self.live.as_mut() else {
             return false;
         };
-        let Some(account) = &state.account else {
+        let Some(_) = &state.account else {
             return false;
         };
-        ui.label(
-            egui::RichText::new(&account.name)
-                .family(egui::FontFamily::Name("Zalo Semibold".into())),
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(&account_label)
+                    .family(egui::FontFamily::Name("Zalo Semibold".into())),
+            )
+            .wrap(),
         );
-        ui.label(format!("ID Zalo: {}", account.id));
         ui.label(state.connection_label());
         ui.add_space(10.0);
         ui.label("Tin nhắn chỉ hiện xác nhận khi Zalo đã nhận và lưu được trên thiết bị. Xác nhận này chưa có nghĩa người nhận đã xem.");
         ui.add_space(8.0);
         ui.label(
-            "Gọi điện, ảnh, tệp và nhập lịch sử chưa được hỗ trợ. Dữ liệu Electron được giữ riêng.",
+            "Chưa hỗ trợ gọi điện, gửi ảnh/tệp hoặc nhập lịch sử. Có thể xem ảnh và nội dung được chia sẻ đã nhận.",
         );
         ui.add_space(10.0);
         if ui.button("Đăng xuất").clicked() {
@@ -319,10 +326,11 @@ impl NativeApp {
 
     pub(super) fn live_account_footer(&mut self, ui: &mut egui::Ui, rect: egui::Rect) -> bool {
         let colors = crate::theme::palette(ui.ctx());
+        let account_label = self.account_label().to_owned();
         let Some(state) = self.live.as_mut() else {
             return false;
         };
-        let Some(account) = state.account.as_ref() else {
+        let Some(_) = state.account.as_ref() else {
             return false;
         };
         let mut content =
@@ -330,22 +338,18 @@ impl NativeApp {
         let mut logout = false;
         content.horizontal(|ui| {
             ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 ui.set_max_width((rect.width() - 115.0).max(80.0));
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(if account.name.is_empty() {
-                            &account.id
-                        } else {
-                            &account.name
-                        })
-                        .size(13.0),
+                        egui::RichText::new(&account_label).size(super::visuals::TEXT_BODY),
                     )
                     .truncate(),
                 )
-                .on_hover_text(format!("{} · ID {}", account.name, account.id));
+                .on_hover_text(&account_label);
                 ui.label(
                     egui::RichText::new(state.connection_label())
-                        .size(10.0)
+                        .size(super::visuals::TEXT_SMALL)
                         .color(colors.text_secondary),
                 );
             });
@@ -400,6 +404,7 @@ impl NativeApp {
 
     pub(super) fn show_login(&mut self, ctx: &egui::Context) -> bool {
         let colors = crate::theme::palette(ctx);
+        let enabled = !self.modal_blocked && !self.modal_open();
         let Some(state) = self.live.as_mut() else {
             return false;
         };
@@ -409,20 +414,27 @@ impl NativeApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(colors.surface))
             .show(ctx, |ui| {
+                if !enabled {
+                    ui.disable();
+                }
                 super::visuals::background(ui, ui.max_rect(), "--layer-background", colors.surface);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if super::visuals::icon_button(
-                        ui,
-                        super::visuals::Icon::Settings,
-                        "Cài đặt giao diện",
-                        true,
-                    )
-                    .clicked()
-                    {
-                        self.settings_open = true;
-                    }
-                });
-                if let Some(action) = state.login.show(ui, true) {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 32.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if super::visuals::icon_button(
+                            ui,
+                            super::visuals::Icon::Settings,
+                            "Cài đặt giao diện",
+                            true,
+                        )
+                        .clicked()
+                        {
+                            self.settings_open = true;
+                        }
+                    },
+                );
+                if let Some(action) = state.login.show(ui, enabled) {
                     state.action(action);
                 }
             });
@@ -674,13 +686,37 @@ impl NativeApp {
         if state.logout_dialog {
             let mut open = true;
             let mut accepted = false;
-            egui::Window::new("Đăng xuất Zalo").open(&mut open).collapsible(false).resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
-                    ui.set_max_width(350.0);
-                    ui.label("Đăng xuất và xóa phiên đã lưu trên thiết bị này? Lịch sử được giữ riêng trong hồ sơ hiện tại.");
-                    ui.add_space(8.0);
-                    if ui.button("Đăng xuất").clicked() { accepted = true; }
-                });
+            let mut cancelled = false;
+            let response = super::dialog::show(
+                ctx,
+                "logout_dialog",
+                "Đăng xuất Zalo",
+                400.0,
+                false,
+                |ui| {
+                    super::dialog::body(ui, |ui| {
+                        ui.add(egui::Label::new("Đăng xuất và xóa phiên đã lưu trên thiết bị này? Lịch sử được giữ riêng trong hồ sơ hiện tại.").wrap());
+                    });
+                    super::dialog::footer(ui, |ui| {
+                        if super::visuals::primary_button(
+                            ui,
+                            true,
+                            "Đăng xuất",
+                            egui::vec2(100.0, 32.0),
+                        )
+                        .clicked()
+                        {
+                            accepted = true;
+                        }
+                        if ui.button("Hủy").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                },
+            );
+            if response.closed || cancelled {
+                open = false;
+            }
             if accepted {
                 match state.controller.logout() {
                     Ok(generation) => {
@@ -708,18 +744,20 @@ impl NativeApp {
                 }
             }
             state.logout_dialog = open;
+            return;
         }
         #[cfg(feature = "messaging")]
-        if state.open_dialog
-            && show_target_dialog(
+        if state.open_dialog {
+            if show_target_dialog(
                 state,
                 &mut self.model,
                 &mut self.drafts,
                 &mut self.latest_page,
                 ctx,
-            )
-        {
-            self.compact_list = false;
+            ) {
+                self.compact_list = false;
+            }
+            return;
         }
         #[cfg(feature = "messaging")]
         if state.review_dialog {
@@ -727,18 +765,44 @@ impl NativeApp {
                 if let Some(review) = state.delivery.review(thread) {
                     let mut open = true;
                     let mut discard = false;
-                    egui::Window::new("Kiểm tra trạng thái gửi tin").open(&mut open).collapsible(false).resizable(false)
-                        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
-                            ui.set_max_width(380.0);
-                            ui.label(if review.accepted {
+                    let mut understood = false;
+                    let response = super::dialog::show(
+                        ctx,
+                        "delivery_review_dialog",
+                        "Kiểm tra trạng thái gửi tin",
+                        440.0,
+                        false,
+                        |ui| {
+                            super::dialog::body(ui, |ui| {
+                                ui.add(egui::Label::new(if review.accepted {
                                 "Zalo đã nhận tin nhắn, nhưng chưa lưu được xác nhận trên thiết bị. Không gửi lại nội dung này. Bản nháp được giữ để bạn kiểm tra."
                             } else {
                                 "Yêu cầu gửi bị ngắt giữa chừng. Tin nhắn có thể đã tới Zalo; bản nháp được giữ lại. Client sẽ không tự gửi lại nội dung chưa rõ trạng thái."
+                            }).wrap());
+                                ui.add_space(8.0);
+                                ui.add(egui::Label::new("Bạn có thể sửa bản nháp để soạn tin khác, hoặc kiểm tra hội thoại trước khi xóa bản nháp này.").wrap());
                             });
-                            ui.add_space(8.0);
-                            ui.label("Bạn có thể sửa bản nháp để soạn tin khác, hoặc kiểm tra hội thoại trước khi xóa bản nháp này.");
-                            if review.same_body && ui.button("Xóa bản nháp này").clicked() { discard = true; }
-                        });
+                            super::dialog::footer(ui, |ui| {
+                                if super::visuals::primary_button(
+                                    ui,
+                                    true,
+                                    "Đã hiểu",
+                                    egui::vec2(100.0, 32.0),
+                                )
+                                .clicked()
+                                {
+                                    understood = true;
+                                }
+                                if review.same_body && ui.button("Xóa bản nháp này").clicked()
+                                {
+                                    discard = true;
+                                }
+                            });
+                        },
+                    );
+                    if response.closed || understood {
+                        open = false;
+                    }
                     if discard {
                         self.drafts.active.text.clear();
                         self.drafts.active.edited();
@@ -749,6 +813,8 @@ impl NativeApp {
                 } else {
                     state.review_dialog = false;
                 }
+            } else {
+                state.review_dialog = false;
             }
         }
     }
@@ -766,55 +832,69 @@ fn show_target_dialog(
     let mut accepted = false;
     let mut open = state.open_dialog;
     let mut requested = false;
-    egui::Window::new("Mở hội thoại")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .default_width(350.0)
-        .show(ctx, |ui| {
-            ui.label("Mở bằng ID Zalo khi danh bạ chưa được đồng bộ.");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut state.group, false, "Cá nhân");
-                ui.radio_value(&mut state.group, true, "Nhóm");
-            });
-            ui.add(
-                egui::TextEdit::singleline(&mut state.target)
-                    .hint_text(if state.group {
-                        "ID nhóm"
-                    } else {
-                        "ID người nhận"
-                    })
-                    .char_limit(24)
-                    .desired_width(320.0),
-            );
-            let valid = crate::protocol::messaging::Target::new(
-                if state.group {
-                    ThreadKind::Group
-                } else {
-                    ThreadKind::Direct
-                },
-                state.target.trim(),
-            )
-            .is_ok();
-            if !state.target.trim().is_empty() && !valid {
-                ui.label(
-                    egui::RichText::new("ID chỉ gồm chữ số và không bắt đầu bằng 0.")
-                        .size(11.0)
-                        .color(colors.text_secondary),
+    let mut cancelled = false;
+    let response = super::dialog::show(
+        ctx,
+        "open_conversation_dialog",
+        "Mở hội thoại",
+        400.0,
+        false,
+        |ui| {
+            let valid = super::dialog::body(ui, |ui| {
+                ui.add(egui::Label::new("Mở bằng ID Zalo khi danh bạ chưa được đồng bộ.").wrap());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut state.group, false, "Cá nhân");
+                    ui.radio_value(&mut state.group, true, "Nhóm");
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.target)
+                        .hint_text(if state.group {
+                            "ID nhóm"
+                        } else {
+                            "ID người nhận"
+                        })
+                        .char_limit(24)
+                        .desired_width(ui.available_width()),
                 );
-            }
-            if ui
-                .add_enabled(
+                let valid = crate::protocol::messaging::Target::new(
+                    if state.group {
+                        ThreadKind::Group
+                    } else {
+                        ThreadKind::Direct
+                    },
+                    state.target.trim(),
+                )
+                .is_ok();
+                if !state.target.trim().is_empty() && !valid {
+                    ui.label(
+                        egui::RichText::new("ID chỉ gồm chữ số và không bắt đầu bằng 0.")
+                            .size(super::visuals::TEXT_SMALL)
+                            .color(colors.text_secondary),
+                    );
+                }
+                valid
+            });
+            super::dialog::footer(ui, |ui| {
+                if super::visuals::primary_button(
+                    ui,
                     valid && state.worker.is_some(),
-                    egui::Button::new("Mở hội thoại"),
+                    "Mở hội thoại",
+                    egui::vec2(125.0, 32.0),
                 )
                 .clicked()
-            {
-                requested = true;
-            }
-        });
+                {
+                    requested = true;
+                }
+                if ui.button("Hủy").clicked() {
+                    cancelled = true;
+                }
+            });
+        },
+    );
+    if response.closed || cancelled {
+        open = false;
+    }
     if requested {
         let kind = if state.group {
             ThreadKind::Group
@@ -892,7 +972,14 @@ fn recovery_controls(
         .color(colors.text_primary),
     );
     if let Some(reason) = reason {
-        ui.add(egui::Label::new(egui::RichText::new(reason).size(11.0).color(colors.error)).wrap());
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(reason)
+                    .size(super::visuals::TEXT_SMALL)
+                    .color(colors.error),
+            )
+            .wrap(),
+        );
     }
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -922,14 +1009,14 @@ fn recovery_controls(
 }
 
 #[cfg(all(test, feature = "messaging"))]
-mod tests {
+pub(in crate::ui) mod tests {
     use super::*;
     use crate::{
         domain::Conversation,
         protocol::{bootstrap::ServerConfig, session::synthetic_session},
     };
 
-    fn fixture(ctx: &egui::Context) -> (NativeApp, PathBuf) {
+    pub(in crate::ui) fn fixture(ctx: &egui::Context) -> (NativeApp, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "zalo-offline-ui-{}",
             crate::domain::local_message_id().unwrap()
@@ -966,6 +1053,9 @@ mod tests {
                 search_folded: String::new(),
                 compact_list: false,
                 details: false,
+                conversation_details: None,
+                modal_blocked: false,
+                modal_focus: None,
                 settings_open: false,
                 theme: crate::theme::ThemeController::new(
                     profile.paths.config_dir.clone(),
@@ -1004,6 +1094,93 @@ mod tests {
             }
             _ => None,
         })
+    }
+
+    #[test]
+    fn recovery_dialogs_fit_compact_windows_and_dismiss_without_losing_draft() {
+        for width in [640.0, 1200.0] {
+            let ctx = egui::Context::default();
+            let (mut app, root) = fixture(&ctx);
+            app.model.selected = Some("d:22".into());
+            assert!(app.drafts.select("d:22").is_ok());
+            app.drafts.active.text = "Bản nháp cần giữ nguyên".into();
+            let account_id = app
+                .live
+                .as_ref()
+                .unwrap()
+                .account
+                .as_ref()
+                .unwrap()
+                .id
+                .clone();
+            for (dialog, dismiss) in [(0, "Hủy"), (1, "Hủy"), (2, "Đã hiểu")] {
+                let state = app.live.as_mut().unwrap();
+                state.logout_dialog = dialog == 0;
+                state.open_dialog = dialog == 1;
+                state.review_dialog = dialog == 2;
+                if dialog == 2 {
+                    state
+                        .delivery
+                        .submitted("d:22", 11, &app.drafts.active.text);
+                    state.delivery.failed("d:22", 11, false);
+                }
+                let frame = |app: &mut NativeApp, events| {
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 480.0),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.live_dialogs(ctx),
+                    )
+                };
+                for _ in 0..3 {
+                    frame(&mut app, vec![]);
+                }
+                let output = frame(&mut app, vec![]);
+                for shape in &output.shapes {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                        assert!(
+                            rect.left() >= 0.0
+                                && rect.right() <= width
+                                && rect.top() >= 0.0
+                                && rect.bottom() <= 480.0,
+                            "dialog text clipped at {width}: {}",
+                            text.galley.job.text
+                        );
+                    }
+                }
+                let pos = text_rect(&output, dismiss).unwrap().center();
+                for pressed in [true, false] {
+                    frame(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                    );
+                }
+                let state = app.live.as_ref().unwrap();
+                assert!(!state.logout_dialog && !state.open_dialog && !state.review_dialog);
+                assert_eq!(state.account.as_ref().unwrap().id, account_id);
+                assert_eq!(app.drafts.active.text, "Bản nháp cần giữ nguyên");
+                assert!(
+                    state.worker.is_none(),
+                    "dialog dismissal must not start network"
+                );
+            }
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -1648,6 +1825,26 @@ mod tests {
     #[ignore = "requires isolated X11 display; QA closes the window via WM_DELETE_WINDOW"]
     fn signed_in_offline_native_window_fixture() {
         use winit::platform::x11::EventLoopBuilderExtX11;
+        struct MeasuredFixture {
+            app: NativeApp,
+            geometry: Option<[f32; 4]>,
+        }
+        impl eframe::App for MeasuredFixture {
+            fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+                let screen = ctx.screen_rect();
+                let geometry = [
+                    ctx.input(|input| input.viewport().native_pixels_per_point.unwrap_or(1.0)),
+                    ctx.pixels_per_point(),
+                    screen.width(),
+                    screen.height(),
+                ];
+                if self.geometry != Some(geometry) {
+                    eprintln!("UI_FIXTURE_DPI native_ppp={} effective_ppp={} logical_width={} logical_height={}", geometry[0], geometry[1], geometry[2], geometry[3]);
+                    self.geometry = Some(geometry);
+                }
+                self.app.update(ctx, frame);
+            }
+        }
         let width = std::env::var("ZALO_UI_FIXTURE_WIDTH")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
@@ -1695,7 +1892,10 @@ mod tests {
                     )
                     .map(|mut app| {
                         fixture_theme(&mut app, &cc.egui_ctx);
-                        Box::new(app) as Box<dyn eframe::App>
+                        Box::new(MeasuredFixture {
+                            app,
+                            geometry: None,
+                        }) as Box<dyn eframe::App>
                     })
                     .map_err(Into::into);
                 }
@@ -2007,7 +2207,30 @@ mod tests {
                     fixture_media(&mut app, &cc.egui_ctx, mode);
                 }
                 fixture_theme(&mut app, &cc.egui_ctx);
-                Ok(Box::new(app))
+                if let Ok(modal) = std::env::var("ZALO_UI_FIXTURE_MODAL") {
+                    match modal.as_str() {
+                        "open" => app.live.as_mut().unwrap().open_dialog = true,
+                        "logout" => app.live.as_mut().unwrap().logout_dialog = true,
+                        "info" => app.details = true,
+                        "review" => {
+                            let thread = app
+                                .model
+                                .selected
+                                .as_deref()
+                                .expect("cached fixture thread");
+                            app.drafts.active.text = "Bản nháp tổng hợp cần được giữ nguyên".into();
+                            let state = app.live.as_mut().unwrap();
+                            state.delivery.submitted(thread, 7, &app.drafts.active.text);
+                            state.delivery.failed(thread, 7, false);
+                            state.review_dialog = true;
+                        }
+                        _ => panic!("Unknown synthetic modal fixture"),
+                    }
+                }
+                Ok(Box::new(MeasuredFixture {
+                    app,
+                    geometry: None,
+                }))
             }),
         )
         .unwrap();

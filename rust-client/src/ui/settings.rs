@@ -1,6 +1,6 @@
 //! Presentation settings; preference I/O stays in the bounded theme worker.
 use crate::theme::{ThemeController, ThemeMode};
-use eframe::egui::{self, Align2, RichText};
+use eframe::egui::{self, RichText};
 
 #[derive(Default)]
 pub(super) struct Settings {
@@ -12,44 +12,47 @@ pub(super) struct Settings {
     show_icons: bool,
     icon_query: String,
     icon_page: usize,
+    token_filter: Option<String>,
+    token_matches: Vec<&'static crate::theme::catalog::Token>,
+    icon_filter: Option<String>,
+    icon_matches: Vec<&'static crate::theme::catalog::Glyph>,
 }
 
 impl Settings {
     pub fn show(&mut self, ctx: &egui::Context, open: &mut bool, theme: &mut ThemeController) {
-        egui::Window::new("Cài đặt giao diện")
-            .id(egui::Id::new("appearance_settings"))
-            .open(open)
-            .collapsible(false)
-            // Window::new uses auto_shrink(false); reset it before re-enabling bounded scrolling.
-            .auto_sized()
-            .resizable([true, false])
-            .vscroll(true)
-            .default_width(450.0)
-            .max_width((ctx.screen_rect().width() - 32.0).max(260.0))
-            .max_height((ctx.screen_rect().height() - 96.0).max(220.0))
-            // Keep controls stationary while filtering or expanding Advanced.
-            .anchor(Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
-            .show(ctx, |ui| {
-                let colors = crate::theme::palette(ctx);
-                ui.label(RichText::new("Chủ đề Zalo").family(egui::FontFamily::Name("Zalo Semibold".into())).size(18.0));
-                ui.add_space(8.0);
-                let mut mode = theme.mode();
-                ui.horizontal_wrapped(|ui| {
-                    for (value, label) in [
-                        (ThemeMode::Light, "Sáng"),
-                        (ThemeMode::Dark, "Tối"),
-                        (ThemeMode::System, "Hệ thống"),
-                        (ThemeMode::Custom, "Tùy chỉnh"),
-                    ] {
-                        ui.selectable_value(&mut mode, value, label);
+        let mut done = false;
+        let response = super::dialog::show(
+            ctx,
+            "appearance_settings",
+            "Cài đặt giao diện",
+            450.0,
+            true,
+            |ui| {
+                super::dialog::body(ui, |ui| {
+                    let colors = crate::theme::palette(ctx);
+                    ui.label(
+                        RichText::new("Chủ đề Zalo")
+                            .family(egui::FontFamily::Name("Zalo Semibold".into()))
+                            .size(18.0),
+                    );
+                    ui.add_space(8.0);
+                    let mut mode = theme.mode();
+                    ui.horizontal_wrapped(|ui| {
+                        for (value, label) in [
+                            (ThemeMode::Light, "Sáng"),
+                            (ThemeMode::Dark, "Tối"),
+                            (ThemeMode::System, "Hệ thống"),
+                            (ThemeMode::Custom, "Tùy chỉnh"),
+                        ] {
+                            ui.selectable_value(&mut mode, value, label);
+                        }
+                    });
+                    if mode != theme.mode() {
+                        theme.set_mode(mode);
+                        theme.poll(ctx);
                     }
-                });
-                if mode != theme.mode() {
-                    theme.set_mode(mode);
-                    theme.poll(ctx);
-                }
-                ui.label(RichText::new("Giao diện được lưu riêng cho hồ sơ này. Chế độ Hệ thống theo giao diện sáng/tối của hệ điều hành.").size(12.0).color(colors.text_secondary));
-                egui::CollapsingHeader::new("Nâng cao: màu và biểu tượng").id_salt("advanced_appearance").default_open(false).show(ui, |ui| {
+                    ui.label(RichText::new("Giao diện được lưu riêng cho hồ sơ này. Chế độ Hệ thống theo giao diện sáng/tối của hệ điều hành.").size(12.0).color(colors.text_secondary));
+                    egui::CollapsingHeader::new("Nâng cao: màu và biểu tượng").id_salt("advanced_appearance").default_open(false).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.selectable_value(&mut self.show_icons, false, "Màu sắc");
                         ui.selectable_value(&mut self.show_icons, true, "Bộ biểu tượng gốc");
@@ -62,17 +65,29 @@ impl Settings {
                         ui.label(RichText::new("Chọn Tùy chỉnh để thay màu; các chủ đề còn lại dùng đúng token gốc.").size(12.0).color(colors.text_secondary));
                     }
                 });
-                if let Some(error) = theme.persistence_error().or(self.error.as_deref()) {
-                    ui.add_space(8.0);
-                    ui.add(egui::Label::new(RichText::new(error).color(colors.error)).wrap());
-                }
-            });
+                    if let Some(error) = theme.persistence_error().or(self.error.as_deref()) {
+                        ui.add_space(8.0);
+                        ui.add(egui::Label::new(RichText::new(error).color(colors.error)).wrap());
+                    }
+                });
+                super::dialog::footer(ui, |ui| {
+                    if super::visuals::primary_button(ui, true, "Xong", egui::vec2(80.0, 32.0))
+                        .clicked()
+                    {
+                        done = true;
+                    }
+                });
+            },
+        );
+        if response.closed || done {
+            *open = false;
+        }
     }
 
     fn custom(&mut self, ui: &mut egui::Ui, theme: &mut ThemeController) {
         let colors = crate::theme::palette(ui.ctx());
         ui.separator();
-        ui.label("Token chỉ đổi giao diện khi thành phần hiện có sử dụng nó; các token còn lại chỉ được lưu.").on_hover_text("Custom kế thừa chủ đề Sáng. Xem UI_ASSET_INVENTORY.md để đối chiếu role native; gradient áp dụng cho ba role nền được mô tả bên dưới.");
+        ui.label("Tùy chỉnh màu dựa trên chủ đề Sáng. Một số màu chỉ áp dụng khi thành phần tương ứng được hiển thị.");
         if !self.selected_token.is_empty() {
             ui.add(
                 egui::Label::new(RichText::new(&self.selected_token).color(colors.text_secondary))
@@ -105,7 +120,7 @@ impl Settings {
                     ui.add(
                         egui::Label::new(
                             RichText::new(&token.light)
-                                .size(11.0)
+                                .size(super::visuals::TEXT_SMALL)
                                 .color(colors.text_secondary),
                         )
                         .wrap(),
@@ -156,12 +171,8 @@ impl Settings {
         {
             self.token_page = 0;
         }
-        let query = self.query.to_lowercase();
-        let matches = || {
-            crate::theme::catalog::tokens()
-                .filter(|token| query.is_empty() || token.name.to_lowercase().contains(&query))
-        };
-        let count = matches().count();
+        self.filter_tokens();
+        let count = self.token_matches.len();
         let pages = count.div_ceil(24).max(1);
         self.token_page = self.token_page.min(pages - 1);
         egui::ScrollArea::vertical()
@@ -170,7 +181,12 @@ impl Settings {
             .min_scrolled_height(150.0)
             .max_height(150.0)
             .show(ui, |ui| {
-                for token in matches().skip(self.token_page * 24).take(24) {
+                for token in self
+                    .token_matches
+                    .iter()
+                    .skip(self.token_page * 24)
+                    .take(24)
+                {
                     let response = ui.add(
                         egui::Button::new(&token.name)
                             .selected(self.selected_token == token.name)
@@ -235,12 +251,8 @@ impl Settings {
         {
             self.icon_page = 0;
         }
-        let query = self.icon_query.to_lowercase();
-        let matches = || {
-            crate::theme::catalog::glyphs()
-                .filter(|glyph| query.is_empty() || glyph.class.to_lowercase().contains(&query))
-        };
-        let count = matches().count();
+        self.filter_icons();
+        let count = self.icon_matches.len();
         let pages = count.div_ceil(24).max(1);
         self.icon_page = self.icon_page.min(pages - 1);
         egui::ScrollArea::vertical()
@@ -249,7 +261,7 @@ impl Settings {
             .min_scrolled_height(230.0)
             .max_height(230.0)
             .show(ui, |ui| {
-                for glyph in matches().skip(self.icon_page * 24).take(24) {
+                for glyph in self.icon_matches.iter().skip(self.icon_page * 24).take(24) {
                     ui.horizontal(|ui| {
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
@@ -289,6 +301,28 @@ impl Settings {
             }
         });
     }
+
+    fn filter_tokens(&mut self) {
+        if self.token_filter.as_deref() == Some(self.query.as_str()) {
+            return;
+        }
+        let query = self.query.to_lowercase();
+        self.token_matches = crate::theme::catalog::tokens()
+            .filter(|token| query.is_empty() || token.name.to_lowercase().contains(&query))
+            .collect();
+        self.token_filter = Some(self.query.clone());
+    }
+
+    fn filter_icons(&mut self) {
+        if self.icon_filter.as_deref() == Some(self.icon_query.as_str()) {
+            return;
+        }
+        let query = self.icon_query.to_lowercase();
+        self.icon_matches = crate::theme::catalog::glyphs()
+            .filter(|glyph| query.is_empty() || glyph.class.to_lowercase().contains(&query))
+            .collect();
+        self.icon_filter = Some(self.icon_query.clone());
+    }
 }
 
 /// Preview uses the same parser and paint path as actual native backgrounds.
@@ -305,6 +339,36 @@ mod tests {
     use super::*;
     use crate::profile::Profile;
     use std::sync::Arc;
+
+    #[test]
+    fn advanced_catalog_search_reuses_results_until_query_changes() {
+        let mut settings = Settings::default();
+        settings.filter_tokens();
+        settings.filter_icons();
+        assert!(settings.token_matches.len() > 700);
+        assert!(settings.icon_matches.len() > 1000);
+        let tokens = settings.token_matches.as_ptr();
+        let icons = settings.icon_matches.as_ptr();
+        settings.filter_tokens();
+        settings.filter_icons();
+        assert_eq!(settings.token_matches.as_ptr(), tokens);
+        assert_eq!(settings.icon_matches.as_ptr(), icons);
+        settings.query = "TEXT-PRIMARY".into();
+        settings.icon_query = "poll".into();
+        settings.filter_tokens();
+        settings.filter_icons();
+        assert!(!settings.token_matches.is_empty());
+        assert!(settings
+            .token_matches
+            .iter()
+            .all(|token| token.name.contains("text-primary")));
+        assert!(!settings.icon_matches.is_empty());
+        assert!(settings
+            .icon_matches
+            .iter()
+            .all(|glyph| glyph.class.to_lowercase().contains("poll")));
+        assert_eq!(settings.token_filter.as_deref(), Some("TEXT-PRIMARY"));
+    }
 
     fn frame(
         settings: &mut Settings,
@@ -327,6 +391,15 @@ mod tests {
                 settings.show(ctx, &mut true, theme);
             },
         )
+    }
+    fn visible_text_position(output: &egui::FullOutput, text: &str) -> Option<egui::Pos2> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text_shape) if text_shape.galley.job.text == text => {
+                let center = text_shape.pos + text_shape.galley.size() / 2.0;
+                shape.clip_rect.contains(center).then_some(center)
+            }
+            _ => None,
+        })
     }
     fn text_position(output: &egui::FullOutput, text: &str) -> egui::Pos2 {
         output
@@ -362,8 +435,37 @@ mod tests {
         for _ in 0..3 {
             frame(settings, theme, ctx, width, vec![]);
         }
-        let output = frame(settings, theme, ctx, width, vec![]);
-        let pos = text_position(&output, label);
+        let mut output = frame(settings, theme, ctx, width, vec![]);
+        // Advanced content now scrolls inside the bounded modal body. Exercise
+        // actual wheel navigation before clicking, including controls above it.
+        for delta in std::iter::repeat_n(-80.0, 8).chain(std::iter::repeat_n(80.0, 16)) {
+            if visible_text_position(&output, label).is_some() {
+                break;
+            }
+            output = frame(
+                settings,
+                theme,
+                ctx,
+                width,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(width / 2.0 + 215.0, 220.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, delta),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            for _ in 0..3 {
+                output = frame(settings, theme, ctx, width, vec![]);
+            }
+        }
+        let pos = visible_text_position(&output, label).unwrap_or_else(|| {
+            panic!(
+                "Control {label} remains clipped at {:?}",
+                text_position(&output, label)
+            );
+        });
         for pressed in [true, false] {
             frame(
                 settings,

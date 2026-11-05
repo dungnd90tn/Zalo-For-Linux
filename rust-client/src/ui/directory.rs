@@ -197,12 +197,12 @@ impl DirectoryView {
             });
             let response = ui.add(egui::TextEdit::singleline(&mut self.search).id_source("directory_search").hint_text(if self.is_group { "Tìm tên nhóm" } else { "Tìm tên trong danh bạ" }).char_limit(128).desired_width(f32::INFINITY));
             if response.changed() { self.reset_query(ui.ctx()); }
-            ui.label(RichText::new("Danh bạ đã lưu trên thiết bị").size(10.5).color(colors.text_secondary));
+            ui.label(RichText::new("Danh bạ đã lưu trên thiết bị").size(visuals::TEXT_SMALL).color(colors.text_secondary));
             if !self.summary.is_empty() {
-                ui.add(egui::Label::new(RichText::new(&self.summary).size(10.5).color(colors.text_secondary)).wrap()).on_hover_text(&self.detail);
+                ui.add(egui::Label::new(RichText::new(&self.summary).size(visuals::TEXT_SMALL).color(colors.text_secondary)).wrap()).on_hover_text(&self.detail);
             }
             if let Some(error) = &self.error {
-                ui.add(egui::Label::new(RichText::new(error).size(11.0).color(colors.error)).wrap());
+                ui.add(egui::Label::new(RichText::new(error).size(visuals::TEXT_SMALL).color(colors.error)).wrap());
                 if ui.small_button("Thử lại").clicked() { action = Some(Action::Retry); }
             }
         });
@@ -288,13 +288,13 @@ impl DirectoryView {
                     };
                     text.label(
                         RichText::new(subtitle)
-                            .size(11.0)
+                            .size(visuals::TEXT_SMALL)
                             .color(colors.text_secondary),
                     );
                     if response.clicked() && (!self.pending || !self.block_rows) {
                         action = Some(Action::Open(entry.clone()));
                     }
-                    response.on_hover_text(format!("Mở hội thoại · ID {}", entry.remote_id));
+                    response.on_hover_text(format!("Mở hội thoại với {}", entry.display_name));
                 }
             });
         egui::Frame::none()
@@ -317,7 +317,7 @@ impl DirectoryView {
                             self.entries.len(),
                             if self.is_group { "nhóm" } else { "liên hệ" }
                         ))
-                        .size(10.5)
+                        .size(visuals::TEXT_SMALL)
                         .color(colors.text_secondary),
                     );
                     if ui

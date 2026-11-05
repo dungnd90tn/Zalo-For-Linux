@@ -1,6 +1,6 @@
 //! Native login presentation. Authentication decisions and image decoding belong to the worker.
 use super::visuals::{self, Icon};
-use eframe::egui::{self, vec2, Align, Color32, FontId, Layout, RichText, Sense};
+use eframe::egui::{self, vec2, Align, Color32, Layout, RichText, Sense};
 
 const MAX_QR_SIDE: usize = 1024;
 
@@ -32,6 +32,7 @@ pub(super) struct LoginView {
     qr: Option<egui::TextureHandle>,
     retry_restore: bool,
     startup_attempt: bool,
+    phone_tab: bool,
 }
 
 impl LoginView {
@@ -50,6 +51,7 @@ impl LoginView {
         };
         self.error = None;
         self.qr = None;
+        self.phone_tab = false;
     }
 
     pub fn signed_out(&mut self, generation: u64) {
@@ -59,6 +61,7 @@ impl LoginView {
         self.startup_attempt = false;
         self.error = None;
         self.qr = None;
+        self.phone_tab = false;
     }
 
     pub fn progress(&mut self, generation: u64, phase: Phase) {
@@ -112,14 +115,14 @@ impl LoginView {
         true
     }
 
-    pub fn show(&self, ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
+    pub fn show(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| self.show_column(ui, enabled))
             .inner
     }
 
-    fn show_column(&self, outer: &mut egui::Ui, enabled: bool) -> Option<Action> {
+    fn show_column(&mut self, outer: &mut egui::Ui, enabled: bool) -> Option<Action> {
         let colors = crate::theme::palette(outer.ctx());
         let mut action = None;
         let compact = outer.available_height() < 600.0;
@@ -153,48 +156,50 @@ impl LoginView {
             );
         }
         ui.add_space(if compact { 12.0 } else { 26.0 });
-        let (tabs, _) = ui.allocate_exact_size(vec2(width, 36.0), Sense::hover());
-        ui.painter().line_segment(
-            [tabs.left_bottom(), tabs.right_bottom()],
-            egui::Stroke::new(1.0_f32, colors.border),
-        );
-        ui.painter().text(
-            tabs.left_center() + vec2(55.0, 0.0),
-            egui::Align2::CENTER_CENTER,
-            "VỚI MÃ QR",
-            FontId::proportional(13.0),
-            colors.primary,
-        );
-        ui.painter().line_segment(
-            [
-                tabs.left_bottom() + vec2(12.0, 0.0),
-                tabs.left_bottom() + vec2(135.0, 0.0),
-            ],
-            egui::Stroke::new(2.0_f32, colors.primary),
-        );
-        let phone = ui.interact(
-            egui::Rect::from_min_max(tabs.center_top(), tabs.right_bottom()),
-            ui.id().with("phone_login_unavailable"),
-            Sense::hover(),
-        );
-        ui.painter().text(
-            tabs.center() + vec2(90.0, 0.0),
-            egui::Align2::CENTER_CENTER,
-            "VỚI SỐ ĐIỆN THOẠI",
-            FontId::proportional(12.0),
-            colors.text_secondary,
-        );
-        phone.on_hover_text("Đăng nhập bằng số điện thoại chưa được hỗ trợ trong client native.");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (phone, label) in [(false, "VỚI MÃ QR"), (true, "VỚI SỐ ĐIỆN THOẠI")] {
+                let selected = self.phone_tab == phone;
+                let response = ui.add_sized(
+                    vec2(width / 2.0, 36.0),
+                    egui::Button::new(RichText::new(label).size(12.0).color(if selected {
+                        colors.primary
+                    } else {
+                        colors.text_secondary
+                    }))
+                    .frame(false),
+                );
+                ui.painter().line_segment(
+                    [response.rect.left_bottom(), response.rect.right_bottom()],
+                    egui::Stroke::new(
+                        if selected { 2.0_f32 } else { 1.0_f32 },
+                        if selected {
+                            colors.primary
+                        } else {
+                            colors.border
+                        },
+                    ),
+                );
+                visuals::focus_outline(ui, &response, response.rect, 0.0);
+                if response.clicked() {
+                    self.phone_tab = phone;
+                }
+            }
+        });
         ui.add_space(if compact { 12.0 } else { 20.0 });
 
-        let qr_size = if matches!(self.phase, Phase::SignedOut | Phase::Failed) && compact {
+        let qr_size = if self.phone_tab
+            || (matches!(self.phase, Phase::SignedOut | Phase::Failed) && compact)
+        {
             80.0
         } else {
             224.0
         };
         let (qr_rect, _) = ui.allocate_exact_size(vec2(qr_size, qr_size), Sense::hover());
         ui.painter().rect_filled(qr_rect, 2.0, Color32::WHITE);
-        if let Some(texture) = &self.qr {
+        if self.phone_tab {
+            visuals::icon(ui, qr_rect.shrink(20.0), Icon::Phone, colors.text_secondary);
+        } else if let Some(texture) = &self.qr {
             ui.painter().image(
                 texture.id(),
                 qr_rect.shrink(5.0),
@@ -227,40 +232,44 @@ impl LoginView {
             }
         }
         ui.add_space(12.0);
-        let (title, hint) = match self.phase {
-            Phase::SignedOut => (
-                "Đăng nhập bằng mã QR",
-                "Mở ứng dụng Zalo trên điện thoại để quét mã.",
-            ),
-            Phase::CreatingQr => (
-                "Đang tạo mã QR…",
-                "Kết nối an toàn tới dịch vụ đăng nhập Zalo.",
-            ),
-            Phase::WaitingForScan => (
-                "Quét mã QR bằng Zalo",
-                "Mở Zalo trên điện thoại → quét QR để tiếp tục.",
-            ),
-            Phase::WaitingForPhone => (
-                "Đã quét mã QR",
-                "Xác nhận yêu cầu đăng nhập trên điện thoại của bạn.",
-            ),
-            Phase::VerifyingTrust => (
-                "Đang xác minh thiết bị…",
-                "Vui lòng giữ Zalo trên điện thoại đang mở.",
-            ),
-            Phase::Bootstrapping => (
-                "Đang hoàn tất đăng nhập…",
-                "Xác minh tài khoản và thiết lập phiên làm việc.",
-            ),
-            Phase::Restoring => (
-                "Đang khôi phục phiên…",
-                "Kiểm tra phiên đã lưu trước khi mở hội thoại.",
-            ),
-            Phase::Failed if self.retry_restore => (
-                "Chưa khôi phục được phiên",
-                "Phiên đã lưu vẫn được giữ. Kiểm tra kết nối và thử lại.",
-            ),
-            Phase::Failed => ("Chưa thể đăng nhập", "Bạn có thể tạo mã mới và thử lại."),
+        let (title, hint) = if self.phone_tab {
+            ("Đăng nhập bằng số điện thoại", "Cách đăng nhập này chưa được hỗ trợ. Dùng mã QR để đăng nhập bằng Zalo trên điện thoại.")
+        } else {
+            match self.phase {
+                Phase::SignedOut => (
+                    "Đăng nhập bằng mã QR",
+                    "Mở ứng dụng Zalo trên điện thoại để quét mã.",
+                ),
+                Phase::CreatingQr => (
+                    "Đang tạo mã QR…",
+                    "Kết nối an toàn tới dịch vụ đăng nhập Zalo.",
+                ),
+                Phase::WaitingForScan => (
+                    "Quét mã QR bằng Zalo",
+                    "Mở Zalo trên điện thoại → quét QR để tiếp tục.",
+                ),
+                Phase::WaitingForPhone => (
+                    "Đã quét mã QR",
+                    "Xác nhận yêu cầu đăng nhập trên điện thoại của bạn.",
+                ),
+                Phase::VerifyingTrust => (
+                    "Đang xác minh thiết bị…",
+                    "Vui lòng giữ Zalo trên điện thoại đang mở.",
+                ),
+                Phase::Bootstrapping => (
+                    "Đang hoàn tất đăng nhập…",
+                    "Xác minh tài khoản và thiết lập phiên làm việc.",
+                ),
+                Phase::Restoring => (
+                    "Đang khôi phục phiên…",
+                    "Kiểm tra phiên đã lưu trước khi mở hội thoại.",
+                ),
+                Phase::Failed if self.retry_restore => (
+                    "Chưa khôi phục được phiên",
+                    "Phiên đã lưu vẫn được giữ. Kiểm tra kết nối và thử lại.",
+                ),
+                Phase::Failed => ("Chưa thể đăng nhập", "Bạn có thể tạo mã mới và thử lại."),
+            }
         };
         ui.label(
             RichText::new(title)
@@ -268,13 +277,28 @@ impl LoginView {
                 .family(egui::FontFamily::Name("Zalo Semibold".into())),
         );
         ui.add_space(3.0);
-        ui.label(RichText::new(hint).size(12.0).color(colors.text_secondary));
+        ui.add(
+            egui::Label::new(RichText::new(hint).size(12.0).color(colors.text_secondary)).wrap(),
+        );
         if let Some(error) = &self.error {
             ui.add_space(7.0);
             ui.add(egui::Label::new(RichText::new(error).size(12.0).color(colors.error)).wrap());
         }
         ui.add_space(if compact { 10.0 } else { 18.0 });
-        if matches!(self.phase, Phase::SignedOut | Phase::Failed) {
+        if self.phone_tab {
+            if visuals::primary_button(ui, enabled, "Dùng mã QR", vec2(240.0, 36.0)).clicked() {
+                self.phone_tab = false;
+            }
+            if !matches!(self.phase, Phase::SignedOut | Phase::Failed) {
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Hủy đăng nhập"))
+                    .clicked()
+                {
+                    action = Some(Action::Cancel);
+                }
+            }
+        } else if matches!(self.phase, Phase::SignedOut | Phase::Failed) {
             if visuals::primary_button(
                 ui,
                 enabled,
@@ -308,27 +332,53 @@ impl LoginView {
                 action = Some(Action::Begin);
             }
         } else {
-            ui.horizontal(|ui| {
-                if self.phase == Phase::WaitingForScan
-                    && ui
-                        .add_enabled(enabled, egui::Button::new("Tạo mã mới"))
+            // A full-width horizontal row centers its own frame, not its children.
+            // Give the action group a bounded frame on the same axis as the QR.
+            let action_width = 144.0;
+            let gap = ui.spacing().item_spacing.x;
+            let has_refresh = self.phase == Phase::WaitingForScan;
+            let group_width = if has_refresh {
+                action_width * 2.0 + gap
+            } else {
+                action_width
+            };
+            ui.allocate_ui_with_layout(
+                vec2(group_width, 36.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    if self.phase == Phase::WaitingForScan
+                        && ui
+                            .add_enabled_ui(enabled, |ui| {
+                                ui.add_sized(
+                                    vec2(action_width, 36.0),
+                                    egui::Button::new("Tạo mã mới"),
+                                )
+                            })
+                            .inner
+                            .clicked()
+                    {
+                        action = Some(Action::Begin);
+                    }
+                    if ui
+                        .add_enabled_ui(enabled, |ui| {
+                            ui.add_sized(
+                                vec2(action_width, 36.0),
+                                egui::Button::new("Hủy đăng nhập"),
+                            )
+                        })
+                        .inner
                         .clicked()
-                {
-                    action = Some(Action::Begin);
-                }
-                if ui
-                    .add_enabled(enabled, egui::Button::new("Hủy đăng nhập"))
-                    .clicked()
-                {
-                    action = Some(Action::Cancel);
-                }
-            });
+                    {
+                        action = Some(Action::Cancel);
+                    }
+                },
+            );
         }
         if !enabled {
             ui.add_space(7.0);
             ui.label(
                 RichText::new("Chạy client với --live để bật đăng nhập. Bản demo dùng --demo.")
-                    .size(11.0)
+                    .size(visuals::TEXT_SMALL)
                     .color(colors.text_secondary),
             );
         }
@@ -348,6 +398,177 @@ fn validated_rgba_size(width: u32, height: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qr_action_groups_and_phone_cta_share_the_card_axis_at_native_scales() {
+        for size in [vec2(640.0, 480.0), vec2(1200.0, 780.0)] {
+            for native_scale in [1.0, 1.5, 2.0] {
+                let ctx = egui::Context::default();
+                super::super::visuals::install(&ctx);
+                let mut view = LoginView::default();
+                view.start(7, false);
+                for (phase, phone) in [
+                    (Phase::WaitingForScan, false),
+                    (Phase::WaitingForPhone, false),
+                    (Phase::CreatingQr, false),
+                    (Phase::Restoring, false),
+                    (Phase::SignedOut, false),
+                    (Phase::Failed, false),
+                    (Phase::WaitingForScan, true),
+                ] {
+                    view.phase = phase;
+                    view.phone_tab = phone;
+                    let render = |view: &mut LoginView| {
+                        let mut input = egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            ..Default::default()
+                        };
+                        input
+                            .viewports
+                            .get_mut(&egui::ViewportId::ROOT)
+                            .unwrap()
+                            .native_pixels_per_point = Some(native_scale);
+                        ctx.run(input, |ctx| {
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none())
+                                .show(ctx, |ui| {
+                                    assert!(view.show(ui, true).is_none());
+                                });
+                        })
+                    };
+                    let _ = render(&mut view);
+                    let output = render(&mut view);
+                    let qr = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Rect(rect)
+                                if rect.fill == Color32::WHITE
+                                    && rect.rect.width() == rect.rect.height()
+                                    && matches!(rect.rect.width(), 80.0 | 224.0) =>
+                            {
+                                Some(rect.rect)
+                            }
+                            _ => None,
+                        })
+                        .expect("QR/phone card must be visible");
+                    let epsilon = 1.0 / native_scale;
+                    assert!((qr.center().x - size.x / 2.0).abs() <= epsilon);
+                    if !phone && !matches!(phase, Phase::SignedOut | Phase::Failed) {
+                        let actions: Vec<_> = output
+                            .shapes
+                            .iter()
+                            .filter_map(|shape| match &shape.shape {
+                                egui::Shape::Rect(rect)
+                                    if rect.rect.size() == vec2(144.0, 36.0) =>
+                                {
+                                    Some(rect.rect)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(
+                            actions.len(),
+                            if phase == Phase::WaitingForScan { 2 } else { 1 }
+                        );
+                        let group = actions.iter().copied().reduce(egui::Rect::union).unwrap();
+                        assert!(
+                            (group.center().x - qr.center().x).abs() <= epsilon,
+                            "Actual QR actions must share card center: group={group:?}, qr={qr:?}"
+                        );
+                        assert!(actions
+                            .iter()
+                            .all(|rect| (rect.center().y - group.center().y).abs() <= epsilon));
+                    } else {
+                        let center = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::Shape::Rect(rect)
+                                    if rect.rect.size() == vec2(240.0, 36.0) =>
+                                {
+                                    Some(rect.rect.center().x)
+                                }
+                                _ => None,
+                            })
+                            .unwrap();
+                        assert!((center - qr.center().x).abs() <= epsilon);
+                    }
+                    assert_eq!(view.generation(), 7);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn phone_info_tab_preserves_qr_attempt_and_keeps_cancel_accessible() {
+        for width in [640.0, 1200.0] {
+            let ctx = egui::Context::default();
+            super::super::visuals::install(&ctx);
+            let mut view = LoginView::default();
+            view.start(7, false);
+            assert!(view.pixels(&ctx, 7, 1, 1, &[255; 4]));
+            let qr = view.qr.as_ref().unwrap().id();
+            let frame = |view: &mut LoginView, events| {
+                let mut action = None;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(width, 480.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            action = view.show(ui, true);
+                        });
+                    },
+                );
+                (output, action)
+            };
+            for (label, expected_phone, expected_action) in [
+                ("VỚI SỐ ĐIỆN THOẠI", true, None),
+                ("Dùng mã QR", false, None),
+                ("VỚI SỐ ĐIỆN THOẠI", true, None),
+                ("Hủy đăng nhập", true, Some(Action::Cancel)),
+            ] {
+                let (output, _) = frame(&mut view, vec![]);
+                let pos = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == label => {
+                            Some(text.pos + text.galley.size() / 2.0)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("missing {label} at {width}"));
+                for pressed in [true, false] {
+                    let (_, action) = frame(
+                        &mut view,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                    );
+                    if !pressed {
+                        assert!(action == expected_action);
+                    }
+                }
+                assert_eq!(view.phone_tab, expected_phone);
+                assert_eq!(view.generation(), 7);
+                assert!(view.phase == Phase::WaitingForScan);
+                assert_eq!(view.qr.as_ref().unwrap().id(), qr);
+            }
+        }
+    }
     #[test]
     fn late_qr_and_progress_cannot_replace_the_current_login_attempt() {
         let ctx = egui::Context::default();

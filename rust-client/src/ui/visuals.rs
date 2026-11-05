@@ -2,6 +2,28 @@
 //! Source selectors and asset provenance are recorded in UI_THEME.md.
 use eframe::egui::{self, vec2, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui};
 
+// Source body is .875rem and message timestamps are .75rem (16px root).
+// Keep metadata readable instead of shrinking individual labels below this scale.
+pub const TEXT_SMALL: f32 = 12.0;
+pub const TEXT_BODY: f32 = 14.0;
+pub const TEXT_MESSAGE: f32 = 15.0;
+pub const TEXT_HEADING: f32 = 18.0;
+
+/// Fit cached physical pixels inside a logical frame without enlarging the bitmap.
+/// Window resize changes available space, never the frame's upper bound or DPI.
+#[cfg(feature = "messaging")]
+pub fn fit_image(
+    source_pixels: egui::Vec2,
+    bounds: egui::Vec2,
+    pixels_per_point: f32,
+) -> egui::Vec2 {
+    let native_size = source_pixels / pixels_per_point;
+    let scale = (bounds.x.max(0.0) / native_size.x)
+        .min(bounds.y.max(0.0) / native_size.y)
+        .min(1.0);
+    native_size * scale
+}
+
 pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     // Reuse existing repository assets directly, never a third-party client's artwork.
@@ -46,16 +68,16 @@ pub fn install(ctx: &egui::Context) {
     style.spacing.interact_size = vec2(32.0, 32.0);
     style
         .text_styles
-        .insert(egui::TextStyle::Body, FontId::proportional(14.0));
+        .insert(egui::TextStyle::Body, FontId::proportional(TEXT_BODY));
     style
         .text_styles
-        .insert(egui::TextStyle::Button, FontId::proportional(14.0));
+        .insert(egui::TextStyle::Button, FontId::proportional(TEXT_BODY));
     style
         .text_styles
-        .insert(egui::TextStyle::Small, FontId::proportional(12.0));
+        .insert(egui::TextStyle::Small, FontId::proportional(TEXT_SMALL));
     style
         .text_styles
-        .insert(egui::TextStyle::Heading, FontId::proportional(18.0));
+        .insert(egui::TextStyle::Heading, FontId::proportional(TEXT_HEADING));
     ctx.set_style(style);
     // Palette installation does not rebuild fonts or rasterize unused glyphs.
     crate::theme::apply(ctx, crate::theme::ThemeMode::Light);
@@ -149,7 +171,6 @@ pub fn icon_button(ui: &mut Ui, kind: Icon, label: &str, enabled: bool) -> egui:
     response.on_hover_text(label).on_disabled_hover_text(label)
 }
 
-#[cfg(feature = "live-login")]
 pub fn primary_button(ui: &mut Ui, enabled: bool, text: &str, size: egui::Vec2) -> egui::Response {
     let colors = crate::theme::palette(ui.ctx());
     ui.scope(|ui| {

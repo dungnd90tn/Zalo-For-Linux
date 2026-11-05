@@ -1,16 +1,21 @@
 //! Original native desktop UI. File, database, and network work stays off the render thread.
 #[cfg(feature = "messaging")]
 mod delivery;
+mod dialog;
 #[cfg(feature = "messaging")]
 mod directory;
 #[cfg(feature = "messaging")]
 mod hydration;
+#[cfg(all(test, feature = "messaging"))]
+mod layout_tests;
 #[cfg(feature = "live-login")]
 mod live;
 #[cfg(feature = "live-login")]
 mod login;
 #[cfg(feature = "messaging")]
 mod media;
+#[cfg(all(test, feature = "messaging"))]
+mod modal_tests;
 mod senders;
 mod settings;
 #[cfg(feature = "messaging")]
@@ -24,6 +29,23 @@ use eframe::egui::{self, pos2, vec2, Align, Align2, FontId, Layout, RichText, Se
 use std::sync::Arc;
 use visuals::{avatar, divider, icon, icon_button, Icon};
 
+// Original source dimensions are logical points, independent of window size and native DPI.
+const RAIL_WIDTH: f32 = 64.0;
+const CONVERSATION_LIST_WIDTH: f32 = 344.0;
+const CONVERSATION_LIST_MIN_WIDTH: f32 = 280.0;
+const CONVERSATION_LIST_MAX_WIDTH: f32 = 420.0;
+const CHAT_HEADER_HEIGHT: f32 = 68.0;
+const CONVERSATION_INFO_WIDTH: f32 = 344.0;
+const MIN_CHAT_WIDTH_WITH_INFO: f32 = 360.0;
+const COMPACT_BREAKPOINT: f32 = 940.0;
+
+struct ModalFocus {
+    id: egui::Id,
+    account: Option<String>,
+    thread: Option<String>,
+    generation: u64,
+}
+
 pub struct NativeApp {
     worker: Option<Worker>,
     model: Model,
@@ -33,6 +55,9 @@ pub struct NativeApp {
     search_folded: String,
     compact_list: bool,
     details: bool,
+    conversation_details: Option<(String, String)>,
+    modal_blocked: bool,
+    modal_focus: Option<ModalFocus>,
     settings_open: bool,
     theme: crate::theme::ThemeController,
     settings: settings::Settings,
@@ -82,6 +107,9 @@ impl NativeApp {
             search_folded: String::new(),
             compact_list: false,
             details: false,
+            conversation_details: None,
+            modal_blocked: false,
+            modal_focus: None,
             settings_open: false,
             theme,
             settings: settings::Settings::default(),
@@ -106,6 +134,53 @@ impl NativeApp {
             false
         }
     }
+
+    fn modal_open(&self) -> bool {
+        if self.settings_open || self.details {
+            return true;
+        }
+        #[cfg(feature = "live-login")]
+        if let Some(state) = &self.live {
+            if state.logout_dialog {
+                return true;
+            }
+            #[cfg(feature = "messaging")]
+            if state.open_dialog || state.review_dialog {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn latch_modal_input(&mut self, ctx: &egui::Context) {
+        if self.modal_open() && !self.modal_blocked {
+            self.modal_focus = ctx.memory(|memory| memory.focused()).map(|id| ModalFocus {
+                id,
+                account: self.account_id().map(str::to_owned),
+                thread: self.model.selected.clone(),
+                generation: self.model.generation,
+            });
+            if let Some(focus) = &self.modal_focus {
+                ctx.memory_mut(|memory| memory.surrender_focus(focus.id));
+            }
+            self.modal_blocked = true;
+        }
+    }
+
+    fn update_modal_input(&mut self, ctx: &egui::Context) {
+        if !self.modal_open() && self.modal_blocked {
+            if let Some(focus) = self.modal_focus.take() {
+                if focus.account.as_deref() == self.account_id()
+                    && focus.thread == self.model.selected
+                    && focus.generation == self.model.generation
+                {
+                    ctx.memory_mut(|memory| memory.request_focus(focus.id));
+                }
+            }
+            self.modal_blocked = false;
+        }
+        self.latch_modal_input(ctx);
+    }
     fn account_id(&self) -> Option<&str> {
         #[cfg(feature = "live-login")]
         {
@@ -122,8 +197,8 @@ impl NativeApp {
     fn account_label(&self) -> &str {
         #[cfg(feature = "live-login")]
         if let Some(account) = self.live.as_ref().and_then(|state| state.account.as_ref()) {
-            return if account.name.is_empty() {
-                &account.id
+            return if account.name.trim().is_empty() {
+                "Tài khoản Zalo"
             } else {
                 &account.name
             };
@@ -260,6 +335,9 @@ impl NativeApp {
     }
 
     fn send_local(&mut self) {
+        if self.modal_blocked || self.modal_open() {
+            return;
+        }
         #[cfg(feature = "messaging")]
         if let Some(state) = &mut self.live {
             if !state.can_send(self.model.selected.as_deref()) || self.model.pending {
@@ -356,10 +434,13 @@ impl NativeApp {
     fn navigation(&mut self, ctx: &egui::Context, compact: bool) {
         let colors = crate::theme::palette(ctx);
         egui::SidePanel::left("navigation")
-            .exact_width(64.0)
+            .exact_width(RAIL_WIDTH)
             .resizable(false)
             .frame(egui::Frame::none().fill(colors.nav_background))
             .show(ctx, |ui| {
+                if self.modal_blocked || self.modal_open() {
+                    ui.disable();
+                }
                 visuals::background(
                     ui,
                     ui.max_rect(),
@@ -367,7 +448,7 @@ impl NativeApp {
                     colors.nav_background,
                 );
                 ui.add_space(21.0);
-                let (rect, _) = ui.allocate_exact_size(vec2(64.0, 44.0), Sense::hover());
+                let (rect, _) = ui.allocate_exact_size(vec2(RAIL_WIDTH, 44.0), Sense::hover());
                 avatar(
                     ui,
                     egui::Rect::from_center_size(rect.center(), vec2(40.0, 40.0)),
@@ -403,7 +484,7 @@ impl NativeApp {
                 ] {
                     let (rect, response) = ui
                         .add_enabled_ui(enabled, |ui| {
-                            ui.allocate_exact_size(vec2(64.0, 56.0), Sense::click())
+                            ui.allocate_exact_size(vec2(RAIL_WIDTH, 56.0), Sense::click())
                         })
                         .inner;
                     if selected || response.hovered() || response.is_pointer_button_down_on() {
@@ -451,11 +532,11 @@ impl NativeApp {
                     ui,
                     egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
                         pos2(ui.max_rect().left(), y),
-                        vec2(64.0, 118.0),
+                        vec2(RAIL_WIDTH, 118.0),
                     )),
                     |ui| {
                         let (rect, response) =
-                            ui.allocate_exact_size(vec2(64.0, 46.0), Sense::click());
+                            ui.allocate_exact_size(vec2(RAIL_WIDTH, 46.0), Sense::click());
                         if self.details
                             || response.hovered()
                             || response.is_pointer_button_down_on()
@@ -484,7 +565,7 @@ impl NativeApp {
                         }
                         response.on_hover_text("Thông tin bản xem trước");
                         let (rect, response) =
-                            ui.allocate_exact_size(vec2(64.0, 46.0), Sense::click());
+                            ui.allocate_exact_size(vec2(RAIL_WIDTH, 46.0), Sense::click());
                         if self.settings_open
                             || response.hovered()
                             || response.is_pointer_button_down_on()
@@ -518,6 +599,9 @@ impl NativeApp {
     }
 
     fn conversations(&mut self, ui: &mut egui::Ui, compact: bool) {
+        if self.modal_blocked || self.modal_open() {
+            ui.disable();
+        }
         let colors = crate::theme::palette(ui.ctx());
         let width = ui.available_width();
         egui::Frame::none()
@@ -591,7 +675,7 @@ impl NativeApp {
                                 if self.demo { " demo" } else { "" }
                             ))
                             .color(colors.text_secondary)
-                            .size(11.0),
+                            .size(visuals::TEXT_SMALL),
                         );
                     });
                 });
@@ -628,14 +712,26 @@ impl NativeApp {
                 if matches == 0 {
                     ui.add_space(42.0);
                     ui.vertical_centered(|ui| {
+                        let searching = !self.search_folded.is_empty();
                         ui.label(
-                            RichText::new("Không tìm thấy hội thoại").color(colors.text_secondary),
+                            RichText::new(if searching {
+                                "Không tìm thấy hội thoại"
+                            } else {
+                                "Chưa có cuộc trò chuyện"
+                            })
+                            .color(colors.text_secondary),
                         );
                         ui.add_space(5.0);
                         ui.label(
-                            RichText::new("Thử một tên khác.")
-                                .size(12.0)
-                                .color(colors.text_secondary),
+                            RichText::new(if searching {
+                                "Thử tìm bằng tên khác hoặc bỏ dấu tiếng Việt."
+                            } else if self.is_signed_in() {
+                                "Mở Danh bạ để bắt đầu trò chuyện."
+                            } else {
+                                "Các cuộc trò chuyện sẽ xuất hiện tại đây."
+                            })
+                            .size(12.0)
+                            .color(colors.text_secondary),
                         );
                     });
                 }
@@ -670,14 +766,17 @@ impl NativeApp {
             } else {
                 "Bản xem trước · chưa đăng nhập"
             },
-            FontId::proportional(10.5),
+            FontId::proportional(visuals::TEXT_SMALL),
             colors.text_secondary,
         );
     }
 
     fn chat_header(&mut self, ui: &mut egui::Ui, compact: bool) {
         let colors = crate::theme::palette(ui.ctx());
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 68.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            vec2(ui.available_width(), CHAT_HEADER_HEIGHT),
+            Sense::hover(),
+        );
         visuals::background(ui, rect, "--layer-background", colors.surface);
         divider(ui, rect.left_bottom(), rect.right_bottom());
         let actions_width = if rect.width() < 490.0 { 42.0 } else { 140.0 };
@@ -703,6 +802,7 @@ impl NativeApp {
             visuals::focus_outline(ui, &response, back, 4.0);
             if response.clicked() {
                 self.compact_list = true;
+                self.conversation_details = None;
             }
             response.on_hover_text("Danh sách trò chuyện");
             left += 28.0;
@@ -728,14 +828,16 @@ impl NativeApp {
                 pos2(rect.right() - actions_width - 10.0, rect.bottom() - 10.0),
             )),
             |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                 ui.add(
                     egui::Label::new(
-                        RichText::new(title)
-                            .size(18.0)
+                        RichText::new(&title)
+                            .size(visuals::TEXT_HEADING)
                             .family(egui::FontFamily::Name("Zalo Semibold".into())),
                     )
                     .truncate(),
-                );
+                )
+                .on_hover_text(&title);
                 ui.add_space(1.0);
                 ui.label(
                     RichText::new(if self.demo {
@@ -744,7 +846,7 @@ impl NativeApp {
                         self.connection_label()
                     })
                     .color(colors.text_secondary)
-                    .size(10.5),
+                    .size(visuals::TEXT_SMALL),
                 );
             },
         );
@@ -757,10 +859,26 @@ impl NativeApp {
                 ))
                 .layout(Layout::right_to_left(Align::Center)),
             |ui| {
-                if icon_button(ui, Icon::Info, "Thông tin hội thoại và bản xem trước", true)
-                    .clicked()
+                if icon_button(
+                    ui,
+                    Icon::Info,
+                    "Thông tin hội thoại",
+                    self.model.selected.is_some(),
+                )
+                .clicked()
                 {
-                    self.details = !self.details;
+                    if let Some(thread) = self.model.selected.clone() {
+                        let scope = (
+                            self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT).into(),
+                            thread,
+                        );
+                        self.conversation_details =
+                            if self.conversation_details.as_ref() == Some(&scope) {
+                                None
+                            } else {
+                                Some(scope)
+                            };
+                    }
                 }
                 if actions_width > 50.0 {
                     icon_button(
@@ -782,7 +900,11 @@ impl NativeApp {
 
     fn composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, height: f32) {
         let colors = crate::theme::palette(ctx);
-        let enabled = (self.demo || self.is_signed_in()) && self.model.selected.is_some();
+        let enabled = ui.is_enabled()
+            && !self.modal_blocked
+            && !self.modal_open()
+            && (self.demo || self.is_signed_in())
+            && self.model.selected.is_some();
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
         visuals::background(ui, rect, "--layer-background", colors.surface);
         divider(ui, rect.left_top(), rect.right_top());
@@ -817,17 +939,15 @@ impl NativeApp {
                         "Đính kèm · chưa hỗ trợ trong bản xem trước",
                         false,
                     );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(if self.demo {
-                                "CHỈ LƯU CỤC BỘ"
-                            } else {
-                                self.connection_label()
-                            })
-                            .size(9.0)
-                            .color(colors.text_secondary),
-                        );
-                    });
+                    if self.demo {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new("CHỈ LƯU CỤC BỘ")
+                                    .size(visuals::TEXT_SMALL)
+                                    .color(colors.text_secondary),
+                            );
+                        });
+                    }
                 });
                 let send_rect = egui::Rect::from_min_size(
                     pos2(rect.right() - 102.0, rect.top() + 51.0),
@@ -845,7 +965,7 @@ impl NativeApp {
                         self.model.selected.as_deref(),
                     ));
                     // Consume the shortcut before TextEdit can turn Enter into a newline.
-                    if !ime_active
+                    if enabled && !ime_active
                         && ctx.memory(|memory| memory.has_focus(composer_id))
                         && ctx.input(|input| input.events.iter().any(|event| matches!(event,egui::Event::Key {key:egui::Key::Enter,pressed:true,repeat:false,modifiers,..} if modifiers.matches_logically(egui::Modifiers::COMMAND))))
                         && ctx.input_mut(|input| {
@@ -885,7 +1005,7 @@ impl NativeApp {
                             state.delivery.edited(thread, &self.drafts.active.text);
                         }
                     }
-                    if self.focus_composer {
+                    if enabled && self.focus_composer {
                         response.request_focus();
                         self.focus_composer = false;
                     }
@@ -925,11 +1045,24 @@ impl NativeApp {
                 if response.clicked() {
                     send = true;
                 }
-                response.on_hover_text(if self.demo {
-                    "Lưu tin nhắn vào demo trên máy này · Ctrl+Enter"
+                let unavailable = if !enabled {
+                    "Đăng nhập và chọn một cuộc trò chuyện để soạn tin."
+                } else if ime_active {
+                    "Hoàn tất phần nhập đang soạn trước khi gửi."
+                } else if self.drafts.active.in_flight() {
+                    "Đang chờ kết quả lượt gửi trước; bản nháp được giữ nguyên."
+                } else if self.drafts.active.text.trim().is_empty() {
+                    "Nhập nội dung tin nhắn."
                 } else {
-                    "Gửi tin nhắn tới Zalo · Ctrl+Enter"
-                });
+                    "Chưa thể gửi. Kiểm tra kết nối và trạng thái lượt gửi trước."
+                };
+                response
+                    .on_hover_text(if self.demo {
+                        "Lưu tin nhắn vào demo trên máy này · Ctrl+Enter"
+                    } else {
+                        "Gửi tin nhắn tới Zalo · Ctrl+Enter"
+                    })
+                    .on_disabled_hover_text(unavailable);
                 if height > 110.0 {
                     ui.painter().text(
                         pos2(rect.left() + 20.0, rect.bottom() - 13.0),
@@ -939,7 +1072,7 @@ impl NativeApp {
                         } else {
                             "Ctrl+Enter để gửi · Enter để xuống dòng"
                         },
-                        FontId::proportional(9.5),
+                        FontId::proportional(visuals::TEXT_SMALL),
                         colors.text_secondary,
                     );
                 }
@@ -955,12 +1088,24 @@ impl NativeApp {
         visuals::background(ui, ui.max_rect(), "--surface-background", colors.canvas);
         ui.spacing_mut().item_spacing.y = 0.0;
         self.chat_header(ui, compact);
+        self.latch_modal_input(ctx);
+        if self.modal_blocked || self.modal_open() {
+            ui.disable();
+        }
         let composer_height = if ui.available_height() < 340.0 {
             100.0
         } else {
             132.0
         };
-        let timeline_height = (ui.available_height() - composer_height - 29.0).max(60.0);
+        let status = timeline_status(
+            &self.model.status,
+            self.model.pending,
+            self.demo,
+            self.connection_label(),
+        )
+        .map(str::to_owned);
+        let status_height = if status.is_some() { 29.0 } else { 0.0 };
+        let timeline_height = (ui.available_height() - composer_height - status_height).max(60.0);
         let timeline_rect =
             egui::Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), timeline_height));
 
@@ -996,16 +1141,14 @@ impl NativeApp {
                                     return;
                                 }
                                 ui.vertical_centered(|ui| {
-                                    ui.label(
-                                        RichText::new(if self.demo {
-                                            "Dữ liệu minh họa · không gửi tới Zalo"
-                                        } else {
-                                            self.connection_label()
-                                        })
-                                        .size(10.0)
+                                    if self.demo {
+                                        ui.label(
+                                        RichText::new("Dữ liệu minh họa · không gửi tới Zalo")
+                                        .size(visuals::TEXT_SMALL)
                                         .color(colors.text_secondary),
-                                    );
-                                    ui.add_space(12.0);
+                                        );
+                                        ui.add_space(12.0);
+                                    }
                                     if self.model.has_older
                                         || self.model.pending
                                         || !self.latest_page
@@ -1105,57 +1248,50 @@ impl NativeApp {
                 }
             },
         );
-        let (status_rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), 29.0), Sense::hover());
-
-        let status = if self.model.status.is_empty() {
-            if self.model.pending {
-                "Đang mở hội thoại…"
-            } else {
-                if self.demo {
-                    "Demo ngoại tuyến. Tin nhắn chỉ được lưu trên thiết bị này."
-                } else {
-                    self.connection_label()
-                }
-            }
-        } else if self.model.status.starts_with("Stored locally") {
-            "Đã lưu trên thiết bị · không gửi tới Zalo"
-        } else {
-            &self.model.status
-        };
-        positioned_ui(
-            ui,
-            egui::UiBuilder::new().max_rect(status_rect.shrink2(vec2(20.0, 4.0))),
-            |ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(status)
-                            .size(10.0)
-                            .color(colors.text_secondary),
+        if let Some(status) = status {
+            let (status_rect, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), status_height), Sense::hover());
+            positioned_ui(
+                ui,
+                egui::UiBuilder::new().max_rect(status_rect.shrink2(vec2(20.0, 4.0))),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&status)
+                                .size(visuals::TEXT_SMALL)
+                                .color(colors.text_secondary),
+                        )
+                        .truncate(),
                     )
-                    .truncate(),
-                )
-                .on_hover_text(status);
-            },
-        );
+                    .on_hover_text(&status);
+                },
+            );
+        }
         self.composer(ui, ctx, composer_height);
     }
 
     fn workspace(&mut self, ctx: &egui::Context) {
         let colors = crate::theme::palette(ctx);
-        let compact = ctx.screen_rect().width() < 940.0;
+        let compact = ctx.screen_rect().width() < COMPACT_BREAKPOINT;
         self.navigation(ctx, compact);
         #[cfg(feature = "messaging")]
         self.live_connection_notice(ctx);
+        self.latch_modal_input(ctx);
         #[cfg(feature = "messaging")]
         let show_directory = self.directory_visible();
         #[cfg(not(feature = "messaging"))]
         let show_directory = false;
+        if show_directory || (compact && self.compact_list) || self.bound_conversation().is_none() {
+            self.conversation_details = None;
+        }
         if compact && show_directory {
             #[cfg(feature = "messaging")]
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(colors.surface))
                 .show(ctx, |ui| {
+                    if self.modal_blocked || self.modal_open() {
+                        ui.disable();
+                    }
                     visuals::background(ui, ui.max_rect(), "--layer-background", colors.surface);
                     self.directory_panel(ui);
                 });
@@ -1169,8 +1305,8 @@ impl NativeApp {
         } else {
             if !compact {
                 egui::SidePanel::left("conversations")
-                    .default_width(344.0)
-                    .width_range(280.0..=420.0)
+                    .default_width(CONVERSATION_LIST_WIDTH)
+                    .width_range(CONVERSATION_LIST_MIN_WIDTH..=CONVERSATION_LIST_MAX_WIDTH)
                     .resizable(true)
                     .frame(
                         egui::Frame::none()
@@ -1178,6 +1314,9 @@ impl NativeApp {
                             .stroke(Stroke::new(1.0_f32, colors.border)),
                     )
                     .show(ctx, |ui| {
+                        if self.modal_blocked || self.modal_open() {
+                            ui.disable();
+                        }
                         visuals::background(
                             ui,
                             ui.max_rect(),
@@ -1192,15 +1331,33 @@ impl NativeApp {
                         self.conversations(ui, false);
                     });
             }
+            // Original source aside is 344px. Keep at least 360px for the chat.
+            let dock_details =
+                ctx.available_rect().width() >= CONVERSATION_INFO_WIDTH + MIN_CHAT_WIDTH_WITH_INFO;
+            if dock_details && self.bound_conversation().is_some() {
+                self.conversation_sidebar(ctx);
+            }
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(colors.canvas))
-                .show(ctx, |ui| self.chat(ui, ctx, compact));
+                .show(ctx, |ui| {
+                    if self.modal_blocked || self.modal_open() {
+                        ui.disable();
+                    }
+                    if !dock_details && self.bound_conversation().is_some() {
+                        self.conversation_information(ui, true);
+                    } else {
+                        self.chat(ui, ctx, compact);
+                    }
+                });
         }
-        if self.details {
+        let application_information = self.details && !self.settings_open;
+        if application_information {
             self.information(ctx);
         }
         #[cfg(feature = "live-login")]
-        self.live_dialogs(ctx);
+        if !self.settings_open && !application_information {
+            self.live_dialogs(ctx);
+        }
         #[cfg(feature = "messaging")]
         if let Some(state) = &mut self.live {
             media::viewer(ctx, &mut state.media);
@@ -1226,24 +1383,173 @@ impl NativeApp {
 
     fn information(&mut self, ctx: &egui::Context) {
         let colors = crate::theme::palette(ctx);
-        let mut open = self.details;
-        egui::Window::new("Thông tin bản xem trước").open(&mut open).collapsible(false).resizable(false)
-            .default_width(370.0).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new("Zalo Native · Rust").size(20.0).family(egui::FontFamily::Name("Zalo Semibold".into())));
-                ui.add_space(12.0);
-                #[cfg(feature = "live-login")]
-                if self.live_information(ui) { return; }
-                ui.label("Giao diện và mã Rust được xây dựng độc lập. Bản demo sử dụng hội thoại giả lập, lưu riêng trong profile demo trên máy này.");
-                ui.add_space(10.0);
-                ui.label("Đã hoạt động: tìm hội thoại, chuyển bản nháp, đọc từng trang và lưu tin nhắn cục bộ.");
-                ui.add_space(10.0);
-                ui.label("Đang phát triển: đăng nhập, gửi nhận thật, gọi điện, ảnh và tệp. Các nút tương ứng được vô hiệu hóa.");
-                ui.add_space(12.0);
-                ui.label(RichText::new("Dữ liệu của ứng dụng Electron được giữ riêng.").size(11.0).color(colors.text_secondary));
-                ui.add_space(8.0);
+        let mut close = false;
+        let response = dialog::show(
+            ctx,
+            "application_information",
+            "Thông tin ứng dụng",
+            400.0,
+            false,
+            |ui| {
+                dialog::body(ui, |ui| {
+                    ui.label(
+                        RichText::new("Zalo Native")
+                            .size(20.0)
+                            .family(egui::FontFamily::Name("Zalo Semibold".into())),
+                    );
+                    #[cfg(feature = "live-login")]
+                    if self.live_information(ui) {
+                        return;
+                    }
+                    ui.label("Bản xem trước sử dụng các cuộc trò chuyện minh họa, lưu riêng trên thiết bị này.");
+                    ui.label("Bạn có thể tìm hội thoại, chuyển bản nháp, đọc từng trang và lưu tin nhắn cục bộ.");
+                    ui.label("Bản demo không gửi tin tới Zalo. Gọi điện và gửi ảnh, tệp chưa được hỗ trợ.");
+                    ui.label(
+                        RichText::new("Dữ liệu của ứng dụng Electron được giữ riêng.")
+                            .size(12.0)
+                            .color(colors.text_secondary),
+                    );
+                });
+                dialog::footer(ui, |ui| {
+                    close = ui.button("Đóng").clicked();
+                });
+            },
+        );
+        if response.closed || close {
+            self.details = false;
+        }
+    }
+
+    fn bound_conversation(&self) -> Option<&Conversation> {
+        let (account, selected) = self.conversation_details.as_ref()?;
+        if account != self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT)
+            || self.model.selected.as_deref() != Some(selected.as_str())
+        {
+            return None;
+        }
+        self.model
+            .conversations
+            .iter()
+            .find(|thread| thread.id == *selected)
+    }
+
+    fn conversation_sidebar(&mut self, ctx: &egui::Context) {
+        let colors = crate::theme::palette(ctx);
+        egui::SidePanel::right("conversation_information_sidebar")
+            .exact_width(CONVERSATION_INFO_WIDTH)
+            .resizable(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(colors.surface)
+                    .stroke(Stroke::new(1.0_f32, colors.divider)),
+            )
+            .show(ctx, |ui| self.conversation_information(ui, false));
+    }
+
+    fn conversation_information(&mut self, ui: &mut egui::Ui, compact: bool) {
+        if self.modal_blocked || self.modal_open() {
+            ui.disable();
+        }
+        let Some(thread) = self.bound_conversation().cloned() else {
+            self.conversation_details = None;
+            return;
+        };
+        let colors = crate::theme::palette(ui.ctx());
+        visuals::background(ui, ui.max_rect(), "--layer-background", colors.surface);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let (header, _) = ui.allocate_exact_size(
+            vec2(ui.available_width(), CHAT_HEADER_HEIGHT),
+            Sense::hover(),
+        );
+        divider(ui, header.left_bottom(), header.right_bottom());
+        ui.painter().text(
+            header.center(),
+            Align2::CENTER_CENTER,
+            "Thông tin hội thoại",
+            FontId::new(14.0, egui::FontFamily::Name("Zalo Semibold".into())),
+            colors.text_primary,
+        );
+        let close = egui::Rect::from_min_size(
+            if compact {
+                header.left_top() + vec2(12.0, 18.0)
+            } else {
+                header.right_top() + vec2(-44.0, 18.0)
+            },
+            vec2(32.0, 32.0),
+        );
+        let response = ui.interact(
+            close,
+            ui.id().with("close_conversation_information"),
+            Sense::click(),
+        );
+        if response.hovered() || response.is_pointer_button_down_on() {
+            ui.painter().rect_filled(
+                close,
+                4.0,
+                if response.is_pointer_button_down_on() {
+                    colors.pressed
+                } else {
+                    colors.hover
+                },
+            );
+        }
+        if compact {
+            icon(ui, close.shrink(7.0), Icon::Back, colors.text_secondary);
+        } else {
+            visuals::source_icon(ui, close.shrink(7.0), "fa-close", colors.text_secondary);
+        }
+        visuals::focus_outline(ui, &response, close, 4.0);
+        if response.clicked() {
+            self.conversation_details = None;
+            self.focus_composer = true;
+        }
+        response.on_hover_text("Đóng thông tin hội thoại");
+        egui::ScrollArea::vertical()
+            .id_salt(("conversation_information_body", &thread.id))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::none().inner_margin(16.0).show(ui, |ui| {
+                    let title = display_title(&thread);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
+                        avatar(ui, rect, &title);
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&title)
+                                    .family(egui::FontFamily::Name("Zalo Semibold".into()))
+                                    .size(visuals::TEXT_HEADING),
+                            )
+                            .wrap(),
+                        );
+                        ui.label(
+                            RichText::new(if self.demo {
+                                "Hội thoại minh họa"
+                            } else if thread.id.starts_with("g:") {
+                                "Nhóm trò chuyện"
+                            } else {
+                                "Trò chuyện riêng"
+                            })
+                            .color(colors.text_secondary),
+                        );
+                    });
+                    if thread.last_message_at_ms > 0
+                        && local_parts(thread.last_message_at_ms).is_some()
+                    {
+                        ui.add_space(18.0);
+                        ui.add(
+                            egui::Label::new(format!(
+                                "Tin nhắn gần nhất đã lưu: {} · {}",
+                                date_label(thread.last_message_at_ms),
+                                clock_label(thread.last_message_at_ms)
+                            ))
+                            .wrap(),
+                        );
+                    }
+                });
             });
-        self.details = open;
     }
 }
 
@@ -1255,19 +1561,28 @@ impl eframe::App for NativeApp {
         }
         self.theme.poll(ctx);
         self.poll_events(ctx);
-        if self.settings_open {
-            self.settings
-                .show(ctx, &mut self.settings_open, &mut self.theme);
-        }
+        #[cfg(feature = "live-login")]
+        self.poll_live(ctx);
+        self.update_modal_input(ctx);
         #[cfg(feature = "live-login")]
         {
-            self.poll_live(ctx);
             if self.show_login(ctx) {
+                self.conversation_details = None;
+                self.latch_modal_input(ctx);
+                if self.settings_open {
+                    self.settings
+                        .show(ctx, &mut self.settings_open, &mut self.theme);
+                }
                 return;
             }
         }
         ctx.input(|input| update_ime_state(&mut self.ime_composing, &input.events));
         self.workspace(ctx);
+        if self.settings_open {
+            self.latch_modal_input(ctx);
+            self.settings
+                .show(ctx, &mut self.settings_open, &mut self.theme);
+        }
     }
 }
 
@@ -1285,7 +1600,47 @@ fn display_title(thread: &Conversation) -> String {
     match thread.id.as_str() {
         "welcome" => "Bắt đầu với Zalo Native".into(),
         "architecture" => "Không gian phát triển".into(),
+        _ if thread.title.trim().is_empty() || thread.title == thread.id => {
+            if thread.id.starts_with("g:") {
+                "Nhóm trò chuyện".into()
+            } else {
+                "Cuộc trò chuyện".into()
+            }
+        }
         _ => thread.title.clone(),
+    }
+}
+
+fn timeline_status<'a>(
+    status: &'a str,
+    pending: bool,
+    demo: bool,
+    connection: &'a str,
+) -> Option<&'a str> {
+    // Suppress only these exact routine labels; faults and delivery notices remain visible.
+    if !matches!(
+        status,
+        "" | "Ngoại tuyến" | "Đã kết nối Zalo" | "Chưa đăng nhập"
+    ) {
+        return Some(
+            if status == "Stored locally in the offline demo; nothing was sent to Zalo." {
+                "Đã lưu trên thiết bị · không gửi tới Zalo"
+            } else {
+                status
+            },
+        );
+    }
+    if pending {
+        Some("Đang mở hội thoại…")
+    } else if demo {
+        Some("Demo ngoại tuyến. Tin nhắn chỉ được lưu trên thiết bị này.")
+    } else if matches!(
+        connection,
+        "Ngoại tuyến" | "Đã kết nối Zalo" | "Chưa đăng nhập"
+    ) {
+        None
+    } else {
+        Some(connection)
     }
 }
 
@@ -1326,21 +1681,23 @@ fn conversation_row(
                 vec2(content.width() - 40.0, 23.0),
             )),
             |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                 ui.add(
                     egui::Label::new(
                         RichText::new(title)
-                            .size(13.0)
+                            .size(visuals::TEXT_BODY)
                             .family(egui::FontFamily::Name("Zalo Semibold".into())),
                     )
                     .truncate(),
-                );
+                )
+                .on_hover_text(title);
             },
         );
         ui.painter().text(
             content.right_top() + vec2(0.0, 4.0),
             Align2::RIGHT_TOP,
             clock_label(thread.last_message_at_ms),
-            FontId::proportional(9.5),
+            FontId::proportional(visuals::TEXT_SMALL),
             colors.text_secondary,
         );
         let preview = if thread.last_text.is_empty() {
@@ -1360,7 +1717,7 @@ fn conversation_row(
                 ui.add(
                     egui::Label::new(
                         RichText::new(preview.replace(['\n', '\r'], " "))
-                            .size(11.5)
+                            .size(visuals::TEXT_SMALL)
                             .color(colors.text_secondary),
                     )
                     .truncate(),
@@ -1449,7 +1806,7 @@ fn message_bubble(
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(sender_name)
-                                        .size(10.5)
+                                        .size(visuals::TEXT_SMALL)
                                         .color(colors.text_secondary),
                                 )
                                 .truncate(),
@@ -1476,10 +1833,14 @@ fn message_bubble(
                                     match cache.visible(ui.ctx(), *sticker) {
                                         stickers::Presentation::Image(texture) => {
                                             let size = texture.size_vec2();
-                                            let scale = 130.0 / size.x.max(size.y);
+                                            let display = visuals::fit_image(
+                                                size,
+                                                vec2(ui.available_width().min(130.0), 130.0),
+                                                ui.ctx().pixels_per_point(),
+                                            );
                                             ui.add(
                                                 egui::Image::new(&texture)
-                                                    .fit_to_exact_size(size * scale),
+                                                    .fit_to_exact_size(display),
                                             )
                                             .on_hover_text("Nhãn dán · ảnh xem trước tĩnh");
                                         }
@@ -1505,7 +1866,7 @@ fn message_bubble(
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(&message.text)
-                                        .size(14.0)
+                                        .size(visuals::TEXT_MESSAGE)
                                         .color(colors.text_primary),
                                 )
                                 .wrap(),
@@ -1514,7 +1875,7 @@ fn message_bubble(
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(clock_label(message.sent_at_ms))
-                                    .size(9.0)
+                                    .size(visuals::TEXT_SMALL)
                                     .color(colors.text_secondary),
                             );
                             if own {
@@ -1527,7 +1888,7 @@ fn message_bubble(
                                     } else {
                                         "Đã lưu trên máy"
                                     })
-                                    .size(9.0)
+                                    .size(visuals::TEXT_SMALL)
                                     .color(colors.text_secondary),
                                 );
                             }
@@ -1552,8 +1913,12 @@ fn sticker_placeholder(ui: &mut egui::Ui, label: &str) -> egui::Response {
                 let (rect, _) = ui.allocate_exact_size(vec2(25.0, 25.0), Sense::hover());
                 icon(ui, rect, Icon::Smile, colors.text_secondary);
                 ui.add(
-                    egui::Label::new(RichText::new(label).size(11.0).color(colors.text_secondary))
-                        .wrap(),
+                    egui::Label::new(
+                        RichText::new(label)
+                            .size(visuals::TEXT_SMALL)
+                            .color(colors.text_secondary),
+                    )
+                    .wrap(),
                 );
             });
         })
@@ -1616,6 +1981,72 @@ fn date_label(milliseconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn routine_connection_labels_do_not_hide_faults_loading_or_delivery_uncertainty() {
+        assert_eq!(timeline_status("", false, false, "Đã kết nối Zalo"), None);
+        assert_eq!(
+            timeline_status("Ngoại tuyến", false, false, "Ngoại tuyến"),
+            None
+        );
+        assert_eq!(
+            timeline_status("", true, false, "Đã kết nối Zalo"),
+            Some("Đang mở hội thoại…")
+        );
+        for status in [
+            "Ngoại tuyến · không lưu được lịch sử",
+            "Định dạng kết nối nhận tin chưa được hỗ trợ.",
+            "Zalo đã nhận tin nhưng chưa lưu được kết quả trên thiết bị.",
+            "Chưa xác định kết quả gửi; không tự gửi lại.",
+            "Background queue is full. Your draft is preserved; try again.",
+        ] {
+            assert_eq!(
+                timeline_status(status, false, false, "Đã kết nối Zalo"),
+                Some(status)
+            );
+            assert_eq!(
+                timeline_status(status, true, false, "Đã kết nối Zalo"),
+                Some(status)
+            );
+        }
+        assert_eq!(
+            timeline_status("", false, false, "Đang kết nối lại…"),
+            Some("Đang kết nối lại…")
+        );
+        assert_eq!(
+            timeline_status("", false, false, "Phiên đã hết hạn"),
+            Some("Phiên đã hết hạn")
+        );
+        assert_eq!(
+            timeline_status(
+                "Stored locally in the offline demo; nothing was sent to Zalo.",
+                false,
+                true,
+                "Chưa đăng nhập"
+            ),
+            Some("Đã lưu trên thiết bị · không gửi tới Zalo")
+        );
+        assert!(timeline_status("", false, true, "Chưa đăng nhập")
+            .unwrap()
+            .contains("Demo"));
+    }
+    #[test]
+    fn unnamed_conversations_have_neutral_presentation_without_changing_identity() {
+        let mut thread = Conversation {
+            id: "d:123".into(),
+            title: "d:123".into(),
+            last_message_at_ms: 0,
+            last_text: String::new(),
+            last_sender: String::new(),
+        };
+        assert_eq!(display_title(&thread), "Cuộc trò chuyện");
+        assert_eq!(thread.id, "d:123");
+        assert_eq!(thread.title, "d:123");
+        thread.id = "g:456".into();
+        thread.title.clear();
+        assert_eq!(display_title(&thread), "Nhóm trò chuyện");
+        thread.title = "Nhóm Thiết kế – Nguyễn Thị Minh Anh".into();
+        assert_eq!(display_title(&thread), thread.title);
+    }
     #[test]
     fn live_sender_alignment_uses_the_verified_account_without_demo_aliases() {
         assert!(is_own_sender("123", Some("123")));

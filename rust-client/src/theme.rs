@@ -102,6 +102,8 @@ pub struct Palette {
     pub text_placeholder: Color32,
     pub text_disabled: Color32,
     pub border: Color32,
+    pub divider: Color32,
+    pub curtain: Color32,
     pub canvas: Color32,
     pub surface: Color32,
     pub hover: Color32,
@@ -151,6 +153,8 @@ impl Palette {
             text_placeholder: color("--text-placeholder"),
             text_disabled: color("--text-disabled"),
             border: color("--border"),
+            divider: color("--divider"),
+            curtain: color("--curtain"),
             canvas: color("--surface-background"),
             surface: color("--layer-background"),
             hover: color("--layer-background-hover"),
@@ -393,8 +397,18 @@ mod tests {
     fn custom_overlay_changes_only_requested_tokens_and_reset_inherits_original() {
         let mut overrides = BTreeMap::new();
         overrides.insert("--text-primary".into(), "#123456".into());
+        overrides.insert("--curtain".into(), "#11223388".into());
+        overrides.insert("--divider".into(), "#33445566".into());
         let custom = Palette::from_mode(ThemeMode::Custom, false, &overrides);
         assert_eq!(custom.text_primary, Color32::from_rgb(18, 52, 86));
+        assert_eq!(
+            custom.curtain,
+            Color32::from_rgba_unmultiplied(17, 34, 51, 136)
+        );
+        assert_eq!(
+            custom.divider,
+            Color32::from_rgba_unmultiplied(51, 68, 85, 102)
+        );
         assert_eq!(
             custom.canvas,
             Palette::from_mode(ThemeMode::Light, false, &BTreeMap::new()).canvas

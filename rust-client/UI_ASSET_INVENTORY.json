@@ -74686,6 +74686,8 @@
       "--button-primary-pressed",
       "--button-primary-text",
       "--button-secondary-neutral-pressed",
+      "--curtain",
+      "--divider",
       "--icon-navbar-disabled",
       "--icon-navbar-normal",
       "--layer-background",
@@ -76290,11 +76292,9 @@
       "--cta-link-neutral-disable",
       "--cta-link-pressed",
       "--cta-link-primary",
-      "--curtain",
       "--curtain-bold",
       "--curtain-subtle",
       "--default-thumbnail-size",
-      "--divider",
       "--divider-bold",
       "--divider-on-color",
       "--divider-subtle",
@@ -145664,6 +145664,18 @@
         ]
       },
       {
+        "role": "divider",
+        "source_tokens": [
+          "--divider"
+        ]
+      },
+      {
+        "role": "curtain",
+        "source_tokens": [
+          "--curtain"
+        ]
+      },
+      {
         "role": "canvas",
         "source_tokens": [
           "--surface-background"
@@ -145771,14 +145783,14 @@
       }
     ],
     "source": {
-      "bytes": 12101,
+      "bytes": 12905,
       "path": "rust-client/src/ui/visuals.rs",
-      "sha256": "dbc3cbbd21fd0ab644f5976ed87f460606a429f569eaa8b1aadbaee68804ff92"
+      "sha256": "4e3ebe5924e773d29e69d2d7bc41b5ab86159d0a36588670fa28e96127c11b91"
     },
     "theme_source": {
-      "bytes": 16500,
+      "bytes": 17006,
       "path": "rust-client/src/theme.rs",
-      "sha256": "6d2dcecfbc8679df5f6ee66344240f71516facffa73d5339de1ba38fdec4fd70"
+      "sha256": "bdc31d816f7b5cc981c41c86964028f42efa50e245f654eae9a1979f8e0299eb"
     }
   },
   "schema_version": 1,
