@@ -7,6 +7,6 @@ Exec=@EXECUTABLE@ --live
 Icon=zalo-linux-rust-preview
 Terminal=false
 Categories=Network;InstantMessaging;
-StartupNotify=true
+StartupNotify=false
 StartupWMClass=zalo-linux-rust-preview
 X-Zalo-Native-Managed=true

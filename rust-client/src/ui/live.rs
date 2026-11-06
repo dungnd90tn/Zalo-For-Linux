@@ -31,15 +31,17 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub sender_names: super::senders::Names,
     #[cfg(feature = "messaging")]
-    hydration: super::hydration::Hydration,
+    pub(super) hydration: super::hydration::Hydration,
+    #[cfg(feature = "messaging")]
+    pub privacy: super::privacy::Privacy,
     #[cfg(feature = "messaging")]
     pub worker: Option<LiveWorker>,
     #[cfg(feature = "messaging")]
     session: Option<Arc<crate::protocol::session::VerifiedSession>>,
     #[cfg(feature = "messaging")]
-    context: egui::Context,
+    pub(super) context: egui::Context,
     #[cfg(feature = "messaging")]
-    reason: Option<String>,
+    pub(super) reason: Option<String>,
     #[cfg(feature = "messaging")]
     pub connection: LiveConnection,
     #[cfg(feature = "messaging")]
@@ -83,6 +85,8 @@ impl LiveState {
             sender_names: Default::default(),
             #[cfg(feature = "messaging")]
             hydration: Default::default(),
+            #[cfg(feature = "messaging")]
+            privacy: Default::default(),
             #[cfg(feature = "messaging")]
             worker: None,
             #[cfg(feature = "messaging")]
@@ -145,6 +149,12 @@ impl LiveState {
             return false;
         };
         let repaint = self.context.clone();
+        self.privacy.reset_worker();
+        self.sender_names = Default::default();
+        self.hydration = Default::default();
+        self.media = Default::default();
+        self.stickers = Default::default();
+        self.directory.privacy_reset(&self.context, false);
         match LiveWorker::start(
             profile,
             session.clone(),
@@ -213,6 +223,8 @@ impl LiveState {
             self.connection = LiveConnection::Offline;
         }
         self.worker = None;
+        self.privacy.reset_worker();
+        self.privacy.status = crate::app::live::LivePrivacyStatus::Failed;
     }
 
     pub fn connection_label(&self) -> &'static str {
@@ -233,7 +245,9 @@ impl LiveState {
         return self.account.is_some()
             && self.worker.is_some()
             && self.connection == LiveConnection::Online
-            && thread.is_some_and(|thread| self.delivery.can_send(thread));
+            && thread.is_some_and(|thread| {
+                self.privacy.visible(thread) && self.delivery.can_send(thread)
+            });
         #[cfg(not(feature = "messaging"))]
         {
             let _ = thread;
@@ -244,34 +258,19 @@ impl LiveState {
 
 impl NativeApp {
     #[cfg(feature = "messaging")]
-    pub(super) fn live_connection_notice(&mut self, ctx: &egui::Context) {
-        let colors = crate::theme::palette(ctx);
-        let enabled = !self.modal_blocked && !self.modal_open();
+    pub(super) fn live_recovery(&mut self, ui: &mut egui::Ui) {
         let Some(state) = &mut self.live else {
             return;
         };
         if state.account.is_none() || state.connection == LiveConnection::Online {
             return;
         }
-        let mut action = None;
-        egui::TopBottomPanel::top("live_connection_notice")
-            .min_height(90.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(colors.selected)
-                    .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
-            )
-            .show(ctx, |ui| {
-                if !enabled {
-                    ui.disable();
-                }
-                action = recovery_controls(
-                    ui,
-                    state.connection,
-                    state.worker.is_some(),
-                    state.reason.as_deref(),
-                );
-            });
+        let action = recovery_controls(
+            ui,
+            state.connection,
+            state.worker.is_some(),
+            state.reason.as_deref(),
+        );
         match action {
             Some(RecoveryAction::Retry) => {
                 if let Some(worker) = &state.worker {
@@ -290,8 +289,10 @@ impl NativeApp {
                 state.ensure_worker(self._profile.clone());
                 state.open_dialog = true;
             }
-            Some(RecoveryAction::Logout) => state.logout_dialog = true,
             None => {}
+        }
+        if action.is_some() {
+            self.account_popup = None;
         }
     }
 
@@ -317,49 +318,6 @@ impl NativeApp {
         ui.label(
             "Chưa hỗ trợ gọi điện, gửi ảnh/tệp hoặc nhập lịch sử. Có thể xem ảnh và nội dung được chia sẻ đã nhận.",
         );
-        ui.add_space(10.0);
-        if ui.button("Đăng xuất").clicked() {
-            state.logout_dialog = true;
-        }
-        true
-    }
-
-    pub(super) fn live_account_footer(&mut self, ui: &mut egui::Ui, rect: egui::Rect) -> bool {
-        let colors = crate::theme::palette(ui.ctx());
-        let account_label = self.account_label().to_owned();
-        let Some(state) = self.live.as_mut() else {
-            return false;
-        };
-        let Some(_) = state.account.as_ref() else {
-            return false;
-        };
-        let mut content =
-            ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(14.0, 8.0))));
-        let mut logout = false;
-        content.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.set_max_width((rect.width() - 115.0).max(80.0));
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&account_label).size(super::visuals::TEXT_BODY),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(&account_label);
-                ui.label(
-                    egui::RichText::new(state.connection_label())
-                        .size(super::visuals::TEXT_SMALL)
-                        .color(colors.text_secondary),
-                );
-            });
-            if ui.small_button("Đăng xuất").clicked() {
-                logout = true;
-            }
-        });
-        if logout {
-            state.logout_dialog = true;
-        }
         true
     }
 
@@ -411,6 +369,7 @@ impl NativeApp {
         if state.account.is_some() {
             return false;
         }
+        let mut settings_response = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(colors.surface))
             .show(ctx, |ui| {
@@ -422,22 +381,29 @@ impl NativeApp {
                     egui::vec2(ui.available_width(), 32.0),
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        if super::visuals::icon_button(
+                        let response = super::visuals::icon_button(
                             ui,
                             super::visuals::Icon::Settings,
-                            "Cài đặt giao diện",
+                            "Cài đặt và tài khoản",
                             true,
-                        )
-                        .clicked()
-                        {
-                            self.settings_open = true;
-                        }
+                        );
+                        settings_response = Some(response);
                     },
                 );
                 if let Some(action) = state.login.show(ui, enabled) {
                     state.action(action);
                 }
             });
+        if let Some(response) = settings_response {
+            self.prepare_account_popup_trigger(
+                super::account::PopupKind::Settings,
+                response.rect,
+                &response,
+            );
+            if response.clicked() {
+                self.toggle_account_popup(super::account::PopupKind::Settings, response.rect);
+            }
+        }
         true
     }
 
@@ -445,6 +411,8 @@ impl NativeApp {
         let Some(mut state) = self.live.take() else {
             return;
         };
+        #[cfg(feature = "messaging")]
+        self.quarantine_privacy(&mut state, ctx, false);
         #[cfg(feature = "messaging")]
         if let Some(account) = state.account.as_ref() {
             state.sender_names.sync_scope(&account.id, &self.model, ctx);
@@ -536,6 +504,7 @@ impl NativeApp {
                         state.media = Default::default();
                         state.sender_names = Default::default();
                         state.hydration = Default::default();
+                        state.privacy.reset_worker();
                         state.review_dialog = false;
                     }
                     self.model = Model::default();
@@ -547,7 +516,9 @@ impl NativeApp {
             }
         }
         #[cfg(feature = "messaging")]
-        state.directory.poll_request(state.worker.as_ref(), ctx);
+        if state.privacy.ready() {
+            state.directory.poll_request(state.worker.as_ref(), ctx);
+        }
         #[cfg(feature = "messaging")]
         while remaining > 0 && Instant::now() < deadline {
             let event = state
@@ -558,100 +529,23 @@ impl NativeApp {
                 break;
             };
             remaining -= 1;
-            let Some(account_id) = state.account.as_ref().map(|account| account.id.clone()) else {
-                continue;
-            };
-            if event.account_id() != account_id {
-                continue;
-            }
-            state.sender_names.apply(&event, &account_id, &self.model);
-            state
-                .hydration
-                .apply(&event, &account_id, &mut self.model, ctx);
-            if matches!(&event, LiveEvent::DirectoryChanged { .. }) {
-                state.hydration.invalidate(&account_id, &self.model, ctx);
-            }
-            let refresh_senders = matches!(
-                &event,
-                LiveEvent::Page { .. }
-                    | LiveEvent::Received { .. }
-                    | LiveEvent::Sent { .. }
-                    | LiveEvent::DirectoryChanged { .. }
-                    | LiveEvent::Ready { .. }
-            );
-            let force_names = matches!(&event, LiveEvent::DirectoryChanged { .. });
-            state.directory.apply(&event, &account_id, ctx);
-            state.observe_status(&event);
-            match &event {
-                LiveEvent::SendFailed {
-                    thread,
-                    request_id,
-                    unknown_delivery: true,
-                    server_accepted,
-                    ..
-                } => {
-                    state.delivery.failed(thread, *request_id, *server_accepted);
-                    if self.model.selected.as_deref() == Some(thread) {
-                        state.delivery.edited(thread, &self.drafts.active.text);
-                        state.review_dialog = true;
-                    }
-                }
-                LiveEvent::Sent {
-                    thread, request_id, ..
-                } => state.delivery.sent(thread, *request_id),
-                _ => {}
-            }
-            let opened = match &event {
-                LiveEvent::Opened {
-                    generation,
-                    conversation,
-                    ..
-                } if *generation == self.model.generation => Some(conversation.id.clone()),
-                _ => None,
-            };
-            self.drafts.apply_live(&event, &account_id);
-            if self.model.apply_live(event, &account_id, self.latest_page) && refresh_senders {
-                state
-                    .sender_names
-                    .prepare(&account_id, &self.model, force_names, ctx);
-            }
-            if let Some(thread) = opened {
-                let _ = self.drafts.select(&thread);
-                if let Some(worker) = &state.worker {
-                    let _ = self
-                        .model
-                        .select_live_if_accepted(thread, |command| worker.submit(command));
-                }
-            }
-            if self.model.selected.is_none() {
-                if let Some(thread) = self
-                    .model
-                    .conversations
-                    .first()
-                    .map(|thread| thread.id.clone())
-                {
-                    if let Some(worker) = &state.worker {
-                        if self
-                            .model
-                            .select_live_if_accepted(thread.clone(), |command| {
-                                worker.submit(command)
-                            })
-                            .is_ok()
-                        {
-                            let _ = self.drafts.select(&thread);
-                        }
-                    }
-                }
-            }
+            self.apply_live_event(&mut state, event, ctx);
         }
         #[cfg(feature = "messaging")]
-        state.sender_names.poll(state.worker.as_ref(), ctx);
+        if state.privacy.ready() {
+            state.sender_names.poll(state.worker.as_ref(), ctx);
+            state.privacy.sync_query(&self.search, ctx);
+        }
+        #[cfg(feature = "messaging")]
+        state.privacy.poll_query(state.worker.as_ref(), ctx);
         #[cfg(feature = "messaging")]
         {
-            if let Some(account) = state.account.as_ref() {
+            if let Some(account) = state.account.as_ref().filter(|_| state.privacy.ready()) {
                 state.hydration.sync_scope(&account.id, &self.model, ctx);
             }
-            state.hydration.poll(state.worker.as_ref(), ctx);
+            if state.privacy.ready() {
+                state.hydration.poll(state.worker.as_ref(), ctx);
+            }
         }
         #[cfg(feature = "messaging")]
         if state
@@ -660,11 +554,16 @@ impl NativeApp {
             .is_some_and(|worker| worker.events.is_closed() && worker.events.is_empty())
         {
             state.worker_closed(&mut self.model, &mut self.drafts, self.latest_page);
+            self.quarantine_privacy(&mut state, ctx, true);
         }
         #[cfg(feature = "messaging")]
-        state.stickers.poll(ctx, deadline, &mut remaining);
+        if state.privacy.ready() {
+            state.stickers.poll(ctx, deadline, &mut remaining);
+        }
         #[cfg(feature = "messaging")]
-        state.media.poll(ctx, deadline, &mut remaining);
+        if state.privacy.ready() {
+            state.media.poll(ctx, deadline, &mut remaining);
+        }
         if !state.controller.events.is_empty() {
             ctx.request_repaint();
         }
@@ -677,6 +576,166 @@ impl NativeApp {
             ctx.request_repaint();
         }
         self.live = Some(state);
+    }
+
+    #[cfg(feature = "messaging")]
+    pub(super) fn apply_live_event(
+        &mut self,
+        state: &mut LiveState,
+        event: LiveEvent,
+        ctx: &egui::Context,
+    ) {
+        let Some(account_id) = state.account.as_ref().map(|account| account.id.clone()) else {
+            return;
+        };
+        if event.account_id() != account_id {
+            return;
+        }
+        // Durable settlement is independent of whether its conversation is still visible.
+        self.drafts.apply_live(&event, &account_id);
+        match &event {
+            LiveEvent::Sent {
+                thread, request_id, ..
+            }
+            | LiveEvent::SendSettled {
+                thread,
+                request_id,
+                accepted: true,
+                ..
+            } => state.delivery.sent(thread, *request_id),
+            LiveEvent::SendFailed {
+                thread,
+                request_id,
+                unknown_delivery: true,
+                server_accepted,
+                ..
+            } => {
+                state.delivery.failed(thread, *request_id, *server_accepted);
+                if state.privacy.visible(thread) && self.model.selected.as_deref() == Some(thread) {
+                    state.delivery.edited(thread, &self.drafts.active.text);
+                    state.review_dialog = true;
+                }
+            }
+            LiveEvent::SendSettled {
+                thread,
+                request_id,
+                accepted: false,
+                ..
+            } => state.delivery.failed(thread, *request_id, false),
+            _ => {}
+        }
+        state.observe_status(&event);
+        if matches!(
+            &event,
+            LiveEvent::Connection {
+                state: LiveConnection::Expired,
+                ..
+            }
+        ) {
+            state.worker = None;
+            state.privacy.reset_worker();
+            state.privacy.status = crate::app::live::LivePrivacyStatus::Failed;
+            self.quarantine_privacy(state, ctx, true);
+        }
+        if state.privacy.snapshot(&event) {
+            self.quarantine_privacy(state, ctx, true);
+            return;
+        }
+        if matches!(&event, LiveEvent::PrivacyChanged { .. }) {
+            return;
+        }
+        if matches!(&event, LiveEvent::HiddenMatches { .. }) {
+            state.privacy.matches(&event);
+            return;
+        }
+        if matches!(&event, LiveEvent::HiddenUnlockResult { .. }) {
+            if let Some((thread, generation)) =
+                state
+                    .privacy
+                    .unlock_result(&event, &account_id, state.login.generation())
+            {
+                if self.drafts.select(&thread).is_ok() {
+                    self.model.generation = generation;
+                    self.model.selected = Some(thread.clone());
+                    self.model.messages.clear();
+                    self.model.pending = true;
+                    self.model.has_older = false;
+                    self.compact_list = false;
+                    self.latest_page = true;
+                    self.focus_composer = true;
+                    state.delivery.edited(&thread, &self.drafts.active.text);
+                } else if !state.privacy.cancel(state.worker.as_ref()) {
+                    state.worker = None;
+                    state.privacy.reset_worker();
+                }
+            }
+            return;
+        }
+        // Reject private payloads before directory/name/media enrichment can consume them.
+        let Some(event) = state.privacy.project(event) else {
+            return;
+        };
+        state.privacy.observe_conversation(&event);
+        self.quarantine_privacy(state, ctx, false);
+        state.sender_names.apply(&event, &account_id, &self.model);
+        state
+            .hydration
+            .apply(&event, &account_id, &mut self.model, ctx);
+        if matches!(&event, LiveEvent::DirectoryChanged { .. }) {
+            state.hydration.invalidate(&account_id, &self.model, ctx);
+        }
+        let refresh_senders = matches!(
+            &event,
+            LiveEvent::Page { .. }
+                | LiveEvent::Received { .. }
+                | LiveEvent::Sent { .. }
+                | LiveEvent::DirectoryChanged { .. }
+                | LiveEvent::Ready { .. }
+        );
+        let force_names = matches!(&event, LiveEvent::DirectoryChanged { .. });
+        state.directory.apply(&event, &account_id, ctx);
+        let opened = match &event {
+            LiveEvent::Opened {
+                generation,
+                conversation,
+                ..
+            } if *generation == self.model.generation => Some(conversation.id.clone()),
+            _ => None,
+        };
+        if self.model.apply_live(event, &account_id, self.latest_page) && refresh_senders {
+            state
+                .sender_names
+                .prepare(&account_id, &self.model, force_names, ctx);
+        }
+        self.quarantine_privacy(state, ctx, false);
+        if let Some(thread) = opened {
+            let _ = self.drafts.select(&thread);
+            if let Some(worker) = &state.worker {
+                let _ = self
+                    .model
+                    .select_live_if_accepted(thread, |command| worker.submit(command));
+            }
+        }
+        if state.privacy.ready() && state.privacy.prompt.is_none() && self.model.selected.is_none()
+        {
+            if let Some(thread) = self
+                .model
+                .conversations
+                .iter()
+                .find(|thread| state.privacy.list_visible(&thread.id))
+                .map(|thread| thread.id.clone())
+            {
+                if let Some(worker) = &state.worker {
+                    if self
+                        .model
+                        .select_live_if_accepted(thread.clone(), |command| worker.submit(command))
+                        .is_ok()
+                    {
+                        let _ = self.drafts.select(&thread);
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn live_dialogs(&mut self, ctx: &egui::Context) {
@@ -734,6 +793,7 @@ impl NativeApp {
                             state.media = Default::default();
                             state.sender_names = Default::default();
                             state.hydration = Default::default();
+                            state.privacy.reset_worker();
                             state.review_dialog = false;
                         }
                         self.model = Model::default();
@@ -878,7 +938,7 @@ fn show_target_dialog(
             super::dialog::footer(ui, |ui| {
                 if super::visuals::primary_button(
                     ui,
-                    valid && state.worker.is_some(),
+                    valid && state.worker.is_some() && state.privacy.ready(),
                     "Mở hội thoại",
                     egui::vec2(125.0, 32.0),
                 )
@@ -903,7 +963,23 @@ fn show_target_dialog(
         };
         if let Ok(target) = crate::protocol::messaging::Target::new(kind, state.target.trim()) {
             let thread = target.thread_id();
-            if !drafts.can_select(&thread) {
+            if !state.privacy.ready() {
+                model.pending = false;
+                model.status = "Đang xác minh trạng thái riêng tư của hội thoại.".into();
+            } else if state.privacy.hidden(&thread) {
+                if let Some(account) = &state.account {
+                    state.privacy.begin_prompt(
+                        account.id.clone(),
+                        state.login.generation(),
+                        crate::app::live::HiddenCandidate {
+                            thread_id: thread,
+                            title: "Hội thoại ẩn".into(),
+                        },
+                    );
+                    open = false;
+                    model.pending = false;
+                }
+            } else if !drafts.can_select(&thread) {
                 model.status = "Đã đạt giới hạn bản nháp đang mở.".into();
             } else if let Some(worker) = &state.worker {
                 let generation = model.generation.wrapping_add(1);
@@ -938,7 +1014,6 @@ fn show_target_dialog(
 enum RecoveryAction {
     Retry,
     Open,
-    Logout,
 }
 
 /// The same recovery controls remain reachable when the compact sidebar is hidden.
@@ -957,20 +1032,20 @@ fn recovery_controls(
     );
     let expired = connection == LiveConnection::Expired;
     ui.spacing_mut().item_spacing.y = 5.0;
-    ui.label(
-        egui::RichText::new(if expired {
-            "Phiên đăng nhập đã hết hạn"
-        } else if !worker_alive {
-            "Gửi nhận đã dừng · vẫn giữ bản nháp"
-        } else if active {
-            "Đang kết nối tới Zalo…"
-        } else {
-            "Ngoại tuyến · vẫn có thể đọc tin đã lưu và soạn bản nháp"
-        })
-        .size(12.0)
-        .family(egui::FontFamily::Name("Zalo Semibold".into()))
-        .color(colors.text_primary),
-    );
+    if !active && !expired {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(if worker_alive {
+                    "Bạn vẫn có thể đọc tin đã lưu và soạn bản nháp."
+                } else {
+                    "Gửi nhận đã dừng; bản nháp được giữ nguyên."
+                })
+                .size(super::visuals::TEXT_SMALL)
+                .color(colors.text_secondary),
+            )
+            .wrap(),
+        );
+    }
     if let Some(reason) = reason {
         ui.add(
             egui::Label::new(
@@ -994,15 +1069,8 @@ fn recovery_controls(
         if ui.small_button("Mở hội thoại").clicked() {
             action = Some(RecoveryAction::Open);
         }
-        if ui
-            .small_button(if expired {
-                "Đăng nhập lại"
-            } else {
-                "Đăng xuất"
-            })
-            .clicked()
-        {
-            action = Some(RecoveryAction::Logout);
+        if expired {
+            ui.add(egui::Label::new("Mở menu bánh răng để đăng xuất và đăng nhập lại.").wrap());
         }
     });
     action
@@ -1037,6 +1105,7 @@ pub(in crate::ui) mod tests {
                 websocket: vec![],
             },
         ));
+        state.privacy = super::super::privacy::Privacy::fixture_ready();
         state.account = Some(Account {
             id: session.account_id().into(),
             name: session.display_name().into(),
@@ -1057,6 +1126,8 @@ pub(in crate::ui) mod tests {
                 modal_blocked: false,
                 modal_focus: None,
                 settings_open: false,
+                account_popup: None,
+                account_trigger_focus: None,
                 theme: crate::theme::ThemeController::new(
                     profile.paths.config_dir.clone(),
                     Arc::new(|| {}),
@@ -1064,6 +1135,7 @@ pub(in crate::ui) mod tests {
                 .unwrap(),
                 settings: super::super::settings::Settings::default(),
                 fixture_system_theme: None,
+                fixture_connection: None,
                 focus_composer: false,
                 latest_page: true,
                 ime_composing: false,
@@ -1113,6 +1185,7 @@ pub(in crate::ui) mod tests {
                 .unwrap()
                 .id
                 .clone();
+            let session = app.live.as_ref().unwrap().session.as_ref().unwrap().clone();
             for (dialog, dismiss) in [(0, "Hủy"), (1, "Hủy"), (2, "Đã hiểu")] {
                 let state = app.live.as_mut().unwrap();
                 state.logout_dialog = dialog == 0;
@@ -1172,6 +1245,7 @@ pub(in crate::ui) mod tests {
                 let state = app.live.as_ref().unwrap();
                 assert!(!state.logout_dialog && !state.open_dialog && !state.review_dialog);
                 assert_eq!(state.account.as_ref().unwrap().id, account_id);
+                assert!(Arc::ptr_eq(state.session.as_ref().unwrap(), &session));
                 assert_eq!(app.drafts.active.text, "Bản nháp cần giữ nguyên");
                 assert!(
                     state.worker.is_none(),
@@ -1208,24 +1282,25 @@ pub(in crate::ui) mod tests {
                         });
                     },
                 );
-                for label in [
-                    "Kết nối lại",
-                    "Mở hội thoại",
-                    "Đăng xuất",
-                    "Kết nối TLS chưa hoàn tất.",
-                ] {
+                for label in ["Kết nối lại", "Mở hội thoại", "Kết nối TLS chưa hoàn tất."]
+                {
                     let rect = text_rect(&output, label)
                         .unwrap_or_else(|| panic!("missing {label} at {width}"));
                     assert!(rect.bottom() <= 480.0 && rect.right() <= width);
                 }
             }
+            let ordinary = render(&mut app, &ctx, width);
+            assert!(text_rect(&ordinary, "Kết nối lại").is_none());
+            assert!(text_rect(&ordinary, "Kết nối TLS chưa hoàn tất.").is_none());
+            app.toggle_account_popup(
+                super::super::account::PopupKind::Status,
+                egui::Rect::from_center_size(egui::pos2(32.0, 43.0), egui::vec2(40.0, 40.0)),
+            );
+            render(&mut app, &ctx, width);
+            render(&mut app, &ctx, width);
             let output = render(&mut app, &ctx, width);
-            for label in [
-                "Kết nối lại",
-                "Mở hội thoại",
-                "Đăng xuất",
-                "Mở hội thoại bằng ID",
-            ] {
+            for label in ["Kết nối lại", "Mở hội thoại", "Kết nối TLS chưa hoàn tất."]
+            {
                 let rect = text_rect(&output, label).unwrap_or_else(|| {
                     panic!(
                         "workspace missing {label} at {width}; texts={:?}",
@@ -1341,7 +1416,6 @@ pub(in crate::ui) mod tests {
         for (label, expected) in [
             ("Kết nối lại", RecoveryAction::Retry),
             ("Mở hội thoại", RecoveryAction::Open),
-            ("Đăng xuất", RecoveryAction::Logout),
         ] {
             let mut action = None;
             let mut draw = |events| {
@@ -1520,27 +1594,82 @@ pub(in crate::ui) mod tests {
                 observed_at_ms: 100,
             })
             .unwrap();
-        drop(store);
+        // Explicit synthetic channels exercise the real UI handler without claiming
+        // that an empty-endpoint worker has verified a remote privacy policy.
+        let (worker, mut commands, events) = LiveWorker::presentation_fixture("11");
+        let state = app.live.as_mut().unwrap();
+        state.worker = Some(worker);
+        state.privacy.reset_worker();
+        state.directory.visible = true;
         app.model.selected = Some("d:22".into());
         app.drafts.select("d:22").unwrap();
         app.drafts.active.text = "Bản nháp hội thoại trước".into();
+        store.begin_live_privacy("11").unwrap();
+        app.open_directory_entry(entry.clone());
+        assert!(
+            app.directory_visible(),
+            "Unknown privacy cannot open cached contacts"
+        );
+        assert!(commands.try_recv().is_err());
+        assert!(store.open_conversation("11", "d:33", "Nguyễn Hà").is_err());
+        app.live.as_mut().unwrap().directory.visible = false;
+        store.replace_live_privacy("11", &[], None).unwrap();
+        events
+            .try_send(LiveEvent::PrivacyChanged {
+                account_id: "11".into(),
+                revision: 1,
+                status: crate::app::live::LivePrivacyStatus::Ready,
+                hidden_threads: vec![],
+                unlocked_thread: None,
+            })
+            .unwrap();
+        app.poll_live(&ctx);
         app.live.as_mut().unwrap().directory.visible = true;
         app.open_directory_entry(entry);
         assert!(!app.directory_visible());
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            app.poll_live(&ctx);
-            if !app.model.pending
-                && app
-                    .model
-                    .conversations
-                    .iter()
-                    .any(|c| c.id == "d:33" && c.title == "Nguyễn Hà")
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        let LiveCommand::Open {
+            generation,
+            kind,
+            remote_id,
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("Expected an authorized cached-contact open");
+        };
+        assert_eq!((kind, remote_id.as_str()), (ThreadKind::Direct, "33"));
+        let title = store
+            .directory_record("11", "d:33")
+            .unwrap()
+            .unwrap()
+            .display_name;
+        let conversation = store.open_conversation("11", "d:33", &title).unwrap();
+        events
+            .try_send(LiveEvent::Opened {
+                account_id: "11".into(),
+                generation,
+                conversation,
+            })
+            .unwrap();
+        app.poll_live(&ctx);
+        let LiveCommand::Load {
+            generation,
+            thread,
+            before,
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("Opening a verified contact must load its own page");
+        };
+        assert_eq!(thread, "d:33");
+        assert!(before.is_none());
+        events
+            .try_send(LiveEvent::Page {
+                account_id: "11".into(),
+                generation,
+                thread,
+                messages: store.page("11", "d:33", None, 50).unwrap(),
+                has_older: false,
+            })
+            .unwrap();
+        app.poll_live(&ctx);
         assert_eq!(app.model.selected.as_deref(), Some("d:33"));
         assert!(app
             .model
@@ -1557,6 +1686,7 @@ pub(in crate::ui) mod tests {
         );
         assert!(app.load_latest("d:22".into()));
         assert_eq!(app.drafts.active.text, "Bản nháp hội thoại trước");
+        drop(store);
         drop(app);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1903,6 +2033,8 @@ pub(in crate::ui) mod tests {
                 *root.lock().unwrap() = Some(path);
                 if online {
                     app.live.as_mut().unwrap().connection = LiveConnection::Online;
+                    // Synthetic visual state only; no production authentication claim.
+                    app.fixture_connection = Some(LiveConnection::Online);
                 }
                 if cached {
                     let messages: Vec<_> = [

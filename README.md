@@ -1,33 +1,34 @@
-# Zalo Native for Linux
+# Zalo Native cho Linux
 
-**A native Zalo client for Linux, built in Rust.**
+**Ứng dụng Zalo trên Linux, phát triển bằng Rust với giao diện native.**
 
-The application combines an `egui`/`eframe` interface, SQLite-backed local history and asynchronous networking workers. It renders without a WebView and uses the repository's existing Zalo theme, fonts and icons to keep the familiar messaging experience.
+Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu bằng SQLite và các tác vụ nền xử lý kết nối. Ứng dụng hiển thị trực tiếp, không dùng WebView; đồng thời tận dụng bộ màu, phông chữ và biểu tượng Zalo có sẵn trong kho mã để giữ trải nghiệm quen thuộc.
 
-**Status: active native preview.** QR login, saved-session restore, incoming text and photos have reached real-account use. The client remains a partial implementation: complete bidirectional messaging, synchronization and long-running behavior still need acceptance. Performance comparisons against equivalent workloads have not been completed.
+**Hiện trạng: bản thử nghiệm đang được phát triển.** Đăng nhập QR, khôi phục phiên, nhận tin nhắn văn bản và ảnh đã được sử dụng với tài khoản thực. Ứng dụng chưa hoàn thiện toàn bộ tính năng; gửi–nhận hai chiều, đồng bộ đầy đủ và độ ổn định khi chạy lâu vẫn cần được xác nhận thêm. Dự án chưa có kết quả so sánh hiệu năng trên các tác vụ tương đương.
 
-This is a community project, unaffiliated with Zalo or VNG Corporation.
+Đây là dự án cộng đồng, không thuộc Zalo hay VNG và không phải ứng dụng chính thức của các đơn vị này.
 
-## What the client does today
+## Những gì ứng dụng hiện có
 
-- **Sign in with QR.** Startup restores a saved session automatically or opens QR login. Confirmed expiry requests a new QR; transient connection errors preserve the session and offer Retry.
-- **Keep local conversations usable.** Cached history, contact/group names, recent previews and per-conversation drafts remain available while offline. Unknown senders use neutral labels.
-- **Display incoming content.** Text, structured notices, static sticker previews, photos and bounded OA/shared-card previews have native presentations. PNG/JPEG/WebP and a static JPEG XL subset are supported; cached images open in a native viewer.
-- **Adapt to the window.** Wide and compact layouts preserve drafts and selection. Font roles and bounded image frames stay consistent as the window grows.
-- **Use the existing Zalo appearance.** Light, Dark, System and Custom modes, original glyphs and per-profile appearance settings are included.
-- **Expose actionable diagnostics.** Connection faults show a stage/category, with bounded structural logs for investigation.
+- **Đăng nhập bằng QR:** tự kiểm tra phiên đã lưu khi mở ứng dụng; nếu chưa đăng nhập thì hiển thị QR. Phiên được xác nhận hết hạn sẽ yêu cầu quét lại; lỗi kết nối tạm thời vẫn giữ phiên và cho phép thử lại.
+- **Đọc lịch sử và soạn nháp khi ngoại tuyến:** giữ lịch sử, tên liên hệ/nhóm và bản nháp riêng cho từng cuộc trò chuyện. Nội dung chỉ hiển thị khi đã xác minh được trạng thái hội thoại ẩn; nếu lần kiểm tra mới thất bại, ứng dụng tạm giữ kín nội dung. Người gửi chưa xác định được tên có nhãn thay thế trung tính.
+- **Tôn trọng hội thoại đã ẩn trên Zalo:** loại khỏi danh sách thông thường; tìm tên và nhập PIN Zalo hiện có để mở riêng hội thoại được chọn.
+- **Hiển thị nội dung nhận được:** văn bản, thông báo hệ thống, ảnh xem trước của sticker tĩnh, ảnh và một số thẻ OA/nội dung được chia sẻ. Hỗ trợ PNG/JPEG/WebP và một phần JPEG XL tĩnh; ảnh đã tải có thể mở trong khung xem của ứng dụng.
+- **Thích ứng với kích thước cửa sổ:** bố cục rộng và gọn giữ lại hội thoại đang chọn cùng bản nháp. Cỡ chữ và giới hạn khung ảnh được giữ nhất quán khi thay đổi kích thước.
+- **Dùng giao diện quen thuộc của Zalo:** có chế độ sáng, tối, theo hệ thống và tùy chỉnh; lựa chọn giao diện được lưu theo từng hồ sơ.
+- **Có thông tin chẩn đoán:** lỗi kết nối hiển thị giai đoạn/nhóm lỗi, kèm nhật ký có giới hạn dung lượng để hỗ trợ điều tra.
 
-Poll messages show embedded notices/questions; poll details, results and voting are unavailable. Unknown card templates retain an explicit fallback rather than pretending to support their actions.
+Tin nhắn bình chọn hiện hiển thị thông báo/câu hỏi đính kèm; chưa có chi tiết, kết quả hay thao tác bỏ phiếu. Với mẫu thẻ chưa hỗ trợ, ứng dụng thông báo rõ thay vì hiển thị các thao tác không hoạt động.
 
-## Build and run
+## Biên dịch và chạy
 
-### Linux build dependencies
+### Cài các gói cần thiết trên Linux
 
-This is a userspace application: choose dependencies by distribution, rather than kernel version. No custom kernel or kernel headers are required. The GUI needs a desktop session and a working OpenGL graphics driver; keep the driver appropriate for your hardware.
+Đây là ứng dụng chạy trong môi trường người dùng: hãy chọn gói theo **bản phân phối Linux**, không cần biên dịch riêng theo phiên bản kernel hay cài kernel headers. Giao diện cần phiên đăng nhập desktop và trình điều khiển đồ họa hỗ trợ OpenGL phù hợp với phần cứng.
 
-Current validation targets Linux x86_64. The package names below have been checked against distribution indexes; this does not mean an end-to-end build and desktop test has been completed on every listed distribution.
+Môi trường kiểm thử hiện tại là Linux x86_64. Tên gói dưới đây đã được đối chiếu với danh mục của từng bản phân phối; chưa có nghĩa là ứng dụng đã được biên dịch và kiểm tra giao diện đầy đủ trên tất cả các hệ này.
 
-**Ubuntu / Debian** — [Ubuntu package index](https://packages.ubuntu.com/noble/libgl1-mesa-dev), [Debian package index](https://packages.debian.org/trixie/libxkbcommon-x11-0):
+**Ubuntu / Debian** — [gói trên Ubuntu](https://packages.ubuntu.com/noble/libgl1-mesa-dev), [gói trên Debian](https://packages.debian.org/trixie/libxkbcommon-x11-0):
 
 ```bash
 sudo apt update
@@ -35,32 +36,32 @@ sudo apt install build-essential pkg-config git curl ca-certificates python3 \
   libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libgl1-mesa-dev
 ```
 
-**Fedora** — [OpenGL development package](https://packages.fedoraproject.org/pkgs/libglvnd/libglvnd-devel/):
+**Fedora** — [gói phát triển OpenGL](https://packages.fedoraproject.org/pkgs/libglvnd/libglvnd-devel/):
 
 ```bash
 sudo dnf install gcc gcc-c++ make pkgconf-pkg-config git curl ca-certificates python3 \
   libxkbcommon-devel libxkbcommon-x11 wayland-devel libX11-devel libglvnd-devel
 ```
 
-**Arch Linux** — [build tools](https://archlinux.org/packages/core/any/base-devel/), [X11 keyboard library](https://archlinux.org/packages/extra/x86_64/libxkbcommon-x11/):
+**Arch Linux** — [bộ công cụ biên dịch](https://archlinux.org/packages/core/any/base-devel/), [thư viện bàn phím X11](https://archlinux.org/packages/extra/x86_64/libxkbcommon-x11/):
 
 ```bash
 sudo pacman -Syu --needed base-devel git curl ca-certificates python \
   libxkbcommon libxkbcommon-x11 wayland libx11 libglvnd
 ```
 
-### Get the source
+### Tải mã nguồn
 
 ```bash
 git clone https://github.com/dungnd90tn/Zalo-For-Linux.git
 cd Zalo-For-Linux
 ```
 
-Commands below run from the repository root unless stated otherwise.
+Các lệnh bên dưới được chạy từ thư mục gốc của kho mã, trừ khi có ghi chú khác.
 
-### Install the pinned toolchain and build
+### Cài bộ công cụ Rust và biên dịch
 
-Install `rustup` using the [official Rust installation guide](https://rust-lang.org/tools/install/), then reopen your terminal so its tools are on `PATH`. The repository pins **Rust 1.99.1** with `rustfmt` and `clippy` in [rust-toolchain.toml](rust-client/rust-toolchain.toml):
+Cài `rustup` theo [hướng dẫn chính thức của Rust](https://rust-lang.org/tools/install/), sau đó mở lại terminal để các công cụ có trong `PATH`. Dự án cố định **Rust 1.99.1**, kèm `rustfmt` và `clippy`, trong [rust-toolchain.toml](rust-client/rust-toolchain.toml):
 
 ```bash
 rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
@@ -68,39 +69,45 @@ rustup toolchain install 1.99.1 --profile minimal --component rustfmt --componen
 ./scripts/rust/build.sh --offline
 ```
 
-Fetch needs network access; subsequent build/check commands can work offline once dependencies are cached. Build helpers select the pinned toolchain automatically. Run direct Cargo commands inside `rust-client/` so the pin applies. With a custom Cargo target directory, use that directory instead of the default binary paths shown below.
+Lần tải thư viện cần kết nối mạng. Khi đã có đủ thư viện trong bộ nhớ đệm, có thể biên dịch và kiểm tra bằng các lệnh ngoại tuyến. Script của dự án tự chọn bộ công cụ đã cố định; nếu gọi Cargo trực tiếp, hãy chạy trong `rust-client/`. Nếu dùng thư mục đích Cargo tùy chỉnh, thay đường dẫn mặc định của tệp thực thi trong các ví dụ dưới đây cho phù hợp.
 
-### Explore without an account
+### Dùng thử không cần tài khoản
 
 ```bash
 ./scripts/rust/run.sh --demo
 ```
 
-Demo mode uses synthetic conversations and does not contact Zalo. For a displayless storage/worker check:
+Chế độ demo dùng hội thoại giả lập, không kết nối đến Zalo. Để kiểm tra tác vụ nền và lưu trữ mà không mở cửa sổ:
 
 ```bash
 ./scripts/rust/run.sh --demo --headless
 ```
 
-### Sign in to Zalo
+### Đăng nhập Zalo
 
 ```bash
 ./scripts/rust/run.sh --live
 ```
 
-The script builds the optional live features and launches the app. On first use, scan the QR code and approve login on your phone; later launches check the saved session automatically. The phone-number tab is explanatory: **phone-number login is not implemented**.
+Script biên dịch với các tính năng kết nối rồi mở ứng dụng. Ở lần đầu, quét mã QR và xác nhận đăng nhập trên điện thoại; những lần sau ứng dụng tự kiểm tra phiên đã lưu. Tab số điện thoại hiện chỉ cung cấp thông tin: **chưa hỗ trợ đăng nhập bằng số điện thoại**.
 
-After a live build, run the executable directly without Cargo:
+Sau khi biên dịch bản live, có thể chạy trực tiếp mà không cần Cargo:
 
 ```bash
 ./rust-client/target/release/zalo-rust --live
 ```
 
-Live mode contacts Zalo using the selected native profile. Default/demo builds exclude the optional HTTP, WebSocket and trust engines. Live builds also leave the experimental Signal engine inactive.
+Chế độ live kết nối đến Zalo bằng hồ sơ đã chọn. Bản mặc định/demo không bao gồm các thành phần HTTP, WebSocket và mô-đun xác thực tùy chọn. Bản live cũng chưa kích hoạt thành phần Signal đang thử nghiệm.
 
-### Install the application launcher
+### Mở hội thoại đã ẩn
 
-Build live mode immediately before installing: the desktop entry launches `--live`, and a later default/demo build can replace the workspace executable.
+Nhập tên trong ô tìm kiếm, chọn kết quả hội thoại ẩn rồi nhập **PIN Zalo hiện có gồm 4 chữ số**. PIN đúng chỉ mở hội thoại vừa chọn. Chuyển sang hội thoại khác, quay lại danh sách, mở danh bạ, đăng xuất hoặc khởi động lại ứng dụng sẽ khóa lại. Client Linux chưa hỗ trợ tạo, đặt lại PIN hay bỏ ẩn hội thoại.
+
+Ứng dụng lấy danh sách ẩn mới khi mở, khi cửa sổ được lấy nét trở lại và định kỳ khoảng 30 giây. Thay đổi trên điện thoại **chưa được đồng bộ tức thời**. Khi chưa xác minh được danh sách, nội dung được giữ kín, kể cả lịch sử đã lưu; bấm avatar để xem trạng thái hoặc chọn **Kiểm tra lại quyền riêng tư**.
+
+### Thêm ứng dụng vào menu Linux
+
+Biên dịch bản live ngay trước khi cài: mục trong menu chạy với `--live`, trong khi một lần biên dịch mặc định/demo sau đó có thể ghi đè tệp thực thi trong thư mục mã nguồn.
 
 ```bash
 ./scripts/rust/build.sh --offline --features live
@@ -108,68 +115,70 @@ python3 scripts/rust/install-desktop.py --dry-run
 python3 scripts/rust/install-desktop.py
 ```
 
-Open **Zalo Native** from your application menu. The installer copies the executable, creates a user-scoped desktop entry and installs the existing Zalo app icon. It does not launch the app, enable autostart or change profiles.
+Mở **Zalo Native** từ menu ứng dụng. Trình cài đặt sao chép tệp thực thi, tạo mục ứng dụng cho người dùng hiện tại và cài biểu tượng Zalo có sẵn. Quá trình này không mở ứng dụng, bật tự khởi động hay thay đổi hồ sơ.
 
-Run the installer again after rebuilding to update the installed copy, then close the old window and reopen Zalo Native. See [desktop integration](rust-client/linux/README.md) for managed paths, custom binaries and disposable staging.
+Sau mỗi lần biên dịch bản mới, chạy lại trình cài đặt để cập nhật bản đã cài, rồi đóng cửa sổ cũ và mở lại Zalo Native. Xem [tích hợp desktop](rust-client/linux/README.md) để biết vị trí các tệp, cách chọn tệp thực thi và cài thử vào thư mục riêng.
 
-## Current boundaries
+## Những phần còn cần hoàn thiện
 
-The [feature parity checklist](rust-client/FEATURE_PARITY.md) separates implemented behavior from verified acceptance. In particular:
+[Bảng đối chiếu tính năng](rust-client/FEATURE_PARITY.md) phân biệt phần đã triển khai với phần đã được kiểm chứng. Các nhóm việc chính còn lại:
 
-| Area | Remaining work |
+| Nhóm | Phần còn thiếu hoặc cần xác nhận |
 | --- | --- |
-| Messaging | Complete real-account personal/group send–receive acceptance, reconnect behavior and long-running operation |
-| Synchronization | Full remote history, complete member discovery and downloaded avatars |
-| Content | Media uploads, file/voice attachments, animated stickers and remaining OA layouts |
-| Message actions | Replies, forwards, mentions, reactions, recall/delete and read receipts |
-| Polls and search | Poll detail/results/voting and full message search |
-| Linux integration | Tray/notifications, screenshot integration and broader desktop acceptance |
-| Login and encryption | Phone-number authentication and production Signal/E2EE messaging |
-| Distribution | Native release packages, updater and backup/history import |
+| Nhắn tin | Xác nhận đầy đủ gửi–nhận cá nhân/nhóm với tài khoản thực, kết nối lại và vận hành lâu dài |
+| Đồng bộ | Toàn bộ lịch sử từ máy chủ, danh sách thành viên đầy đủ và tải ảnh đại diện |
+| Nội dung | Gửi ảnh, tệp, ghi âm, sticker động và các mẫu thẻ OA còn lại |
+| Thao tác tin nhắn | Trả lời, chuyển tiếp, nhắc tên, thả cảm xúc, thu hồi/xóa và trạng thái đã đọc |
+| Bình chọn và tìm kiếm | Chi tiết/kết quả/bỏ phiếu và tìm kiếm toàn bộ tin nhắn |
+| Tích hợp Linux | Khay hệ thống, thông báo, chụp màn hình và kiểm tra trên nhiều môi trường desktop |
+| Đăng nhập và mã hóa | Đăng nhập số điện thoại và nhắn tin Signal/E2EE trong bản sử dụng thực tế |
+| Phân phối | Gói cài đặt native, cập nhật tự động và nhập bản sao lưu/lịch sử |
 
-Voice/video calls are unsupported. Unsupported encryption is never treated as ordinary text. Shared-card, poll and remaining OA behavior still require real-account verification; passing synthetic fixtures does not establish universal template support or full parity.
+Chưa hỗ trợ gọi thoại/video. Nội dung có cơ chế mã hóa chưa được hỗ trợ sẽ không bị xử lý như văn bản thông thường. Thẻ chia sẻ, bình chọn và các mẫu OA còn lại vẫn cần kiểm tra bằng tài khoản thực; bộ dữ liệu kiểm thử không chứng minh ứng dụng hỗ trợ mọi mẫu thẻ hay đã hoàn thiện toàn bộ tính năng.
 
-X11 input/rendering and an IME adapter have test coverage. Native Wayland font clarity, window integration and IME behavior still need desktop acceptance. A local test suite does not establish compatibility with every compositor or input method.
+Đã có kiểm thử nhập liệu/hiển thị trên X11 và bộ tích hợp IME. Độ rõ của chữ, tích hợp cửa sổ và hoạt động của bộ gõ trên Wayland native vẫn cần xác nhận trên desktop thực tế. Kết quả kiểm thử cục bộ không bảo đảm tương thích với mọi trình quản lý cửa sổ hay bộ gõ.
 
-## Profiles and privacy
+## Hồ sơ dữ liệu và quyền riêng tư
 
-The client keeps data, configuration and cache in their respective XDG directories under `zalo-rust/profiles/<name>`. Default profile names are:
+Ứng dụng lưu dữ liệu, cấu hình và bộ nhớ đệm trong các thư mục XDG tương ứng, dưới `zalo-rust/profiles/<name>`. Tên hồ sơ mặc định:
 
-| Mode | Profile |
+| Chế độ | Hồ sơ |
 | --- | --- |
 | `--demo` | `rust-demo` |
 | `--live` | `rust-live` |
-| Neither flag | `rust-pilot` |
+| Không có hai cờ trên | `rust-pilot` |
 
-Use `--profile-root` and `--profile` for explicit locations, or `ZALO_RUST_PROFILE_ROOT` and `ZALO_RUST_PROFILE` with the run script. Explicit CLI flags take precedence. Use disposable profiles for development; never share credentials, session files or history databases.
+Dùng `--profile-root` và `--profile` để chọn vị trí/tên hồ sơ, hoặc đặt `ZALO_RUST_PROFILE_ROOT` và `ZALO_RUST_PROFILE` khi dùng script chạy ứng dụng. Cờ dòng lệnh được ưu tiên. Khi phát triển, hãy dùng hồ sơ thử nghiệm riêng; không chia sẻ thông tin đăng nhập, tệp phiên hay cơ sở dữ liệu tin nhắn.
 
-SQLite migrations preserve supported existing data. Older executables may not understand a newer schema; replacing a binary does not downgrade its database. Existing desktop history is not imported automatically.
+PIN và giá trị băm dùng để xác minh PIN chỉ được giữ trong bộ nhớ khi ứng dụng chạy, không lưu bền vững vào hồ sơ. Cơ chế khóa hội thoại kiểm soát việc hiển thị; **PIN không mã hóa cơ sở dữ liệu SQLite**.
 
-### Diagnose a problem
+Quá trình nâng cấp cấu trúc cơ sở dữ liệu SQLite giữ lại dữ liệu cũ được hỗ trợ. Tệp thực thi cũ có thể không đọc được cấu trúc dữ liệu mới; thay tệp thực thi không đồng nghĩa với hạ phiên bản cơ sở dữ liệu. Ứng dụng chưa tự nhập lịch sử từ ứng dụng desktop đang có.
 
-Inspect capabilities and locate the live profile's diagnostics without starting login or writing profile data:
+### Chẩn đoán lỗi
+
+Xem các khả năng đã biên dịch và tìm đường dẫn nhật ký của hồ sơ live mà không khởi động đăng nhập hay ghi dữ liệu hồ sơ:
 
 ```bash
 ./rust-client/target/release/zalo-rust --doctor --profile rust-live
 ```
 
-Normal launches write rotating structural logs at the selected cache profile's `diagnostics/native.log`; the terminal and doctor output show the path. Add bounded protocol metadata when reproducing a connection problem:
+Ứng dụng tự ghi nhật ký cấu trúc tại `diagnostics/native.log` trong thư mục bộ nhớ đệm của hồ sơ; nhật ký được xoay vòng và giới hạn dung lượng. Terminal và kết quả `--doctor` cho biết đường dẫn cụ thể. Khi tái hiện lỗi kết nối, có thể bổ sung thông tin giao thức có giới hạn:
 
 ```bash
 ./rust-client/target/release/zalo-rust --live --debug-log
 ```
 
-Logs omit message text, account identifiers, URLs, cookies, credentials and raw responses. Review any report before sharing it. A connection error should be investigated through its diagnostic stage/category; clearing a profile is not a routine recovery step.
+Nhật ký không ghi nội dung tin nhắn, mã định danh tài khoản, URL, cookie, thông tin đăng nhập hay phản hồi thô từ máy chủ. Kiểm tra lại báo cáo trước khi chia sẻ. Khi gặp lỗi kết nối, hãy dựa vào giai đoạn/nhóm lỗi trong chẩn đoán; không cần xóa hồ sơ như một bước xử lý thông thường.
 
-## Development and verification
+## Phát triển và kiểm thử
 
-Run the default checks from the repository root:
+Chạy bộ kiểm tra mặc định từ thư mục gốc:
 
 ```bash
 ./scripts/rust/check.sh
 ```
 
-This checks formatting, Rust/Python tooling tests, Clippy, dependency boundaries and informational/headless CLI behavior. For optional-feature integration coverage:
+Lệnh này kiểm tra định dạng, các bài kiểm thử Rust/Python, Clippy, giới hạn phụ thuộc và các chế độ dòng lệnh không cần giao diện. Để kiểm tra tích hợp các tính năng tùy chọn:
 
 ```bash
 (
@@ -179,39 +188,39 @@ This checks formatting, Rust/Python tooling tests, Clippy, dependency boundaries
 )
 ```
 
-Protocol fixtures require the `openssl` executable and permission to bind local loopback sockets. To verify a live release binary with disposable synthetic profiles:
+Kiểm thử giao thức cần lệnh `openssl` và quyền mở socket trên địa chỉ loopback cục bộ. Để kiểm tra nhanh bản release live với hồ sơ và dữ liệu giả lập riêng:
 
 ```bash
 ./scripts/rust/build.sh --offline --features live
 python3 scripts/rust/smoke-release.py --expect-live
 ```
 
-Run that block from the repository root. Release smoke does not sign in to a real account. GUI, IME and real-account checks remain separate; [validation](rust-client/VALIDATION.md) records reproducible procedures and their limits. The root `package.json` is not the native application's build or test entry point.
+Chạy khối lệnh trên từ thư mục gốc. Kiểm tra release không đăng nhập tài khoản thực. Giao diện, IME và hoạt động với tài khoản thực cần được kiểm tra riêng; [hướng dẫn kiểm chứng](rust-client/VALIDATION.md) ghi lại quy trình và giới hạn của từng loại kiểm tra. `package.json` ở thư mục gốc không phải điểm bắt đầu để biên dịch hay kiểm thử ứng dụng Rust.
 
-## Project structure
+## Cấu trúc dự án
 
-| Location | Purpose |
+| Đường dẫn | Nội dung |
 | --- | --- |
-| `rust-client/src/` | Domain models, SQLite storage, workers, protocol adapters, profiles and native UI |
-| `rust-client/src/ui/` | Login, conversation, media, settings and shared UI components |
-| `rust-client/examples/` | Synthetic performance and storage harnesses |
-| `scripts/rust/` | Build/run/check helpers, desktop installer, smoke checks and tooling tests |
-| `rust-client/vendor/egui-winit/` | Pinned Linux IME adapter changes |
-| `pc-dist/` | Existing Zalo fonts, icons, theme assets and protocol reference bundles |
+| `rust-client/src/` | Mô hình dữ liệu, lưu trữ SQLite, tác vụ nền, giao thức, hồ sơ và giao diện native |
+| `rust-client/src/ui/` | Đăng nhập, hội thoại, nội dung đa phương tiện, cài đặt và thành phần giao diện dùng chung |
+| `rust-client/examples/` | Công cụ đo hiệu năng và lưu trữ với dữ liệu giả lập |
+| `scripts/rust/` | Script biên dịch/chạy/kiểm tra, trình cài desktop và kiểm thử công cụ |
+| `rust-client/vendor/egui-winit/` | Các thay đổi tích hợp IME trên Linux của phiên bản đang cố định |
+| `pc-dist/` | Phông chữ, biểu tượng, giao diện Zalo và các bundle tham chiếu giao thức có sẵn |
 
-Network requests, storage work and media decoding belong off the render path. Keep queues/caches bounded, preserve account/conversation scope, and guard against stale asynchronous results. See [architecture](rust-client/ARCHITECTURE.md) for the implementation model.
+Xử lý mạng, truy cập dữ liệu và giải mã ảnh phải chạy ngoài luồng dựng giao diện. Giữ giới hạn hàng đợi/bộ nhớ đệm, tách đúng phạm vi tài khoản/hội thoại và loại bỏ kết quả bất đồng bộ đã lỗi thời. Xem [kiến trúc](rust-client/ARCHITECTURE.md) để hiểu cách tổ chức ứng dụng.
 
-## Contributing and documentation
+## Đóng góp và tài liệu
 
-Start with [Repository Guidelines](AGENTS.md) for contribution rules. Describe the changed behavior and verification, and attach screenshots for UI changes. Native UI work follows [UI Design](rust-client/UI_DESIGN.md) and [UI agent rules](rust-client/src/ui/AGENTS.md), including the existing theme/icon system and consistent sizing.
+Đọc [hướng dẫn của kho mã](AGENTS.md) trước khi đóng góp. Mô tả hành vi thay đổi, cách đã kiểm tra và đính kèm ảnh chụp nếu sửa giao diện. Phần giao diện native tuân theo [thiết kế UI](rust-client/UI_DESIGN.md) và [quy tắc cho agent UI](rust-client/src/ui/AGENTS.md), bao gồm bộ màu/biểu tượng hiện có và kích thước nhất quán.
 
-- [Architecture](rust-client/ARCHITECTURE.md): application boundaries and worker/storage design.
-- [Feature parity](rust-client/FEATURE_PARITY.md): implemented flows, gaps and acceptance criteria.
-- [UI theme](rust-client/UI_THEME.md): appearance modes, source assets and token coverage.
-- [Media contracts](rust-client/PROTOCOL_MEDIA.md): supported content, decoding and resource limits.
-- [Validation](rust-client/VALIDATION.md): test commands and desktop acceptance evidence.
-- [Migration status](rust-client/MIGRATION_STATUS.md): implementation checkpoints and current verification history.
+- [Kiến trúc](rust-client/ARCHITECTURE.md): ranh giới các thành phần, tác vụ nền và lưu trữ.
+- [Đối chiếu tính năng](rust-client/FEATURE_PARITY.md): phần đã làm, phần còn thiếu và tiêu chí xác nhận.
+- [Giao diện và theme](rust-client/UI_THEME.md): các chế độ hiển thị, tài nguyên gốc và phạm vi áp dụng token.
+- [Quy ước nội dung đa phương tiện](rust-client/PROTOCOL_MEDIA.md): định dạng hỗ trợ, giải mã và giới hạn tài nguyên.
+- [Kiểm chứng](rust-client/VALIDATION.md): lệnh kiểm thử và bằng chứng kiểm tra trên desktop.
+- [Tiến độ phát triển](rust-client/MIGRATION_STATUS.md): các mốc triển khai và lịch sử kiểm chứng.
 
-Zalo branding and bundled assets remain attributable to their respective owners. Integration work does not imply affiliation or endorsement; bundled third-party code retains its own notices.
+Thương hiệu Zalo và tài nguyên đi kèm thuộc về chủ sở hữu tương ứng. Việc tích hợp không thể hiện sự liên kết hay bảo chứng; mã bên thứ ba giữ nguyên các thông báo bản quyền/giấy phép của mình.
 
-Report reproducible bugs or propose improvements through [GitHub Issues](https://github.com/dungnd90tn/Zalo-For-Linux/issues). Include the build/version, desktop environment, display backend, reproduction steps and sanitized diagnostics when relevant.
+Gửi lỗi có thể tái hiện hoặc đề xuất cải tiến tại [GitHub Issues](https://github.com/dungnd90tn/Zalo-For-Linux/issues). Khi báo lỗi, cung cấp phiên bản ứng dụng, môi trường desktop, X11/Wayland, các bước tái hiện và thông tin chẩn đoán đã loại bỏ dữ liệu nhạy cảm nếu có.

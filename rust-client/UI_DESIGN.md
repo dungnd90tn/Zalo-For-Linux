@@ -22,7 +22,7 @@ Client dùng egui/eframe native, không WebView/Electron. Không sao chép mã h
 
 Font Segoe UI regular/Semibold/Bold và hai icon font gốc khởi tạo một lần; metadata 12, body/button 14, nội dung chat 15, heading 18, tiêu đề modal 16 đơn vị logic egui. Không dùng chữ phụ 9–11,5 để tiết kiệm chỗ. Catalog giữ toàn bộ token và 1.034 glyph/alias đã kiểm cmap; raster chỉ khi dùng. [Kiểm kê](UI_ASSET_INVENTORY.md) phân biệt nguồn đầy đủ với thành phần native.
 
-Cài đặt mở từ rail hoặc màn đăng nhập: Sáng/Tối/Hệ thống/Tùy chỉnh, lưu riêng trong profile bằng worker. System theo tín hiệu egui/winit; thiếu tín hiệu dùng Light, chưa xác nhận mọi desktop Linux. Custom kế thừa Light, ghi đè màu/reset; gradient hai điểm màu hỗ trợ nền chat, rail và surface. Token/editor và danh mục icon nằm trong Nâng cao, đóng mặc định; không tự bật tính năng chưa hỗ trợ.
+Bấm bánh răng mở menu; chọn “Thiết lập giao diện” để mở Sáng/Tối/Hệ thống/Tùy chỉnh, lưu riêng trong profile bằng worker. Khi đã đăng nhập, mục “Đăng xuất” riêng chỉ mở hộp xác nhận; Hủy giữ phiên và bản nháp. Màn đăng nhập chỉ có mục giao diện. System theo tín hiệu egui/winit; thiếu tín hiệu dùng Light, chưa xác nhận mọi desktop Linux. Custom kế thừa Light, ghi đè màu/reset; gradient hai điểm màu hỗ trợ nền chat, rail và surface. Token/editor và danh mục icon nằm trong Nâng cao, đóng mặc định; không tự bật tính năng chưa hỗ trợ.
 
 ## Bố cục và thành phần
 
@@ -34,7 +34,7 @@ Thông tin hội thoại nằm ở sidebar phải rộng 344 khi còn đủ ít 
 
 Resize/maximize cùng DPI chỉ tăng vùng đọc, không nhân cỡ chữ hay chiều rộng rail/list/sidebar, chiều cao header hoặc hitbox. Ảnh/sticker giữ tỉ lệ, có giới hạn kích thước và không phóng vượt số pixel nguồn; viewer căn ảnh giữa hai chiều trong khung tối đa 740×540, chỉ thu nhỏ khi cửa sổ thiếu chỗ; chú thích cuộn riêng để liên kết ảnh gốc vẫn tới được. Khi DPI màn hình đổi, toolkit raster lại font theo mật độ pixel thật; không ép zoom/DPI toàn ứng dụng hoặc kéo giãn bitmap.
 
-Modal dùng `dialog.rs`: curtain theo token gốc, header cao 48, tiêu đề 16, glyph đóng 24 trong hitbox 30, viền bo 4, body cuộn có padding 14×16. Footer là hàng nút cao 32 cộng padding, không kéo giãn theo chiều cao cửa sổ. Khi modal mở, chặn cả pointer, phím tắt và dispatch nền; đóng modal chỉ khôi phục focus khi tài khoản/thread/generation còn khớp. Settings, mở hội thoại, đăng xuất, kiểm tra gửi và thông tin ứng dụng dùng cùng quy tắc.
+Modal dùng `dialog.rs`: curtain theo token gốc, header cao 48, tiêu đề 16, glyph đóng 24 trong hitbox 30, viền bo 4, body cuộn có padding 14×16. Footer là hàng nút cao 32 cộng padding, không kéo giãn theo chiều cao cửa sổ. Khi modal mở, chặn cả pointer, phím tắt và dispatch nền; đóng modal chỉ khôi phục focus khi tài khoản/thread/generation còn khớp. Settings, mở hội thoại, đăng xuất, kiểm tra gửi và thông tin ứng dụng dùng cùng quy tắc. Popup avatar/bánh răng cũng chặn thao tác nền; Escape, bấm ngoài hoặc bấm lại nút neo để đóng. Vị trí popup bám nút neo khi resize; đổi tài khoản, thế hệ đăng nhập hoặc hội thoại hủy popup và không khôi phục focus sang scope khác.
 
 | Thành phần | Nơi sửa chính |
 | --- | --- |
@@ -53,7 +53,19 @@ Hiện tại, mở `--live` tự gửi lệnh startup đến worker. Worker đ�
 
 Hủy/đăng xuất không tự chạy lại startup trong cửa sổ hiện tại. Generation loại bỏ kết quả cũ. Đăng nhập số điện thoại chưa hỗ trợ; tab hiện chỉ giải thích giới hạn, giữ lần QR đang chạy và cho phép hủy. Nhóm nút dưới QR có khung hữu hạn, căn cùng trục giữa với mã QR; thao tác chuyển tab không bắt đầu một phiên xác thực khác.
 
-Trạng thái Online chỉ đến từ xác thực transport. Khi Offline, vẫn cho đọc cache, chọn liên hệ và soạn nháp. Banner phải nêu nguyên nhân an toàn, có kết nối lại/đăng xuất; không suy diễn online của từng người. Lỗi batch lưu dữ liệu tạm dừng transport, giữ lịch sử/cursor và thao tác cục bộ.
+Trạng thái Online chỉ đến từ xác thực transport, hiển thị bằng chấm cạnh avatar trên rail; không suy diễn online của từng người. Bấm avatar xem trạng thái, nguyên nhân lỗi an toàn và thao tác kết nối lại/mở hội thoại; phiên hết hạn hướng dẫn đăng xuất qua menu bánh răng. Không đặt banner trạng thái hoặc footer tài khoản/đăng xuất thường trực. Khi Offline và đã xác minh quyền riêng tư trong worker hiện tại, vẫn cho đọc cache được phép, chọn liên hệ và soạn nháp. Lỗi batch lưu dữ liệu tạm dừng transport, giữ lịch sử/cursor và thao tác cục bộ.
+
+## Hội thoại ẩn trên Zalo
+
+Mỗi worker mới phải lấy thành công trạng thái hội thoại ẩn từ Zalo trước khi hiện tên, danh bạ, lịch sử hoặc ảnh. Khi chưa biết hoặc kiểm tra thất bại, chỉ vẽ một workspace trung tính sau rail, cả ở cửa sổ rộng và compact: Checking hiện “Đang xác minh…”, Failed hiện “Chưa xác minh được…”. Avatar giải thích trạng thái và cho thử lại; menu bánh răng vẫn dùng được. Không dùng snapshot cũ để mặc định hiện nội dung khi khởi động lại.
+
+Danh sách thường luôn bỏ hội thoại ẩn, kể cả khi đang mở khóa. Tìm theo tên/ID mới hiện ứng viên chỉ gồm tên công khai và glyph khóa; không preview, giờ hay số chưa đọc. Tên trống/ID thô dùng “Hội thoại ẩn”. Bấm ứng viên hoặc mở ID đã ẩn đều yêu cầu mã PIN Zalo có sẵn: đúng bốn chữ số ASCII, che ký tự, không lưu/log PIN hoặc verifier. Sai PIN không mở; Hủy vô hiệu cả yêu cầu đang chờ.
+
+Xác minh đúng chỉ mở hội thoại đang yêu cầu. Quay lại, đổi hội thoại/danh bạ, đóng worker hoặc hết phiên khóa lại; kết quả cũ không được mở lại nội dung. Xóa cache trình bày khi khóa nhưng giữ nháp, lịch sử thô, cursor và ACK/outbox; ACK tương ứng vẫn giải quyết lượt gửi cũ, không xóa phần sửa mới.
+
+Worker kiểm tra khi khởi động, lấy focus/thử lại và theo chu kỳ khoảng 30 giây sau lần kiểm tra hoàn tất. Thời điểm nhận thay đổi từ điện thoại còn phụ thuộc thời gian HTTP (deadline 15 giây), không bảo đảm cập nhật trong tối đa 30 giây. Refresh cùng policy giữ quyền đang mở; lỗi hoặc policy/PIN thay đổi thu hồi quyền. Policy/lease nằm trong RAM của Rust và SQLite TEMP memory; schema vẫn 7. PIN chỉ kiểm soát quyền hiển thị trong app, không mã hóa SQLite. Chưa hỗ trợ ẩn/bỏ ẩn, đổi/reset PIN hoặc kênh cập nhật tức thì từ client native.
+
+Kiểm thử synthetic UI và TLS loopback xác minh các nhánh tương tác, scope và storage; không thay thế kiểm chứng hidden/PIN trên tài khoản thật. Nguồn đối chiếu là hidden manager `EFQ6` (`_updateAllDataHidden`/`isKeyPIN`) trong `pc-dist/compact-app-pc.e08d0d44f38873747a6b.js`.
 
 ## Tin nhắn và danh tính
 

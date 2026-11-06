@@ -15,7 +15,8 @@ pub(super) fn show<R>(
 ) -> DialogResponse {
     let colors = crate::theme::palette(ctx);
     egui::Area::new(Id::new((id, "curtain")))
-        .order(egui::Order::Foreground)
+        // Clicking the curtain may raise its Area; keep it below the modal Window.
+        .order(egui::Order::Middle)
         .fixed_pos(ctx.screen_rect().min)
         .show(ctx, |ui| {
             let (rect, _) =

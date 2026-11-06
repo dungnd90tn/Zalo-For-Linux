@@ -11,6 +11,7 @@ pub mod e2ee;
 pub mod message_content;
 mod message_info;
 mod message_media;
+mod privacy;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
 
@@ -102,7 +103,10 @@ const CONVERSATIONS_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
     LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
     LEFT JOIN message_media media ON media.account_id=m.account_id AND media.thread_id=m.thread_id AND media.message_id=m.message_id
-    WHERE c.account_id=?1 ORDER BY c.last_message_at_ms DESC,c.thread_id LIMIT ?2";
+    WHERE c.account_id=?1
+    AND NOT EXISTS(SELECT 1 FROM temp.live_privacy p WHERE p.account_id=c.account_id AND p.ready=0)
+    AND NOT EXISTS(SELECT 1 FROM temp.live_hidden h WHERE h.account_id=c.account_id AND h.thread_id=c.thread_id)
+    ORDER BY c.last_message_at_ms DESC,c.thread_id LIMIT ?2";
 const CONVERSATION_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
     CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),'') END,COALESCE(m.sender,'') FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
@@ -243,6 +247,7 @@ impl MessageStore {
         message_info::initialize(&conn)?;
         message_media::initialize(&conn, version)?;
         conn.execute_batch("PRAGMA user_version=7; COMMIT;")?;
+        privacy::initialize(&conn)?;
         Ok(Self { conn })
     }
 
@@ -288,6 +293,9 @@ impl MessageStore {
     ) -> Result<u64> {
         validate_id(account)?;
         validate_id(thread)?;
+        if !self.live_thread_visible(account, thread)? {
+            bail!(FailureReason::Validation);
+        }
         if text.len() > crate::domain::MAX_TEXT_BYTES || now_ms < 1 {
             bail!("Invalid outgoing message");
         }
@@ -645,6 +653,9 @@ impl MessageStore {
     ) -> Result<Option<InfoMessageContent>> {
         validate_id(account).map_err(|_| FailureReason::Validation)?;
         validate_id(thread).map_err(|_| FailureReason::Validation)?;
+        if !self.live_thread_visible(account, thread)? {
+            return Ok(None);
+        }
         validate_id(id).map_err(|_| FailureReason::Validation)?;
         message_info::load(&self.conn, account, thread, id)
     }
@@ -659,6 +670,9 @@ impl MessageStore {
     ) -> Result<Option<MediaMessageContent>> {
         validate_id(account).map_err(|_| FailureReason::Validation)?;
         validate_id(thread).map_err(|_| FailureReason::Validation)?;
+        if !self.live_thread_visible(account, thread)? {
+            return Ok(None);
+        }
         validate_id(id).map_err(|_| FailureReason::Validation)?;
         message_media::load(&self.conn, account, thread, id)
     }
@@ -672,6 +686,9 @@ impl MessageStore {
     ) -> Result<Vec<Message>> {
         validate_id(account).map_err(|_| FailureReason::Validation)?;
         validate_id(thread).map_err(|_| FailureReason::Validation)?;
+        if !self.live_thread_visible(account, thread)? {
+            return Ok(Vec::new());
+        }
         if message_ids.len() > MAX_REFRESH_MESSAGES {
             bail!(FailureReason::Validation);
         }
@@ -735,6 +752,9 @@ impl MessageStore {
     ) -> Result<Conversation> {
         validate_id(account)?;
         validate_id(thread)?;
+        if !self.live_thread_visible(account, thread)? {
+            bail!(FailureReason::Validation);
+        }
         if title.is_empty() || title.len() > 512 {
             bail!("Invalid conversation title");
         }
@@ -766,6 +786,9 @@ impl MessageStore {
     ) -> Result<Vec<Message>> {
         validate_id(account)?;
         validate_id(thread)?;
+        if !self.live_thread_visible(account, thread)? {
+            return Ok(Vec::new());
+        }
         if limit == 0 || limit > MAX_PAGE_SIZE {
             bail!("Page size must be 1–{MAX_PAGE_SIZE}");
         }

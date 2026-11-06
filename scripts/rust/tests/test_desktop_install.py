@@ -47,10 +47,12 @@ class DesktopInstallTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(original.read_bytes()).digest(),
                              hashlib.sha256(installed.read_bytes()).digest())
         self.binary.write_bytes(b"\x7fELFupdated-synthetic")
+        desktop.write_text(desktop.read_text().replace("StartupNotify=false", "StartupNotify=true"))
         installer.install(self.binary, self.data, refresh=False)
         self.assertEqual((self.data / "zalo-linux-rust-preview/bin/zalo-rust").read_bytes(),
                          self.binary.read_bytes())
         self.assertEqual(electron.read_text(), "Existing Electron entry")
+        self.assertIn("StartupNotify=false\n", desktop.read_text())
 
     def test_dry_run_does_not_create_data_or_launch_an_executable(self):
         result = installer.install(self.binary, self.data, dry_run=True)
@@ -96,11 +98,14 @@ class DesktopInstallTests(unittest.TestCase):
         gio.g_desktop_app_info_new_from_filename.restype = ctypes.c_void_p
         gio.g_app_info_get_executable.argtypes = [ctypes.c_void_p]
         gio.g_app_info_get_executable.restype = ctypes.c_char_p
+        gio.g_desktop_app_info_get_boolean.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        gio.g_desktop_app_info_get_boolean.restype = ctypes.c_int
         gio.g_object_unref.argtypes = [ctypes.c_void_p]
         info = gio.g_desktop_app_info_new_from_filename(os.fsencode(desktop))
         self.assertTrue(info, "GLib rejected generated desktop identity/Exec")
         try:
             self.assertTrue(gio.g_app_info_get_executable(info))
+            self.assertFalse(gio.g_desktop_app_info_get_boolean(info, b"StartupNotify"))
             callback_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
             children = []
             callback = callback_type(lambda _info, pid, _data: children.append(pid))

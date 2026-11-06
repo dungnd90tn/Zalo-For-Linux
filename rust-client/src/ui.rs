@@ -1,4 +1,7 @@
 //! Original native desktop UI. File, database, and network work stays off the render thread.
+mod account;
+#[cfg(all(test, feature = "messaging"))]
+mod account_tests;
 #[cfg(feature = "messaging")]
 mod delivery;
 mod dialog;
@@ -16,6 +19,12 @@ mod login;
 mod media;
 #[cfg(all(test, feature = "messaging"))]
 mod modal_tests;
+#[cfg(feature = "messaging")]
+mod privacy;
+#[cfg(all(test, feature = "messaging"))]
+mod privacy_native_fixture;
+#[cfg(all(test, feature = "messaging"))]
+mod privacy_tests;
 mod senders;
 mod settings;
 #[cfg(feature = "messaging")]
@@ -39,11 +48,13 @@ const CONVERSATION_INFO_WIDTH: f32 = 344.0;
 const MIN_CHAT_WIDTH_WITH_INFO: f32 = 360.0;
 const COMPACT_BREAKPOINT: f32 = 940.0;
 
+#[derive(Clone)]
 struct ModalFocus {
     id: egui::Id,
     account: Option<String>,
     thread: Option<String>,
     generation: u64,
+    auth_generation: Option<u64>,
 }
 
 pub struct NativeApp {
@@ -59,10 +70,14 @@ pub struct NativeApp {
     modal_blocked: bool,
     modal_focus: Option<ModalFocus>,
     settings_open: bool,
+    account_popup: Option<account::Popup>,
+    account_trigger_focus: Option<ModalFocus>,
     theme: crate::theme::ThemeController,
     settings: settings::Settings,
     #[cfg(test)]
     fixture_system_theme: Option<egui::Theme>,
+    #[cfg(all(test, feature = "messaging"))]
+    fixture_connection: Option<crate::app::live::LiveConnection>,
     focus_composer: bool,
     latest_page: bool,
     ime_composing: bool,
@@ -111,10 +126,14 @@ impl NativeApp {
             modal_blocked: false,
             modal_focus: None,
             settings_open: false,
+            account_popup: None,
+            account_trigger_focus: None,
             theme,
             settings: settings::Settings::default(),
             #[cfg(test)]
             fixture_system_theme: None,
+            #[cfg(all(test, feature = "messaging"))]
+            fixture_connection: None,
             focus_composer: false,
             latest_page: true,
             ime_composing: false,
@@ -136,11 +155,15 @@ impl NativeApp {
     }
 
     fn modal_open(&self) -> bool {
-        if self.settings_open || self.details {
+        if self.settings_open || self.details || self.account_popup.is_some() {
             return true;
         }
         #[cfg(feature = "live-login")]
         if let Some(state) = &self.live {
+            #[cfg(feature = "messaging")]
+            if state.privacy.prompt.is_some() {
+                return true;
+            }
             if state.logout_dialog {
                 return true;
             }
@@ -154,12 +177,11 @@ impl NativeApp {
 
     fn latch_modal_input(&mut self, ctx: &egui::Context) {
         if self.modal_open() && !self.modal_blocked {
-            self.modal_focus = ctx.memory(|memory| memory.focused()).map(|id| ModalFocus {
-                id,
-                account: self.account_id().map(str::to_owned),
-                thread: self.model.selected.clone(),
-                generation: self.model.generation,
-            });
+            self.modal_focus = self
+                .account_popup
+                .as_mut()
+                .and_then(|popup| popup.focus.take())
+                .or_else(|| self.modal_focus_snapshot(ctx));
             if let Some(focus) = &self.modal_focus {
                 ctx.memory_mut(|memory| memory.surrender_focus(focus.id));
             }
@@ -168,11 +190,23 @@ impl NativeApp {
     }
 
     fn update_modal_input(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton { pressed: true, .. }
+                        | egui::Event::Key { pressed: true, .. }
+                )
+            })
+        }) {
+            self.account_trigger_focus = None;
+        }
         if !self.modal_open() && self.modal_blocked {
             if let Some(focus) = self.modal_focus.take() {
                 if focus.account.as_deref() == self.account_id()
                     && focus.thread == self.model.selected
                     && focus.generation == self.model.generation
+                    && focus.auth_generation == self.auth_generation()
                 {
                     ctx.memory_mut(|memory| memory.request_focus(focus.id));
                 }
@@ -232,13 +266,24 @@ impl NativeApp {
     }
 
     fn load_latest(&mut self, thread: String) -> bool {
+        #[cfg(feature = "messaging")]
+        {
+            if !self.privacy_visible(&thread) {
+                return false;
+            }
+            if self.model.selected.as_deref() != Some(&thread) {
+                self.relock_hidden();
+            }
+        }
         if !self.drafts.can_select(&thread) {
             self.model.status = "Đã đạt giới hạn bản nháp hội thoại đang mở.".into();
             return false;
         }
         #[cfg(feature = "messaging")]
         if let Some(state) = &mut self.live {
-            if state.account.is_some() && !state.ensure_worker(self._profile.clone()) {
+            if state.account.is_some()
+                && (!state.ensure_worker(self._profile.clone()) || !state.privacy.visible(&thread))
+            {
                 self.model.status =
                     "Chưa mở được hội thoại. Hãy chọn Kết nối lại; bản nháp được giữ nguyên."
                         .into();
@@ -287,6 +332,15 @@ impl NativeApp {
     }
 
     fn older_page(&mut self) {
+        #[cfg(feature = "messaging")]
+        if self
+            .model
+            .selected
+            .as_deref()
+            .is_some_and(|thread| !self.privacy_visible(thread))
+        {
+            return;
+        }
         if self.model.pending {
             return;
         }
@@ -336,6 +390,16 @@ impl NativeApp {
 
     fn send_local(&mut self) {
         if self.modal_blocked || self.modal_open() {
+            return;
+        }
+        #[cfg(feature = "messaging")]
+        if !self.privacy_ready()
+            || self
+                .model
+                .selected
+                .as_deref()
+                .is_some_and(|thread| !self.privacy_visible(thread))
+        {
             return;
         }
         #[cfg(feature = "messaging")]
@@ -448,12 +512,7 @@ impl NativeApp {
                     colors.nav_background,
                 );
                 ui.add_space(21.0);
-                let (rect, _) = ui.allocate_exact_size(vec2(RAIL_WIDTH, 44.0), Sense::hover());
-                avatar(
-                    ui,
-                    egui::Rect::from_center_size(rect.center(), vec2(40.0, 40.0)),
-                    self.account_label(),
-                );
+                self.account_avatar(ui);
                 ui.add_space(27.0);
                 #[cfg(feature = "messaging")]
                 let directory = self.directory_visible();
@@ -520,6 +579,10 @@ impl NativeApp {
                                     state.directory.visible = false;
                                 }
                                 self.compact_list |= compact;
+                                #[cfg(feature = "messaging")]
+                                if compact {
+                                    self.relock_hidden();
+                                }
                             }
                             _ => {}
                         }
@@ -567,6 +630,7 @@ impl NativeApp {
                         let (rect, response) =
                             ui.allocate_exact_size(vec2(RAIL_WIDTH, 46.0), Sense::click());
                         if self.settings_open
+                            || self.account_popup_is(account::PopupKind::Settings)
                             || response.hovered()
                             || response.is_pointer_button_down_on()
                         {
@@ -575,7 +639,9 @@ impl NativeApp {
                                 0.0,
                                 if response.is_pointer_button_down_on() {
                                     colors.nav_pressed
-                                } else if self.settings_open {
+                                } else if self.settings_open
+                                    || self.account_popup_is(account::PopupKind::Settings)
+                                {
                                     colors.nav_selected
                                 } else {
                                     colors.nav_hover
@@ -589,10 +655,15 @@ impl NativeApp {
                             colors.nav_text,
                         );
                         visuals::nav_focus_outline(ui, &response, rect);
+                        self.prepare_account_popup_trigger(
+                            account::PopupKind::Settings,
+                            rect,
+                            &response,
+                        );
                         if response.clicked() {
-                            self.settings_open = !self.settings_open;
+                            self.toggle_account_popup(account::PopupKind::Settings, rect);
                         }
-                        response.on_hover_text("Cài đặt giao diện");
+                        response.on_hover_text("Cài đặt và tài khoản");
                     },
                 );
             });
@@ -601,6 +672,11 @@ impl NativeApp {
     fn conversations(&mut self, ui: &mut egui::Ui, compact: bool) {
         if self.modal_blocked || self.modal_open() {
             ui.disable();
+        }
+        #[cfg(feature = "messaging")]
+        if !self.privacy_ready() {
+            self.show_privacy_neutral(ui);
+            return;
         }
         let colors = crate::theme::palette(ui.ctx());
         let width = ui.available_width();
@@ -667,28 +743,53 @@ impl NativeApp {
                             .family(egui::FontFamily::Name("Zalo Semibold".into()))
                             .size(13.0),
                     );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} hội thoại{}",
-                                self.model.conversations.len(),
-                                if self.demo { " demo" } else { "" }
-                            ))
-                            .color(colors.text_secondary)
-                            .size(visuals::TEXT_SMALL),
-                        );
+                    let count = self
+                        .model
+                        .conversations
+                        .iter()
+                        .filter(|thread| {
+                            #[cfg(feature = "messaging")]
+                            {
+                                self.privacy_list_visible(&thread.id)
+                            }
+                            #[cfg(not(feature = "messaging"))]
+                            {
+                                let _ = thread;
+                                true
+                            }
+                        })
+                        .count();
+                    let label =
+                        format!("{count} hội thoại{}", if self.demo { " demo" } else { "" });
+                    let (count_rect, response) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+                    ui.painter().text(
+                        count_rect.right_center(),
+                        Align2::RIGHT_CENTER,
+                        &label,
+                        FontId::proportional(visuals::TEXT_SMALL),
+                        colors.text_secondary,
+                    );
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), &label)
                     });
                 });
             });
         let mut selection = None;
         egui::ScrollArea::vertical()
             .id_salt("conversation_list")
-            .max_height((ui.available_height() - 64.0).max(60.0))
+            .max_height(
+                (ui.available_height() - if self.is_signed_in() { 0.0 } else { 64.0 }).max(60.0),
+            )
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 let mut matches = 0;
                 for thread in &self.model.conversations {
+                    #[cfg(feature = "messaging")]
+                    if !self.privacy_list_visible(&thread.id) {
+                        continue;
+                    }
                     let title = display_title(thread);
                     if !self.search_folded.is_empty()
                         && !fold_search(&title).contains(&self.search_folded)
@@ -709,7 +810,11 @@ impl NativeApp {
                         selection = Some(thread.id.clone());
                     }
                 }
-                if matches == 0 {
+                #[cfg(feature = "messaging")]
+                let hidden_matches = self.hidden_search_rows(ui);
+                #[cfg(not(feature = "messaging"))]
+                let hidden_matches = false;
+                if matches == 0 && !hidden_matches {
                     ui.add_space(42.0);
                     ui.vertical_centered(|ui| {
                         let searching = !self.search_folded.is_empty();
@@ -741,15 +846,14 @@ impl NativeApp {
                 self.compact_list = false;
             }
         }
+        if self.is_signed_in() {
+            return;
+        }
         let rect = ui.max_rect();
         let footer =
             egui::Rect::from_min_max(pos2(rect.left(), rect.bottom() - 55.0), rect.right_bottom());
         visuals::background(ui, footer, "--layer-background", colors.surface);
         divider(ui, footer.left_top(), footer.right_top());
-        #[cfg(feature = "live-login")]
-        if self.live_account_footer(ui, footer) {
-            return;
-        }
         icon(
             ui,
             egui::Rect::from_min_size(footer.min + vec2(16.0, 17.0), vec2(18.0, 18.0)),
@@ -761,8 +865,6 @@ impl NativeApp {
             Align2::LEFT_TOP,
             if self.demo {
                 "Dữ liệu demo · chỉ lưu trên máy"
-            } else if self.is_signed_in() {
-                self.connection_label()
             } else {
                 "Bản xem trước · chưa đăng nhập"
             },
@@ -801,6 +903,8 @@ impl NativeApp {
             icon(ui, back.shrink(4.0), Icon::Back, colors.text_secondary);
             visuals::focus_outline(ui, &response, back, 4.0);
             if response.clicked() {
+                #[cfg(feature = "messaging")]
+                self.relock_hidden();
                 self.compact_list = true;
                 self.conversation_details = None;
             }
@@ -812,10 +916,17 @@ impl NativeApp {
             .selected
             .as_deref()
             .and_then(|id| {
-                self.model
-                    .conversations
-                    .iter()
-                    .find(|thread| thread.id == id)
+                #[cfg(feature = "messaging")]
+                {
+                    self.visible_conversation(id)
+                }
+                #[cfg(not(feature = "messaging"))]
+                {
+                    self.model
+                        .conversations
+                        .iter()
+                        .find(|thread| thread.id == id)
+                }
             })
             .map(display_title)
             .unwrap_or_else(|| "Zalo Native".into());
@@ -842,8 +953,15 @@ impl NativeApp {
                 ui.label(
                     RichText::new(if self.demo {
                         "Hội thoại minh họa · ngoại tuyến"
+                    } else if self
+                        .model
+                        .selected
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("g:"))
+                    {
+                        "Nhóm trò chuyện"
                     } else {
-                        self.connection_label()
+                        "Trò chuyện riêng"
                     })
                     .color(colors.text_secondary)
                     .size(visuals::TEXT_SMALL),
@@ -900,7 +1018,17 @@ impl NativeApp {
 
     fn composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, height: f32) {
         let colors = crate::theme::palette(ctx);
-        let enabled = ui.is_enabled()
+        #[cfg(feature = "messaging")]
+        let privacy_enabled = self.privacy_ready()
+            && self
+                .model
+                .selected
+                .as_deref()
+                .is_none_or(|thread| self.privacy_visible(thread));
+        #[cfg(not(feature = "messaging"))]
+        let privacy_enabled = true;
+        let enabled = privacy_enabled
+            && ui.is_enabled()
             && !self.modal_blocked
             && !self.modal_open()
             && (self.demo || self.is_signed_in())
@@ -1271,12 +1399,15 @@ impl NativeApp {
     }
 
     fn workspace(&mut self, ctx: &egui::Context) {
+        self.sync_account_popup();
         let colors = crate::theme::palette(ctx);
         let compact = ctx.screen_rect().width() < COMPACT_BREAKPOINT;
         self.navigation(ctx, compact);
-        #[cfg(feature = "messaging")]
-        self.live_connection_notice(ctx);
         self.latch_modal_input(ctx);
+        #[cfg(feature = "messaging")]
+        let privacy_pending = !self.privacy_ready();
+        #[cfg(not(feature = "messaging"))]
+        let privacy_pending = false;
         #[cfg(feature = "messaging")]
         let show_directory = self.directory_visible();
         #[cfg(not(feature = "messaging"))]
@@ -1284,13 +1415,23 @@ impl NativeApp {
         if show_directory || (compact && self.compact_list) || self.bound_conversation().is_none() {
             self.conversation_details = None;
         }
-        if compact && show_directory {
+        if privacy_pending {
+            #[cfg(feature = "messaging")]
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(colors.canvas).inner_margin(24.0))
+                .show(ctx, |ui| self.show_privacy_neutral(ui));
+        } else if compact && show_directory {
             #[cfg(feature = "messaging")]
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(colors.surface))
                 .show(ctx, |ui| {
                     if self.modal_blocked || self.modal_open() {
                         ui.disable();
+                    }
+                    #[cfg(feature = "messaging")]
+                    if !self.privacy_ready() {
+                        self.show_privacy_neutral(ui);
+                        return;
                     }
                     visuals::background(ui, ui.max_rect(), "--layer-background", colors.surface);
                     self.directory_panel(ui);
@@ -1343,6 +1484,11 @@ impl NativeApp {
                     if self.modal_blocked || self.modal_open() {
                         ui.disable();
                     }
+                    #[cfg(feature = "messaging")]
+                    if !self.privacy_ready() {
+                        self.show_privacy_neutral(ui);
+                        return;
+                    }
                     if !dock_details && self.bound_conversation().is_some() {
                         self.conversation_information(ui, true);
                     } else {
@@ -1361,6 +1507,11 @@ impl NativeApp {
         #[cfg(feature = "messaging")]
         if let Some(state) = &mut self.live {
             media::viewer(ctx, &mut state.media);
+        }
+        self.show_account_popup(ctx);
+        #[cfg(feature = "messaging")]
+        if !self.settings_open && !application_information {
+            self.hidden_pin_dialog(ctx);
         }
     }
 
@@ -1422,15 +1573,26 @@ impl NativeApp {
 
     fn bound_conversation(&self) -> Option<&Conversation> {
         let (account, selected) = self.conversation_details.as_ref()?;
+        #[cfg(feature = "messaging")]
+        if !self.privacy_visible(selected) {
+            return None;
+        }
         if account != self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT)
             || self.model.selected.as_deref() != Some(selected.as_str())
         {
             return None;
         }
-        self.model
-            .conversations
-            .iter()
-            .find(|thread| thread.id == *selected)
+        #[cfg(feature = "messaging")]
+        {
+            self.visible_conversation(selected)
+        }
+        #[cfg(not(feature = "messaging"))]
+        {
+            self.model
+                .conversations
+                .iter()
+                .find(|thread| thread.id == *selected)
+        }
     }
 
     fn conversation_sidebar(&mut self, ctx: &egui::Context) {
@@ -1563,12 +1725,20 @@ impl eframe::App for NativeApp {
         self.poll_events(ctx);
         #[cfg(feature = "live-login")]
         self.poll_live(ctx);
+        #[cfg(all(test, feature = "messaging"))]
+        if let Some(connection) = self.fixture_connection {
+            if let Some(state) = &mut self.live {
+                state.connection = connection;
+            }
+        }
+        self.sync_account_popup();
         self.update_modal_input(ctx);
         #[cfg(feature = "live-login")]
         {
             if self.show_login(ctx) {
                 self.conversation_details = None;
                 self.latch_modal_input(ctx);
+                self.show_account_popup(ctx);
                 if self.settings_open {
                     self.settings
                         .show(ctx, &mut self.settings_open, &mut self.theme);

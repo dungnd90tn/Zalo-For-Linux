@@ -5,6 +5,8 @@ pub mod bootstrap;
 pub mod client;
 #[cfg(feature = "messaging")]
 pub mod directory;
+#[cfg(feature = "messaging")]
+pub(crate) mod hidden;
 #[cfg(feature = "network")]
 pub mod http;
 #[cfg(feature = "messaging")]

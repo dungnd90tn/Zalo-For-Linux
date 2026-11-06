@@ -49,6 +49,7 @@ enum Reply {
     Directory,
     DirectoryFail,
     DirectoryStall,
+    Privacy,
 }
 #[derive(Default)]
 struct State {
@@ -58,10 +59,14 @@ struct State {
     socket_requests: Mutex<Vec<(u16, u64)>>,
     upgrades: AtomicUsize,
     directory_stalled: AtomicBool,
+    directory_enabled: AtomicBool,
     observed_commands: Mutex<Vec<u16>>,
     pings: AtomicUsize,
     http_sends: AtomicUsize,
     echoed: AtomicBool,
+    privacy_requests: AtomicUsize,
+    privacy_hold: AtomicBool,
+    privacy_policy: AtomicUsize,
 }
 struct Fixture {
     addr: SocketAddr,
@@ -132,10 +137,11 @@ impl Fixture {
         }
     }
     fn session(&self) -> Arc<VerifiedSession> {
-        let config=ServerConfig::parse(&json!({"zpw_service_map_v3":{"chat":["https://wpa.zaloapp.com"],"group":["https://wpa.zaloapp.com"]},"zpw_ws":["wss://wpa.zaloapp.com"]})).unwrap();
+        let config=ServerConfig::parse(&json!({"zpw_service_map_v3":{"chat":["https://wpa.zaloapp.com"],"group":["https://wpa.zaloapp.com"],"conversation":["https://wpa.zaloapp.com"]},"zpw_ws":["wss://wpa.zaloapp.com"]})).unwrap();
         Arc::new(synthetic_session(self.profile.clone(), config))
     }
     fn directory_session(&self, websocket: bool) -> Arc<VerifiedSession> {
+        self.state.directory_enabled.store(true, Ordering::SeqCst);
         let config=ServerConfig::parse(&json!({"zpw_service_map_v3":{"chat":["https://wpa.zaloapp.com"],"group":["https://wpa.zaloapp.com"],"profile":["https://wpa.zaloapp.com"],"conversation":["https://wpa.zaloapp.com"]},"zpw_ws":if websocket{json!(["wss://wpa.zaloapp.com"])}else{json!([])}})).unwrap();
         Arc::new(synthetic_session(self.profile.clone(), config))
     }
@@ -611,6 +617,7 @@ fn serve(
         .push((path.clone(), String::from_utf8(body.clone()).unwrap()));
     let route = path.split('?').next().unwrap();
     if [
+        "/api/hiddenconvers/get-all",
         "/api/group/getlg/v3",
         "/api/social/friend/getfriends",
         "/api/preloadconvers/get-last-msgs",
@@ -646,6 +653,34 @@ fn serve(
             Reply::Directory | Reply::DirectoryFail | Reply::DirectoryStall
         );
         let data = match route {
+            "/api/hiddenconvers/get-all" => {
+                assert_eq!(parameters, json!({"imei":"native-fixture"}));
+                state.privacy_requests.fetch_add(1, Ordering::SeqCst);
+                let started = std::time::Instant::now();
+                while state.privacy_hold.load(Ordering::SeqCst)
+                    && started.elapsed() < Duration::from_secs(3)
+                {
+                    std::thread::park_timeout(Duration::from_millis(2));
+                }
+                if matches!(reply, Reply::Privacy) {
+                    match state.privacy_policy.load(Ordering::SeqCst) {
+                        0 => {
+                            json!({"pin":"81dc9bdb52d04dc20036dbd8313ed055","threads":[{"is_group":0,"thread_id":"22"},{"is_group":1,"thread_id":"22"}]})
+                        }
+                        1 => {
+                            json!({"pin":"4a7d1ed414474e4033ac29ccb8653d9b","threads":[{"is_group":0,"thread_id":"22"},{"is_group":1,"thread_id":"22"}]})
+                        }
+                        2 => {
+                            let _=stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            let _ = stream.flush();
+                            return;
+                        }
+                        _ => json!({"pin":null,"threads":[]}),
+                    }
+                } else {
+                    json!({"pin":null,"threads":[]})
+                }
+            }
             "/api/social/friend/getfriends" => {
                 assert_eq!(parameters["count"], 20_000);
                 let mut entries =
@@ -659,7 +694,11 @@ fn serve(
             }
             _ => {
                 assert_eq!(parameters["threadIdLocalMsgId"], "{}");
-                if matches!(reply, Reply::MediaPages(_) | Reply::RichCards) {
+                // A generic session advertises conversation solely for mandatory privacy checks.
+                // Only an explicitly requested directory fixture seeds preview history/sidecars.
+                if !state.directory_enabled.load(Ordering::SeqCst) {
+                    json!({"msgs":[]})
+                } else if matches!(reply, Reply::MediaPages(_) | Reply::RichCards) {
                     let rich = matches!(reply, Reply::RichCards);
                     let mut data = if rich {
                         rich_card_batch(true)
@@ -703,12 +742,22 @@ fn serve(
         };
         let inner = json!({"error_code":0,"data":data});
         let response=serde_json::to_vec(&json!({"error_code":0,"data":cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()})).unwrap();
-        write!(
+        if let Err(error) = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             response.len()
-        )
-        .unwrap();
+        ) {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                ),
+                "unexpected synthetic response write failure: {error}"
+            );
+            return;
+        }
         let _ = stream.write_all(&response);
         let _ = stream.flush();
         return;
@@ -880,6 +929,7 @@ async fn real_tls_websocket_personal_and_group_text_use_production_codec_capabil
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
+        privacy: Default::default(),
     };
     let mut socket = f.connection().await;
     let auth = socket.next().await.unwrap().unwrap();
@@ -1350,6 +1400,7 @@ async fn info_preview_and_socket_orders_keep_identical_full_metadata_without_ack
             account: "11".into(),
             tx,
             repaint: Arc::new(|| {}),
+            privacy: Default::default(),
         };
         let mut socket = f.connection().await;
         if preview_first {
@@ -1453,6 +1504,7 @@ async fn media_preview_and_socket_orders_preserve_complete_metadata_across_chunk
             account: "11".into(),
             tx,
             repaint: Arc::new(|| {}),
+            privacy: Default::default(),
         };
         let mut socket = f.connection().await;
         if preview_first {
@@ -1606,6 +1658,7 @@ async fn http_media_refresh_enriches_durable_legacy_placeholders_without_rewindi
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
+        privacy: Default::default(),
     };
     let mut connection = None;
     let session = f.session();
@@ -1755,6 +1808,7 @@ async fn actual_socket_media_raw_conflict_rolls_back_entire_following_page_and_c
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
+        privacy: Default::default(),
     };
     let mut socket = f.connection().await;
     let auth = socket.next().await.unwrap().unwrap();
@@ -1951,12 +2005,26 @@ async fn info_batches_commit_full_content_before_publish_and_reject_changed_acti
             .iter()
             .map(|(path, _)| path.split('?').next().unwrap().to_owned())
             .collect();
-        assert!(
-            request_paths.len() <= 1
-                && request_paths
+        assert_eq!(
+            request_paths
+                .iter()
+                .filter(|path| path.as_str() == "/api/hiddenconvers/get-all")
+                .count(),
+            1
+        );
+        for optional_bootstrap in ["/api/group/getlg/v3", "/api/preloadconvers/get-last-msgs"] {
+            assert!(
+                request_paths
                     .iter()
-                    .all(|path| path == "/api/group/getlg/v3"),
-            "only the normal group-directory bootstrap may make HTTPS requests: {request_paths:?}"
+                    .filter(|path| path.as_str() == optional_bootstrap)
+                    .count()
+                    <= 1
+            );
+        }
+        assert!(
+            request_paths.len() <= 3 && request_paths.iter().all(|path| matches!(path.as_str(),
+                "/api/hiddenconvers/get-all" | "/api/group/getlg/v3" | "/api/preloadconvers/get-last-msgs")),
+            "only bounded privacy/group/neutral-preview bootstrap reads are permitted: {request_paths:?}"
         );
         assert!(
             !request_paths
@@ -2384,6 +2452,7 @@ async fn connection_account_and_authenticated_decoder_gate_peer_routing_before_s
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
+        privacy: Default::default(),
     };
     let mut connection = f.connection().await;
     for authenticated in [false, true] {
@@ -2713,6 +2782,7 @@ async fn offline_page_budget_rejects_excess_pages_before_persistence_or_next_req
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
+        privacy: Default::default(),
     };
     let mut connection = f.connection().await;
     connection.next().await.unwrap();
@@ -2968,7 +3038,10 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
         } else {
             Arc::new(synthetic_session(
                 f.profile.clone(),
-                ServerConfig::parse(&json!({})).unwrap(),
+                ServerConfig::parse(
+                    &json!({"zpw_service_map_v3":{"conversation":["https://wpa.zaloapp.com"]}}),
+                )
+                .unwrap(),
             ))
         };
         let (commands, rx) = mpsc::channel(16);
@@ -3013,15 +3086,20 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
             .unwrap();
             assert_eq!(observed.category, expected_category);
             assert!(!task.is_finished());
-            // Advancing beyond all reconnect backoffs must not retry poison data.
-            tokio::time::pause();
-            tokio::time::advance(Duration::from_secs(60)).await;
-            tokio::task::yield_now().await;
-            assert!(matches!(
-                events.try_recv(),
-                Err(mpsc::error::TryRecvError::Empty)
-            ));
-            tokio::time::resume();
+            if attempt == 0 {
+                // Test every terminal class beyond all reconnect backoffs. Startup
+                // privacy is already verified before this first transport attempt.
+                // The explicit second reconnect may have a real TLS privacy fetch
+                // in flight, whose deadline must not be expired by artificial time.
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(60)).await;
+                tokio::time::resume();
+                tokio::task::yield_now().await;
+                assert!(matches!(
+                    events.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            }
             commands
                 .send(LiveCommand::Open {
                     generation: 7,
@@ -3100,13 +3178,31 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
             f.state.upgrades.load(Ordering::SeqCst),
             if reply.is_some() { 2 } else { 0 }
         );
-        assert!(f
-            .state
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(path, _)| path.starts_with("/api/group/getlg/v3?")));
+        {
+            let requests = f.state.requests.lock().unwrap();
+            let count = |route: &str| {
+                requests
+                    .iter()
+                    .filter(|(path, _)| path.split('?').next() == Some(route))
+                    .count()
+            };
+            assert_eq!(count("/api/group/getlg/v3"), usize::from(reply.is_some()));
+            assert_eq!(count("/api/preloadconvers/get-last-msgs"), 1);
+            // One startup check, one explicit reconnect and at most one periodic
+            // check from the deliberate 60-second advance; in-flight requests coalesce.
+            assert!((2..=3).contains(&count("/api/hiddenconvers/get-all")));
+            assert!(requests.len() <= 5);
+            assert!(requests.iter().all(|(path, body)| body.is_empty()
+                && matches!(
+                    path.split('?').next(),
+                    Some(
+                        "/api/hiddenconvers/get-all"
+                            | "/api/group/getlg/v3"
+                            | "/api/preloadconvers/get-last-msgs"
+                    )
+                )));
+        }
+        assert_eq!(f.state.http_sends.load(Ordering::SeqCst), 0);
         commands.send(LiveCommand::Shutdown).await.unwrap();
         tokio::time::timeout(Duration::from_millis(500), task)
             .await
@@ -3277,7 +3373,28 @@ async fn actual_runtime_discovers_named_cached_directory_and_previews_without_we
         })
         .await
         .unwrap();
-        assert_eq!(f.state.requests.lock().unwrap().len(), 6);
+        // Startup and explicit directory refresh each verify the hidden policy too.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while f.state.privacy_requests.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let requests = f.state.requests.lock().unwrap();
+            let hidden = requests
+                .iter()
+                .filter(|(path, _)| path.split('?').next() == Some("/api/hiddenconvers/get-all"))
+                .count();
+            assert_eq!(hidden, 2);
+            assert_eq!(
+                requests.len() - hidden,
+                6,
+                "two complete friend/group/preview discovery passes"
+            );
+            assert_eq!(requests.len(), 8);
+        }
         stop.send(true).unwrap();
         tokio::time::timeout(Duration::from_millis(500), task)
             .await
@@ -3416,6 +3533,7 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
+        privacy: Default::default(),
     };
     events
         .emit(LiveEvent::Received {
@@ -3841,6 +3959,7 @@ async fn sender_name_commands_use_the_existing_actor_and_echo_only_the_requested
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
+        privacy: Default::default(),
     };
     let session = f.session();
     let client = f.client();
@@ -4167,4 +4286,250 @@ fn sqlite_failure_log_is_structural_and_visible_without_debug_and_never_contains
     assert_eq!(event["storage_failure"], "conflicting_message");
     assert!(event.get("sqlite_code").is_none());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn hidden_policy_real_tls_search_pin_cancel_scope_and_remote_revoke() {
+    let f = Fixture::new(Reply::Privacy);
+    let session = f.session();
+    let transports = f.transports();
+    let db = Database::open(f.profile.clone(), "11".into())
+        .await
+        .unwrap();
+    db.call(|s| {
+        for (thread, id) in [("d:22", "1"), ("g:22", "2"), ("d:44", "3")] {
+            s.insert_batch(&[crate::domain::Message {
+                account_id: "11".into(),
+                thread_id: thread.into(),
+                id: id.into(),
+                sender: "22".into(),
+                text: "synthetic private body".into(),
+                sticker: None,
+                media: None,
+                sent_at_ms: 1,
+            }])?;
+        }
+        s.set_title("11", "d:22", "Nguyễn An")?;
+        s.begin_live_privacy("11")
+    })
+    .await
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(64);
+    let output = Events {
+        account: "11".into(),
+        tx,
+        repaint: Arc::new(|| {}),
+        privacy: std::sync::RwLock::new(privacy::Projection {
+            status: LivePrivacyStatus::Checking,
+            ..Default::default()
+        }),
+    };
+    let mut policy = privacy::Privacy::new();
+    assert!(db
+        .call(|s| s.conversations("11", 50))
+        .await
+        .unwrap()
+        .is_empty());
+    policy.start(session.clone(), &transports);
+    let result = tokio::time::timeout(Duration::from_secs(3), policy.result())
+        .await
+        .unwrap();
+    policy.completed(result, &db, &output).await.unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(LiveEvent::PrivacyChanged {
+            status: LivePrivacyStatus::Ready,
+            ..
+        })
+    ));
+    let Some(LiveEvent::Ready { conversations, .. }) = rx.recv().await else {
+        panic!("visible projection")
+    };
+    assert_eq!(
+        conversations
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["d:44"]
+    );
+    policy
+        .command(
+            LiveCommand::SearchHidden {
+                generation: 10,
+                query: "nguyen an".into(),
+            },
+            &db,
+            &output,
+            &session,
+            &transports,
+        )
+        .await
+        .unwrap();
+    let Some(LiveEvent::HiddenMatches { candidates, .. }) = rx.recv().await else {
+        panic!("candidate search")
+    };
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].thread_id, "d:22");
+    let rev = output.privacy.read().unwrap().revision;
+    policy
+        .command(
+            LiveCommand::UnlockHidden {
+                generation: 11,
+                revision: rev,
+                thread: "d:22".into(),
+                pin: HiddenPin::new("0000").unwrap(),
+            },
+            &db,
+            &output,
+            &session,
+            &transports,
+        )
+        .await
+        .unwrap();
+    let result = policy.result().await;
+    policy.completed(result, &db, &output).await.unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(LiveEvent::HiddenUnlockResult {
+            outcome: HiddenUnlockOutcome::IncorrectPin,
+            ..
+        })
+    ));
+    assert!(db
+        .call(|s| s.page("11", "d:22", None, 50))
+        .await
+        .unwrap()
+        .is_empty());
+    // Cancel is delivered before the fresh request completes: it must invalidate the pending secret/authorization.
+    f.state.privacy_hold.store(true, Ordering::SeqCst);
+    policy
+        .command(
+            LiveCommand::UnlockHidden {
+                generation: 12,
+                revision: rev,
+                thread: "d:22".into(),
+                pin: HiddenPin::new("1234").unwrap(),
+            },
+            &db,
+            &output,
+            &session,
+            &transports,
+        )
+        .await
+        .unwrap();
+    policy
+        .command(
+            LiveCommand::RelockHidden,
+            &db,
+            &output,
+            &session,
+            &transports,
+        )
+        .await
+        .unwrap();
+    f.state.privacy_hold.store(false, Ordering::SeqCst);
+    let result = policy.result().await;
+    policy.completed(result, &db, &output).await.unwrap();
+    assert!(rx.try_recv().is_err());
+    assert!(output.privacy.read().unwrap().unlocked.is_none());
+    policy
+        .command(
+            LiveCommand::UnlockHidden {
+                generation: 13,
+                revision: rev,
+                thread: "d:22".into(),
+                pin: HiddenPin::new("1234").unwrap(),
+            },
+            &db,
+            &output,
+            &session,
+            &transports,
+        )
+        .await
+        .unwrap();
+    let result = policy.result().await;
+    policy.completed(result, &db, &output).await.unwrap();
+    assert!(
+        matches!(rx.recv().await,Some(LiveEvent::PrivacyChanged{unlocked_thread:Some(ref id),..}) if id=="d:22")
+    );
+    assert!(matches!(
+        rx.recv().await,
+        Some(LiveEvent::HiddenUnlockResult {
+            generation: 13,
+            outcome: HiddenUnlockOutcome::Unlocked,
+            ..
+        })
+    ));
+    assert!(
+        matches!(rx.recv().await,Some(LiveEvent::Opened{generation:13,conversation,..}) if conversation.id=="d:22")
+    );
+    assert_eq!(
+        db.call(|s| s.page("11", "d:22", None, 50))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        db.call(|s| s.page("11", "g:22", None, 50))
+            .await
+            .unwrap()
+            .is_empty(),
+        "same remote ID group is not globally unlocked"
+    );
+    // An unchanged background check retains the one open lease and emits no reset/duplicate projection.
+    let unchanged_revision = output.privacy.read().unwrap().revision;
+    policy.start(session.clone(), &transports);
+    let result = policy.result().await;
+    policy.completed(result, &db, &output).await.unwrap();
+    assert_eq!(output.privacy.read().unwrap().revision, unchanged_revision);
+    assert_eq!(
+        output.privacy.read().unwrap().unlocked.as_deref(),
+        Some("d:22")
+    );
+    assert_eq!(
+        db.call(|s| s.page("11", "d:22", None, 50))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(rx.try_recv().is_err());
+    // A changed remote PIN revokes the open lease; messages and cursor remain untouched.
+    f.state.privacy_policy.store(1, Ordering::SeqCst);
+    policy.start(session.clone(), &transports);
+    let result = policy.result().await;
+    policy.completed(result, &db, &output).await.unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(LiveEvent::PrivacyChanged {
+            unlocked_thread: None,
+            ..
+        })
+    ));
+    let _ = rx.recv().await;
+    assert!(db
+        .call(|s| s.page("11", "d:22", None, 50))
+        .await
+        .unwrap()
+        .is_empty());
+    f.state.privacy_policy.store(2, Ordering::SeqCst);
+    policy.start(session.clone(), &transports);
+    let result = policy.result().await;
+    policy.completed(result, &db, &output).await.unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(LiveEvent::PrivacyChanged {
+            status: LivePrivacyStatus::Failed,
+            ..
+        })
+    ));
+    assert!(
+        db.call(|s| s.page("11", "d:44", None, 50))
+            .await
+            .unwrap()
+            .is_empty(),
+        "failed policy cannot expose even a cached previously-visible conversation"
+    );
+    assert!(f.state.privacy_requests.load(Ordering::SeqCst) >= 6);
 }

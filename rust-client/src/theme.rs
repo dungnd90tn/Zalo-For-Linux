@@ -121,6 +121,10 @@ pub struct Palette {
     pub date_text: Color32,
     pub avatar_accents: [Color32; 5],
     pub on_color: Color32,
+    pub status_online: Color32,
+    pub status_connecting: Color32,
+    pub status_offline: Color32,
+    pub status_ring: Color32,
 }
 
 impl Palette {
@@ -178,6 +182,11 @@ impl Palette {
                 color("--accent-stealblue-bg"),
             ],
             on_color: color("--text-on-color"),
+            // Original .avatar-online-dot:after uses G60 with a WA100 ring.
+            status_online: color("--G60"),
+            status_connecting: color("--icon-warning"),
+            status_offline: color("--grey-dot"),
+            status_ring: color("--WA100"),
         }
     }
 }

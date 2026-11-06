@@ -1,0 +1,58 @@
+{
+  "provenance": "Exact original _updateAllDataHidden and isKeyPIN methods; synthetic 1234 PIN only; no original persistence/request code executed. Native fail-closed parsing, four-ASCII-digit input and leases are separate policy tests.",
+  "endpoint": "/api/hiddenconvers/get-all",
+  "snapshots": [
+    {
+      "threads": [],
+      "original_ids": []
+    },
+    {
+      "threads": [
+        {
+          "thread_id": "12",
+          "is_group": false
+        },
+        {
+          "thread_id": "12",
+          "is_group": true
+        },
+        {
+          "thread_id": "90",
+          "is_group": true
+        }
+      ],
+      "original_ids": [
+        "12",
+        "g12",
+        "g90"
+      ]
+    }
+  ],
+  "synthetic_pin_digest": "81dc9bdb52d04dc20036dbd8313ed055",
+  "pin_cases": [
+    {
+      "pin": "1234",
+      "accepted": true
+    },
+    {
+      "pin": "0000",
+      "accepted": false
+    },
+    {
+      "pin": "",
+      "accepted": false
+    },
+    {
+      "pin": "123",
+      "accepted": false
+    },
+    {
+      "pin": "12345",
+      "accepted": false
+    },
+    {
+      "pin": null,
+      "accepted": false
+    }
+  ]
+}

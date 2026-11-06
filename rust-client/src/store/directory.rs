@@ -280,7 +280,7 @@ impl MessageStore {
             bail!("Invalid directory cursor");
         }
         let mut statement = self.conn.prepare_cached("SELECT remote_id,is_group,display_name,avatar_url,is_friend,is_blocked,member_count FROM directory_entries
-            WHERE account_id=?1 AND is_group=?2 AND (display_name,thread_id)>(?3,?4) AND (?5='' OR instr(search_name,?5)>0 OR instr(remote_id,?5)>0)
+            WHERE account_id=?1 AND is_group=?2 AND NOT EXISTS(SELECT 1 FROM temp.live_privacy p WHERE p.account_id=directory_entries.account_id AND p.ready=0) AND NOT EXISTS(SELECT 1 FROM temp.live_hidden h WHERE h.account_id=directory_entries.account_id AND h.thread_id=directory_entries.thread_id) AND (display_name,thread_id)>(?3,?4) AND (?5='' OR instr(search_name,?5)>0 OR instr(remote_id,?5)>0)
             ORDER BY display_name,thread_id LIMIT ?6")?;
         let records = statement
             .query_map(
@@ -310,6 +310,9 @@ impl MessageStore {
     pub fn directory_record(&self, account: &str, thread: &str) -> Result<Option<DirectoryRecord>> {
         validate_id(account)?;
         validate_id(thread)?;
+        if !self.live_thread_visible(account, thread)? {
+            return Ok(None);
+        }
         Ok(self.conn.query_row("SELECT remote_id,is_group,display_name,avatar_url,is_friend,is_blocked,member_count FROM directory_entries WHERE account_id=?1 AND thread_id=?2",params![account,thread],|row|Ok(DirectoryRecord {
             remote_id:row.get(0)?,is_group:row.get(1)?,display_name:row.get(2)?,avatar_url:row.get(3)?,is_friend:row.get(4)?,is_blocked:row.get(5)?,member_count:row.get(6)?,
         })).optional()?)

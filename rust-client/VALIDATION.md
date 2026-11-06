@@ -564,3 +564,94 @@ compatible executable is `/tmp/zalo-default169-previous-c652`. No personal
 profile/account was opened; GNOME Wayland decoration acceptance remains separate.
 
 The coordinator installed and independently verified this exact artifact (SHA-256 `473377efbf4c2ca4f82b13d4b5f3c4816a2c04339331a7ff8a9e77d408ef67bd`, 20,771,424 bytes, mode 0755) without launching the app or opening account/profile data.
+
+## Avatar status and account menus (2026-11-06)
+
+Signed-in status now appears on the rail avatar; its popup exposes connection
+details and recovery. The persistent status banner and account/logout footer,
+including reserved space, are removed. The gear opens separate appearance and
+logout actions; logout still requires confirmation. Signed-out users only see
+appearance. The palette adds four original-source roles (35 roles/38 tokens).
+
+Seven pointer/state regressions cover menu routing, confirmation cancellation,
+draft/session preservation, blocked background sending/navigation, outside/Esc/
+same-anchor dismissal, scoped focus restoration, stale account/auth/thread
+invalidation, resize anchoring and fully clipped recovery controls. Final checks
+pass **194 default Rust**, **445 all-feature Rust**, **five IME adapter** and
+**19 Python** tests, formatting, strict default/all-feature all-target Clippy,
+and catalog/inventory reproducibility. Two opt-in native fixtures remain ignored
+in the normal suite.
+
+Approved isolated X11 captures cover Light/Dark, synthetic Online/Offline and
+1200×780/640×480. Online is a test-only display override, not transport evidence.
+The refreshed Offline status popups keep both recovery actions visible after
+gear-to-status switching. All sessions close normally with zero network
+connects. Images/logs use `/tmp/zalo-rust-gui-check/account-*`; final gate proofs
+use `/tmp/zalo-account-final-*`. No personal profile/account was opened. Existing
+native Wayland and fresh real x-unikey acceptance boundaries remain unchanged.
+
+The locked offline LIVE artifact is **20,778,592 bytes**, SHA-256
+`f7d840780939684ede192070bb823c6e917bec372cf990507adcc89ceb61d5f6`.
+Schema-seven smoke passes restart/legacy preservation, 19 messages/six threads,
+locking, private bounded diagnostics and informational no-write checks with
+`network_used=false`. Separate disposable doctor confirms compiled live support,
+no authentication/network startup and no profile writes.
+
+The coordinator installed and independently verified this exact artifact (SHA-256 `f7d840780939684ede192070bb823c6e917bec372cf990507adcc89ceb61d5f6`, 20,778,592 bytes, mode 0755) with matching Zalo Native launcher/icon/window identity, without launching the app or opening account/profile data.
+
+## Mobile hidden conversations and launcher feedback (2026-11-06)
+
+Fresh live workers require a successful source-backed hidden-conversation
+snapshot before exposing cached names, history or media. Failed checks retain a
+neutral workspace. Normal lists exclude every hidden thread; explicit search
+returns bounded name/lock candidates without previews. The existing four-digit
+Zalo PIN authorizes only the requested thread. Cancellation, navigation, worker
+loss, expiry and changed policy revoke access. PIN/verifier material is neither
+logged nor persisted. Policy uses Rust memory and SQLite TEMP memory, with no
+schema change or SQLite encryption. Periodic refresh waits about 30 seconds
+after completion; HTTP completion adds latency, so this is not an instant or
+maximum-30-second remote-change guarantee.
+
+The independent original-JavaScript oracle covers snapshot replacement and PIN
+semantics. Real loopback TLS tests verify encrypted get-all requests, incorrect
+PIN, cancellation, one-thread authorization, unchanged refresh, remote revocation
+and fail-closed HTTP errors. Store regressions verify filtering before LIMIT,
+account scope, full persistent-row preservation, receive cursors/outbox/ACKs,
+memory-only policy and idempotent initialization. Eleven UI regressions exercise
+masked input, IME/repeated Enter, stale replies, scoped caches, queued ACKs after
+relock, actual row clicks and modal hit layers. Default checks pass 193 library
+and three CLI tests, five IME adapter tests and 19 Python tooling tests. The final
+all-feature suite passes 450 library, three CLI and 12 integration tests; three
+opt-in native fixtures remain ignored. Formatting, strict default/all-feature
+all-target Clippy, catalog/inventory reproducibility and the source oracle pass.
+After two equivalent lint corrections, ten hidden-flow and eleven UI tests also
+pass against the final sources.
+
+Approved isolated X11 captures cover Light/Dark, 1200×780/640×480, minimal search,
+wrong PIN, pending cancellation, actual private title/body after unlock, relock,
+and bounded single Checking/Failed workspaces. Cancellation traces establish
+pending→closed before any grant. Every accepted session closes normally with
+zero network connections. These fake-worker presentation fixtures use the real
+UI event handler; backend TLS tests provide separate protocol evidence. Images
+and binary provenance are under `/tmp/zalo-rust-gui-check/privacy-*`; aborted or
+incorrectly named intermediate captures are not acceptance evidence.
+
+The managed launcher now sets `StartupNotify=false` instead of advertising an
+unimplemented startup-completion handshake. Five installer tests include actual
+GLib parsing and replacement of an older managed entry. GLib launches an
+isolated disposable `--demo` entry, closes normally and releases its profile
+lock with no Internet connection; its trace includes one refused local X11
+startup probe. No real desktop entry/account/profile was launched. Actual GNOME
+cursor behavior, mobile hidden/PIN acceptance and native Wayland rendering
+remain user-verification boundaries; existing IME evidence is unchanged.
+
+The locked offline LIVE artifact is **20,946,144 bytes**, SHA-256
+`23e3a95a8620ddaa6780977354587e5b11c3465570a73096528623d5b437d3dc`.
+Schema-seven smoke passes restart/legacy preservation, 19 messages/six threads,
+locking and private bounded diagnostics with `network_used=false`. A separate
+disposable doctor confirms compiled live support, no authentication/network
+startup and an empty profile root. Gate/artifact/doctor proofs use
+`/tmp/zalo-hidden-final-*`; the previous compatible executable is
+`/tmp/zalo-hidden-previous-f7d8`. No real account, PIN or profile was inspected.
+
+The coordinator installed and independently verified this exact artifact (SHA-256 `23e3a95a8620ddaa6780977354587e5b11c3465570a73096528623d5b437d3dc`, 20,946,144 bytes, mode 0755), matching Zalo Native launcher/icon/window identity and `StartupNotify=false`, without launching the app or opening account/profile data.

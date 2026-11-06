@@ -38,7 +38,11 @@ font cmaps; the 15 semantic controls resolve through this registry. Font assets
 retain their repository provenance. Font setup happens once, with no frame-time
 file reads or eager glyph rasterization.
 
-Open appearance settings from the bottom rail gear or login-screen gear. Four
+The bottom rail/login gear opens an anchored menu; its appearance entry opens
+settings. Signed-in logout has a separate menu entry and confirmation; signed-out
+menus expose appearance only. The rail avatar uses original online `--G60`, ring
+`--WA100`, offline `--grey-dot` and connecting `--icon-warning` roles. Its popup
+holds connection details/recovery, replacing permanent status/account bars. Four
 modes are persisted independently in the native profile's `config/theme.json` by
 a bounded worker, without reading Electron preferences. Custom inherits Light;
 System follows the signal reported by egui/winit and falls back to Light when
@@ -60,7 +64,7 @@ body/button 14, chat text 15, headings 18 and modal titles 16. Native DPI and fo
 antialiasing remain toolkit controlled; resizing a window does not change these
 roles. Shared modal chrome binds `--curtain` and `--divider`, with a 48 px header,
 original close glyph and a bounded action row. Original-source inventory now
-tracks 31 palette roles/34 source tokens; all 758 tokens remain available in the
+tracks 35 palette roles/38 source tokens; all 758 tokens remain available in the
 catalog. This does not imply every source component is implemented.
 
 Avatars currently use generated initials for both cached live names and synthetic
