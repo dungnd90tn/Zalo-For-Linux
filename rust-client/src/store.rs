@@ -11,6 +11,7 @@ pub mod e2ee;
 pub mod message_content;
 mod message_info;
 mod message_media;
+mod overview;
 mod privacy;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;

@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod info;
 pub mod media;
+pub mod overview;
 pub use media::{
     CardButton, CardRow, FileDescriptor, MediaContentError, MediaDescriptor, MediaKind,
     MediaMessageContent, MessageMediaBinding, PhotoDescriptor, PollDescriptor,
     WebContentDescriptor, MAX_MEDIA_DESCRIPTOR_BYTES,
 };
+pub use overview::{ConversationOverview, SharedItem, SharedKind, OVERVIEW_ITEM_LIMIT};
 
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 200;

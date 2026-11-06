@@ -13,6 +13,7 @@ mod dialog;
 mod directory;
 #[cfg(feature = "messaging")]
 mod hydration;
+mod information;
 #[cfg(all(test, feature = "messaging"))]
 mod layout_tests;
 #[cfg(feature = "live-login")]
@@ -51,6 +52,8 @@ const CONVERSATION_LIST_MIN_WIDTH: f32 = 280.0;
 const CONVERSATION_LIST_MAX_WIDTH: f32 = 420.0;
 const CHAT_HEADER_HEIGHT: f32 = 76.0;
 const CONVERSATION_ROW_HEIGHT: f32 = 72.0;
+/// Longest side of a sticker, in logical points.
+const STICKER_SIZE: f32 = 130.0;
 const CONVERSATION_INFO_WIDTH: f32 = 344.0;
 const MIN_CHAT_WIDTH_WITH_INFO: f32 = 360.0;
 const COMPACT_BREAKPOINT: f32 = 940.0;
@@ -88,6 +91,7 @@ pub struct NativeApp {
     focus_composer: bool,
     latest_page: bool,
     ime_composing: bool,
+    info_tab: information::InfoTab,
     #[cfg(feature = "live-login")]
     live: Option<live::LiveState>,
     // The worker shuts down before the profile lock is released.
@@ -144,6 +148,7 @@ impl NativeApp {
             focus_composer: false,
             latest_page: true,
             ime_composing: false,
+            info_tab: Default::default(),
             #[cfg(feature = "live-login")]
             live: None,
             _profile: Arc::new(profile),
@@ -1761,45 +1766,7 @@ impl NativeApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Frame::none().inner_margin(16.0).show(ui, |ui| {
-                    let title = display_title(&thread);
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                    ui.add_space(8.0);
-                    ui.vertical_centered(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
-                        self.profile_avatar(ui, rect, &title, &thread.id);
-                        ui.add_space(8.0);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&title)
-                                    .family(egui::FontFamily::Name("Zalo Semibold".into()))
-                                    .size(visuals::TEXT_HEADING),
-                            )
-                            .wrap(),
-                        );
-                        ui.label(
-                            RichText::new(if self.demo {
-                                "Hội thoại minh họa"
-                            } else if thread.id.starts_with("g:") {
-                                "Nhóm trò chuyện"
-                            } else {
-                                "Trò chuyện riêng"
-                            })
-                            .color(colors.text_secondary),
-                        );
-                    });
-                    if thread.last_message_at_ms > 0
-                        && local_parts(thread.last_message_at_ms).is_some()
-                    {
-                        ui.add_space(18.0);
-                        ui.add(
-                            egui::Label::new(format!(
-                                "Tin nhắn gần nhất đã lưu: {} · {}",
-                                date_label(thread.last_message_at_ms),
-                                clock_label(thread.last_message_at_ms)
-                            ))
-                            .wrap(),
-                        );
-                    }
+                    self.information_body(ui, &thread);
                 });
             });
     }
@@ -2066,6 +2033,8 @@ fn message_bubble(
     // Own plain text gets the solid accent bubble with on-color text. Media, stickers and cards
     // draw their own labels in the standard text roles, so they keep the surface bubble.
     let accent = own && message.media.is_none() && message.sticker.is_none();
+    // A sticker is the picture alone: no bubble fill, border or padding around it.
+    let bare = message.sticker.is_some();
     let ink = if accent {
         colors.on_color
     } else {
@@ -2122,7 +2091,39 @@ fn message_bubble(
                 .max(status_width)
                 .min(max_bubble)
         })
-        .unwrap_or(max_bubble);
+        .unwrap_or_else(|| {
+            if !bare {
+                return max_bubble;
+            }
+            // Fit the sticker: as wide as the picture, or the sender/status line if that is wider.
+            let sender_width = if own {
+                0.0
+            } else {
+                ui.painter()
+                    .layout_no_wrap(
+                        sender_name.into(),
+                        FontId::proportional(visuals::TEXT_SMALL),
+                        colors.text_secondary,
+                    )
+                    .size()
+                    .x
+            };
+            let (time, status) = status_galleys(
+                ui,
+                message.sent_at_ms,
+                own,
+                account.is_some(),
+                colors.text_secondary,
+            );
+            let status_width = time.size().x
+                + status.as_ref().map_or(0.0, |status| {
+                    ui.spacing().item_spacing.x * 2.0 + 12.0 + status.size().x
+                });
+            STICKER_SIZE
+                .max(sender_width)
+                .max(status_width)
+                .min(max_bubble)
+        });
     ui.with_layout(
         if own {
             Layout::right_to_left(Align::Min)
@@ -2135,12 +2136,14 @@ fn message_bubble(
                 visuals::avatar_photo(ui, rect, sender_avatar, avatar_texture);
             }
             egui::Frame::none()
-                .fill(if accent {
+                .fill(if bare {
+                    egui::Color32::TRANSPARENT
+                } else if accent {
                     colors.bubble_own
                 } else {
                     colors.bubble_incoming
                 })
-                .stroke(if accent {
+                .stroke(if bare || accent {
                     Stroke::NONE
                 } else {
                     Stroke::new(1.0_f32, colors.border)
@@ -2151,7 +2154,11 @@ fn message_bubble(
                     sw: if own { 18.0 } else { 4.0 },
                     se: if own { 4.0 } else { 18.0 },
                 })
-                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                .inner_margin(if bare {
+                    egui::Margin::ZERO
+                } else {
+                    egui::Margin::symmetric(14.0, 10.0)
+                })
                 .show(ui, |ui| {
                     // A right-to-left frame starts with its minimum rectangle at
                     // the right edge. Give plain content its measured width before
@@ -2190,18 +2197,30 @@ fn message_bubble(
                                     )) =>
                                 {
                                     match cache.visible(ui.ctx(), *sticker) {
-                                        stickers::Presentation::Image(texture) => {
-                                            let size = texture.size_vec2();
+                                        stickers::Presentation::Image { texture, uv } => {
+                                            // `uv` is the visible frame; its pixel size, not the
+                                            // atlas size, decides the display size.
+                                            let size = vec2(
+                                                uv.width() * texture.size_vec2().x,
+                                                uv.height() * texture.size_vec2().y,
+                                            );
                                             let display = visuals::fit_image(
                                                 size,
-                                                vec2(ui.available_width().min(130.0), 130.0),
+                                                vec2(
+                                                    ui.available_width().min(STICKER_SIZE),
+                                                    STICKER_SIZE,
+                                                ),
                                                 ui.ctx().pixels_per_point(),
                                             );
                                             ui.add(
                                                 egui::Image::new(&texture)
+                                                    .uv(uv)
+                                                    // `display` already has the frame's
+                                                    // aspect; the atlas's own is different.
+                                                    .maintain_aspect_ratio(false)
                                                     .fit_to_exact_size(display),
                                             )
-                                            .on_hover_text("Nhãn dán · ảnh xem trước tĩnh");
+                                            .on_hover_text("Nhãn dán");
                                         }
                                         stickers::Presentation::Loading => {
                                             sticker_placeholder(ui, "Đang tải nhãn dán…");

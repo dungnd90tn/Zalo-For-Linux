@@ -9,7 +9,8 @@ pub mod media;
 pub mod stickers;
 
 use crate::domain::{
-    local_message_id, validate_id, Conversation, Cursor, Message, MAX_PAGE_SIZE, MAX_TEXT_BYTES,
+    local_message_id, validate_id, Conversation, ConversationOverview, Cursor, Message,
+    MAX_PAGE_SIZE, MAX_TEXT_BYTES, OVERVIEW_ITEM_LIMIT,
 };
 use crate::store::MessageStore;
 use anyhow::{bail, Result};
@@ -40,6 +41,11 @@ pub enum Command {
         text: String,
         request_id: u64,
     },
+    /// Counts and the newest pictures, files and links of one conversation's saved history.
+    Overview {
+        generation: u64,
+        thread: String,
+    },
     Shutdown,
 }
 #[derive(Debug)]
@@ -57,6 +63,16 @@ pub enum Event {
         id: String,
         request_id: u64,
         conversation: Conversation,
+    },
+    Overview {
+        generation: u64,
+        thread: String,
+        overview: Box<ConversationOverview>,
+    },
+    /// The summary could not be read; the conversation itself is unaffected.
+    OverviewFailed {
+        generation: u64,
+        thread: String,
     },
     Fault(String),
     RequestFailed {
@@ -173,6 +189,24 @@ impl Worker {
                             );
                             (generation, thread, Some(request_id), result)
                         }
+                        Command::Overview { generation, thread } => {
+                            let event = match store.conversation_overview(
+                                DEMO_ACCOUNT,
+                                &thread,
+                                OVERVIEW_ITEM_LIMIT,
+                            ) {
+                                Ok(overview) => Event::Overview {
+                                    generation,
+                                    thread,
+                                    overview: Box::new(overview),
+                                },
+                                Err(_) => Event::OverviewFailed { generation, thread },
+                            };
+                            if !emit(event) {
+                                break;
+                            }
+                            continue;
+                        }
                         Command::Shutdown => break,
                     };
                     let event = result.unwrap_or_else(|e| Event::RequestFailed {
@@ -210,6 +244,7 @@ fn submit(
         Command::SendDemo { thread, text, .. } => {
             validate_id(thread).is_ok() && !text.trim().is_empty() && text.len() <= MAX_TEXT_BYTES
         }
+        Command::Overview { thread, .. } => validate_id(thread).is_ok(),
         Command::Shutdown => true,
     };
     if !valid {
@@ -429,6 +464,21 @@ impl DraftBook {
     }
 }
 
+/// What the information panel shows for the selected conversation. The data belongs to one
+/// thread and one selection generation; anything else is ignored or refetched.
+#[derive(Default)]
+pub(crate) struct OverviewState {
+    thread: Option<String>,
+    generation: u64,
+    pending: bool,
+    data: Option<ConversationOverview>,
+    /// Loaded-message signature when the data was requested, to notice newer messages.
+    signature: Option<(usize, Option<String>)>,
+    requested: Option<(usize, Option<String>)>,
+    /// Signature of the last failed request, so a failure is not retried every frame.
+    failed: Option<(usize, Option<String>)>,
+}
+
 #[derive(Default)]
 pub struct Model {
     pub conversations: Vec<Conversation>,
@@ -438,8 +488,90 @@ pub struct Model {
     pub has_older: bool,
     pub pending: bool,
     pub status: String,
+    pub(crate) overview: OverviewState,
 }
 impl Model {
+    fn message_signature(&self) -> (usize, Option<String>) {
+        (
+            self.messages.len(),
+            self.messages.last().map(|message| message.id.clone()),
+        )
+    }
+    /// The saved-history summary for `thread`, if one has arrived for the current selection.
+    pub fn overview(&self, thread: &str) -> Option<&ConversationOverview> {
+        (self.overview.thread.as_deref() == Some(thread)
+            && self.overview.generation == self.generation)
+            .then_some(self.overview.data.as_ref())
+            .flatten()
+    }
+    /// Whether a summary request for `thread` is waiting for its reply.
+    pub fn overview_pending(&self, thread: &str) -> bool {
+        self.overview.pending
+            && self.overview.generation == self.generation
+            && self.overview.thread.as_deref() == Some(thread)
+    }
+    /// True when a request is worth making: the data is for another thread or selection, or
+    /// there is none (and the last attempt did not just fail), or it is older than the loaded
+    /// messages. Never true while a request for this very selection is in flight.
+    pub fn overview_stale(&self, thread: &str) -> bool {
+        let state = &self.overview;
+        if state.thread.as_deref() != Some(thread) || state.generation != self.generation {
+            return true;
+        }
+        let signature = Some(self.message_signature());
+        if state.pending || state.failed == signature {
+            return false;
+        }
+        state.data.is_none() || state.signature != signature
+    }
+    /// Record a request after `enqueue` accepted it, passing the selection generation to scope
+    /// the reply. Older data for the same thread stays visible while the new one loads.
+    pub fn request_overview(
+        &mut self,
+        thread: &str,
+        enqueue: impl FnOnce(u64) -> std::result::Result<(), SubmitError>,
+    ) -> std::result::Result<(), SubmitError> {
+        let generation = self.generation;
+        enqueue(generation)?;
+        if self.overview.thread.as_deref() != Some(thread) || self.overview.generation != generation
+        {
+            self.overview.data = None;
+            self.overview.signature = None;
+        }
+        self.overview.thread = Some(thread.to_owned());
+        self.overview.generation = generation;
+        self.overview.pending = true;
+        self.overview.failed = None;
+        self.overview.requested = Some(self.message_signature());
+        Ok(())
+    }
+    pub fn apply_overview(
+        &mut self,
+        generation: u64,
+        thread: &str,
+        overview: ConversationOverview,
+    ) -> bool {
+        if generation != self.generation
+            || self.selected.as_deref() != Some(thread)
+            || self.overview.thread.as_deref() != Some(thread)
+            || self.overview.generation != generation
+        {
+            return false;
+        }
+        self.overview.data = Some(overview);
+        self.overview.signature = self.overview.requested.clone();
+        self.overview.failed = None;
+        self.overview.pending = false;
+        true
+    }
+    /// A failed request must not block later attempts, nor be retried every frame.
+    pub fn overview_failed(&mut self, generation: u64, thread: &str) {
+        if self.overview.generation == generation && self.overview.thread.as_deref() == Some(thread)
+        {
+            self.overview.pending = false;
+            self.overview.failed = self.overview.requested.clone();
+        }
+    }
     pub fn select(&mut self, thread: String) -> Command {
         self.generation = self.generation.wrapping_add(1);
         self.selected = Some(thread.clone());
@@ -514,6 +646,15 @@ impl Model {
                         "Stored locally in the offline demo; nothing was sent to Zalo.".into();
                 }
                 true
+            }
+            Event::Overview {
+                generation,
+                thread,
+                overview,
+            } => self.apply_overview(generation, &thread, *overview),
+            Event::OverviewFailed { generation, thread } => {
+                self.overview_failed(generation, &thread);
+                false
             }
             Event::Fault(error) => {
                 self.pending = false;
@@ -921,5 +1062,85 @@ mod tests {
             store.page(DEMO_ACCOUNT, "welcome", None, 10).unwrap().len(),
             2
         );
+    }
+    fn summary(total: u64) -> ConversationOverview {
+        ConversationOverview {
+            total_messages: total,
+            ..Default::default()
+        }
+    }
+    fn message(id: &str) -> Message {
+        Message {
+            account_id: DEMO_ACCOUNT.into(),
+            thread_id: "welcome".into(),
+            id: id.into(),
+            sender: "x".into(),
+            text: "t".into(),
+            sticker: None,
+            media: None,
+            sent_at_ms: 1,
+        }
+    }
+    #[test]
+    fn overview_is_scoped_to_the_selection_and_refetched_only_when_stale() {
+        let mut model = Model {
+            selected: Some("welcome".into()),
+            messages: vec![message("a")],
+            ..Default::default()
+        };
+        assert!(model.overview_stale("welcome"), "nothing requested yet");
+        let mut sent = None;
+        model
+            .request_overview("welcome", |generation| {
+                sent = Some(generation);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(sent, Some(model.generation));
+        assert!(model.overview_pending("welcome"));
+        assert!(!model.overview_stale("welcome"), "one request at a time");
+        // A reply for another thread or an older selection is ignored.
+        assert!(!model.apply_overview(model.generation, "other", summary(9)));
+        assert!(!model.apply_overview(model.generation + 1, "welcome", summary(9)));
+        assert!(model.overview("welcome").is_none());
+        assert!(model.apply_overview(model.generation, "welcome", summary(2)));
+        assert_eq!(model.overview("welcome").unwrap().total_messages, 2);
+        assert!(!model.overview_pending("welcome"));
+        assert!(
+            !model.overview_stale("welcome"),
+            "fresh until messages change"
+        );
+        // A newer message makes it stale; the old data stays visible while refetching.
+        model.messages.push(message("b"));
+        assert!(model.overview_stale("welcome"));
+        model.request_overview("welcome", |_| Ok(())).unwrap();
+        assert_eq!(model.overview("welcome").unwrap().total_messages, 2);
+        // Changing the selection hides it at once.
+        model.generation += 1;
+        assert!(model.overview("welcome").is_none());
+        assert!(model.overview_stale("welcome"));
+    }
+    #[test]
+    fn rejected_or_failed_overview_requests_do_not_stick_or_spin() {
+        let mut model = Model {
+            selected: Some("welcome".into()),
+            ..Default::default()
+        };
+        let busy = model.request_overview("welcome", |_| Err(SubmitError::Busy));
+        assert_eq!(busy, Err(SubmitError::Busy));
+        assert!(
+            !model.overview_pending("welcome"),
+            "a refused request is not pending"
+        );
+        assert!(model.overview_stale("welcome"), "and may be retried");
+        model.request_overview("welcome", |_| Ok(())).unwrap();
+        model.overview_failed(model.generation, "welcome");
+        assert!(!model.overview_pending("welcome"));
+        assert!(
+            !model.overview_stale("welcome"),
+            "a failure is not retried until the messages change"
+        );
+        model.messages.push(message("c"));
+        assert!(model.overview_stale("welcome"));
     }
 }

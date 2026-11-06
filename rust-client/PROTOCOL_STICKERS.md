@@ -37,18 +37,40 @@ Both public source samples were independently fetched once without credentials:
 No downloaded artwork or account data is committed.
 
 The background loader uses TLS verification, no cookies/authentication and no
-redirects. It streams at most 1 MiB, decodes bounded PNG dimensions up to 512×512
-and at most 1 MiB RGBA, and shows the first PNG frame. Requests are deduplicated
-and capped at 32; decoded LRU cache is capped at 64 entries / 8 MiB; the result
-queue holds four images. UI textures have their own 64-entry / 8-MiB budget.
-Failures cool down for 30 seconds and emit closed `sticker_assets` diagnostics,
-including numeric HTTP status. Successful downloads emit debug-only Ready with RGBA
-byte count; no IDs, URLs or payloads enter the log. Drop cancels
+redirects. It streams at most 2 MiB and detects the format from the file signature, never
+from `Content-Type` (the CDN labels some JPEG bytes `image/png`). Supported:
+
+- PNG: a still (at most 512×512 / 1 MiB RGBA), or a **sprite strip** whose width is a whole
+  number of square frames (frames = width / height, 2–64), the original client's
+  `stickerSpriteUrl` + `totalFrames` model;
+- JPEG and static WebP as stills;
+- animated WebP and GIF with their own per-frame delays (clamped to 20–1000 ms).
+
+Catalog stickers request `https://api.zaloapp.com/api/emoticon/sprite?size=130&eid={id}`
+first: probed anonymously it returns a still PNG for static stickers, a PNG strip (2–22
+frames seen) for sprite animations and an animated WebP for others. Any failure except a
+transport error falls back to the still `webpc` thumbnail. Built-in `catId=0` stickers have no
+animation resource. A zip package (effect stickers) is refused as an unsupported format.
+
+Every animation is packed into one RGBA atlas no larger than 2048 px per side (egui panics on
+a bigger texture; frames wrap onto more rows) and 4 MiB; a longer (over 64 frames) or heavier
+animation degrades to its first frame instead of failing. The UI draws one frame as a
+sub-rectangle of the atlas chosen from the frame clock, so every copy of a sticker shows the
+same frame. It advances only while the window has focus and requests a repaint only for the next
+frame boundary. Sprite strips play at a fixed 100 ms per frame: the real per-frame `duration`
+comes from the authenticated sticker detail API, which this credential-free loader does not call.
+
+Requests are deduplicated and capped at 32; the decoded LRU cache is capped at 64 entries /
+16 MiB; the result queue holds four images. UI textures have their own 64-entry / 16-MiB budget
+that counts the still and the atlas. Failures cool down for 30 seconds and emit closed
+`sticker_assets` diagnostics, including numeric HTTP status. Successful downloads emit
+debug-only Ready with the RGBA byte count; no IDs, URLs or payloads enter the log. Drop cancels
 stalled requests and queue waits without joining on the rendering thread.
 
-Full animation, GIF/WebP/sprite resources, effect stickers, catalog refresh and
-sticker sending remain separate work. An unavailable thumbnail remains a truthful
-local placeholder and does not change messaging connection state.
+A sticker message is drawn as the picture alone: no bubble fill, border or padding, and exactly
+as wide as the picture (or its sender/status line when that is wider). An unavailable image
+remains a truthful local placeholder and does not change messaging connection state. Effect
+stickers, catalog refresh and sticker sending remain separate work.
 
 Offline checks:
 

@@ -74,6 +74,8 @@ impl Projection {
                 return None
             }
             LiveEvent::Page { thread, .. }
+            | LiveEvent::Overview { thread, .. }
+            | LiveEvent::OverviewFailed { thread, .. }
             | LiveEvent::MessagesRefreshed { thread, .. }
             | LiveEvent::MessagesRefreshFailed { thread, .. }
             | LiveEvent::SenderNames { thread, .. }
@@ -454,7 +456,9 @@ impl Privacy {
                     self.start(session.clone(), transports);
                 }
                 let requested = match &command {
-                    LiveCommand::Load { thread, .. } => Some(thread.clone()),
+                    LiveCommand::Load { thread, .. } | LiveCommand::Overview { thread, .. } => {
+                        Some(thread.clone())
+                    }
                     LiveCommand::Open {
                         kind, remote_id, ..
                     } => Some(Target::new(*kind, remote_id)?.thread_id()),

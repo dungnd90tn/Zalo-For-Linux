@@ -1689,6 +1689,7 @@ async fn handle_command(
         LiveCommand::RefreshMessages { thread, .. }
         | LiveCommand::ResolveSenders { thread, .. }
         | LiveCommand::Load { thread, .. }
+        | LiveCommand::Overview { thread, .. }
         | LiveCommand::Send { thread, .. } => Some(thread.clone()),
         LiveCommand::Open {
             kind, remote_id, ..
@@ -1927,6 +1928,33 @@ async fn handle_command(
                     generation,
                     thread,
                     error: "Cannot load this conversation".into(),
+                },
+            };
+            events.emit(event).await?;
+        }
+        LiveCommand::Overview { generation, thread } => {
+            let account = events.account.clone();
+            let requested = thread.clone();
+            let result = db
+                .call_with(StorageOperation::LoadHistory, move |s| {
+                    s.conversation_overview(
+                        &account,
+                        &requested,
+                        crate::domain::OVERVIEW_ITEM_LIMIT,
+                    )
+                })
+                .await;
+            let event = match result {
+                Ok(overview) => LiveEvent::Overview {
+                    account_id: events.account.clone(),
+                    generation,
+                    thread,
+                    overview: Box::new(overview),
+                },
+                Err(_) => LiveEvent::OverviewFailed {
+                    account_id: events.account.clone(),
+                    generation,
+                    thread,
                 },
             };
             events.emit(event).await?;

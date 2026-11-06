@@ -120,7 +120,7 @@ The shell scripts parse each other with `grep`/`cut`, so their formatting is loa
 - `start.sh` launches **with the Chromium sandbox** and only falls back to `--no-sandbox` if bring-up actually fails, printing the root-level fix. Do not reintroduce an unconditional `--no-sandbox`: the sandbox works on Ubuntu 24.04+/26.04 despite `kernel.apparmor_restrict_unprivileged_userns=1`. `ZALO_NO_SANDBOX=1` is the deliberate escape hatch.
 - **Bump `version.txt` on every build you hand over, even a rebuild of the same change.** Two artifacts that differ but share a version are indistinguishable once installed, and hours get lost debugging a stale build. The helper logs the running version to `~/.config/ZaloData/zalo-cap.log` for the same reason: an app left open across an upgrade keeps running its old in-memory code, which looks exactly like a broken build.
 - `version.txt` (e.g. `v1.2.1`) is the update oracle. Both `start.sh` (AppImage path) and `update.sh` fetch `version.txt` from the `latest` branch on GitHub raw and compare with `version_lt`. Bumping it is what triggers user-facing update prompts — bump it in the same commit as a release.
-- Release flow: publish a GitHub release → [.github/workflows/build-appimage.yml](.github/workflows/build-appimage.yml) checks out `latest`, runs `build-appimage.sh`, and uploads `dist/*.AppImage` to the release.
+- Release flow: publish a GitHub release whose tag is `v<rust-client/Cargo.toml version>` → [.github/workflows/build-packages.yml](.github/workflows/build-packages.yml) runs `scripts/rust/package.sh` (pinned Docker images, glibc 2.31 baseline), installs the result with `apt`/`dnf` in clean containers (`scripts/rust/package/verify.sh`) and uploads `dist/rust/*.deb`, `*.rpm` and `SHA256SUMS` to the release. CI no longer builds the Electron AppImage; `build-appimage.sh`/`build-deb.sh` remain for manual builds only. Re-running the workflow for the same version needs a higher `package_release` input.
 
 ## Packaging targets
 
@@ -177,7 +177,7 @@ Every external artifact this repo fetches is pinned to an exact version **and** 
 | node-addon-api | `generate-addon.py`, `generate-jxl-addon.py` | 8.9.1 | Current line; fine now that Electron 43 embeds Node 24.18.1 |
 | libjxl / libjpeg-turbo | build host, copied into `zjxl/build/linux_x64/` | whatever the builder has | Vendored into the addon dir, so the shipped bytes are fixed at build time rather than resolved on the user's machine |
 | node-gyp | `generate-addon.py` | 12.4.0 | Build-host only, no ABI effect; 13.x requires Node ^22.22.2 |
-| GitHub Actions | `.github/workflows/build-appimage.yml` | commit SHAs | A mutable `@v4` tag can be repointed at new code by the action's owner |
+| GitHub Actions | `.github/workflows/build-packages.yml`, `rust-client.yml` | commit SHAs | A mutable `@v4` tag can be repointed at new code by the action's owner |
 
 `package.json` is different: it is VNG's upstream manifest for bundles that are already built and shipped in `main-dist/`/`pc-dist/`. Nothing installs from it, so changing versions there has no effect on what runs — do not "upgrade" it expecting a result.
 

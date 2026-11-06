@@ -13,7 +13,8 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 - **Đăng nhập bằng QR:** tự kiểm tra phiên đã lưu khi mở ứng dụng; nếu chưa đăng nhập thì hiển thị QR. Phiên được xác nhận hết hạn sẽ yêu cầu quét lại; lỗi kết nối tạm thời vẫn giữ phiên và cho phép thử lại.
 - **Đọc lịch sử và soạn nháp khi ngoại tuyến:** giữ lịch sử, tên liên hệ/nhóm và bản nháp riêng cho từng cuộc trò chuyện. Nội dung chỉ hiển thị khi đã xác minh được trạng thái hội thoại ẩn; nếu lần kiểm tra mới thất bại, ứng dụng tạm giữ kín nội dung. Người gửi chưa xác định được tên có nhãn thay thế trung tính.
 - **Tôn trọng hội thoại đã ẩn trên Zalo:** loại khỏi danh sách thông thường; tìm tên và nhập PIN Zalo hiện có để mở riêng hội thoại được chọn.
-- **Hiển thị nội dung nhận được:** văn bản, thông báo hệ thống, ảnh xem trước của sticker tĩnh, ảnh và một số thẻ OA/nội dung được chia sẻ. Hỗ trợ PNG/JPEG/WebP và một phần JPEG XL tĩnh; ảnh đã tải có thể mở trong khung xem của ứng dụng.
+- **Hiển thị nội dung nhận được:** văn bản, thông báo hệ thống, sticker (tĩnh và động, hiển thị không nền), ảnh và một số thẻ OA/nội dung được chia sẻ. Hỗ trợ PNG/JPEG/WebP và một phần JPEG XL tĩnh; ảnh đã tải có thể mở trong khung xem của ứng dụng.
+- **Thông tin hội thoại:** số tin và khoảng thời gian đã lưu, cùng danh sách ảnh, tệp và liên kết từng xuất hiện trong lịch sử; bấm một mục để mở trong trình duyệt.
 - **Thích ứng với kích thước cửa sổ:** bố cục rộng và gọn giữ lại hội thoại đang chọn cùng bản nháp. Cỡ chữ và giới hạn khung ảnh được giữ nhất quán khi thay đổi kích thước.
 - **Giao diện thiết kế lại, sáng và tối:** có chế độ sáng, tối, theo hệ thống và tùy chỉnh; nút **Sáng/Tối** ở thanh bên đổi nhanh, lựa chọn được lưu theo từng hồ sơ. Phông chữ và biểu tượng vẫn là bộ Zalo có sẵn.
 - **Phím tắt soạn tin:** `Enter` gửi, `Ctrl+Enter` (hoặc `Shift+Enter`) xuống dòng. Ứng dụng không gửi khi bộ gõ tiếng Việt đang soạn chữ.
@@ -43,10 +44,10 @@ Tải gói của [bản phát hành](changelogs/RELEASE-v2.0.0.md) rồi cài b�
 
 ```bash
 # Ubuntu / Debian
-sudo apt install ./zalo-native_2.0.0-1_amd64.deb
+sudo apt install ./zalo-native_2.0.0-2_amd64.deb
 
 # Fedora / RHEL / AlmaLinux / Rocky (yum dùng cùng lệnh)
-sudo dnf install ./zalo-native-2.0.0-1.x86_64.rpm
+sudo dnf install ./zalo-native-2.0.0-2.x86_64.rpm
 ```
 
 Mở **Zalo Native** từ menu ứng dụng hoặc chạy `zalo-native --live`; `zalo-native --demo` mở bản dùng thử. Gỡ cài đặt bằng `sudo apt remove zalo-native` hoặc `sudo dnf remove zalo-native`. Gói độc lập với gói Electron `zalo` và có thể cài cùng lúc. Hiện chưa có kho `apt`/`dnf` để tự cập nhật: muốn nâng cấp, cài gói mới hơn theo cùng lệnh.
