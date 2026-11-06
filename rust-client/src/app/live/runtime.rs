@@ -18,6 +18,7 @@ use url::Url;
 
 #[cfg(test)]
 mod integration_tests;
+mod privacy;
 
 #[test]
 fn outgoing_mismatch_diagnostics_report_only_closed_field_flags() {
@@ -696,10 +697,18 @@ impl DirectorySync {
                 })
                 .await?;
             self.conversations_changed = false;
-            permit.send(LiveEvent::DirectoryChanged {
+            let event = LiveEvent::DirectoryChanged {
                 account_id: events.account.clone(),
                 conversations,
-            });
+            };
+            if let Some(event) = events
+                .privacy
+                .read()
+                .map_err(|_| anyhow::anyhow!("Privacy state unavailable"))?
+                .event(event)
+            {
+                permit.send(event);
+            }
         }
         (events.repaint)();
         Ok(())
@@ -719,9 +728,18 @@ struct Events {
     account: String,
     tx: mpsc::Sender<LiveEvent>,
     repaint: Arc<dyn Fn() + Send + Sync>,
+    privacy: std::sync::RwLock<privacy::Projection>,
 }
 impl Events {
     async fn emit(&self, event: LiveEvent) -> Result<()> {
+        let event = self
+            .privacy
+            .read()
+            .map_err(|_| anyhow::anyhow!("Privacy state unavailable"))?
+            .event(event);
+        let Some(event) = event else {
+            return Ok(());
+        };
         (self.repaint)();
         self.tx
             .send(event)
@@ -823,6 +841,10 @@ async fn run_with_transports(
         account,
         tx: events,
         repaint,
+        privacy: std::sync::RwLock::new(privacy::Projection {
+            status: LivePrivacyStatus::Checking,
+            ..Default::default()
+        }),
     };
     if *cancel.borrow() {
         return;
@@ -1514,7 +1536,42 @@ async fn handle_command(
     session: &VerifiedSession,
     client: &reqwest::Client,
 ) -> Result<CommandOutcome> {
+    let requested = match &command {
+        LiveCommand::RefreshMessages { thread, .. }
+        | LiveCommand::ResolveSenders { thread, .. }
+        | LiveCommand::Load { thread, .. }
+        | LiveCommand::Send { thread, .. } => Some(thread.clone()),
+        LiveCommand::Open {
+            kind, remote_id, ..
+        } => Some(Target::new(*kind, remote_id)?.thread_id()),
+        _ => None,
+    };
+    if requested.as_deref().is_some_and(|thread| {
+        !events
+            .privacy
+            .read()
+            .is_ok_and(|state| state.permits(thread))
+    }) {
+        if let LiveCommand::Send {
+            thread, request_id, ..
+        } = command
+        {
+            events
+                .emit(LiveEvent::SendSettled {
+                    account_id: events.account.clone(),
+                    thread,
+                    request_id,
+                    accepted: false,
+                })
+                .await?;
+        }
+        return Ok(CommandOutcome::Continue);
+    }
     match command {
+        LiveCommand::RefreshPrivacy
+        | LiveCommand::RelockHidden
+        | LiveCommand::SearchHidden { .. }
+        | LiveCommand::UnlockHidden { .. } => return Ok(CommandOutcome::Continue),
         LiveCommand::Reconnect | LiveCommand::RefreshDirectory { .. } => {
             return Ok(CommandOutcome::Continue)
         }
@@ -1868,17 +1925,10 @@ async fn run_inner(
 ) -> Result<()> {
     let db = Database::open(profile, events.account.clone()).await?;
     let account = events.account.clone();
-    let conversations = db
-        .call_with(StorageOperation::Conversations, move |s| {
-            s.conversations(&account, crate::domain::MAX_PAGE_SIZE)
-        })
-        .await?;
-    events
-        .emit(LiveEvent::Ready {
-            account_id: events.account.clone(),
-            conversations,
-        })
-        .await?;
+    db.call(move |s| s.begin_live_privacy(&account)).await?;
+    privacy::Privacy::announce(events).await?;
+    let mut privacy = privacy::Privacy::new();
+    privacy.start(session.clone(), transports);
     let client = transports.http.clone();
     let mut directory = DirectorySync::new();
     directory.request(0, session.clone(), db.handle()?, transports);
@@ -1889,7 +1939,13 @@ async fn run_inner(
     let mut next_connect = tokio::time::Instant::now();
     let mut next_ping = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
+        let privacy_deadline = privacy.next_check;
+        let privacy_ready = events
+            .privacy
+            .read()
+            .is_ok_and(|state| state.status == LivePrivacyStatus::Ready);
         tokio::select! {
+            biased;
             result = async { (&mut directory.running.as_mut().expect("guarded directory sync").task).await }, if directory.running.is_some() => {
                 directory.completed(result,session.clone(),db.handle()?,transports);
             },
@@ -1902,6 +1958,7 @@ async fn run_inner(
             },
             command = commands.recv() => {
                 let Some(command) = command else { return Ok(()) };
+                let Some(command) = privacy.command(command,&db,events,&session,transports).await? else { continue; };
                 if let LiveCommand::RefreshDirectory{generation}=command {
                     directory.request(generation,session.clone(),db.handle()?,transports);
                     continue;
@@ -1930,12 +1987,16 @@ async fn run_inner(
                     CommandOutcome::Continue => {},
                 }
             },
-            _ = tokio::time::sleep_until(next_connect), if connection.is_none() && !network_paused => {
+            result = privacy.result(), if privacy.running() => { privacy.completed(result,&db,events).await?; },
+            _ = tokio::time::sleep_until(privacy_deadline), if !privacy.running() => { privacy.start(session.clone(),transports); },
+            _ = tokio::time::sleep_until(next_connect), if connection.is_none() && !network_paused && privacy_ready => {
                 events.connection(if retries == 0 { LiveConnection::Connecting } else { LiveConnection::Reconnecting }).await?;
                 let connecting = transports.connect(&session, retries);
                 tokio::pin!(connecting);
                 let result = loop {
+                    let privacy_deadline=privacy.next_check;
                     tokio::select! {
+                        biased;
                         result = async { (&mut directory.running.as_mut().expect("guarded directory sync").task).await }, if directory.running.is_some() => {
                             directory.completed(result,session.clone(),db.handle()?,transports);
                         },
@@ -1949,6 +2010,7 @@ async fn run_inner(
                         result = &mut connecting => break Some(result),
                         command = commands.recv() => {
                             let Some(command) = command else { return Ok(()) };
+                            let Some(command) = privacy.command(command,&db,events,&session,transports).await? else { continue; };
                             if let LiveCommand::RefreshDirectory{generation}=command {
                                 directory.request(generation,session.clone(),db.handle()?,transports);
                                 continue;
@@ -1971,7 +2033,9 @@ async fn run_inner(
                                 CommandOutcome::PauseTransport => { network_paused=true;break None; },
                                 CommandOutcome::Continue => {},
                             }
-                        }
+                        },
+                        result = privacy.result(), if privacy.running() => { privacy.completed(result,&db,events).await?; },
+                        _ = tokio::time::sleep_until(privacy_deadline), if !privacy.running() => { privacy.start(session.clone(),transports); },
                     }
                 };
                 let Some(result) = result else {

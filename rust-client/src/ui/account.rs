@@ -226,6 +226,8 @@ impl NativeApp {
                                         );
                                         #[cfg(feature = "messaging")]
                                         self.live_recovery(ui);
+                                        #[cfg(feature = "messaging")]
+                                        self.privacy_status_controls(ui);
                                         if self.demo {
                                             ui.add(
                                                 egui::Label::new(

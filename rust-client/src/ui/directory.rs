@@ -35,6 +35,23 @@ pub(super) struct DirectoryView {
 }
 
 impl DirectoryView {
+    pub(super) fn privacy_reset(&mut self, ctx: &egui::Context, ready: bool) {
+        self.entries.clear();
+        self.generation = self.generation.wrapping_add(1);
+        self.after = None;
+        self.next = None;
+        self.previous.clear();
+        self.pending = false;
+        self.loaded = false;
+        self.summary.clear();
+        self.detail.clear();
+        self.error = None;
+        self.deadline = None;
+        self.dirty = true;
+        if ready && self.visible {
+            self.queue_reload(ctx);
+        }
+    }
     pub fn activate(&mut self, ctx: &egui::Context) {
         self.visible = true;
         if self.dirty || (!self.loaded && !self.pending) {
@@ -155,10 +172,7 @@ impl DirectoryView {
                     && report.completed_friends
                     && report.completed_groups
                 {
-                    format!(
-                        "Đã cập nhật {} liên hệ · {} nhóm",
-                        report.contacts, report.groups
-                    )
+                    "Đã cập nhật danh bạ".into()
                 } else {
                     "Cập nhật chưa đầy đủ · vẫn dùng được dữ liệu đã lưu".into()
                 };
@@ -352,6 +366,7 @@ impl NativeApp {
             .is_some_and(|state| state.account.is_some() && state.directory.visible)
     }
     pub(super) fn activate_directory(&mut self, ctx: &egui::Context) {
+        self.relock_hidden();
         if let Some(state) = &mut self.live {
             if state.account.is_some() {
                 state.ensure_worker(self._profile.clone());
@@ -360,6 +375,10 @@ impl NativeApp {
         }
     }
     pub(super) fn directory_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.privacy_ready() {
+            self.show_privacy_neutral(ui);
+            return;
+        }
         let Some(state) = &mut self.live else {
             return;
         };
@@ -410,6 +429,10 @@ impl NativeApp {
     }
     pub(super) fn open_directory_entry(&mut self, entry: DirectoryRecord) {
         let thread = entry.thread_id();
+        if !self.privacy_list_visible(&thread) {
+            return;
+        }
+        self.relock_hidden();
         if !self.drafts.can_select(&thread) {
             self.model.status = "Đã đạt giới hạn bản nháp đang mở.".into();
             return;
@@ -417,7 +440,10 @@ impl NativeApp {
         let Some(state) = &mut self.live else {
             return;
         };
-        if state.account.is_none() || !state.ensure_worker(self._profile.clone()) {
+        if state.account.is_none()
+            || !state.ensure_worker(self._profile.clone())
+            || !state.privacy.visible(&thread)
+        {
             return;
         }
         let generation = self.model.generation.wrapping_add(1);

@@ -11,7 +11,8 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 ## Những gì ứng dụng hiện có
 
 - **Đăng nhập bằng QR:** tự kiểm tra phiên đã lưu khi mở ứng dụng; nếu chưa đăng nhập thì hiển thị QR. Phiên được xác nhận hết hạn sẽ yêu cầu quét lại; lỗi kết nối tạm thời vẫn giữ phiên và cho phép thử lại.
-- **Đọc lịch sử và soạn nháp khi ngoại tuyến:** giữ các hội thoại đã lưu, tên liên hệ/nhóm và bản nháp riêng cho từng cuộc trò chuyện. Người gửi chưa xác định được tên sẽ có nhãn thay thế trung tính.
+- **Đọc lịch sử và soạn nháp khi ngoại tuyến:** giữ lịch sử, tên liên hệ/nhóm và bản nháp riêng cho từng cuộc trò chuyện. Nội dung chỉ hiển thị khi đã xác minh được trạng thái hội thoại ẩn; nếu lần kiểm tra mới thất bại, ứng dụng tạm giữ kín nội dung. Người gửi chưa xác định được tên có nhãn thay thế trung tính.
+- **Tôn trọng hội thoại đã ẩn trên Zalo:** loại khỏi danh sách thông thường; tìm tên và nhập PIN Zalo hiện có để mở riêng hội thoại được chọn.
 - **Hiển thị nội dung nhận được:** văn bản, thông báo hệ thống, ảnh xem trước của sticker tĩnh, ảnh và một số thẻ OA/nội dung được chia sẻ. Hỗ trợ PNG/JPEG/WebP và một phần JPEG XL tĩnh; ảnh đã tải có thể mở trong khung xem của ứng dụng.
 - **Thích ứng với kích thước cửa sổ:** bố cục rộng và gọn giữ lại hội thoại đang chọn cùng bản nháp. Cỡ chữ và giới hạn khung ảnh được giữ nhất quán khi thay đổi kích thước.
 - **Dùng giao diện quen thuộc của Zalo:** có chế độ sáng, tối, theo hệ thống và tùy chỉnh; lựa chọn giao diện được lưu theo từng hồ sơ.
@@ -98,6 +99,12 @@ Sau khi biên dịch bản live, có thể chạy trực tiếp mà không cần
 
 Chế độ live kết nối đến Zalo bằng hồ sơ đã chọn. Bản mặc định/demo không bao gồm các thành phần HTTP, WebSocket và mô-đun xác thực tùy chọn. Bản live cũng chưa kích hoạt thành phần Signal đang thử nghiệm.
 
+### Mở hội thoại đã ẩn
+
+Nhập tên trong ô tìm kiếm, chọn kết quả hội thoại ẩn rồi nhập **PIN Zalo hiện có gồm 4 chữ số**. PIN đúng chỉ mở hội thoại vừa chọn. Chuyển sang hội thoại khác, quay lại danh sách, mở danh bạ, đăng xuất hoặc khởi động lại ứng dụng sẽ khóa lại. Client Linux chưa hỗ trợ tạo, đặt lại PIN hay bỏ ẩn hội thoại.
+
+Ứng dụng lấy danh sách ẩn mới khi mở, khi cửa sổ được lấy nét trở lại và định kỳ khoảng 30 giây. Thay đổi trên điện thoại **chưa được đồng bộ tức thời**. Khi chưa xác minh được danh sách, nội dung được giữ kín, kể cả lịch sử đã lưu; bấm avatar để xem trạng thái hoặc chọn **Kiểm tra lại quyền riêng tư**.
+
 ### Thêm ứng dụng vào menu Linux
 
 Biên dịch bản live ngay trước khi cài: mục trong menu chạy với `--live`, trong khi một lần biên dịch mặc định/demo sau đó có thể ghi đè tệp thực thi trong thư mục mã nguồn.
@@ -142,6 +149,8 @@ Chưa hỗ trợ gọi thoại/video. Nội dung có cơ chế mã hóa chưa đ
 | Không có hai cờ trên | `rust-pilot` |
 
 Dùng `--profile-root` và `--profile` để chọn vị trí/tên hồ sơ, hoặc đặt `ZALO_RUST_PROFILE_ROOT` và `ZALO_RUST_PROFILE` khi dùng script chạy ứng dụng. Cờ dòng lệnh được ưu tiên. Khi phát triển, hãy dùng hồ sơ thử nghiệm riêng; không chia sẻ thông tin đăng nhập, tệp phiên hay cơ sở dữ liệu tin nhắn.
+
+PIN và giá trị băm dùng để xác minh PIN chỉ được giữ trong bộ nhớ khi ứng dụng chạy, không lưu bền vững vào hồ sơ. Cơ chế khóa hội thoại kiểm soát việc hiển thị; **PIN không mã hóa cơ sở dữ liệu SQLite**.
 
 Quá trình nâng cấp cấu trúc cơ sở dữ liệu SQLite giữ lại dữ liệu cũ được hỗ trợ. Tệp thực thi cũ có thể không đọc được cấu trúc dữ liệu mới; thay tệp thực thi không đồng nghĩa với hạ phiên bản cơ sở dữ liệu. Ứng dụng chưa tự nhập lịch sử từ ứng dụng desktop đang có.
 

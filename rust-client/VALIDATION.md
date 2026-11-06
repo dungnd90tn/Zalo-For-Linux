@@ -598,3 +598,60 @@ locking, private bounded diagnostics and informational no-write checks with
 no authentication/network startup and no profile writes.
 
 The coordinator installed and independently verified this exact artifact (SHA-256 `f7d840780939684ede192070bb823c6e917bec372cf990507adcc89ceb61d5f6`, 20,778,592 bytes, mode 0755) with matching Zalo Native launcher/icon/window identity, without launching the app or opening account/profile data.
+
+## Mobile hidden conversations and launcher feedback (2026-11-06)
+
+Fresh live workers require a successful source-backed hidden-conversation
+snapshot before exposing cached names, history or media. Failed checks retain a
+neutral workspace. Normal lists exclude every hidden thread; explicit search
+returns bounded name/lock candidates without previews. The existing four-digit
+Zalo PIN authorizes only the requested thread. Cancellation, navigation, worker
+loss, expiry and changed policy revoke access. PIN/verifier material is neither
+logged nor persisted. Policy uses Rust memory and SQLite TEMP memory, with no
+schema change or SQLite encryption. Periodic refresh waits about 30 seconds
+after completion; HTTP completion adds latency, so this is not an instant or
+maximum-30-second remote-change guarantee.
+
+The independent original-JavaScript oracle covers snapshot replacement and PIN
+semantics. Real loopback TLS tests verify encrypted get-all requests, incorrect
+PIN, cancellation, one-thread authorization, unchanged refresh, remote revocation
+and fail-closed HTTP errors. Store regressions verify filtering before LIMIT,
+account scope, full persistent-row preservation, receive cursors/outbox/ACKs,
+memory-only policy and idempotent initialization. Eleven UI regressions exercise
+masked input, IME/repeated Enter, stale replies, scoped caches, queued ACKs after
+relock, actual row clicks and modal hit layers. Default checks pass 193 library
+and three CLI tests, five IME adapter tests and 19 Python tooling tests. The final
+all-feature suite passes 450 library, three CLI and 12 integration tests; three
+opt-in native fixtures remain ignored. Formatting, strict default/all-feature
+all-target Clippy, catalog/inventory reproducibility and the source oracle pass.
+After two equivalent lint corrections, ten hidden-flow and eleven UI tests also
+pass against the final sources.
+
+Approved isolated X11 captures cover Light/Dark, 1200×780/640×480, minimal search,
+wrong PIN, pending cancellation, actual private title/body after unlock, relock,
+and bounded single Checking/Failed workspaces. Cancellation traces establish
+pending→closed before any grant. Every accepted session closes normally with
+zero network connections. These fake-worker presentation fixtures use the real
+UI event handler; backend TLS tests provide separate protocol evidence. Images
+and binary provenance are under `/tmp/zalo-rust-gui-check/privacy-*`; aborted or
+incorrectly named intermediate captures are not acceptance evidence.
+
+The managed launcher now sets `StartupNotify=false` instead of advertising an
+unimplemented startup-completion handshake. Five installer tests include actual
+GLib parsing and replacement of an older managed entry. GLib launches an
+isolated disposable `--demo` entry, closes normally and releases its profile
+lock with no Internet connection; its trace includes one refused local X11
+startup probe. No real desktop entry/account/profile was launched. Actual GNOME
+cursor behavior, mobile hidden/PIN acceptance and native Wayland rendering
+remain user-verification boundaries; existing IME evidence is unchanged.
+
+The locked offline LIVE artifact is **20,946,144 bytes**, SHA-256
+`23e3a95a8620ddaa6780977354587e5b11c3465570a73096528623d5b437d3dc`.
+Schema-seven smoke passes restart/legacy preservation, 19 messages/six threads,
+locking and private bounded diagnostics with `network_used=false`. A separate
+disposable doctor confirms compiled live support, no authentication/network
+startup and an empty profile root. Gate/artifact/doctor proofs use
+`/tmp/zalo-hidden-final-*`; the previous compatible executable is
+`/tmp/zalo-hidden-previous-f7d8`. No real account, PIN or profile was inspected.
+
+The coordinator installed and independently verified this exact artifact (SHA-256 `23e3a95a8620ddaa6780977354587e5b11c3465570a73096528623d5b437d3dc`, 20,946,144 bytes, mode 0755), matching Zalo Native launcher/icon/window identity and `StartupNotify=false`, without launching the app or opening account/profile data.

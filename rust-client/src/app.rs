@@ -383,6 +383,13 @@ pub struct DraftBook {
     parked: std::collections::HashMap<String, Composer>,
 }
 impl DraftBook {
+    /// Remove the visible composer while retaining its recipient and pending acknowledgement.
+    pub fn park_active(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.parked.insert(thread, std::mem::take(&mut self.active));
+        }
+    }
+
     pub fn can_select(&self, thread: &str) -> bool {
         self.thread.as_deref() == Some(thread)
             || self.parked.contains_key(thread)

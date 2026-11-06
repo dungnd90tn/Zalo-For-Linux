@@ -123,6 +123,9 @@ pub struct DirectoryFetcher {
     client: Client,
 }
 impl DirectoryFetcher {
+    pub(crate) fn from_client(client: Client) -> Self {
+        Self { client }
+    }
     pub fn new() -> Result<Self, DirectoryFailure> {
         let client = Client::builder()
             .no_proxy()
@@ -141,7 +144,7 @@ impl DirectoryFetcher {
     pub(crate) fn with_client(client: Client) -> Self {
         Self { client }
     }
-    async fn fetch(
+    pub(crate) async fn fetch(
         &self,
         session: &VerifiedSession,
         request: wire::DirectoryRequest,
@@ -265,6 +268,16 @@ impl DirectoryFetcher {
             )
         })?;
         envelope_data(inner, stage, true)
+    }
+    pub(crate) async fn hidden(
+        &self,
+        session: &VerifiedSession,
+    ) -> Result<crate::protocol::hidden::HiddenSnapshot, DirectoryFailure> {
+        let stage = DirectoryStage::Synchronization;
+        let request =
+            crate::protocol::hidden::request(session.imei()).map_err(|e| wire_failure(stage, e))?;
+        let value = self.fetch(session, request, stage).await?;
+        crate::protocol::hidden::parse(&value).map_err(|e| wire_failure(stage, e))
     }
     pub async fn synchronize<S: DirectorySink>(
         &self,

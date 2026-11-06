@@ -97,8 +97,65 @@ impl std::fmt::Display for LiveDiagnostic {
         f.write_str("]")
     }
 }
+/// Public presentation state; the remote PIN verifier never crosses this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivePrivacyStatus {
+    Checking,
+    Ready,
+    Failed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenUnlockOutcome {
+    Unlocked,
+    IncorrectPin,
+    Unavailable,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenCandidate {
+    pub thread_id: String,
+    pub title: String,
+}
+/// Four existing Zalo PIN digits. Debug output is deliberately redacted.
+pub struct HiddenPin([u8; 4]);
+impl HiddenPin {
+    pub fn new(value: &str) -> Option<Self> {
+        if value.len() != 4 || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut digits = [0; 4];
+        digits.copy_from_slice(value.as_bytes());
+        Some(Self(digits))
+    }
+    pub(crate) fn digest(&self) -> [u8; 16] {
+        use md5::{Digest, Md5};
+        Md5::digest(self.0).into()
+    }
+}
+impl std::fmt::Debug for HiddenPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HiddenPin([REDACTED])")
+    }
+}
+impl Drop for HiddenPin {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
 #[derive(Debug)]
 pub enum LiveCommand {
+    RefreshPrivacy,
+    SearchHidden {
+        generation: u64,
+        query: String,
+    },
+    UnlockHidden {
+        generation: u64,
+        revision: u64,
+        thread: String,
+        pin: HiddenPin,
+    },
+    RelockHidden,
     Reconnect,
     RefreshMessages {
         generation: u64,
@@ -139,6 +196,34 @@ pub enum LiveCommand {
 }
 #[derive(Debug)]
 pub enum LiveEvent {
+    PrivacyChanged {
+        account_id: String,
+        revision: u64,
+        status: LivePrivacyStatus,
+        hidden_threads: Vec<String>,
+        unlocked_thread: Option<String>,
+    },
+    HiddenMatches {
+        account_id: String,
+        generation: u64,
+        revision: u64,
+        query: String,
+        candidates: Vec<HiddenCandidate>,
+    },
+    HiddenUnlockResult {
+        account_id: String,
+        generation: u64,
+        revision: u64,
+        thread: String,
+        outcome: HiddenUnlockOutcome,
+    },
+    /// Content-free durable acknowledgement for a draft whose view was locked meanwhile.
+    SendSettled {
+        account_id: String,
+        thread: String,
+        request_id: u64,
+        accepted: bool,
+    },
     MessagesRefreshed {
         account_id: String,
         generation: u64,
@@ -239,7 +324,11 @@ pub enum LiveEvent {
 impl LiveEvent {
     pub fn account_id(&self) -> &str {
         match self {
-            Self::MessagesRefreshed { account_id, .. }
+            Self::PrivacyChanged { account_id, .. }
+            | Self::HiddenMatches { account_id, .. }
+            | Self::HiddenUnlockResult { account_id, .. }
+            | Self::SendSettled { account_id, .. }
+            | Self::MessagesRefreshed { account_id, .. }
             | Self::MessagesRefreshFailed { account_id, .. }
             | Self::SenderNames { account_id, .. }
             | Self::DirectoryPage { account_id, .. }
@@ -304,12 +393,38 @@ impl LiveWorker {
             thread: Some(thread),
         })
     }
+    /// Synthetic presentation harness: production bounds and submit validation,
+    /// without a runtime thread, session, profile or network capability.
+    #[cfg(test)]
+    pub(crate) fn presentation_fixture(
+        account: &str,
+    ) -> (Self, mpsc::Receiver<LiveCommand>, mpsc::Sender<LiveEvent>) {
+        let (commands, rx) = mpsc::channel(super::COMMAND_CAPACITY);
+        let (tx, events) = mpsc::channel(super::EVENT_CAPACITY);
+        let (stop, _) = watch::channel(false);
+        (
+            Self {
+                account: account.into(),
+                commands,
+                events,
+                stop,
+                thread: None,
+            },
+            rx,
+            tx,
+        )
+    }
     pub fn account_id(&self) -> &str {
         &self.account
     }
     pub fn submit(&self, command: LiveCommand) -> std::result::Result<(), SubmitError> {
         use crate::protocol::messaging::Target;
         let valid = match &command {
+            LiveCommand::RefreshPrivacy | LiveCommand::RelockHidden => true,
+            LiveCommand::SearchHidden { query, .. } => {
+                query.chars().count() <= 128 && !query.chars().any(char::is_control)
+            }
+            LiveCommand::UnlockHidden { thread, .. } => Target::from_thread(thread).is_ok(),
             LiveCommand::RefreshMessages {
                 thread,
                 message_ids,
@@ -407,7 +522,12 @@ impl super::Composer {
             return;
         }
         match event {
-            LiveEvent::Sent { request_id, .. } => {
+            LiveEvent::Sent { request_id, .. }
+            | LiveEvent::SendSettled {
+                request_id,
+                accepted: true,
+                ..
+            } => {
                 if let Some((pending, revision)) = self.pending {
                     if pending == *request_id {
                         if self.revision == revision {
@@ -418,7 +538,12 @@ impl super::Composer {
                     }
                 }
             }
-            LiveEvent::SendFailed { request_id, .. } => {
+            LiveEvent::SendFailed { request_id, .. }
+            | LiveEvent::SendSettled {
+                request_id,
+                accepted: false,
+                ..
+            } => {
                 if self.pending.is_some_and(|(p, _)| p == *request_id) {
                     self.pending = None;
                 }
@@ -440,7 +565,9 @@ impl super::DraftBook {
             return;
         }
         match event {
-            LiveEvent::Sent { thread, .. } | LiveEvent::SendFailed { thread, .. } => {
+            LiveEvent::Sent { thread, .. }
+            | LiveEvent::SendFailed { thread, .. }
+            | LiveEvent::SendSettled { thread, .. } => {
                 if self.thread.as_deref() == Some(thread) {
                     self.active.apply_live(event, account_id)
                 } else if let Some(composer) = self.parked.get_mut(thread) {
@@ -595,7 +722,11 @@ impl super::Model {
                 self.status = diagnostic.to_string();
                 true
             }
-            LiveEvent::MessagesRefreshed { .. }
+            LiveEvent::PrivacyChanged { .. }
+            | LiveEvent::HiddenMatches { .. }
+            | LiveEvent::HiddenUnlockResult { .. }
+            | LiveEvent::SendSettled { .. }
+            | LiveEvent::MessagesRefreshed { .. }
             | LiveEvent::MessagesRefreshFailed { .. }
             | LiveEvent::SenderNames { .. }
             | LiveEvent::DirectoryPage { .. }

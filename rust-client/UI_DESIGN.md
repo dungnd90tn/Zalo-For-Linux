@@ -53,7 +53,19 @@ Hiện tại, mở `--live` tự gửi lệnh startup đến worker. Worker đ�
 
 Hủy/đăng xuất không tự chạy lại startup trong cửa sổ hiện tại. Generation loại bỏ kết quả cũ. Đăng nhập số điện thoại chưa hỗ trợ; tab hiện chỉ giải thích giới hạn, giữ lần QR đang chạy và cho phép hủy. Nhóm nút dưới QR có khung hữu hạn, căn cùng trục giữa với mã QR; thao tác chuyển tab không bắt đầu một phiên xác thực khác.
 
-Trạng thái Online chỉ đến từ xác thực transport, hiển thị bằng chấm cạnh avatar trên rail; không suy diễn online của từng người. Bấm avatar xem trạng thái, nguyên nhân lỗi an toàn và thao tác kết nối lại/mở hội thoại; phiên hết hạn hướng dẫn đăng xuất qua menu bánh răng. Không đặt banner trạng thái hoặc footer tài khoản/đăng xuất thường trực. Khi Offline, vẫn cho đọc cache, chọn liên hệ và soạn nháp. Lỗi batch lưu dữ liệu tạm dừng transport, giữ lịch sử/cursor và thao tác cục bộ.
+Trạng thái Online chỉ đến từ xác thực transport, hiển thị bằng chấm cạnh avatar trên rail; không suy diễn online của từng người. Bấm avatar xem trạng thái, nguyên nhân lỗi an toàn và thao tác kết nối lại/mở hội thoại; phiên hết hạn hướng dẫn đăng xuất qua menu bánh răng. Không đặt banner trạng thái hoặc footer tài khoản/đăng xuất thường trực. Khi Offline và đã xác minh quyền riêng tư trong worker hiện tại, vẫn cho đọc cache được phép, chọn liên hệ và soạn nháp. Lỗi batch lưu dữ liệu tạm dừng transport, giữ lịch sử/cursor và thao tác cục bộ.
+
+## Hội thoại ẩn trên Zalo
+
+Mỗi worker mới phải lấy thành công trạng thái hội thoại ẩn từ Zalo trước khi hiện tên, danh bạ, lịch sử hoặc ảnh. Khi chưa biết hoặc kiểm tra thất bại, chỉ vẽ một workspace trung tính sau rail, cả ở cửa sổ rộng và compact: Checking hiện “Đang xác minh…”, Failed hiện “Chưa xác minh được…”. Avatar giải thích trạng thái và cho thử lại; menu bánh răng vẫn dùng được. Không dùng snapshot cũ để mặc định hiện nội dung khi khởi động lại.
+
+Danh sách thường luôn bỏ hội thoại ẩn, kể cả khi đang mở khóa. Tìm theo tên/ID mới hiện ứng viên chỉ gồm tên công khai và glyph khóa; không preview, giờ hay số chưa đọc. Tên trống/ID thô dùng “Hội thoại ẩn”. Bấm ứng viên hoặc mở ID đã ẩn đều yêu cầu mã PIN Zalo có sẵn: đúng bốn chữ số ASCII, che ký tự, không lưu/log PIN hoặc verifier. Sai PIN không mở; Hủy vô hiệu cả yêu cầu đang chờ.
+
+Xác minh đúng chỉ mở hội thoại đang yêu cầu. Quay lại, đổi hội thoại/danh bạ, đóng worker hoặc hết phiên khóa lại; kết quả cũ không được mở lại nội dung. Xóa cache trình bày khi khóa nhưng giữ nháp, lịch sử thô, cursor và ACK/outbox; ACK tương ứng vẫn giải quyết lượt gửi cũ, không xóa phần sửa mới.
+
+Worker kiểm tra khi khởi động, lấy focus/thử lại và theo chu kỳ khoảng 30 giây sau lần kiểm tra hoàn tất. Thời điểm nhận thay đổi từ điện thoại còn phụ thuộc thời gian HTTP (deadline 15 giây), không bảo đảm cập nhật trong tối đa 30 giây. Refresh cùng policy giữ quyền đang mở; lỗi hoặc policy/PIN thay đổi thu hồi quyền. Policy/lease nằm trong RAM của Rust và SQLite TEMP memory; schema vẫn 7. PIN chỉ kiểm soát quyền hiển thị trong app, không mã hóa SQLite. Chưa hỗ trợ ẩn/bỏ ẩn, đổi/reset PIN hoặc kênh cập nhật tức thì từ client native.
+
+Kiểm thử synthetic UI và TLS loopback xác minh các nhánh tương tác, scope và storage; không thay thế kiểm chứng hidden/PIN trên tài khoản thật. Nguồn đối chiếu là hidden manager `EFQ6` (`_updateAllDataHidden`/`isKeyPIN`) trong `pc-dist/compact-app-pc.e08d0d44f38873747a6b.js`.
 
 ## Tin nhắn và danh tính
 
