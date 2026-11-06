@@ -24,6 +24,32 @@ The server's explicit QR flags select `PhoneApproved` or `TrustedDevice`. Phone 
 
 The messaging worker accepts only that opaque capability. HTTPS sends and WSS receives run outside the UI; SQLite work has its own worker. Outgoing delivery state is persisted, and uncertain sends are not silently retried. Account/thread/message IDs scope incoming deduplication and cursors. Unsupported media in a known legacy batch is represented by an explicit placeholder. E2EE/Signal queues are not consumed or acknowledged, and unknown wire formats fail closed without encryption downgrade. These implementations and local fixtures do not establish successful real-account operation.
 
+## Content, identity and schema evolution
+
+Schema eight stores full immutable rich-message source content separately from
+bounded rendering projections. `share.file` uses its own typed file descriptor;
+its HTTPS URL is offered only after an explicit click in the browser. The UI does
+not auto-download attachments, execute files, extract folders or decrypt E2EE
+files. Exact legacy placeholders can gain metadata only from matching replay or
+server-returned previews; a parser upgrade cannot recreate missing old payloads.
+
+The v6/v7→v8 migration rebuilds the media-kind CHECK constraint inside the existing
+SQLite transaction and copies every metadata/projection/preview byte unchanged.
+It preserves history, keys, foreign keys, outbox and receive cursors. Failure
+rolls back the table and version. Older binaries reject schema eight; there is no
+database downgrade path.
+
+Avatars use a maximum of 64 scoped directory point lookups per request and
+separate user/group identity keys. Own-profile metadata comes from the original
+`me-v2` endpoint as an optional final directory-sync step; it may wait for other
+requests and its failure does not change Online or hidden-policy readiness.
+The shared media pipeline decodes avatar images off the UI thread, capped at
+256 physical pixels with no upscaling. Worker cache limits remain 32 entries/
+16 MiB; avatar GPU payload is capped at 64 textures/4 MiB. Account/policy epochs,
+URL binding, cancellation and hidden-thread gates prevent stale images from
+crossing presentation scopes. Initials remain the fallback; these bounds and
+source contracts do not certify real-server avatar availability.
+
 ## Performance acceptance
 
 Measure release builds using the [validation procedure](VALIDATION.md). Require queue/cache limits to hold under synthetic load, deterministic deduplication after repeated delivery, pagination correctness when timestamps collide, and explicit behavior under queue saturation and cancellation. Use SQLite query plans to verify pagination uses its index rather than a temporary sorting table or full scan.

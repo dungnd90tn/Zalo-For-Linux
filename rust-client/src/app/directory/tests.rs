@@ -254,6 +254,14 @@ fn serve(
     let params: Value = serde_json::from_str(&parameters).unwrap();
     assert_eq!(params["imei"], "native-fixture");
     let data = match url.path() {
+        "/api/social/profile/me-v2" => {
+            assert_eq!(params["avatar_size"], 120);
+            assert_eq!(
+                url.query_pairs().find(|(key, _)| key == "os").unwrap().1,
+                "8"
+            );
+            json!({"profile":{"userId":"11","displayName":"Synthetic","avatar":"https://s120.avatar.talk.zdn.vn/self.png"}})
+        }
         "/api/social/friend/getfriends" => {
             assert_eq!(params["page"], 1);
             assert_eq!(params["count"], 20000);
@@ -521,8 +529,8 @@ async fn authenticated_preview_source_shapes_and_rejections_preserve_local_state
             );
             assert!(sink.store.page("11", "g:77", None, 10).unwrap().is_empty());
             assert_eq!(
-                sink.commits, 3,
-                "only friends and the two valid group pages may commit"
+                sink.commits, 4,
+                "only friends, the two valid group pages and self profile may commit"
             );
         }
         assert!(fixture
@@ -534,6 +542,7 @@ async fn authenticated_preview_source_shapes_and_rejections_preserve_local_state
             .all(|(path, _, _)| matches!(
                 path.as_str(),
                 "/api/social/friend/getfriends"
+                    | "/api/social/profile/me-v2"
                     | "/api/group/getlg/v3"
                     | "/api/preloadconvers/get-last-msgs"
             )));
@@ -569,6 +578,7 @@ async fn real_tls_discovery_commits_named_offline_cache_and_recent_messages_with
         (1, 2, 2)
     );
     assert!(report.completed_friends && report.completed_groups);
+    assert!(report.completed_profile);
     assert!(!report.completed_previews);
     assert_eq!(report.unsupported_encrypted, 1);
     assert_eq!(
@@ -595,7 +605,7 @@ async fn real_tls_discovery_commits_named_offline_cache_and_recent_messages_with
     assert_eq!(repeat.preview_messages, 2);
     assert_eq!(sink.store.page("11", "d:12", None, 100).unwrap().len(), 1);
     let requests = fixture.state.requests.lock().unwrap();
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 10);
     assert!(requests
         .iter()
         .all(|(_, _, cookie)| cookie == "zpw_sek=synthetic"));
@@ -617,7 +627,7 @@ async fn redirects_and_oversize_responses_are_partial_sanitized_failures_not_cac
             .synchronize(&fixture.session(), &mut sink, watch::channel(false).1)
             .await
             .unwrap();
-        assert_eq!(report.failures.len(), 3);
+        assert_eq!(report.failures.len(), 4);
         assert!(report.failures.iter().all(|f| f.category == category));
         assert_eq!(sink.commits, 0);
         for error in report.failures {

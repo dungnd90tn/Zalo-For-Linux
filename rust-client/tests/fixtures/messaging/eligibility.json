@@ -1,0 +1,432 @@
+{
+  "provenance": "Exact original getListUserE2eeWithPagination and source-extracted command 563 with synthetic responses. Logger arguments remain evaluated: missing/null first-page uids/pendingUids throw; later-page merge supplies defaults. Native strict type/resource/correlation rules are separate safety tests.",
+  "cases": [
+    {
+      "name": "terminal_flag_absent",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": [],
+          "pendingUids": []
+        }
+      ],
+      "accepted": true,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        }
+      ],
+      "result": {
+        "err": 0,
+        "threads": [],
+        "waitUids": [],
+        "uids": [],
+        "pendingUids": []
+      },
+      "failure": null
+    },
+    {
+      "name": "terminal_flag_null",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": [],
+          "pendingUids": [],
+          "hasMore": null
+        }
+      ],
+      "accepted": true,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        }
+      ],
+      "result": {
+        "err": 0,
+        "threads": [],
+        "waitUids": [],
+        "uids": [],
+        "pendingUids": [],
+        "hasMore": null
+      },
+      "failure": null
+    },
+    {
+      "name": "terminal_flag_zero",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": [],
+          "pendingUids": [],
+          "hasMore": 0
+        }
+      ],
+      "accepted": true,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        }
+      ],
+      "result": {
+        "err": 0,
+        "threads": [],
+        "waitUids": [],
+        "uids": [],
+        "pendingUids": [],
+        "hasMore": 0
+      },
+      "failure": null
+    },
+    {
+      "name": "terminal_flag_false",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": [],
+          "pendingUids": [],
+          "hasMore": false
+        }
+      ],
+      "accepted": true,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        }
+      ],
+      "result": {
+        "err": 0,
+        "threads": [],
+        "waitUids": [],
+        "uids": [],
+        "pendingUids": [],
+        "hasMore": false
+      },
+      "failure": null
+    },
+    {
+      "name": "first_uids_absent",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "pendingUids": []
+        }
+      ],
+      "accepted": false,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        }
+      ],
+      "result": null,
+      "failure": "TypeError"
+    },
+    {
+      "name": "first_uids_null",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": null,
+          "pendingUids": []
+        }
+      ],
+      "accepted": false,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        }
+      ],
+      "result": null,
+      "failure": "TypeError"
+    },
+    {
+      "name": "first_pending_absent",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": []
+        }
+      ],
+      "accepted": false,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        }
+      ],
+      "result": null,
+      "failure": "TypeError"
+    },
+    {
+      "name": "first_pending_null",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": [],
+          "pendingUids": null
+        }
+      ],
+      "accepted": false,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        }
+      ],
+      "result": null,
+      "failure": "TypeError"
+    },
+    {
+      "name": "second_optional_absent",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": [],
+          "pendingUids": [],
+          "hasMore": 1,
+          "lastId": 22
+        },
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": []
+        }
+      ],
+      "accepted": true,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        },
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 12,
+            "data": {
+              "reqIid": 1,
+              "lastId": 22,
+              "first": false
+            }
+          }
+        }
+      ],
+      "result": {
+        "err": 0,
+        "threads": [],
+        "waitUids": [],
+        "uids": [],
+        "pendingUids": []
+      },
+      "failure": null
+    },
+    {
+      "name": "two_pages_target_retained",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [
+            {
+              "uid": "22"
+            }
+          ],
+          "waitUids": [],
+          "uids": [],
+          "pendingUids": [],
+          "hasMore": true,
+          "lastId": 22
+        },
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": [],
+          "pendingUids": [],
+          "hasMore": 0
+        }
+      ],
+      "accepted": true,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        },
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 12,
+            "data": {
+              "reqIid": 1,
+              "lastId": 22,
+              "first": false
+            }
+          }
+        }
+      ],
+      "result": {
+        "err": 0,
+        "threads": [
+          {
+            "uid": "22"
+          }
+        ],
+        "waitUids": [],
+        "uids": [],
+        "pendingUids": [],
+        "hasMore": 0
+      },
+      "failure": null
+    },
+    {
+      "name": "string_false_is_truthy",
+      "pages": [
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": [],
+          "pendingUids": [],
+          "hasMore": "false",
+          "lastId": 22
+        },
+        {
+          "err": 0,
+          "threads": [],
+          "waitUids": [],
+          "uids": [],
+          "pendingUids": [],
+          "hasMore": 0
+        }
+      ],
+      "accepted": true,
+      "requests": [
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 11,
+            "data": {
+              "reqIid": 1,
+              "first": true
+            }
+          }
+        },
+        {
+          "cmd": 563,
+          "subCmd": 0,
+          "data": {
+            "reqId": 12,
+            "data": {
+              "reqIid": 1,
+              "lastId": 22,
+              "first": false
+            }
+          }
+        }
+      ],
+      "result": {
+        "err": 0,
+        "threads": [],
+        "waitUids": [],
+        "uids": [],
+        "pendingUids": [],
+        "hasMore": 0
+      },
+      "failure": null
+    }
+  ]
+}

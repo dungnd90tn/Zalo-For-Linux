@@ -11,20 +11,20 @@ const MAX_PROJECTION_BYTES: usize = MAX_MEDIA_DESCRIPTOR_BYTES;
 const MAX_PREVIEW_BYTES: usize = 4 * MAX_PREVIEW_CHARS;
 
 pub(super) fn initialize(conn: &Connection, version: i64) -> Result<()> {
-    // Rebuild only the v6 sidecar CHECK constraint, inside the caller's transaction.
+    // Extend the v6/v7 sidecar CHECK constraint inside the caller's transaction.
     // INSERT...SELECT retains the original immutable JSON and presentation bytes.
-    if version == 6 {
+    if version == 6 || version == 7 {
         conn.execute_batch("ALTER TABLE message_media RENAME TO message_media_v6;")?;
     }
     conn.execute_batch("CREATE TABLE IF NOT EXISTS message_media(
         account_id TEXT NOT NULL,thread_id TEXT NOT NULL,message_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK(kind IN ('chat.photo','chat.webcontent','chat.recommended','group.poll')),
+        kind TEXT NOT NULL CHECK(kind IN ('chat.photo','chat.webcontent','chat.recommended','group.poll','share.file')),
         metadata TEXT NOT NULL CHECK(length(CAST(metadata AS BLOB))<=4194304),
         projection TEXT NOT NULL CHECK(length(CAST(projection AS BLOB))<=16384),
         preview TEXT NOT NULL CHECK(length(CAST(preview AS BLOB))<=1024),
         PRIMARY KEY(account_id,thread_id,message_id),
         FOREIGN KEY(account_id,thread_id,message_id) REFERENCES messages(account_id,thread_id,message_id) ON DELETE CASCADE);")?;
-    if version == 6 {
+    if version == 6 || version == 7 {
         conn.execute_batch("INSERT INTO message_media(account_id,thread_id,message_id,kind,metadata,projection,preview)
             SELECT account_id,thread_id,message_id,kind,metadata,projection,preview FROM message_media_v6;
             DROP TABLE message_media_v6;")?;
@@ -237,6 +237,7 @@ mod tests {
             MediaKind::WebContent,
             MediaKind::Recommended,
             MediaKind::Poll,
+            MediaKind::File,
         ] {
             let mut store = MessageStore::in_memory().unwrap();
             let (m, content) = message(kind, "one");
@@ -578,7 +579,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            7
+            8
         );
     }
 
@@ -631,7 +632,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            7
+            8
         );
         for m in originals {
             assert_eq!(

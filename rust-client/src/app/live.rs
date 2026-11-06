@@ -2,7 +2,9 @@
 use super::SubmitError;
 pub use crate::app::directory::{DirectoryFailure, DirectoryReport};
 pub use crate::protocol::messaging::ThreadKind;
-pub use crate::store::directory::{DirectoryCursor, DirectoryRecord, SenderName, MAX_SENDER_NAMES};
+pub use crate::store::directory::{
+    AvatarIdentity, DirectoryCursor, DirectoryRecord, SenderName, MAX_AVATARS, MAX_SENDER_NAMES,
+};
 use crate::{
     domain::{Conversation, Cursor, Message, MAX_TEXT_BYTES},
     profile::Profile,
@@ -144,6 +146,10 @@ impl Drop for HiddenPin {
 
 #[derive(Debug)]
 pub enum LiveCommand {
+    ResolveAvatars {
+        generation: u64,
+        thread_ids: Vec<String>,
+    },
     RefreshPrivacy,
     SearchHidden {
         generation: u64,
@@ -196,6 +202,11 @@ pub enum LiveCommand {
 }
 #[derive(Debug)]
 pub enum LiveEvent {
+    Avatars {
+        account_id: String,
+        generation: u64,
+        avatars: Vec<AvatarIdentity>,
+    },
     PrivacyChanged {
         account_id: String,
         revision: u64,
@@ -324,7 +335,8 @@ pub enum LiveEvent {
 impl LiveEvent {
     pub fn account_id(&self) -> &str {
         match self {
-            Self::PrivacyChanged { account_id, .. }
+            Self::Avatars { account_id, .. }
+            | Self::PrivacyChanged { account_id, .. }
             | Self::HiddenMatches { account_id, .. }
             | Self::HiddenUnlockResult { account_id, .. }
             | Self::SendSettled { account_id, .. }
@@ -420,6 +432,12 @@ impl LiveWorker {
     pub fn submit(&self, command: LiveCommand) -> std::result::Result<(), SubmitError> {
         use crate::protocol::messaging::Target;
         let valid = match &command {
+            LiveCommand::ResolveAvatars { thread_ids, .. } => {
+                thread_ids.len() <= MAX_AVATARS
+                    && thread_ids
+                        .iter()
+                        .all(|thread| Target::from_thread(thread).is_ok())
+            }
             LiveCommand::RefreshPrivacy | LiveCommand::RelockHidden => true,
             LiveCommand::SearchHidden { query, .. } => {
                 query.chars().count() <= 128 && !query.chars().any(char::is_control)
@@ -722,7 +740,8 @@ impl super::Model {
                 self.status = diagnostic.to_string();
                 true
             }
-            LiveEvent::PrivacyChanged { .. }
+            LiveEvent::Avatars { .. }
+            | LiveEvent::PrivacyChanged { .. }
             | LiveEvent::HiddenMatches { .. }
             | LiveEvent::HiddenUnlockResult { .. }
             | LiveEvent::SendSettled { .. }
@@ -817,6 +836,34 @@ mod tests {
             message: message(),
             conversation: conversation(),
         }
+    }
+    #[test]
+    fn avatar_submit_is_bounded_and_only_accepts_typed_live_threads() {
+        let (worker, mut commands, _events) = LiveWorker::presentation_fixture("11");
+        for threads in [
+            vec!["d:22".into(); MAX_AVATARS + 1],
+            vec!["22".into()],
+            vec!["g:0".into()],
+        ] {
+            assert_eq!(
+                worker.submit(LiveCommand::ResolveAvatars {
+                    generation: 5,
+                    thread_ids: threads
+                }),
+                Err(SubmitError::Invalid)
+            );
+        }
+        assert!(commands.try_recv().is_err());
+        worker
+            .submit(LiveCommand::ResolveAvatars {
+                generation: 5,
+                thread_ids: vec!["d:11".into(), "g:22".into()],
+            })
+            .unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            LiveCommand::ResolveAvatars { generation: 5, .. }
+        ));
     }
     #[test]
     fn wrong_account_and_older_page_events_do_not_mutate_selected_pane() {

@@ -126,6 +126,9 @@ impl LoginView {
         let colors = crate::theme::palette(outer.ctx());
         let mut action = None;
         let compact = outer.available_height() < 600.0;
+        // 44 px controls when there is room; compact windows keep the 36 px rows so the QR,
+        // tabs and cancel action still fit a 640×480 window.
+        let button_height = if compact { 36.0 } else { 44.0 };
         let width = outer.available_width().min(410.0);
         let mut column = outer.new_child(
             egui::UiBuilder::new()
@@ -286,7 +289,9 @@ impl LoginView {
         }
         ui.add_space(if compact { 10.0 } else { 18.0 });
         if self.phone_tab {
-            if visuals::primary_button(ui, enabled, "Dùng mã QR", vec2(240.0, 36.0)).clicked() {
+            if visuals::primary_button(ui, enabled, "Dùng mã QR", vec2(240.0, button_height))
+                .clicked()
+            {
                 self.phone_tab = false;
             }
             if !matches!(self.phase, Phase::SignedOut | Phase::Failed) {
@@ -309,7 +314,7 @@ impl LoginView {
                 } else {
                     "Đăng nhập bằng mã QR"
                 },
-                vec2(240.0, 36.0),
+                vec2(240.0, button_height),
             )
             .clicked()
             {
@@ -343,14 +348,14 @@ impl LoginView {
                 action_width
             };
             ui.allocate_ui_with_layout(
-                vec2(group_width, 36.0),
+                vec2(group_width, button_height),
                 Layout::left_to_right(Align::Center),
                 |ui| {
                     if self.phase == Phase::WaitingForScan
                         && ui
                             .add_enabled_ui(enabled, |ui| {
                                 ui.add_sized(
-                                    vec2(action_width, 36.0),
+                                    vec2(action_width, button_height),
                                     egui::Button::new("Tạo mã mới"),
                                 )
                             })
@@ -362,7 +367,7 @@ impl LoginView {
                     if ui
                         .add_enabled_ui(enabled, |ui| {
                             ui.add_sized(
-                                vec2(action_width, 36.0),
+                                vec2(action_width, button_height),
                                 egui::Button::new("Hủy đăng nhập"),
                             )
                         })
@@ -402,6 +407,8 @@ mod tests {
     #[test]
     fn qr_action_groups_and_phone_cta_share_the_card_axis_at_native_scales() {
         for size in [vec2(640.0, 480.0), vec2(1200.0, 780.0)] {
+            // Compact windows keep 36 px controls; roomy ones use the redesign's 44 px.
+            let control_height = if size.y < 600.0 { 36.0 } else { 44.0 };
             for native_scale in [1.0, 1.5, 2.0] {
                 let ctx = egui::Context::default();
                 super::super::visuals::install(&ctx);
@@ -460,7 +467,7 @@ mod tests {
                             .iter()
                             .filter_map(|shape| match &shape.shape {
                                 egui::Shape::Rect(rect)
-                                    if rect.rect.size() == vec2(144.0, 36.0) =>
+                                    if rect.rect.size() == vec2(144.0, control_height) =>
                                 {
                                     Some(rect.rect)
                                 }
@@ -485,7 +492,7 @@ mod tests {
                             .iter()
                             .find_map(|shape| match &shape.shape {
                                 egui::Shape::Rect(rect)
-                                    if rect.rect.size() == vec2(240.0, 36.0) =>
+                                    if rect.rect.size() == vec2(240.0, control_height) =>
                                 {
                                     Some(rect.rect.center().x)
                                 }

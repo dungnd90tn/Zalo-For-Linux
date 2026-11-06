@@ -62,7 +62,7 @@ impl Settings {
                     } else if mode == ThemeMode::Custom {
                         self.custom(ui, theme);
                     } else {
-                        ui.label(RichText::new("Chọn Tùy chỉnh để thay màu; các chủ đề còn lại dùng đúng token gốc.").size(12.0).color(colors.text_secondary));
+                        ui.label(RichText::new("Chọn Tùy chỉnh để thay màu; Sáng và Tối dùng bảng màu thiết kế đã duyệt.").size(12.0).color(colors.text_secondary));
                     }
                 });
                     if let Some(error) = theme.persistence_error().or(self.error.as_deref()) {
@@ -105,11 +105,13 @@ impl Settings {
                     egui::vec2(ui.available_width(), 26.0),
                     egui::Sense::hover(),
                 );
+                let default_light = crate::theme::default_value(&token.name, false)
+                    .unwrap_or_else(|| token.light.clone());
                 let raw = theme
                     .overrides()
                     .get(&self.selected_token)
                     .map(String::as_str)
-                    .unwrap_or(&token.light);
+                    .unwrap_or(&default_light);
                 if gradient_preview(ui, rect, raw) {
                     // Shared background renderer shows the actual source/custom stop positions.
                 } else if let Some(color) = theme.color(&self.selected_token) {
@@ -119,7 +121,7 @@ impl Settings {
                 } else {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(&token.light)
+                            RichText::new(&default_light)
                                 .size(super::visuals::TEXT_SMALL)
                                 .color(colors.text_secondary),
                         )
@@ -193,7 +195,13 @@ impl Settings {
                             .frame(false),
                     );
                     let clicked = response.clicked();
-                    response.on_hover_text(format!("Sáng: {}\nTối: {}", token.light, token.dark));
+                    response.on_hover_text(format!(
+                        "Sáng: {}\nTối: {}",
+                        crate::theme::default_value(&token.name, false)
+                            .unwrap_or_else(|| token.light.clone()),
+                        crate::theme::default_value(&token.name, true)
+                            .unwrap_or_else(|| token.dark.clone())
+                    ));
                     if clicked {
                         self.selected_token = token.name.clone();
                         self.override_value = theme

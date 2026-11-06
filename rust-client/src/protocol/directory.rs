@@ -69,6 +69,10 @@ impl DirectoryRequest {
             .append_pair("zpw_ver", "681")
             .append_pair("zpw_type", client_type.api_type())
             .append_pair("params", encrypted);
+        if self.path == "/api/social/profile/me-v2" {
+            // Source getOSCode() returns8 for navigator.platform Linux (688250).
+            url.query_pairs_mut().append_pair("os", "8");
+        }
         if self.initial_friends {
             url.query_pairs_mut().append_pair("init", "1");
         }
@@ -80,6 +84,33 @@ fn device(imei: &str) -> Result<(), DirectoryError> {
         return Err(DirectoryError::Invalid);
     }
     Ok(())
+}
+/// Original getProfileMeV2 (bundle491758), consumed as data.profile (332565).
+pub fn self_profile_request(imei: &str) -> Result<DirectoryRequest, DirectoryError> {
+    device(imei)?;
+    Ok(DirectoryRequest {
+        service: DirectoryService::Profile,
+        path: "/api/social/profile/me-v2",
+        parameters: json!({"avatar_size":120,"imei":imei}),
+        initial_friends: false,
+    })
+}
+pub fn parse_self_profile(data: &Value, account: &str) -> Result<DirectoryEntry, DirectoryError> {
+    numeric_id(account).map_err(|_| DirectoryError::Invalid)?;
+    let profile = data.get("profile").ok_or(DirectoryError::Invalid)?;
+    let remote_id = id(profile.get("userId").ok_or(DirectoryError::Invalid)?)?;
+    if remote_id != account {
+        return Err(DirectoryError::Invalid);
+    }
+    Ok(DirectoryEntry {
+        kind: ThreadKind::Direct,
+        remote_id,
+        display_name: name(profile, "displayName")?,
+        avatar_url: avatar(profile.get("avatar")),
+        is_friend: None,
+        is_blocked: None,
+        member_count: None,
+    })
 }
 /// Bundle N398578–398591 requests one bounded full friend list, not guessed paging.
 pub fn friends_request(imei: &str) -> Result<DirectoryRequest, DirectoryError> {
@@ -172,7 +203,12 @@ fn flag(value: Option<&Value>, default: bool) -> Result<bool, DirectoryError> {
     }
 }
 fn avatar(value: Option<&Value>) -> Option<String> {
-    let text = value?.as_str().filter(|s| s.len() <= 2048)?;
+    avatar_url(value?.as_str()?)
+}
+pub fn avatar_url(text: &str) -> Option<String> {
+    if text.len() > 2048 || text.trim() != text || text.chars().any(char::is_control) {
+        return None;
+    }
     let url = Url::parse(text).ok()?;
     let host = url.host_str()?;
     let allowed = ["zalo.me", "zaloapp.com", "zdn.vn", "zadn.vn"]
@@ -291,6 +327,31 @@ pub fn parse_groups(data: &Value, page: u32) -> Result<GroupPage, DirectoryError
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_self_profile_is_bound_to_authenticated_user_and_linux_contract() {
+        let request = self_profile_request("native-fixture").unwrap();
+        assert_eq!(
+            request.parameters,
+            json!({"avatar_size":120,"imei":"native-fixture"})
+        );
+        let address = request
+            .encrypted_url(
+                &Url::parse("https://wpa.zaloapp.com/").unwrap(),
+                "synthetic",
+                ClientType::PcLinux24,
+            )
+            .unwrap();
+        assert_eq!(address.path(), "/api/social/profile/me-v2");
+        assert!(address
+            .query_pairs()
+            .any(|(key, value)| key == "os" && value == "8"));
+        let value = json!({"profile":{"userId":"11","displayName":"Tài khoản tổng hợp","avatar":"https://s120.avatar.talk.zdn.vn/self.png"},"biz":{"unknown":"retain"}});
+        let profile = parse_self_profile(&value, "11").unwrap();
+        assert_eq!(profile.thread_id(), "d:11");
+        assert!(profile.avatar_url.is_some());
+        assert!(parse_self_profile(&value, "22").is_err());
+        assert!(parse_self_profile(&value["profile"], "11").is_err());
+    }
     #[test]
     fn known_wire_requests_and_profile_normalization_are_bounded() {
         let friends = friends_request("synthetic-device").unwrap();
@@ -526,6 +587,7 @@ fn parse_previews_inner(
                             super::messaging::FrameMessageKind::Recommended
                         }
                         crate::domain::MediaKind::Poll => super::messaging::FrameMessageKind::Poll,
+                        crate::domain::MediaKind::File => super::messaging::FrameMessageKind::File,
                     }
                 } else if incoming.message.sticker.is_some() {
                     super::messaging::FrameMessageKind::Sticker

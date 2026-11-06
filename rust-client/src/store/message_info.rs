@@ -358,7 +358,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            7
+            8
         );
         assert_eq!(store.page("11", "g:22", None, 10).unwrap(), vec![m]);
         assert_eq!(store.page("11", "d:22", None, 10).unwrap(), vec![sticker]);

@@ -3,6 +3,10 @@ mod account;
 #[cfg(all(test, feature = "messaging"))]
 mod account_tests;
 #[cfg(feature = "messaging")]
+mod avatars;
+#[cfg(test)]
+mod conversation_tests;
+#[cfg(feature = "messaging")]
 mod delivery;
 mod dialog;
 #[cfg(feature = "messaging")]
@@ -27,6 +31,8 @@ mod privacy_native_fixture;
 mod privacy_tests;
 mod senders;
 mod settings;
+#[cfg(test)]
+mod shot_fixture;
 #[cfg(feature = "messaging")]
 mod stickers;
 mod visuals;
@@ -36,14 +42,15 @@ use crate::domain::{fold_search, Conversation, Message};
 use crate::profile::Profile;
 use eframe::egui::{self, pos2, vec2, Align, Align2, FontId, Layout, RichText, Sense, Stroke};
 use std::sync::Arc;
-use visuals::{avatar, divider, icon, icon_button, Icon};
+use visuals::{divider, icon, icon_button, Icon};
 
 // Original source dimensions are logical points, independent of window size and native DPI.
-const RAIL_WIDTH: f32 = 64.0;
+const RAIL_WIDTH: f32 = 68.0;
 const CONVERSATION_LIST_WIDTH: f32 = 344.0;
 const CONVERSATION_LIST_MIN_WIDTH: f32 = 280.0;
 const CONVERSATION_LIST_MAX_WIDTH: f32 = 420.0;
-const CHAT_HEADER_HEIGHT: f32 = 68.0;
+const CHAT_HEADER_HEIGHT: f32 = 76.0;
+const CONVERSATION_ROW_HEIGHT: f32 = 72.0;
 const CONVERSATION_INFO_WIDTH: f32 = 344.0;
 const MIN_CHAT_WIDTH_WITH_INFO: f32 = 360.0;
 const COMPACT_BREAKPOINT: f32 = 940.0;
@@ -242,6 +249,23 @@ impl NativeApp {
         } else {
             "Zalo"
         }
+    }
+    fn profile_avatar(&mut self, ui: &egui::Ui, rect: egui::Rect, title: &str, identity: &str) {
+        #[cfg(feature = "messaging")]
+        let texture = self.live.as_mut().and_then(|state| {
+            (state.account.is_some()
+                && state.privacy.ready()
+                && state.privacy.visible(identity)
+                && ui.is_rect_visible(rect))
+            .then(|| state.avatars.visible(ui.ctx(), identity))
+            .flatten()
+        });
+        #[cfg(not(feature = "messaging"))]
+        let texture: Option<egui::TextureHandle> = {
+            let _ = identity;
+            None
+        };
+        visuals::avatar_photo(ui, rect, title, texture.as_ref());
     }
     fn connection_label(&self) -> &str {
         #[cfg(feature = "live-login")]
@@ -546,27 +570,19 @@ impl NativeApp {
                             ui.allocate_exact_size(vec2(RAIL_WIDTH, 56.0), Sense::click())
                         })
                         .inner;
-                    if selected || response.hovered() || response.is_pointer_button_down_on() {
-                        let fill = if response.is_pointer_button_down_on() {
-                            colors.nav_pressed
-                        } else if selected {
-                            colors.nav_selected
-                        } else {
-                            colors.nav_hover
-                        };
-                        ui.painter().rect_filled(rect, 0.0, fill);
-                    }
+                    visuals::rail_button(ui, rect, &response, selected);
                     icon(
                         ui,
                         egui::Rect::from_center_size(rect.center(), vec2(24.0, 24.0)),
                         kind,
-                        if enabled {
-                            colors.nav_text
-                        } else {
+                        if !enabled {
                             colors.nav_text_disabled
+                        } else if selected {
+                            colors.on_color
+                        } else {
+                            colors.nav_text
                         },
                     );
-                    visuals::nav_focus_outline(ui, &response, rect);
                     if enabled && response.clicked() {
                         match kind {
                             Icon::Contacts => {
@@ -590,71 +606,84 @@ impl NativeApp {
                     response.on_hover_text(title).on_disabled_hover_text(title);
                 }
                 let bottom = ui.max_rect().bottom();
-                let y = (bottom - 118.0).max(ui.cursor().top() + 12.0);
+                let y = (bottom - 160.0).max(ui.cursor().top() + 12.0);
                 positioned_ui(
                     ui,
                     egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
                         pos2(ui.max_rect().left(), y),
-                        vec2(RAIL_WIDTH, 118.0),
+                        vec2(RAIL_WIDTH, 160.0),
                     )),
                     |ui| {
+                        // No original glyph exists for a light/dark switch, so the control
+                        // names the mode it selects instead of drawing a substitute symbol.
+                        let to_dark = !colors.dark;
                         let (rect, response) =
-                            ui.allocate_exact_size(vec2(RAIL_WIDTH, 46.0), Sense::click());
-                        if self.details
-                            || response.hovered()
-                            || response.is_pointer_button_down_on()
-                        {
-                            ui.painter().rect_filled(
-                                rect,
-                                0.0,
-                                if response.is_pointer_button_down_on() {
-                                    colors.nav_pressed
-                                } else if self.details {
-                                    colors.nav_selected
-                                } else {
-                                    colors.nav_hover
-                                },
-                            );
+                            ui.allocate_exact_size(vec2(RAIL_WIDTH, 52.0), Sense::click());
+                        visuals::rail_button(ui, rect, &response, false);
+                        ui.painter().text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            if to_dark { "Tối" } else { "Sáng" },
+                            FontId::new(
+                                visuals::TEXT_SMALL,
+                                egui::FontFamily::Name("Zalo Semibold".into()),
+                            ),
+                            colors.nav_text,
+                        );
+                        let theme_label = if to_dark {
+                            "Chuyển sang giao diện Tối"
+                        } else {
+                            "Chuyển sang giao diện Sáng"
+                        };
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                theme_label,
+                            )
+                        });
+                        if response.clicked() {
+                            self.theme.set_mode(if to_dark {
+                                crate::theme::ThemeMode::Dark
+                            } else {
+                                crate::theme::ThemeMode::Light
+                            });
                         }
+                        response.on_hover_text(format!(
+                            "{theme_label} · Hệ thống và Tùy chỉnh chọn trong Cài đặt"
+                        ));
+                        let (rect, response) =
+                            ui.allocate_exact_size(vec2(RAIL_WIDTH, 52.0), Sense::click());
+                        visuals::rail_button(ui, rect, &response, self.details);
                         icon(
                             ui,
                             egui::Rect::from_center_size(rect.center(), vec2(23.0, 23.0)),
                             Icon::Info,
-                            colors.nav_text,
+                            if self.details {
+                                colors.on_color
+                            } else {
+                                colors.nav_text
+                            },
                         );
-                        visuals::nav_focus_outline(ui, &response, rect);
                         if response.clicked() {
                             self.details = !self.details;
                         }
                         response.on_hover_text("Thông tin bản xem trước");
                         let (rect, response) =
-                            ui.allocate_exact_size(vec2(RAIL_WIDTH, 46.0), Sense::click());
-                        if self.settings_open
-                            || self.account_popup_is(account::PopupKind::Settings)
-                            || response.hovered()
-                            || response.is_pointer_button_down_on()
-                        {
-                            ui.painter().rect_filled(
-                                rect,
-                                0.0,
-                                if response.is_pointer_button_down_on() {
-                                    colors.nav_pressed
-                                } else if self.settings_open
-                                    || self.account_popup_is(account::PopupKind::Settings)
-                                {
-                                    colors.nav_selected
-                                } else {
-                                    colors.nav_hover
-                                },
-                            );
-                        }
+                            ui.allocate_exact_size(vec2(RAIL_WIDTH, 52.0), Sense::click());
+                        let settings_selected = self.settings_open
+                            || self.account_popup_is(account::PopupKind::Settings);
+                        visuals::rail_button(ui, rect, &response, settings_selected);
                         icon(
                             ui,
                             egui::Rect::from_center_size(rect.center(), vec2(23.0, 23.0)),
                             Icon::Settings,
-                            colors.nav_text,
+                            if settings_selected {
+                                colors.on_color
+                            } else {
+                                colors.nav_text
+                            },
                         );
-                        visuals::nav_focus_outline(ui, &response, rect);
                         self.prepare_account_popup_trigger(
                             account::PopupKind::Settings,
                             rect,
@@ -683,65 +712,75 @@ impl NativeApp {
         egui::Frame::none()
             .inner_margin(egui::Margin::symmetric(16.0, 16.0))
             .show(ui, |ui| {
+                #[cfg(feature = "messaging")]
+                let open_live = self
+                    .live
+                    .as_ref()
+                    .is_some_and(|state| state.account.is_some());
+                #[cfg(not(feature = "messaging"))]
+                let open_live = false;
                 ui.horizontal(|ui| {
-                    let search_width = (ui.available_width() - 40.0).max(100.0);
-                    egui::Frame::none()
-                        .fill(colors.canvas)
-                        .rounding(5.0)
-                        .inner_margin(egui::Margin::symmetric(9.0, 3.0))
-                        .show(ui, |ui| {
-                            ui.set_width(search_width - 18.0);
-                            ui.horizontal(|ui| {
-                                let (rect, _) =
-                                    ui.allocate_exact_size(vec2(16.0, 26.0), Sense::hover());
-                                icon(ui, rect, Icon::Search, colors.text_primary);
-                                let response = ui.add_sized(
-                                    [ui.available_width(), 26.0],
-                                    egui::TextEdit::singleline(&mut self.search)
-                                        .id_source("conversation_search")
-                                        .hint_text("Tìm kiếm")
-                                        .char_limit(256)
-                                        .frame(false)
-                                        .font(egui::TextStyle::Body),
-                                );
-                                if response.changed() {
-                                    self.search_folded = fold_search(&self.search);
-                                }
-                            });
-                        });
-                    #[cfg(feature = "messaging")]
-                    let open_live = self
-                        .live
-                        .as_ref()
-                        .is_some_and(|state| state.account.is_some());
-                    #[cfg(not(feature = "messaging"))]
-                    let open_live = false;
-                    if icon_button(
-                        ui,
-                        Icon::Plus,
-                        if open_live {
-                            "Mở hội thoại Zalo"
-                        } else {
-                            "Tạo hội thoại · chưa hỗ trợ trong bản xem trước"
-                        },
-                        open_live,
-                    )
-                    .clicked()
-                    {
-                        #[cfg(feature = "messaging")]
-                        if let Some(state) = &mut self.live {
-                            state.ensure_worker(self._profile.clone());
-                            state.open_dialog = true;
+                    ui.add(egui::Label::new(
+                        RichText::new("Tin nhắn")
+                            .size(visuals::TEXT_HEADING)
+                            .family(egui::FontFamily::Name("Zalo Semibold".into())),
+                    ));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(
+                            ui,
+                            Icon::Plus,
+                            if open_live {
+                                "Mở hội thoại Zalo"
+                            } else {
+                                "Tạo hội thoại · chưa hỗ trợ trong bản xem trước"
+                            },
+                            open_live,
+                        )
+                        .clicked()
+                        {
+                            #[cfg(feature = "messaging")]
+                            if let Some(state) = &mut self.live {
+                                state.ensure_worker(self._profile.clone());
+                                state.open_dialog = true;
+                            }
                         }
-                    }
+                    });
                 });
-                ui.add_space(13.0);
+                ui.add_space(12.0);
+                egui::Frame::none()
+                    .fill(colors.canvas)
+                    .stroke(Stroke::new(1.0_f32, colors.border))
+                    .rounding(12.0)
+                    .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(16.0, 26.0), Sense::hover());
+                            icon(ui, rect, Icon::Search, colors.text_secondary);
+                            let response = ui.add_sized(
+                                [ui.available_width(), 26.0],
+                                egui::TextEdit::singleline(&mut self.search)
+                                    .id_source("conversation_search")
+                                    .hint_text("Tìm kiếm")
+                                    .char_limit(256)
+                                    .frame(false)
+                                    .font(egui::TextStyle::Body),
+                            );
+                            if response.changed() {
+                                self.search_folded = fold_search(&self.search);
+                            }
+                        });
+                    });
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Tất cả")
-                            .color(colors.primary)
-                            .family(egui::FontFamily::Name("Zalo Semibold".into()))
-                            .size(13.0),
+                    visuals::chip(ui, "Tất cả", true, true, "Tất cả hội thoại");
+                    visuals::chip(
+                        ui,
+                        "Chưa đọc",
+                        false,
+                        false,
+                        "Chưa hỗ trợ: bản xem trước chưa lưu trạng thái chưa đọc",
                     );
                     let count = self
                         .model
@@ -762,7 +801,7 @@ impl NativeApp {
                     let label =
                         format!("{count} hội thoại{}", if self.demo { " demo" } else { "" });
                     let (count_rect, response) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+                        ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
                     ui.painter().text(
                         count_rect.right_center(),
                         Align2::RIGHT_CENTER,
@@ -797,6 +836,19 @@ impl NativeApp {
                         continue;
                     }
                     matches += 1;
+                    #[cfg(feature = "messaging")]
+                    let texture = self.live.as_mut().and_then(|state| {
+                        (state.account.is_some()
+                            && state.privacy.ready()
+                            && ui.is_rect_visible(egui::Rect::from_min_size(
+                                ui.cursor().min,
+                                vec2(width, CONVERSATION_ROW_HEIGHT),
+                            )))
+                        .then(|| state.avatars.visible(ui.ctx(), &thread.id))
+                        .flatten()
+                    });
+                    #[cfg(not(feature = "messaging"))]
+                    let texture: Option<egui::TextureHandle> = None;
                     if conversation_row(
                         ui,
                         width,
@@ -804,6 +856,7 @@ impl NativeApp {
                         &title,
                         self.model.selected.as_deref() == Some(&thread.id),
                         self.account_id(),
+                        texture.as_ref(),
                     )
                     .clicked()
                     {
@@ -881,12 +934,12 @@ impl NativeApp {
         );
         visuals::background(ui, rect, "--layer-background", colors.surface);
         divider(ui, rect.left_bottom(), rect.right_bottom());
-        let actions_width = if rect.width() < 490.0 { 42.0 } else { 140.0 };
-        let mut left = rect.left() + 20.0;
+        let actions_width = if rect.width() < 490.0 { 48.0 } else { 152.0 };
+        let mut left = rect.left() + 24.0;
         if compact {
             let back = egui::Rect::from_min_size(
-                pos2(rect.left() + 10.0, rect.top() + 18.0),
-                vec2(28.0, 32.0),
+                pos2(rect.left() + 10.0, rect.top() + 16.0),
+                vec2(28.0, 44.0),
             );
             let response = ui.interact(back, ui.id().with("back_to_threads"), Sense::click());
             if response.hovered() || response.is_pointer_button_down_on() {
@@ -930,12 +983,13 @@ impl NativeApp {
             })
             .map(display_title)
             .unwrap_or_else(|| "Zalo Native".into());
-        let photo = egui::Rect::from_min_size(pos2(left, rect.top() + 13.0), vec2(42.0, 42.0));
-        avatar(ui, photo, &title);
+        let photo = egui::Rect::from_min_size(pos2(left, rect.top() + 16.0), vec2(44.0, 44.0));
+        let identity = self.model.selected.clone().unwrap_or_default();
+        self.profile_avatar(ui, photo, &title, &identity);
         positioned_ui(
             ui,
             egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(
-                pos2(left + 55.0, rect.top() + 12.0),
+                pos2(left + 58.0, rect.top() + 15.0),
                 pos2(rect.right() - actions_width - 10.0, rect.bottom() - 10.0),
             )),
             |ui| {
@@ -972,8 +1026,8 @@ impl NativeApp {
             ui,
             egui::UiBuilder::new()
                 .max_rect(egui::Rect::from_min_size(
-                    pos2(rect.right() - actions_width - 12.0, rect.top() + 18.0),
-                    vec2(actions_width, 34.0),
+                    pos2(rect.right() - actions_width - 12.0, rect.top() + 16.0),
+                    vec2(actions_width, 44.0),
                 ))
                 .layout(Layout::right_to_left(Align::Center)),
             |ui| {
@@ -1033,9 +1087,16 @@ impl NativeApp {
             && !self.modal_open()
             && (self.demo || self.is_signed_in())
             && self.model.selected.is_some();
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-        visuals::background(ui, rect, "--layer-background", colors.surface);
-        divider(ui, rect.left_top(), rect.right_top());
+        let (outer, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+        // The composer is a rounded card floating on the chat canvas: toolbar on top, editor
+        // and send control below.
+        let rect = egui::Rect::from_min_max(
+            pos2(outer.left() + 24.0, outer.top() + 8.0),
+            pos2(outer.right() - 24.0, outer.bottom() - 16.0),
+        );
+        ui.painter().rect_filled(rect, 16.0, colors.surface);
+        ui.painter()
+            .rect_stroke(rect, 16.0, Stroke::new(1.0_f32, colors.border_strong));
         let mut send = false;
         let ime_active = self.ime_composing
             || ctx.input(|input| {
@@ -1046,7 +1107,7 @@ impl NativeApp {
             });
         positioned_ui(
             ui,
-            egui::UiBuilder::new().max_rect(rect.shrink2(vec2(18.0, 8.0))),
+            egui::UiBuilder::new().max_rect(rect.shrink2(vec2(8.0, 4.0))),
             |ui| {
                 ui.horizontal(|ui| {
                     icon_button(
@@ -1067,23 +1128,28 @@ impl NativeApp {
                         "Đính kèm · chưa hỗ trợ trong bản xem trước",
                         false,
                     );
-                    if self.demo {
+                    if rect.width() >= 480.0 {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(8.0);
                             ui.label(
-                                RichText::new("CHỈ LƯU CỤC BỘ")
-                                    .size(visuals::TEXT_SMALL)
-                                    .color(colors.text_secondary),
+                                RichText::new(if self.demo {
+                                    "CHỈ LƯU CỤC BỘ · Enter để lưu · Ctrl+Enter xuống dòng"
+                                } else {
+                                    "Enter để gửi · Ctrl+Enter để xuống dòng"
+                                })
+                                .size(visuals::TEXT_SMALL)
+                                .color(colors.text_secondary),
                             );
                         });
                     }
                 });
                 let send_rect = egui::Rect::from_min_size(
-                    pos2(rect.right() - 102.0, rect.top() + 51.0),
-                    vec2(82.0, 38.0),
+                    pos2(rect.right() - 12.0 - 72.0, rect.bottom() - 10.0 - 44.0),
+                    vec2(72.0, 44.0),
                 );
                 let editor_rect = egui::Rect::from_min_max(
-                    pos2(rect.left() + 20.0, rect.top() + 48.0),
-                    pos2(send_rect.left() - 14.0, rect.bottom() - 20.0),
+                    pos2(rect.left() + 16.0, rect.top() + 52.0),
+                    pos2(send_rect.left() - 12.0, rect.bottom() - 10.0),
                 );
                 positioned_ui(ui, egui::UiBuilder::new().max_rect(editor_rect), |ui| {
                     // Cursor, undo, and provisional IME selection belong to this draft.
@@ -1092,15 +1158,41 @@ impl NativeApp {
                         self.account_id(),
                         self.model.selected.as_deref(),
                     ));
-                    // Consume the shortcut before TextEdit can turn Enter into a newline.
-                    if enabled && !ime_active
-                        && ctx.memory(|memory| memory.has_focus(composer_id))
-                        && ctx.input(|input| input.events.iter().any(|event| matches!(event,egui::Event::Key {key:egui::Key::Enter,pressed:true,repeat:false,modifiers,..} if modifiers.matches_logically(egui::Modifiers::COMMAND))))
-                        && ctx.input_mut(|input| {
-                            input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)
-                        })
-                    {
-                        send = true;
+                    // Enter sends; Ctrl+Enter and Shift+Enter insert a line break. Handle both before
+                    // TextEdit sees them: a plain Enter is swallowed here (it never becomes a
+                    // newline) and a modified Enter is handed on as the plain key TextEdit turns
+                    // into "\n". Nothing sends while an input method is composing, in the same
+                    // frame as a commit, or for a held (repeating) key.
+                    if enabled && ctx.memory(|memory| memory.has_focus(composer_id)) {
+                        ctx.input_mut(|input| {
+                            input.events.retain_mut(|event| {
+                                let egui::Event::Key {
+                                    key: egui::Key::Enter,
+                                    pressed: true,
+                                    repeat,
+                                    modifiers,
+                                    ..
+                                } = event
+                                else {
+                                    return true;
+                                };
+                                if modifiers.command || modifiers.ctrl || modifiers.shift {
+                                    // Line break: no newline while composing (the IME owns Enter).
+                                    if ime_active {
+                                        return false;
+                                    }
+                                    *modifiers = egui::Modifiers::NONE;
+                                    return true;
+                                }
+                                if modifiers.is_none() {
+                                    if !*repeat && !ime_active {
+                                        send = true;
+                                    }
+                                    return false;
+                                }
+                                true
+                            });
+                        });
                     }
                     ui.set_clip_rect(ui.clip_rect().intersect(editor_rect));
                     let response = egui::ScrollArea::vertical()
@@ -1124,6 +1216,8 @@ impl NativeApp {
                             )
                         })
                         .inner;
+                    let response =
+                        response.on_hover_text("Enter để gửi · Ctrl+Enter để xuống dòng");
                     if response.changed() {
                         self.drafts.active.edited();
                         #[cfg(feature = "messaging")]
@@ -1157,19 +1251,22 @@ impl NativeApp {
                 } else {
                     colors.primary
                 };
-                ui.painter().rect_filled(send_rect, 8.0, send_fill);
+                ui.painter().rect_filled(send_rect, 12.0, send_fill);
                 ui.painter().text(
                     send_rect.center(),
                     Align2::CENTER_CENTER,
                     if self.demo { "Lưu" } else { "Gửi" },
-                    FontId::proportional(13.0),
+                    FontId::new(
+                        visuals::TEXT_BODY,
+                        egui::FontFamily::Name("Zalo Semibold".into()),
+                    ),
                     if can_send {
                         colors.button_primary_text
                     } else {
                         colors.text_placeholder
                     },
                 );
-                visuals::focus_outline(ui, &response, send_rect, 8.0);
+                visuals::focus_outline(ui, &response, send_rect, 12.0);
                 if response.clicked() {
                     send = true;
                 }
@@ -1186,24 +1283,11 @@ impl NativeApp {
                 };
                 response
                     .on_hover_text(if self.demo {
-                        "Lưu tin nhắn vào demo trên máy này · Ctrl+Enter"
+                        "Lưu tin nhắn vào demo trên máy này · Enter"
                     } else {
-                        "Gửi tin nhắn tới Zalo · Ctrl+Enter"
+                        "Gửi tin nhắn tới Zalo · Enter"
                     })
                     .on_disabled_hover_text(unavailable);
-                if height > 110.0 {
-                    ui.painter().text(
-                        pos2(rect.left() + 20.0, rect.bottom() - 13.0),
-                        Align2::LEFT_BOTTOM,
-                        if self.demo {
-                            "Ctrl+Enter để lưu · Enter để xuống dòng"
-                        } else {
-                            "Ctrl+Enter để gửi · Enter để xuống dòng"
-                        },
-                        FontId::proportional(visuals::TEXT_SMALL),
-                        colors.text_secondary,
-                    );
-                }
             },
         );
         if send {
@@ -1220,11 +1304,8 @@ impl NativeApp {
         if self.modal_blocked || self.modal_open() {
             ui.disable();
         }
-        let composer_height = if ui.available_height() < 340.0 {
-            100.0
-        } else {
-            132.0
-        };
+        let composer_height =
+            composer_height(ui.available_height(), &self.drafts.active.text, compact);
         let status = timeline_status(
             &self.model.status,
             self.model.pending,
@@ -1322,11 +1403,20 @@ impl NativeApp {
                                     // Own the small label before independently borrowing the texture cache.
                                     let sender_name=sender.name.to_owned();let sender_avatar=sender.avatar.to_owned();
                                     #[cfg(feature = "messaging")]
+                                    let avatar_texture = self.live.as_mut().and_then(|state| {
+                                        let identity = format!("d:{}",message.sender);
+                                        (state.privacy.ready() && state.privacy.visible(&identity)
+                                            && ui.is_rect_visible(egui::Rect::from_min_size(ui.cursor().min,vec2(30.0,30.0))))
+                                            .then(||state.avatars.visible(ui.ctx(), &identity)).flatten()
+                                    });
+                                    #[cfg(not(feature = "messaging"))]
+                                    let avatar_texture: Option<egui::TextureHandle> = None;
+                                    #[cfg(feature = "messaging")]
                                     let (sticker_cache,media_cache) = match self.live.as_mut() {
                                         Some(state) if state.account.is_some() => (Some(&mut state.stickers),Some(&mut state.media)),
                                         _ => (None,None),
                                     };
-                                    message_bubble(ui, message, compact, own_account.as_deref(), &sender_name,&sender_avatar,
+                                    message_bubble(ui, message, compact, own_account.as_deref(), &sender_name,&sender_avatar,avatar_texture.as_ref(),
                                         #[cfg(feature = "messaging")]
                                         sticker_cache,
                                         #[cfg(feature = "messaging")]
@@ -1633,11 +1723,11 @@ impl NativeApp {
         );
         let close = egui::Rect::from_min_size(
             if compact {
-                header.left_top() + vec2(12.0, 18.0)
+                header.left_top() + vec2(12.0, 16.0)
             } else {
-                header.right_top() + vec2(-44.0, 18.0)
+                header.right_top() + vec2(-56.0, 16.0)
             },
-            vec2(32.0, 32.0),
+            vec2(44.0, 44.0),
         );
         let response = ui.interact(
             close,
@@ -1647,7 +1737,7 @@ impl NativeApp {
         if response.hovered() || response.is_pointer_button_down_on() {
             ui.painter().rect_filled(
                 close,
-                4.0,
+                12.0,
                 if response.is_pointer_button_down_on() {
                     colors.pressed
                 } else {
@@ -1656,11 +1746,11 @@ impl NativeApp {
             );
         }
         if compact {
-            icon(ui, close.shrink(7.0), Icon::Back, colors.text_secondary);
+            icon(ui, close.shrink(12.0), Icon::Back, colors.text_secondary);
         } else {
-            visuals::source_icon(ui, close.shrink(7.0), "fa-close", colors.text_secondary);
+            visuals::source_icon(ui, close.shrink(12.0), "fa-close", colors.text_secondary);
         }
-        visuals::focus_outline(ui, &response, close, 4.0);
+        visuals::focus_outline(ui, &response, close, 12.0);
         if response.clicked() {
             self.conversation_details = None;
             self.focus_composer = true;
@@ -1676,7 +1766,7 @@ impl NativeApp {
                     ui.add_space(8.0);
                     ui.vertical_centered(|ui| {
                         let (rect, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
-                        avatar(ui, rect, &title);
+                        self.profile_avatar(ui, rect, &title, &thread.id);
                         ui.add_space(8.0);
                         ui.add(
                             egui::Label::new(
@@ -1814,6 +1904,19 @@ fn timeline_status<'a>(
     }
 }
 
+fn composer_height(available_height: f32, draft: &str, compact: bool) -> f32 {
+    // The card holds a 44px toolbar above the editor and send control.
+    // Keep the compact geometry; expand only for a multiline draft.
+    if !compact
+        && available_height >= 340.0
+        && draft.bytes().filter(|byte| *byte == b'\n').take(2).count() >= 2
+    {
+        168.0
+    } else {
+        136.0
+    }
+}
+
 fn conversation_row(
     ui: &mut egui::Ui,
     width: f32,
@@ -1821,13 +1924,22 @@ fn conversation_row(
     title: &str,
     selected: bool,
     account: Option<&str>,
+    texture: Option<&egui::TextureHandle>,
 ) -> egui::Response {
     let colors = crate::theme::palette(ui.ctx());
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 79.0), Sense::click());
+    let (rect, _) = ui.allocate_exact_size(vec2(width, CONVERSATION_ROW_HEIGHT), Sense::hover());
+    let response = ui.interact(
+        rect,
+        ui.id().with(("conversation", account, &thread.id)),
+        Sense::click(),
+    );
+    if response.clicked() {
+        response.request_focus();
+    }
     if selected || response.hovered() || response.is_pointer_button_down_on() {
         ui.painter().rect_filled(
-            rect.shrink2(vec2(8.0, 4.0)),
-            6.0,
+            rect.shrink2(vec2(8.0, 2.0)),
+            14.0,
             if response.is_pointer_button_down_on() {
                 colors.pressed
             } else if selected {
@@ -1837,96 +1949,99 @@ fn conversation_row(
             },
         );
     }
-    visuals::focus_outline(ui, &response, rect.shrink2(vec2(8.0, 4.0)), 6.0);
-    let photo = egui::Rect::from_min_size(rect.min + vec2(17.0, 14.0), vec2(48.0, 48.0));
-    avatar(ui, photo, title);
+    visuals::focus_outline(ui, &response, rect.shrink2(vec2(8.0, 2.0)), 14.0);
+    let photo = egui::Rect::from_min_size(rect.min + vec2(20.0, 12.0), vec2(48.0, 48.0));
+    visuals::avatar_photo(ui, photo, title, texture);
     let content =
-        egui::Rect::from_min_max(rect.min + vec2(78.0, 15.0), rect.max - vec2(18.0, 12.0));
-    positioned_ui(ui, egui::UiBuilder::new().max_rect(content), |ui| {
-        ui.spacing_mut().item_spacing.y = 7.0;
-        positioned_ui(
-            ui,
-            egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
-                content.min,
-                vec2(content.width() - 40.0, 23.0),
-            )),
-            |ui| {
-                ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(title)
-                            .size(visuals::TEXT_BODY)
-                            .family(egui::FontFamily::Name("Zalo Semibold".into())),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(title);
-            },
-        );
-        ui.painter().text(
-            content.right_top() + vec2(0.0, 4.0),
-            Align2::RIGHT_TOP,
-            clock_label(thread.last_message_at_ms),
-            FontId::proportional(visuals::TEXT_SMALL),
-            colors.text_secondary,
-        );
-        let preview = if thread.last_text.is_empty() {
-            "Chưa có tin nhắn".into()
-        } else if is_own_sender(&thread.last_sender, account) {
-            format!("Bạn: {}", thread.last_text)
+        egui::Rect::from_min_max(rect.min + vec2(80.0, 15.0), rect.max - vec2(20.0, 12.0));
+    // The complete card is one widget. Child Labels create competing pointer
+    // regions, so painting text keeps preview/title/avatar/padding on this hitbox.
+    row_text(
+        ui,
+        content.min,
+        (content.width() - 40.0).max(0.0),
+        title,
+        FontId::new(
+            visuals::TEXT_BODY,
+            egui::FontFamily::Name("Zalo Semibold".into()),
+        ),
+        if ui.is_enabled() {
+            colors.text_primary
         } else {
-            thread.last_text.clone()
-        };
-        positioned_ui(
-            ui,
-            egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(
-                content.min + vec2(0.0, 30.0),
-                content.max + vec2(0.0, 5.0),
-            )),
-            |ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(preview.replace(['\n', '\r'], " "))
-                            .size(visuals::TEXT_SMALL)
-                            .color(colors.text_secondary),
-                    )
-                    .truncate(),
-                );
-            },
-        );
+            colors.text_disabled
+        },
+    );
+    ui.painter().text(
+        content.right_top() + vec2(0.0, 4.0),
+        Align2::RIGHT_TOP,
+        clock_label(thread.last_message_at_ms),
+        FontId::proportional(visuals::TEXT_SMALL),
+        colors.text_secondary,
+    );
+    let preview = if thread.last_text.is_empty() {
+        "Chưa có tin nhắn".into()
+    } else if is_own_sender(&thread.last_sender, account) {
+        format!("Bạn: {}", thread.last_text)
+    } else {
+        thread.last_text.clone()
+    };
+    row_text(
+        ui,
+        content.min + vec2(0.0, 26.0),
+        content.width().max(0.0),
+        &preview.replace(['\n', '\r'], " "),
+        FontId::proportional(visuals::TEXT_SMALL),
+        if ui.is_enabled() {
+            colors.text_secondary
+        } else {
+            colors.text_disabled
+        },
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            title,
+        )
     });
-    response
+    response.on_hover_text(title)
+}
+
+fn row_text(
+    ui: &egui::Ui,
+    position: egui::Pos2,
+    width: f32,
+    text: &str,
+    font: FontId,
+    color: egui::Color32,
+) {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap.max_width = width;
+    job.wrap.max_rows = 1;
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(position, galley, color);
 }
 
 fn date_separator(ui: &mut egui::Ui, milliseconds: i64) {
     let colors = crate::theme::palette(ui.ctx());
     let text = date_label(milliseconds);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text, FontId::proportional(13.0), colors.date_text);
+    let galley = ui.painter().layout_no_wrap(
+        text,
+        FontId::new(
+            visuals::TEXT_SMALL,
+            egui::FontFamily::Name("Zalo Semibold".into()),
+        ),
+        colors.date_text,
+    );
     let (row, _) = ui.allocate_exact_size(
-        vec2(ui.available_width(), galley.size().y + 5.0),
+        vec2(ui.available_width(), galley.size().y + 14.0),
         Sense::hover(),
     );
-    let pill = egui::Rect::from_center_size(row.center(), galley.size() + vec2(20.0, 5.0));
-    let line = Stroke::new(1.0_f32, colors.date_background);
-    ui.painter().line_segment(
-        [
-            pos2(row.left() + 30.0, row.center().y),
-            pos2(pill.left(), row.center().y),
-        ],
-        line,
-    );
-    ui.painter().line_segment(
-        [
-            pos2(pill.right(), row.center().y),
-            pos2(row.right() - 30.0, row.center().y),
-        ],
-        line,
-    );
-    ui.painter().rect_filled(pill, 10.0, colors.date_background);
+    let pill = egui::Rect::from_center_size(row.center(), galley.size() + vec2(24.0, 8.0));
+    ui.painter().rect_filled(pill, 12.0, colors.date_background);
     ui.painter()
-        .galley(pill.min + vec2(10.0, 2.0), galley, colors.date_text);
+        .galley(pill.min + vec2(12.0, 4.0), galley, colors.date_text);
 }
 
 fn is_own_sender(sender: &str, account: Option<&str>) -> bool {
@@ -1941,13 +2056,73 @@ fn message_bubble(
     account: Option<&str>,
     sender_name: &str,
     sender_avatar: &str,
+    avatar_texture: Option<&egui::TextureHandle>,
     #[cfg(feature = "messaging")] sticker_cache: Option<&mut stickers::StickerCache>,
     #[cfg(feature = "messaging")] media_cache: Option<&mut media::MediaCache>,
     generation: u64,
 ) {
     let colors = crate::theme::palette(ui.ctx());
     let own = is_own_sender(&message.sender, account);
-    let max_bubble = (ui.available_width() * if compact { 0.82 } else { 0.76 }).min(490.0);
+    // Own plain text gets the solid accent bubble with on-color text. Media, stickers and cards
+    // draw their own labels in the standard text roles, so they keep the surface bubble.
+    let accent = own && message.media.is_none() && message.sticker.is_none();
+    let ink = if accent {
+        colors.on_color
+    } else {
+        colors.text_primary
+    };
+    let available = ui.available_width();
+    let outside = 24.0
+        + if own {
+            0.0
+        } else {
+            30.0 + ui.spacing().item_spacing.x
+        };
+    let max_bubble = (available * if compact { 0.82 } else { 0.76 })
+        .min(490.0)
+        .min((available - outside).max(1.0));
+    let body = (message.media.is_none() && message.sticker.is_none()).then(|| {
+        ui.painter().layout(
+            message.text.clone(),
+            FontId::proportional(visuals::TEXT_MESSAGE),
+            ink,
+            max_bubble,
+        )
+    });
+    let content_width = body
+        .as_ref()
+        .map(|body| {
+            let sender_width = if own {
+                0.0
+            } else {
+                ui.painter()
+                    .layout_no_wrap(
+                        sender_name.into(),
+                        FontId::proportional(visuals::TEXT_SMALL),
+                        colors.text_secondary,
+                    )
+                    .size()
+                    .x
+                    .min(max_bubble)
+            };
+            let (time, status) = status_galleys(
+                ui,
+                message.sent_at_ms,
+                own,
+                account.is_some(),
+                colors.text_secondary,
+            );
+            let status_width = time.size().x
+                + status.as_ref().map_or(0.0, |status| {
+                    ui.spacing().item_spacing.x * 2.0 + 12.0 + status.size().x
+                });
+            body.size()
+                .x
+                .max(sender_width)
+                .max(status_width)
+                .min(max_bubble)
+        })
+        .unwrap_or(max_bubble);
     ui.with_layout(
         if own {
             Layout::right_to_left(Align::Min)
@@ -1957,19 +2132,32 @@ fn message_bubble(
         |ui| {
             if !own {
                 let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-                avatar(ui, rect, sender_avatar);
+                visuals::avatar_photo(ui, rect, sender_avatar, avatar_texture);
             }
             egui::Frame::none()
-                .fill(if own {
+                .fill(if accent {
                     colors.bubble_own
                 } else {
                     colors.bubble_incoming
                 })
-                .stroke(Stroke::new(0.65_f32, colors.border))
-                .rounding(8.0)
-                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                .stroke(if accent {
+                    Stroke::NONE
+                } else {
+                    Stroke::new(1.0_f32, colors.border)
+                })
+                .rounding(egui::Rounding {
+                    nw: 18.0,
+                    ne: 18.0,
+                    sw: if own { 18.0 } else { 4.0 },
+                    se: if own { 4.0 } else { 18.0 },
+                })
+                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                 .show(ui, |ui| {
-                    ui.set_max_width(max_bubble);
+                    // A right-to-left frame starts with its minimum rectangle at
+                    // the right edge. Give plain content its measured width before
+                    // entering a top-down layout, so that origin cannot reserve
+                    // the entire maximum bubble width for a short message.
+                    ui.set_max_width(content_width);
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 5.0;
                         if !own {
@@ -1977,7 +2165,8 @@ fn message_bubble(
                                 egui::Label::new(
                                     RichText::new(sender_name)
                                         .size(visuals::TEXT_SMALL)
-                                        .color(colors.text_secondary),
+                                        .family(egui::FontFamily::Name("Zalo Semibold".into()))
+                                        .color(colors.text_tertiary),
                                 )
                                 .truncate(),
                             )
@@ -2032,41 +2221,84 @@ fn message_bubble(
                                 let _ = sticker;
                                 sticker_placeholder(ui, "Nhãn dán");
                             }
+                        } else if let Some(body) = &body {
+                            ui.add(egui::Label::new(body.clone()));
                         } else {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(&message.text)
                                         .size(visuals::TEXT_MESSAGE)
-                                        .color(colors.text_primary),
+                                        .color(ink),
                                 )
                                 .wrap(),
                             );
                         }
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(clock_label(message.sent_at_ms))
-                                    .size(visuals::TEXT_SMALL)
-                                    .color(colors.text_secondary),
-                            );
-                            if own {
-                                let (rect, _) =
-                                    ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
-                                icon(ui, rect, Icon::Check, colors.text_secondary);
-                                ui.label(
-                                    RichText::new(if account.is_some() {
-                                        "Zalo đã nhận"
-                                    } else {
-                                        "Đã lưu trên máy"
-                                    })
-                                    .size(visuals::TEXT_SMALL)
-                                    .color(colors.text_secondary),
-                                );
-                            }
-                        });
+                        message_status(ui, message.sent_at_ms, own, account.is_some(), accent);
                     });
                 });
         },
     );
+}
+
+fn message_status(ui: &mut egui::Ui, sent_at_ms: i64, own: bool, live: bool, accent: bool) {
+    let colors = crate::theme::palette(ui.ctx());
+    // Time and delivery text sit on the accent fill for own plain text; keep them readable there.
+    let meta = if accent {
+        colors.on_color
+    } else {
+        colors.text_secondary
+    };
+    let (time, status) = status_galleys(ui, sent_at_ms, own, live, meta);
+    let gap = ui.spacing().item_spacing.x;
+    let width = time.size().x
+        + status
+            .as_ref()
+            .map_or(0.0, |status| gap + 12.0 + gap + status.size().x);
+    let height = time
+        .size()
+        .y
+        .max(status.as_ref().map_or(0.0, |status| status.size().y))
+        .max(12.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    ui.painter().galley(rect.left_top(), time.clone(), meta);
+    if let Some(status) = status {
+        let check = egui::Rect::from_min_size(
+            rect.left_top() + vec2(time.size().x + gap, (height - 12.0) * 0.5),
+            vec2(12.0, 12.0),
+        );
+        icon(ui, check, Icon::Check, meta);
+        ui.painter().galley(
+            rect.left_top() + vec2(time.size().x + gap + 12.0 + gap, 0.0),
+            status,
+            meta,
+        );
+    }
+}
+
+fn status_galleys(
+    ui: &egui::Ui,
+    sent_at_ms: i64,
+    own: bool,
+    live: bool,
+    color: egui::Color32,
+) -> (Arc<egui::Galley>, Option<Arc<egui::Galley>>) {
+    let font = FontId::proportional(visuals::TEXT_SMALL);
+    let time = ui
+        .painter()
+        .layout_no_wrap(clock_label(sent_at_ms), font.clone(), color);
+    let status = own.then(|| {
+        ui.painter().layout_no_wrap(
+            if live {
+                "Zalo đã nhận"
+            } else {
+                "Đã lưu trên máy"
+            }
+            .into(),
+            font,
+            color,
+        )
+    });
+    (time, status)
 }
 
 fn sticker_placeholder(ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -2230,6 +2462,15 @@ mod tests {
         assert_eq!(fold_search("Đặng"), "dang");
         assert_eq!(fold_search("Ca\u{0300} phe\u{0302}"), "ca phe");
         assert_eq!(fold_search("日本語"), "日本語");
+    }
+
+    #[test]
+    fn composer_card_grows_only_for_multiline_wide_drafts() {
+        assert_eq!(composer_height(780.0, "", false), 136.0);
+        assert_eq!(composer_height(780.0, "một\nhai", false), 136.0);
+        assert_eq!(composer_height(780.0, "một\nhai\nba", false), 168.0);
+        assert_eq!(composer_height(780.0, "một\nhai\nba", true), 136.0);
+        assert_eq!(composer_height(300.0, "một\nhai\nba", false), 136.0);
     }
 
     #[test]

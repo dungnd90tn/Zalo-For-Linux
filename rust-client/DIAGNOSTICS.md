@@ -29,12 +29,12 @@ Receive processing also reports closed field/batch reasons, such as
 `message_client_id`, `message_content`, `message_sender`, `queue_continuation`
 and `queue_progress`. Optional `field_type` describes the rejected JSON type;
 `field_bytes` is a text byte count capped at 65,537. `message_kind` is restricted
-to `webchat`, `webchat_info`, `photo`, `web_content`, `sticker` or `other`. These fields identify a parser
+to `webchat`, `webchat_info`, `photo`, `web_content`, `recommended`, `poll`, `file`, `sticker` or `other`. These fields identify a parser
 boundary without retaining the field value, arbitrary message type or content.
 They are recorded for failures even without `--debug-log`. A prior generic
 `synchronization/invalid` record cannot establish which field failed.
 
-Partial directory failures include closed `directory_stage` labels (`friends`,
+Partial directory failures include closed `directory_stage` labels (`account`, `friends`,
 `groups`, `previews`, `storage`, `synchronization`) and `directory_category`
 labels (`unavailable`, `network`, `timeout`, `http`, `server`, `crypto`, `schema`,
 `resource`, `cancelled`, `storage`). Such a failure can leave the authenticated
@@ -42,6 +42,18 @@ socket Online while one directory stage remains incomplete; it does not by
 itself prove an offline connection or identify the private rejected payload.
 Media download/decode failures use the separate `media_assets` stage with fixed
 reasons and bounded status/byte fields, never a URL or raw codec error.
+
+Send eligibility uses fixed `capability_encrypted`, `capability_schema`,
+`capability_correlation`, `capability_timeout`, `capability_changed` and
+`capability_pagination` reasons. Optional `capability_field` identifies a closed
+parser boundary: `envelope`, `request`, `status`, `more`, `threads`, `waiting`,
+`uids`, `pending`, `cursor`, `group`, `encryption` or `visibility`. `field_type`
+records only its JSON type; command 563 or an intervening command may be attached.
+No target, request ID, list member, cursor value, PIN or message enters the event.
+Confirmed E2EE is distinct from unknown metadata; `capability_changed` means an
+intervening encrypted event invalidated this check, not proof that the selected
+peer changed encryption. These failures are logged without `--debug-log`.
+An older `send/unsupported` line cannot distinguish those causes retroactively.
 
 The startup record identifies the actual executable by package version, feature
 bits, byte size, modification time and SHA-256. Feature bits are network=1,

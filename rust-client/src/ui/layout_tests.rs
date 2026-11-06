@@ -88,18 +88,77 @@ fn send_rect(output: &egui::FullOutput) -> egui::Rect {
         .shapes
         .iter()
         .find_map(|shape| match &shape.shape {
-            egui::epaint::Shape::Rect(rect) if rect.rect.size() == vec2(82.0, 38.0) => {
+            egui::epaint::Shape::Rect(rect) if rect.rect.size() == vec2(72.0, 44.0) => {
                 Some(rect.rect)
             }
             _ => None,
         })
-        .expect("Painted send button must retain its 82×38 logical frame")
+        .expect("Painted send button must retain its 72×44 logical frame")
 }
 
 fn panel_rect(ctx: &egui::Context, id: &str) -> egui::Rect {
     egui::containers::panel::PanelState::load(ctx, egui::Id::new(id))
         .unwrap()
         .rect
+}
+
+#[test]
+fn idle_composer_reclaims_reading_space_but_multiline_and_compact_keep_editor_and_send_inside() {
+    for (size, text, height) in [
+        (vec2(1200.0, 780.0), "Một dòng", 136.0),
+        (vec2(1200.0, 780.0), "Dòng một\nDòng hai\nDòng ba", 168.0),
+        (
+            vec2(640.0, 480.0),
+            "Dòng một\nDòng hai\nDòng ba\nDòng bốn",
+            136.0,
+        ),
+    ] {
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        app.drafts.active.text = text.into();
+        app.focus_composer = true;
+        let output = settle(&mut app, &ctx, size, 1.0);
+        let surface = crate::theme::palette(&ctx).surface;
+        let composer = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == surface
+                        // The card sits 8 above and 16 below the allocated composer band.
+                        && (rect.rect.height() - (height - 24.0)).abs() < 0.5
+                        && (rect.rect.bottom() - (size.y - 16.0)).abs() < 0.5
+                        && rect.rect.left() > 60.0 =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Composer must use bounded content height at the bottom: size={size:?}, expected_height={height}, surfaces={:?}",output.shapes.iter().filter_map(|shape|match &shape.shape{egui::Shape::Rect(rect) if rect.fill==surface=>Some(rect.rect),_=>None}).collect::<Vec<_>>()));
+        let send = send_rect(&output);
+        assert!(
+            composer.contains_rect(send),
+            "Send hitbox must remain inside compact/expanded composer"
+        );
+        let editor = ctx
+            .memory(|memory| memory.focused())
+            .expect("Composer must keep keyboard focus");
+        assert!(egui::TextEdit::load_state(&ctx, editor).is_some());
+        let _ = frame(
+            &mut app,
+            &ctx,
+            size,
+            1.0,
+            vec![egui::Event::Text(" thêm".into())],
+        );
+        assert!(
+            app.drafts.active.text.contains(" thêm"),
+            "The visible editor must remain writable after height selection"
+        );
+        assert!(!app.drafts.active.in_flight());
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[test]
@@ -127,7 +186,7 @@ fn maximize_restore_and_compact_reflow_keep_fonts_frames_draft_and_full_send_hit
             let output = settle(&mut app, &ctx, size, native_scale);
             assert_eq!(ctx.pixels_per_point(), native_scale);
             assert_eq!(ctx.zoom_factor(), 1.0);
-            assert_eq!(panel_rect(&ctx, "navigation").width(), 64.0);
+            assert_eq!(panel_rect(&ctx, "navigation").width(), 68.0);
             if size.x >= 940.0 {
                 assert_eq!(panel_rect(&ctx, "conversations").width(), 344.0);
                 let _ = text_size(&output, TITLE, 14.0);
@@ -137,14 +196,14 @@ fn maximize_restore_and_compact_reflow_keep_fonts_frames_draft_and_full_send_hit
                 .iter()
                 .find_map(|shape| match &shape.shape {
                     egui::epaint::Shape::Rect(rect)
-                        if rect.rect.height() == 68.0 && rect.rect.left() >= 64.0 =>
+                        if rect.rect.height() == 76.0 && rect.rect.left() >= 68.0 =>
                     {
                         Some(rect.rect)
                     }
                     _ => None,
                 })
-                .expect("Chat header must retain its 68-point frame");
-            assert_eq!(header.height(), 68.0);
+                .expect("Chat header must retain its 76-point frame");
+            assert_eq!(header.height(), 76.0);
             let measured = (
                 text_size(&output, TITLE, 18.0),
                 text_size(&output, BODY, 15.0),
@@ -166,8 +225,9 @@ fn maximize_restore_and_compact_reflow_keep_fonts_frames_draft_and_full_send_hit
                 .read_response(ctx.memory(|memory| memory.focused()).unwrap())
                 .unwrap()
                 .rect;
-            assert!((size.x - button.right() - 20.0).abs() <= 1.0 / native_scale);
-            assert!((button.left() - editor.right() - 14.0).abs() <= 1.0 / native_scale);
+            // 24 card inset plus 12 inside the card.
+            assert!((size.x - button.right() - 36.0).abs() <= 1.0 / native_scale);
+            assert!((button.left() - editor.right() - 12.0).abs() <= 1.0 / native_scale);
             assert!(button.center().y >= editor.top() && button.center().y <= editor.bottom());
             assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(button));
             assert_eq!(app.drafts.active.text, original_draft);

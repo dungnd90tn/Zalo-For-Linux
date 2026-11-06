@@ -655,3 +655,118 @@ startup and an empty profile root. Gate/artifact/doctor proofs use
 `/tmp/zalo-hidden-previous-f7d8`. No real account, PIN or profile was inspected.
 
 The coordinator installed and independently verified this exact artifact (SHA-256 `23e3a95a8620ddaa6780977354587e5b11c3465570a73096528623d5b437d3dc`, 20,946,144 bytes, mode 0755), matching Zalo Native launcher/icon/window identity and `StartupNotify=false`, without launching the app or opening account/profile data.
+
+## File cards, identity photos and send verification (2026-11-06)
+
+Incoming `share.file` now projects the source filename, extension, known size and
+folder status. A supported link opens the browser only after an explicit click;
+missing links and encrypted-file markers retain metadata with an unavailable
+explanation. The original-reader oracle passes eight synthetic title/URL cases.
+Complete content remains immutable in the sidecar. Schema eight widens its CHECK
+constraint; populated v6/v7 upgrades preserve existing bytes, account scope,
+outbox and cursors. Independent v7 tests cover repeated startup, foreign-key
+cascades, failed-copy rollback and refusing a newer schema. A schema-seven binary
+cannot reopen an upgraded database; copying back an old executable is not a
+database downgrade.
+
+Visible account, direct-contact and group avatars use scoped directory snapshots
+and bounded background decoding. The own-profile request is optional and does
+not create a friend entry. Metadata batches contain at most 64 identities;
+avatar output is capped at 256 pixels, with 64 GPU textures/a 4 MiB pixel budget.
+Tests cover direct/group ID collisions, account and policy changes, stale URLs
+and results, empty replies and queue saturation. Initials
+remain the fallback. A whole conversation row is one interactive widget: actual
+pointer checks cover avatar, title, preview, time and both padding areas.
+
+Source terminal eligibility flags absent/null/zero now finish verification;
+all four identity lists remain mandatory. The independent 11-case original
+pagination oracle confirms that first-page missing/null lists throw in the source
+reader, while later-page merging supplies defaults. Real loopback HTTPS/WSS tests
+verify successful plaintext sends for the supported terminal flags, and no HTTP
+send/outbox preparation for incomplete lists, an encrypted target or intervening
+encryption events. Such events are not consumed or acknowledged. Fixed diagnostic
+reasons distinguish confirmed encryption from unsupported metadata, mismatched
+replies, timeout, pagination and intervening events. No real-account cause or
+production E2EE support is established by these fixtures.
+
+Final checks pass **204 default Rust**, **489 all-feature Rust**, **five IME
+adapter** and **19 Python** tests, formatting, strict default/all-feature
+all-target Clippy, original-reader oracles and catalog/inventory reproducibility.
+Three opt-in native fixtures remain ignored in normal suites. An earlier
+parallel runtime-only run missed an expected disk diagnostic row; its isolated
+rerun and the final full matrix pass. The bounded global logger was unchanged.
+Earlier failed assertions and gate logs remain under `/tmp/zalo-files-*`.
+
+Approved isolated X11 captures cover Light/Dark at 1200×780 and 640×480, actual
+row navigation, long filenames, unavailable/encrypted cards, identity photos,
+scrolling, a short content-sized outgoing bubble and composer heights 100/132.
+Resize to 1920×1080 preserves logical typography. Native scales 1/1.25/1.5/2
+produce unresampled physical screenshots; sidecars record measured scale and
+dimensions. All sessions close normally with zero Internet or loopback connects.
+These are synthetic presentation fixtures, not a live login or fresh IME test.
+The separate redesign guide remains a future target, not an implemented palette.
+
+GUI proofs use `/tmp/zalo-rust-gui-check/files-avatars-*`. The reviewed immutable
+LIVE test fixture has SHA-256 `a1fbd59cec65ea3fcecb2e6bdf23de93a06696adbf10bbf81400478008333d80`;
+the final all-feature fixture is `1ad4da03407fecde689030679717e3688742cdbfff29ff7dce1be24b1726ab64`.
+Fresh final captures match every wide pixel and compact content pixels; the only
+compact difference is the two-pixel scrollbar tint. Cross-check and DPI JSON
+proofs document this distinction. Read-only GNOME inspection reports a native
+1920×1080 monitor at scale 1, text scale 1; no global font/DPI setting changed.
+Original Segoe faces and toolkit rasterization remain in use. This does not
+establish that the user's Wayland font-perception complaint is resolved.
+
+The locked offline LIVE release is **21,046,272 bytes**, SHA-256
+`25ed50c0d2cfc80db01fc1548597ca0ae1c8e0c100319d11858aaaa624637d71`.
+Schema-eight smoke passes 19 messages/six conversations, restart/legacy
+preservation, locking and private bounded diagnostics with `network_used=false`.
+A separate disposable doctor reports compiled authentication/messaging, no
+authentication/network startup and an empty profile root. Artifact, smoke,
+doctor and frozen-source manifests use `/tmp/zalo-files-final-*.json`. No personal
+account, PIN, conversation history or profile was opened for this checkpoint.
+
+The coordinator installed and independently verified this exact release in the
+managed **Zalo Native** launcher: SHA-256
+`25ed50c0d2cfc80db01fc1548597ca0ae1c8e0c100319d11858aaaa624637d71`,
+21,046,272 bytes, mode 0755. `Exec --live`, icon/`StartupWMClass`, managed ownership
+and `StartupNotify=false` match; original 256/512-pixel icons match their source
+files. Installed doctor uses a disposable profile and reports compiled live
+support with authentication/network startup false. Installation did not launch
+the app or open personal profile/login data. Real file/avatar/send acceptance
+awaits the user's restart.
+
+## Redesign migration evidence (2026-11-06)
+
+Synthetic evidence for the [redesign guide](UI_REDESIGN_GUIDE.md); not real-account or Wayland evidence.
+
+- `./scripts/rust/check.sh` (formatting, tests, strict Clippy, offline smoke) and
+  `cargo test --locked --offline --all-features` plus `cargo clippy --all-features --all-targets -- -D warnings`
+  pass with Rust 1.99.1. New regressions: redesign token values, WCAG AA contrast for the main text/surface pairs in
+  Light and Dark (`theme::tests`), composer card heights, and the updated rail/header/composer geometry assertions in
+  `layout_tests.rs` and `account_tests.rs`.
+- Screenshots of the offline demo come from the app's own framebuffer, never the desktop. The ignored fixtures open one
+  window for about a second:
+
+  ```text
+  env -u WAYLAND_DISPLAY ZALO_UI_SHOT=/tmp/shot.ppm ZALO_UI_SHOT_THEME=dark ZALO_UI_SHOT_SIZE=640x480 \
+    cargo test --locked --offline --lib -- --ignored --exact ui::shot_fixture::demo_screenshot
+  ```
+
+  Extra switches: `ZALO_UI_SHOT_SCENE=settings|info`, `ZALO_UI_SHOT_POINTER=x,y` (hover), `ZALO_UI_SHOT_PRESS=1`,
+  `ZALO_UI_SHOT_TABS=n` (keyboard focus). The signed-in/login fixture (`ui::live::tests::signed_in_offline_native_window_fixture`,
+  `--all-features`) honours `ZALO_UI_SHOT` too, with `ZALO_UI_FIXTURE_LOGIN=qr` for the QR screen.
+- Reviewed: 1200×780 and 640×480 in both themes; row hover, pressed rail button, keyboard focus ring, the settings modal,
+  the conversation information sidebar, QR login and the contact directory (wide and compact). A run with `DISPLAY` unset
+  rendered the same demo on native Wayland. The directory capture uses `ZALO_UI_FIXTURE_READY=1`, which forces the verified
+  privacy state and invented contact rows each frame because the offline worker can never verify privacy; it is a visual
+  state only. Not covered: IME on Wayland and any real account or real desktop session.
+
+## Package evidence (v2.0.0, 2026-11-06)
+
+`./scripts/rust/package.sh` compiles the live release inside a pinned Ubuntu 20.04 container (binary needs only
+`GLIBC_2.30`), builds the `.deb` there and the `.rpm` in a pinned Fedora container, and writes `dist/rust/SHA256SUMS`.
+`./scripts/rust/package/verify.sh` then installs each package through `apt`/`dnf` in clean containers, runs
+`zalo-native --version` and `--doctor` (live compiled, not authenticated, no network), checks the desktop entry, icon
+and `ldd`, runs `rpm -V` for RPMs and removes the package. Passed on Ubuntu 20.04/22.04/24.04, Debian 12 (`.deb`) and
+Fedora 42, AlmaLinux 9 (`.rpm`). Debian 11 could not be tested: its apt mirrors return 404. Container installs say nothing
+about GUI behaviour on real desktops; use the demo window evidence above for that.

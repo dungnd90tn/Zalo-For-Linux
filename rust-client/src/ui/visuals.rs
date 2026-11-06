@@ -139,17 +139,20 @@ pub fn source_icon(ui: &Ui, rect: Rect, class: &str, color: Color32) -> bool {
     true
 }
 
+/// Edge of the square hit target for toolbar icon buttons.
+pub const ICON_BUTTON: f32 = 44.0;
+
 pub fn icon_button(ui: &mut Ui, kind: Icon, label: &str, enabled: bool) -> egui::Response {
     let (rect, response) = ui
         .add_enabled_ui(enabled, |ui| {
-            ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click())
+            ui.allocate_exact_size(vec2(ICON_BUTTON, ICON_BUTTON), Sense::click())
         })
         .inner;
     let colors = crate::theme::palette(ui.ctx());
     if enabled && (response.hovered() || response.is_pointer_button_down_on()) {
         ui.painter().rect_filled(
             rect,
-            4.0,
+            12.0,
             if response.is_pointer_button_down_on() {
                 colors.pressed
             } else {
@@ -159,7 +162,7 @@ pub fn icon_button(ui: &mut Ui, kind: Icon, label: &str, enabled: bool) -> egui:
     }
     icon(
         ui,
-        rect.shrink(5.0),
+        Rect::from_center_size(rect.center(), vec2(20.0, 20.0)),
         kind,
         if enabled {
             colors.text_primary
@@ -167,8 +170,52 @@ pub fn icon_button(ui: &mut Ui, kind: Icon, label: &str, enabled: bool) -> egui:
             colors.text_disabled
         },
     );
-    focus_outline(ui, &response, rect, 4.0);
+    focus_outline(ui, &response, rect, 12.0);
     response.on_hover_text(label).on_disabled_hover_text(label)
+}
+
+/// Pill filter control. `selected` uses the inverse chip colors; a disabled chip stays visible
+/// with its reason in the hover text rather than pretending to filter.
+pub fn chip(ui: &mut Ui, text: &str, selected: bool, enabled: bool, hover: &str) -> egui::Response {
+    let colors = crate::theme::palette(ui.ctx());
+    let text_color = if !enabled {
+        colors.text_disabled
+    } else if selected {
+        colors.chip_on_text
+    } else {
+        colors.text_tertiary
+    };
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        FontId::new(TEXT_BODY, egui::FontFamily::Name("Zalo Semibold".into())),
+        text_color,
+    );
+    let (rect, response) = ui
+        .add_enabled_ui(enabled, |ui| {
+            ui.allocate_exact_size(vec2(galley.size().x + 32.0, ICON_BUTTON), Sense::click())
+        })
+        .inner;
+    let fill = if selected {
+        colors.chip_on_bg
+    } else if enabled && response.is_pointer_button_down_on() {
+        colors.pressed
+    } else if enabled && response.hovered() {
+        colors.hover
+    } else {
+        colors.surface
+    };
+    ui.painter().rect_filled(rect, 22.0, fill);
+    if !selected {
+        ui.painter()
+            .rect_stroke(rect, 22.0, Stroke::new(1.0_f32, colors.border_strong));
+    }
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, text_color);
+    focus_outline(ui, &response, rect, 22.0);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, text)
+    });
+    response.on_hover_text(hover).on_disabled_hover_text(hover)
 }
 
 pub fn primary_button(ui: &mut Ui, enabled: bool, text: &str, size: egui::Vec2) -> egui::Response {
@@ -193,14 +240,13 @@ pub fn primary_button(ui: &mut Ui, enabled: bool, text: &str, size: egui::Vec2) 
         widgets.noninteractive.weak_bg_fill = colors.button_primary_disabled;
         widgets.noninteractive.fg_stroke.color = colors.text_disabled;
         let response = ui.add_enabled(enabled, egui::Button::new(text).min_size(size));
-        focus_outline(ui, &response, response.rect, 5.0);
+        focus_outline(ui, &response, response.rect, 12.0);
         response
     })
     .inner
 }
 
 pub fn avatar(ui: &Ui, rect: Rect, title: &str) {
-    // Initials represent known live names or synthetic contacts; photos are not fetched.
     // These are existing accent token values, not an additional app palette.
     let palette = crate::theme::palette(ui.ctx());
     let colors = palette.avatar_accents;
@@ -224,6 +270,22 @@ pub fn avatar(ui: &Ui, rect: Rect, title: &str) {
     );
 }
 
+pub fn avatar_photo(ui: &Ui, rect: Rect, title: &str, texture: Option<&egui::TextureHandle>) {
+    let Some(texture) = texture else {
+        avatar(ui, rect, title);
+        return;
+    };
+    // Center-crop the real pixels to a circle; never stretch a rectangular photo.
+    let size = texture.size_vec2();
+    let crop = size.min_elem();
+    let uv_size = vec2(crop / size.x, crop / size.y);
+    let uv = Rect::from_center_size(egui::pos2(0.5, 0.5), uv_size);
+    egui::Image::new(texture)
+        .uv(uv)
+        .rounding(rect.width() * 0.5)
+        .paint_at(ui, rect);
+}
+
 pub fn divider(ui: &Ui, start: Pos2, end: Pos2) {
     ui.painter().line_segment(
         [start, end],
@@ -240,6 +302,35 @@ pub fn focus_outline(ui: &Ui, response: &egui::Response, rect: Rect, rounding: f
         rounding,
         crate::theme::palette(ui.ctx()).focus,
     );
+}
+
+/// Edge of the rounded square that carries a rail control.
+pub const RAIL_BUTTON: f32 = 48.0;
+
+/// Paint a rail control as a rounded square centered in its full-width slot and return that
+/// square. Pressed, selected and hover fills come from the navigation roles; keyboard focus uses
+/// the contrasting navigation foreground.
+pub fn rail_button(ui: &Ui, slot: Rect, response: &egui::Response, selected: bool) -> Rect {
+    let colors = crate::theme::palette(ui.ctx());
+    let rect = Rect::from_center_size(slot.center(), vec2(RAIL_BUTTON, RAIL_BUTTON));
+    if selected || response.hovered() || response.is_pointer_button_down_on() {
+        let fill = if response.is_pointer_button_down_on() {
+            colors.nav_pressed
+        } else if selected {
+            colors.nav_selected
+        } else {
+            colors.nav_hover
+        };
+        ui.painter().rect_filled(rect, 12.0, fill);
+    }
+    if response.enabled() && response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            12.0,
+            Stroke::new(1.5_f32, colors.nav_text),
+        );
+    }
+    rect
 }
 
 /// Navigation focus uses its contrasting original on-navigation foreground.

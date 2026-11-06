@@ -2,7 +2,10 @@
 mod cache;
 use crate::{
     app::media::MediaKey,
-    domain::{MediaDescriptor, Message, PhotoDescriptor, PollDescriptor, WebContentDescriptor},
+    domain::{
+        FileDescriptor, MediaDescriptor, Message, PhotoDescriptor, PollDescriptor,
+        WebContentDescriptor,
+    },
 };
 pub(super) use cache::MediaCache;
 use cache::{Presentation, Viewer};
@@ -35,6 +38,95 @@ pub(super) fn show(
             web_card(ui, message, generation, card, cache, max_width, true)
         }
         MediaDescriptor::Poll(poll) => poll_card(ui, poll),
+        MediaDescriptor::File(file) => file_card(ui, file),
+    }
+}
+fn file_card(ui: &mut egui::Ui, file: &FileDescriptor) {
+    let colors = crate::theme::palette(ui.ctx());
+    ui.horizontal_top(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(38.0, 42.0), Sense::hover());
+        super::visuals::source_icon(
+            ui,
+            rect.shrink(4.0),
+            if file.is_folder {
+                "fa-file-menu-icon-folder"
+            } else {
+                "fa-icon-outline-file"
+            },
+            colors.primary,
+        );
+        ui.vertical(|ui| {
+            ui.set_max_width(ui.available_width());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&file.title)
+                        .family(egui::FontFamily::Name("Zalo Semibold".into()))
+                        .size(super::visuals::TEXT_BODY)
+                        .color(colors.text_primary),
+                )
+                .wrap(),
+            );
+            let mut details = Vec::new();
+            if !file.extension.is_empty() {
+                details.push(file.extension.to_uppercase());
+            }
+            if let Some(size) = file.size_bytes {
+                details.push(file_size(size));
+            }
+            if file.is_folder {
+                details.push("Thư mục".into());
+            }
+            if !details.is_empty() {
+                ui.label(
+                    RichText::new(details.join(" · "))
+                        .size(super::visuals::TEXT_SMALL)
+                        .color(colors.text_secondary),
+                );
+            }
+        });
+    });
+    if let Some(url) = file
+        .url
+        .as_deref()
+        .filter(|_| !file.encrypted)
+        .and_then(external_url)
+    {
+        if ui
+            .link(if file.is_folder {
+                "Mở thư mục trong trình duyệt"
+            } else {
+                "Mở tệp trong trình duyệt"
+            })
+            .on_hover_text("Chỉ mở liên kết khi bạn bấm. Ứng dụng không tự tải hoặc thực thi tệp.")
+            .clicked()
+        {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+    } else {
+        ui.add(
+            egui::Label::new(
+                RichText::new(if file.encrypted {
+                    "Tệp được mã hóa chưa hỗ trợ mở trong ứng dụng native."
+                } else {
+                    "Tin nhắn chưa có liên kết mở tệp khả dụng."
+                })
+                .size(super::visuals::TEXT_SMALL)
+                .color(colors.text_secondary),
+            )
+            .wrap(),
+        );
+    }
+}
+fn file_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    if bytes < KIB {
+        format!("{bytes} B")
+    } else if bytes < KIB * KIB {
+        format!("{:.1} KB", bytes as f64 / KIB as f64)
+    } else if bytes < KIB * KIB * KIB {
+        format!("{:.1} MB", bytes as f64 / (KIB * KIB) as f64)
+    } else {
+        format!("{:.1} GB", bytes as f64 / (KIB * KIB * KIB) as f64)
     }
 }
 fn photo_card(
@@ -686,5 +778,83 @@ mod tests {
             assert!(external_url(url).is_none());
         }
         assert!(external_url("https://example.invalid/synthetic?x=1").is_some());
+    }
+
+    #[test]
+    fn file_cards_show_metadata_and_navigate_only_after_explicit_click_on_a_valid_link() {
+        assert!(crate::theme::catalog::glyph("fa-icon-outline-file").is_some());
+        assert!(crate::theme::catalog::glyph("fa-file-menu-icon-folder").is_some());
+        let make = |url: Option<&str>, encrypted| FileDescriptor {
+            title: "Báo cáo kiểm thử với tên tài liệu dài bằng tiếng Việt.pdf".into(),
+            size_bytes: Some(12_345_678),
+            extension: "pdf".into(),
+            url: url.map(str::to_owned),
+            is_folder: false,
+            encrypted,
+        };
+        for (url, encrypted, clickable) in [
+            (Some("https://example.invalid/report.pdf"), false, true),
+            (None, false, false),
+            (Some("javascript:alert(1)"), false, false),
+            (Some("https://example.invalid/secret.zip"), true, false),
+        ] {
+            let ctx = egui::Context::default();
+            super::super::visuals::install(&ctx);
+            let file = make(url, encrypted);
+            let render = |events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(320.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| file_card(ui, &file));
+                    },
+                )
+            };
+            let _ = render(vec![]);
+            let output = render(vec![]);
+            assert!(output.platform_output.open_url.is_none());
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("PDF · 11.8 MB"));
+            assert!(!text.contains("chưa được hỗ trợ]"));
+            let link = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Mở tệp trong trình duyệt" => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()).center())
+                }
+                _ => None,
+            });
+            assert_eq!(link.is_some(), clickable);
+            if let Some(position) = link {
+                let _ = render(vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ]);
+                let output = render(vec![egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }]);
+                assert_eq!(output.platform_output.open_url.unwrap().url, url.unwrap());
+            }
+        }
     }
 }

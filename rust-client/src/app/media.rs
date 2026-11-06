@@ -76,9 +76,11 @@ struct Thumbnail {
 struct Request {
     key: MediaKey,
     generation: u64,
+    thumbnail_side: u32,
 }
 pub struct MediaLoader {
     account_id: String,
+    thumbnail_side: u32,
     commands: mpsc::Sender<Request>,
     events: mpsc::Receiver<MediaEvent>,
     cancel: watch::Sender<bool>,
@@ -87,6 +89,17 @@ pub struct MediaLoader {
 }
 impl MediaLoader {
     pub fn new(account_id: String, repaint: Arc<dyn Fn() + Send + Sync>) -> Result<Self> {
+        Self::with_thumbnail_side(account_id, repaint, MAX_THUMBNAIL_SIDE)
+    }
+    /// Shared transport/decoder with a small physical-pixel output for avatars.
+    pub fn new_avatar(account_id: String, repaint: Arc<dyn Fn() + Send + Sync>) -> Result<Self> {
+        Self::with_thumbnail_side(account_id, repaint, 256)
+    }
+    fn with_thumbnail_side(
+        account_id: String,
+        repaint: Arc<dyn Fn() + Send + Sync>,
+        thumbnail_side: u32,
+    ) -> Result<Self> {
         crate::domain::validate_id(&account_id)?;
         let (commands, receiver) = mpsc::channel(REQUESTS);
         let (sender, events) = mpsc::channel(EVENTS);
@@ -117,6 +130,7 @@ impl MediaLoader {
             })?;
         Ok(Self {
             account_id,
+            thumbnail_side,
             commands,
             events,
             cancel,
@@ -144,6 +158,7 @@ impl MediaLoader {
             .try_send(Request {
                 key: key.clone(),
                 generation,
+                thumbnail_side: self.thumbnail_side,
             })
             .is_err()
         {
@@ -196,6 +211,7 @@ impl MediaLoader {
         drop(sender);
         Self {
             account_id: "11".into(),
+            thumbnail_side: MAX_THUMBNAIL_SIDE,
             commands,
             events,
             cancel,
@@ -260,7 +276,7 @@ async fn worker(
         } else {
             let result = match thumbnail_url(&request.key.url) {
                 Ok(url) => {
-                    tokio::select! {biased;_=cancel.changed()=>break,result=fetch(&client,url)=>result}
+                    tokio::select! {biased;_=cancel.changed()=>break,result=fetch(&client,url,request.thumbnail_side)=>result}
                 }
                 Err(error) => Err(error),
             };
@@ -326,6 +342,7 @@ fn record_failure(failure: MediaFailure) {
 async fn fetch(
     client: &reqwest::Client,
     url: url::Url,
+    thumbnail_side: u32,
 ) -> std::result::Result<Thumbnail, MediaFailure> {
     let mut response = client
         .get(url)
@@ -356,7 +373,7 @@ async fn fetch(
     // This process-wide permit prevents rapid pane changes from multiplying
     // simultaneous decoders; it contains no account or media data.
     let _permit = decode_slot().await?;
-    decode(&bytes)
+    decode_with_side(&bytes, thumbnail_side)
 }
 async fn decode_slot() -> std::result::Result<tokio::sync::SemaphorePermit<'static>, MediaFailure> {
     static DECODE_SLOT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -366,12 +383,19 @@ async fn decode_slot() -> std::result::Result<tokio::sync::SemaphorePermit<'stat
         .await
         .map_err(|_| MediaFailure::Resource)
 }
+#[cfg(test)]
 fn decode(bytes: &[u8]) -> std::result::Result<Thumbnail, MediaFailure> {
+    decode_with_side(bytes, MAX_THUMBNAIL_SIDE)
+}
+fn decode_with_side(
+    bytes: &[u8],
+    thumbnail_side: u32,
+) -> std::result::Result<Thumbnail, MediaFailure> {
     if bytes.len() > MAX_ENCODED {
         return Err(MediaFailure::Resource);
     }
     if bytes.starts_with(&[0xff, 0x0a]) || bytes.starts_with(b"\0\0\0\x0cJXL ") {
-        return decode_jxl(bytes);
+        return decode_jxl_with_limits(bytes, MAX_DECODED as usize, thumbnail_side);
     }
     let format = image::guess_format(bytes).map_err(|_| MediaFailure::Format)?;
     if !matches!(
@@ -403,12 +427,15 @@ fn decode(bytes: &[u8]) -> std::result::Result<Thumbnail, MediaFailure> {
             MediaFailure::Format
         }
     })?;
-    thumbnail(image)
+    thumbnail(image, thumbnail_side)
 }
-fn thumbnail(image: image::DynamicImage) -> std::result::Result<Thumbnail, MediaFailure> {
+fn thumbnail(
+    image: image::DynamicImage,
+    thumbnail_side: u32,
+) -> std::result::Result<Thumbnail, MediaFailure> {
     let (width, height) = (image.width(), image.height());
-    let thumbnail = if width > MAX_THUMBNAIL_SIDE || height > MAX_THUMBNAIL_SIDE {
-        image.thumbnail(MAX_THUMBNAIL_SIDE, MAX_THUMBNAIL_SIDE)
+    let thumbnail = if width > thumbnail_side || height > thumbnail_side {
+        image.thumbnail(thumbnail_side, thumbnail_side)
     } else {
         image
     };
@@ -441,12 +468,17 @@ fn jxl_codestream(bytes: &[u8]) -> std::result::Result<Vec<u8>, MediaFailure> {
     }
     Ok(stream)
 }
-fn decode_jxl(bytes: &[u8]) -> std::result::Result<Thumbnail, MediaFailure> {
-    decode_jxl_with_budget(bytes, MAX_DECODED as usize)
-}
+#[cfg(test)]
 fn decode_jxl_with_budget(
     bytes: &[u8],
     budget: usize,
+) -> std::result::Result<Thumbnail, MediaFailure> {
+    decode_jxl_with_limits(bytes, budget, MAX_THUMBNAIL_SIDE)
+}
+fn decode_jxl_with_limits(
+    bytes: &[u8],
+    budget: usize,
+    thumbnail_side: u32,
 ) -> std::result::Result<Thumbnail, MediaFailure> {
     use jxl_oxide_common::Bundle;
     let stream = jxl_codestream(bytes)?;
@@ -535,7 +567,7 @@ fn decode_jxl_with_budget(
             rgba.put_pixel(x as u32, y, image::Rgba(color));
         }
     }
-    thumbnail(image::DynamicImage::ImageRgba8(rgba))
+    thumbnail(image::DynamicImage::ImageRgba8(rgba), thumbnail_side)
 }
 
 #[cfg(test)]
@@ -663,12 +695,24 @@ mod tests {
         assert!(decode(&container).is_err());
     }
     #[test]
+    fn avatar_decode_uses_small_physical_output_without_upscaling_or_second_decoder() {
+        let image = image::DynamicImage::new_rgba8(1024, 512);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let avatar = decode_with_side(bytes.get_ref(), 256).unwrap();
+        assert_eq!((avatar.width, avatar.height), (256, 128));
+        assert_eq!(avatar.rgba.len(), 256 * 128 * 4);
+        let tiny = thumbnail(image::DynamicImage::new_rgba8(24, 16), 256).unwrap();
+        assert_eq!((tiny.width, tiny.height), (24, 16));
+    }
+    #[test]
     fn request_queue_scope_dedup_backoff_and_explicit_retry_are_bounded() {
         let (commands, mut receiver) = mpsc::channel(REQUESTS);
         let (sender, events) = mpsc::channel(EVENTS);
         let (cancel, stop) = watch::channel(false);
         let mut loader = MediaLoader {
             account_id: "11".into(),
+            thumbnail_side: MAX_THUMBNAIL_SIDE,
             commands,
             events,
             cancel,
@@ -721,7 +765,14 @@ mod tests {
         for id in 0..5 {
             let mut key = key(&id.to_string());
             key.url = "file:///not-network".into();
-            commands.send(Request { key, generation: 1 }).await.unwrap();
+            commands
+                .send(Request {
+                    key,
+                    generation: 1,
+                    thumbnail_side: MAX_THUMBNAIL_SIDE,
+                })
+                .await
+                .unwrap();
         }
         tokio::task::yield_now().await;
         stop.send_replace(true);

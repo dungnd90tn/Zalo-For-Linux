@@ -354,6 +354,12 @@ impl Privacy {
                 }
                 entries.retain(|entry| self.list_visible(&entry.thread_id()));
             }
+            LiveEvent::Avatars { avatars, .. } => {
+                if !self.ready() {
+                    return None;
+                }
+                avatars.retain(|avatar| self.visible(&avatar.thread_id));
+            }
             LiveEvent::Opened { conversation, .. } => {
                 if !self.visible(&conversation.id) {
                     return None;
@@ -464,6 +470,7 @@ impl NativeApp {
             state.sender_names = Default::default();
             state.hydration = Default::default();
             state.media = Default::default();
+            state.avatars = Default::default();
             state.stickers = Default::default();
             state.directory.privacy_reset(ctx, state.privacy.ready());
         }
@@ -472,6 +479,14 @@ impl NativeApp {
         let Some(mut state) = self.live.take() else {
             return;
         };
+        if self
+            .model
+            .selected
+            .as_deref()
+            .is_some_and(|thread| state.privacy.hidden(thread))
+        {
+            state.avatars = Default::default();
+        }
         if !state.privacy.cancel(state.worker.as_ref()) {
             state.worker = None;
             state.privacy.reset_worker();

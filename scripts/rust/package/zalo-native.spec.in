@@ -1,0 +1,39 @@
+# Built by scripts/rust/package.sh from an already compiled binary (compiled against glibc 2.31).
+%global debug_package %{nil}
+%global __os_install_post %{nil}
+
+Name:           zalo-native
+Version:        @VERSION@
+Release:        @RELEASE@
+Summary:        Zalo native client (independent Rust preview)
+License:        LicenseRef-Proprietary-Assets
+URL:            https://github.com/dungnd90tn/Zalo-For-Linux
+BuildArch:      x86_64
+# GL, xkbcommon and the display libraries are loaded at run time, so rpm cannot see them.
+Requires:       libglvnd-glx
+Requires:       libxkbcommon
+Recommends:     libwayland-client
+Recommends:     libX11
+Recommends:     libxkbcommon-x11
+Recommends:     libXcursor
+Recommends:     libXi
+Recommends:     libXrandr
+Recommends:     libglvnd-egl
+Recommends:     xdg-desktop-portal
+
+%description
+Native Linux client for Zalo written in Rust with egui, without Electron. This is
+an unofficial preview: login and messaging are optional features, and the offline
+demo (zalo-native --demo) uses only synthetic data. It is independent from the
+Electron-based "zalo" package and can be installed next to it.
+
+%install
+mkdir -p %{buildroot}
+cp -a @STAGE@/usr %{buildroot}/usr
+
+%files
+%{_bindir}/zalo-native
+%{_datadir}/applications/zalo-linux-rust-preview.desktop
+%{_datadir}/icons/hicolor/256x256/apps/zalo-linux-rust-preview.png
+%{_datadir}/icons/hicolor/512x512/apps/zalo-linux-rust-preview.png
+%doc %{_datadir}/doc/zalo-native/copyright

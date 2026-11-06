@@ -63,11 +63,8 @@ fn submit_key() -> Vec<egui::Event> {
             physical_key: None,
             pressed,
             repeat: false,
-            modifiers: egui::Modifiers {
-                ctrl: true,
-                command: true,
-                ..Default::default()
-            },
+            // Enter is the send key (Ctrl+Enter is a line break).
+            modifiers: egui::Modifiers::NONE,
         })
         .collect()
 }

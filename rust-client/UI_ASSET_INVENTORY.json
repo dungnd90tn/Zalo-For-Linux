@@ -145807,9 +145807,9 @@
       }
     ],
     "source": {
-      "bytes": 12905,
+      "bytes": 13394,
       "path": "rust-client/src/ui/visuals.rs",
-      "sha256": "4e3ebe5924e773d29e69d2d7bc41b5ab86159d0a36588670fa28e96127c11b91"
+      "sha256": "9957862d3e42925bda09c00f6112f96a36fe7a693b1ef104cf0c84ac92cee8c6"
     },
     "theme_source": {
       "bytes": 17405,

@@ -19,6 +19,7 @@ pub enum MediaKind {
     WebContent,
     Recommended,
     Poll,
+    File,
 }
 impl MediaKind {
     pub fn as_str(self) -> &'static str {
@@ -27,6 +28,7 @@ impl MediaKind {
             Self::WebContent => "chat.webcontent",
             Self::Recommended => "chat.recommended",
             Self::Poll => "group.poll",
+            Self::File => "share.file",
         }
     }
     pub fn from_wire(value: &str) -> Option<Self> {
@@ -35,6 +37,7 @@ impl MediaKind {
             "chat.webcontent" => Some(Self::WebContent),
             "chat.recommended" => Some(Self::Recommended),
             "group.poll" => Some(Self::Poll),
+            "share.file" => Some(Self::File),
             _ => None,
         }
     }
@@ -44,6 +47,7 @@ impl MediaKind {
             Self::WebContent => "[Tin nhắn chat.webcontent chưa được hỗ trợ]",
             Self::Recommended => "[Tin nhắn chat.recommended chưa được hỗ trợ]",
             Self::Poll => "[Tin nhắn group.poll chưa được hỗ trợ]",
+            Self::File => "[Tin nhắn share.file chưa được hỗ trợ]",
         }
     }
 }
@@ -87,6 +91,17 @@ pub struct PollDescriptor {
     pub question: String,
     pub anonymous: Option<bool>,
 }
+/// A source file card, not permission to fetch or execute the attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileDescriptor {
+    pub title: String,
+    pub size_bytes: Option<u64>,
+    pub extension: String,
+    pub url: Option<String>,
+    pub is_folder: bool,
+    pub encrypted: bool,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -99,6 +114,7 @@ pub enum MediaDescriptor {
     WebContent(WebContentDescriptor),
     Recommended(WebContentDescriptor),
     Poll(PollDescriptor),
+    File(FileDescriptor),
 }
 impl MediaDescriptor {
     pub fn kind(&self) -> MediaKind {
@@ -107,11 +123,13 @@ impl MediaDescriptor {
             Self::WebContent(_) => MediaKind::WebContent,
             Self::Recommended(_) => MediaKind::Recommended,
             Self::Poll(_) => MediaKind::Poll,
+            Self::File(_) => MediaKind::File,
         }
     }
     pub fn preview_text(&self) -> &str {
         match self {
             Self::Photo(_) => PHOTO_PREVIEW,
+            Self::File(file) => &file.title,
             Self::WebContent(card) | Self::Recommended(card) => &card.title,
             Self::Poll(poll) => {
                 if poll.question.is_empty() {
@@ -164,6 +182,21 @@ impl MediaDescriptor {
                             .iter()
                             .all(|button| text(&button.label, 128) && url(&button.url)),
                     "Invalid web content descriptor"
+                );
+            }
+            Self::File(file) => {
+                ensure!(
+                    !file.title.is_empty()
+                        && text(&file.title, 1024)
+                        && text(&file.extension, 32)
+                        && url(&file.url)
+                        && file
+                            .url
+                            .as_ref()
+                            .is_none_or(|value| value.starts_with("https://"))
+                        && (!file.encrypted || file.url.is_none())
+                        && file.size_bytes.is_none_or(|n| n <= 9_007_199_254_740_991),
+                    "Invalid file descriptor"
                 );
             }
             Self::Poll(poll) => {
@@ -224,6 +257,7 @@ impl MediaMessageContent {
             MediaKind::WebContent => MediaDescriptor::WebContent(web_content(content)),
             MediaKind::Recommended => MediaDescriptor::Recommended(recommended(content)),
             MediaKind::Poll => MediaDescriptor::Poll(poll(content)),
+            MediaKind::File => MediaDescriptor::File(file(content)),
         };
         fit_descriptor(&mut descriptor);
         descriptor
@@ -288,6 +322,7 @@ fn fit_descriptor(descriptor: &mut MediaDescriptor) {
                     card.image_url.take().is_some()
                 }
             }
+            MediaDescriptor::File(file) => file.url.take().is_some(),
             MediaDescriptor::Poll(poll) => {
                 if !poll.question.is_empty() {
                     poll.question
@@ -366,6 +401,57 @@ fn has_encrypted_file_key(content: &Value, params: &Value) -> bool {
     ["secureKey", "e2eeKey"]
         .iter()
         .any(|key| present(content.get(key)) || present(params.get(key)))
+}
+
+/// Source MSG_FILE normalization (bundle28437) and file card params (117341).
+fn file(content: &Value) -> FileDescriptor {
+    let params = parsed(content.get("params")).unwrap_or(Value::Null);
+    let mut title = bounded(content.get("title"), 1024);
+    if title.trim().is_empty() {
+        title = "Tệp đính kèm".into();
+    }
+    let mut extension = bounded(params.get("fileExt"), 32).to_lowercase();
+    extension.truncate(extension.floor_char_boundary(32.min(extension.len())));
+    // Match the original title normalization only for its JSON-string params form.
+    if content.get("params").is_some_and(Value::is_string)
+        && !extension.is_empty()
+        && !["exe", "cmd", "bat", "com", "lnk", "vbs"].contains(&extension.as_str())
+        && !title.to_lowercase().ends_with(&format!(".{extension}"))
+        && title.len() + extension.len() < 1024
+    {
+        title.push('.');
+        title.push_str(&extension);
+    }
+    let size_bytes = params
+        .get("fileSize")
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .filter(|size| *size <= 9_007_199_254_740_991);
+    let encrypted = has_encrypted_file_key(content, &params);
+    let mut address = if encrypted {
+        None
+    } else {
+        url(content.get("href"))
+    };
+    // Source upgrades file downloads to HTTPS. Never send a plain-HTTP file action.
+    if let Some(value) = address.as_mut() {
+        let mut parsed = Url::parse(value).expect("validated file URL");
+        if parsed.scheme() == "http" {
+            let _ = parsed.set_scheme("https");
+            let _ = parsed.set_port(None);
+        }
+        *value = parsed.into();
+    }
+    FileDescriptor {
+        title,
+        size_bytes,
+        extension,
+        url: address,
+        is_folder: params
+            .get("fType")
+            .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+            == Some(2),
+        encrypted,
+    }
 }
 
 fn photo(content: &Value) -> PhotoDescriptor {
@@ -506,6 +592,71 @@ fn poll(content: &Value) -> PollDescriptor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn source_files_match_original_title_url_readers_and_keep_complete_content() {
+        let oracle: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/messaging/files.json"))
+                .unwrap();
+        for case in oracle["cases"].as_array().unwrap() {
+            let content = MediaMessageContent::new(MediaKind::File, &case["content"]).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(content.as_json()).unwrap(),
+                case["content"]
+            );
+            let MediaDescriptor::File(file) = content.descriptor() else {
+                panic!()
+            };
+            assert_eq!(file.title, case["expected"]["title"]);
+            if file.encrypted {
+                assert!(file.url.is_none());
+            } else {
+                assert_eq!(
+                    serde_json::to_value(&file.url).unwrap(),
+                    case["expected"]["href"]
+                );
+            }
+        }
+    }
+    #[test]
+    fn file_actions_reject_unsafe_urls_and_encrypted_markers_without_losing_metadata() {
+        for address in [
+            "file:///private",
+            "javascript:alert(1)",
+            "https://u:p@host.test/x",
+            "https://host.test:444/file",
+        ] {
+            let raw = json!({"title":"Tệp", "href":address,"params":{"fileSize":0},"unknown":{"retain":true}});
+            let content = MediaMessageContent::new(MediaKind::File, &raw).unwrap();
+            let MediaDescriptor::File(file) = content.descriptor() else {
+                panic!()
+            };
+            assert!(file.url.is_none());
+            assert_eq!(file.size_bytes, Some(0));
+            assert_eq!(
+                serde_json::from_str::<Value>(content.as_json()).unwrap(),
+                raw
+            );
+        }
+        for marker in [json!("key"), json!(true), json!({}), json!([])] {
+            let content=MediaMessageContent::new(MediaKind::File,&json!({"href":"https://files.zdn.vn/file","params":{"secureKey":marker,"fileSize":-1,"fType":2}})).unwrap();
+            let MediaDescriptor::File(file) = content.descriptor() else {
+                panic!()
+            };
+            assert!(
+                file.encrypted && file.url.is_none() && file.is_folder && file.size_bytes.is_none()
+            );
+        }
+        let content=MediaMessageContent::new(MediaKind::File,&json!({"title":"\"".repeat(1024),"href":"http://files.zdn.vn/file","params":"{\"fileSize\":\"9007199254740992\"}"})).unwrap();
+        let MediaDescriptor::File(file) = content.descriptor() else {
+            panic!()
+        };
+        assert!(file.size_bytes.is_none());
+        assert_eq!(file.url.as_deref(), Some("https://files.zdn.vn/file"));
+        assert!(
+            serde_json::to_vec(content.descriptor()).unwrap().len() <= MAX_MEDIA_DESCRIPTOR_BYTES
+        );
+    }
 
     #[test]
     fn readonly_recommended_and_poll_match_original_source_readers() {
