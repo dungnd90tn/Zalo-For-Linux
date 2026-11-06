@@ -78,6 +78,12 @@ pub enum Reason {
     ServerCode,
     Invalid,
     Unsupported,
+    CapabilityEncrypted,
+    CapabilitySchema,
+    CapabilityCorrelation,
+    CapabilityTimeout,
+    CapabilityChanged,
+    CapabilityPagination,
     MessageType,
     FrameLength,
     OuterJson,
@@ -135,6 +141,7 @@ pub enum MessageKind {
     WebContent,
     Recommended,
     Poll,
+    File,
     Sticker,
     Other,
 }
@@ -198,6 +205,7 @@ pub enum StorageFailure {
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectoryStage {
+    Account,
     Friends,
     Groups,
     Previews,
@@ -233,8 +241,27 @@ pub enum PreviewField {
     PageMsgs,
     EeMsgs,
 }
+/// Encryption eligibility parser labels, with no peer-provided strings.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityField {
+    Envelope,
+    Request,
+    Status,
+    More,
+    Threads,
+    Waiting,
+    Uids,
+    Pending,
+    Cursor,
+    Group,
+    Encryption,
+    Visibility,
+}
 #[derive(Clone, Copy, Serialize)]
 pub struct Event {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability_field: Option<CapabilityField>,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview_field: Option<PreviewField>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -282,6 +309,7 @@ pub struct Event {
 impl Event {
     pub fn new(kind: Kind, stage: Stage, reason: Reason) -> Self {
         Self {
+            capability_field: None,
             preview_field: None,
             directory_stage: None,
             directory_category: None,
@@ -306,6 +334,10 @@ impl Event {
             message_kind: None,
             server_code_out_of_range: false,
         }
+    }
+    pub fn capability_field(mut self, field: Option<CapabilityField>) -> Self {
+        self.capability_field = field;
+        self
     }
     pub fn directory(mut self, stage: DirectoryStage, category: DirectoryCategory) -> Self {
         self.directory_stage = Some(stage);
@@ -924,6 +956,7 @@ mod tests {
         assert!(plain.get("directory_stage").is_none());
         assert!(plain.get("directory_category").is_none());
         for (stage, expected_stage) in [
+            (DirectoryStage::Account, "account"),
             (DirectoryStage::Friends, "friends"),
             (DirectoryStage::Groups, "groups"),
             (DirectoryStage::Previews, "previews"),
@@ -965,6 +998,7 @@ mod tests {
             (MessageKind::WebContent, "web_content"),
             (MessageKind::Recommended, "recommended"),
             (MessageKind::Poll, "poll"),
+            (MessageKind::File, "file"),
             (MessageKind::Sticker, "sticker"),
             (MessageKind::Other, "other"),
         ] {

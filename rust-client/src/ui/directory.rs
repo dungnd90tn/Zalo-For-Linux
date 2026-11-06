@@ -35,6 +35,37 @@ pub(super) struct DirectoryView {
 }
 
 impl DirectoryView {
+    /// Synthetic rows for native-window captures: the offline worker cannot verify privacy, so it
+    /// never lists contacts. Only the fixture calls this, every frame, with invented names.
+    #[cfg(all(test, feature = "messaging"))]
+    pub(super) fn fixture_rows(&mut self) {
+        let record = |id: &str, name: &str, is_group: bool, friend: Option<bool>| DirectoryRecord {
+            remote_id: id.into(),
+            is_group,
+            display_name: name.into(),
+            avatar_url: None,
+            is_friend: friend,
+            is_blocked: None,
+            member_count: is_group.then_some(3),
+        };
+        self.entries = [
+            ("22", "Đặng Minh", false, Some(true)),
+            ("33", "Nguyễn Hà", false, Some(true)),
+            ("44", "Trần Bảo Ngọc", false, None),
+            ("55", "Lê Quốc Việt", false, Some(true)),
+            ("66", "Phạm Thu Trang", false, Some(true)),
+            ("77", "Vũ Hoàng Long", false, None),
+        ]
+        .into_iter()
+        .map(|(id, name, group, friend)| record(id, name, group, friend))
+        .collect();
+        self.loaded = true;
+        self.pending = false;
+        self.deadline = None;
+        self.error = None;
+        self.block_rows = false;
+        self.summary = "Đã cập nhật danh bạ".into();
+    }
     pub(super) fn privacy_reset(&mut self, ctx: &egui::Context, ready: bool) {
         self.entries.clear();
         self.generation = self.generation.wrapping_add(1);
@@ -193,34 +224,120 @@ impl DirectoryView {
             _ => {}
         }
     }
-    fn show(&mut self, ui: &mut egui::Ui, selected: Option<&str>) -> Option<Action> {
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        selected: Option<&str>,
+        mut avatars: Option<&mut super::avatars::Avatars>,
+    ) -> Option<Action> {
         let colors = crate::theme::palette(ui.ctx());
         let mut action = None;
         ui.spacing_mut().item_spacing.y = 8.0;
-        egui::Frame::none().inner_margin(egui::Margin::symmetric(14.0, 12.0)).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Danh bạ").family(egui::FontFamily::Name("Zalo Semibold".into())).size(18.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add_enabled(!self.syncing, egui::Button::new("Cập nhật").small()).on_hover_text("Cập nhật liên hệ, nhóm và các bản xem trước từ Zalo; không phụ thuộc kết nối nhận tin.").clicked() { action = Some(Action::Refresh); }
+        egui::Frame::none()
+            .inner_margin(egui::Margin::symmetric(16.0, 16.0))
+            .show(ui, |ui| {
+                // A wide single-column list (compact window) keeps title, tabs and refresh on one
+                // row so the rows below keep most of the height.
+                let one_row = ui.available_width() >= 520.0;
+                let tabs = |ui: &mut egui::Ui, this: &mut Self| {
+                    let mut changed = false;
+                    for (group, label) in [(false, "Liên hệ"), (true, "Nhóm")] {
+                        if visuals::chip(ui, label, this.is_group == group, true, label).clicked()
+                            && this.is_group != group
+                        {
+                            this.is_group = group;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        this.reset_query(ui.ctx());
+                    }
+                };
+                let refresh_hint = "Cập nhật liên hệ, nhóm và các bản xem trước từ Zalo; không phụ thuộc kết nối nhận tin.";
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Danh bạ")
+                            .family(egui::FontFamily::Name("Zalo Semibold".into()))
+                            .size(visuals::TEXT_HEADING),
+                    );
+                    if one_row {
+                        ui.add_space(12.0);
+                        tabs(ui, self);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if visuals::chip(ui, "Cập nhật", false, !self.syncing, refresh_hint)
+                            .clicked()
+                        {
+                            action = Some(Action::Refresh);
+                        }
+                    });
                 });
+                if !one_row {
+                    ui.horizontal(|ui| tabs(ui, self));
+                }
+                egui::Frame::none()
+                    .fill(colors.canvas)
+                    .stroke(egui::Stroke::new(1.0_f32, colors.border))
+                    .rounding(12.0)
+                    .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(16.0, 26.0), egui::Sense::hover());
+                            visuals::icon(ui, rect, visuals::Icon::Search, colors.text_secondary);
+                            let response = ui.add_sized(
+                                [ui.available_width(), 26.0],
+                                egui::TextEdit::singleline(&mut self.search)
+                                    .id_source("directory_search")
+                                    .hint_text(if self.is_group {
+                                        "Tìm tên nhóm"
+                                    } else {
+                                        "Tìm tên trong danh bạ"
+                                    })
+                                    .char_limit(128)
+                                    .frame(false),
+                            );
+                            if response.changed() {
+                                self.reset_query(ui.ctx());
+                            }
+                        });
+                    });
+                let roomy = ui.ctx().screen_rect().height() >= 600.0;
+                if roomy {
+                    ui.label(
+                        RichText::new("Danh bạ đã lưu trên thiết bị")
+                            .size(visuals::TEXT_SMALL)
+                            .color(colors.text_secondary),
+                    );
+                }
+                if roomy && !self.summary.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&self.summary)
+                                .size(visuals::TEXT_SMALL)
+                                .color(colors.text_secondary),
+                        )
+                        .wrap(),
+                    )
+                    .on_hover_text(&self.detail);
+                }
+                if let Some(error) = &self.error {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(error)
+                                .size(visuals::TEXT_SMALL)
+                                .color(colors.error),
+                        )
+                        .wrap(),
+                    );
+                    if visuals::chip(ui, "Thử lại", false, true, "Tải lại danh bạ đã lưu").clicked()
+                    {
+                        action = Some(Action::Retry);
+                    }
+                }
             });
-            ui.horizontal(|ui| {
-                let changed = ui.selectable_value(&mut self.is_group, false, "Liên hệ").changed()
-                    | ui.selectable_value(&mut self.is_group, true, "Nhóm").changed();
-                if changed { self.reset_query(ui.ctx()); }
-            });
-            let response = ui.add(egui::TextEdit::singleline(&mut self.search).id_source("directory_search").hint_text(if self.is_group { "Tìm tên nhóm" } else { "Tìm tên trong danh bạ" }).char_limit(128).desired_width(f32::INFINITY));
-            if response.changed() { self.reset_query(ui.ctx()); }
-            ui.label(RichText::new("Danh bạ đã lưu trên thiết bị").size(visuals::TEXT_SMALL).color(colors.text_secondary));
-            if !self.summary.is_empty() {
-                ui.add(egui::Label::new(RichText::new(&self.summary).size(visuals::TEXT_SMALL).color(colors.text_secondary)).wrap()).on_hover_text(&self.detail);
-            }
-            if let Some(error) = &self.error {
-                ui.add(egui::Label::new(RichText::new(error).size(visuals::TEXT_SMALL).color(colors.error)).wrap());
-                if ui.small_button("Thử lại").clicked() { action = Some(Action::Retry); }
-            }
-        });
-        let footer_height = 43.0;
+        let footer_height = 64.0;
         let height = (ui.available_height() - footer_height).max(40.0);
         egui::ScrollArea::vertical()
             .id_salt(("directory_page", self.is_group, self.generation))
@@ -245,7 +362,7 @@ impl DirectoryView {
                 }
                 for entry in &self.entries {
                     let (rect, response) = ui.allocate_exact_size(
-                        vec2(ui.available_width(), 68.0),
+                        vec2(ui.available_width(), 72.0),
                         if self.pending && self.block_rows {
                             Sense::hover()
                         } else {
@@ -255,8 +372,8 @@ impl DirectoryView {
                     let is_selected = selected == Some(entry.thread_id().as_str());
                     if is_selected || response.hovered() || response.is_pointer_button_down_on() {
                         ui.painter().rect_filled(
-                            rect,
-                            0.0,
+                            rect.shrink2(vec2(8.0, 2.0)),
+                            14.0,
                             if response.is_pointer_button_down_on() {
                                 colors.pressed
                             } else if is_selected {
@@ -266,27 +383,30 @@ impl DirectoryView {
                             },
                         );
                     }
-                    visuals::focus_outline(ui, &response, rect, 0.0);
-                    visuals::avatar(
+                    visuals::focus_outline(ui, &response, rect.shrink2(vec2(8.0, 2.0)), 14.0);
+                    let texture = if ui.is_rect_visible(rect) {
+                        avatars
+                            .as_deref_mut()
+                            .and_then(|avatars| avatars.visible(ui.ctx(), &entry.thread_id()))
+                    } else {
+                        None
+                    };
+                    visuals::avatar_photo(
                         ui,
                         egui::Rect::from_center_size(
-                            egui::pos2(rect.left() + 35.0, rect.center().y),
-                            vec2(40.0, 40.0),
+                            egui::pos2(rect.left() + 44.0, rect.center().y),
+                            vec2(48.0, 48.0),
                         ),
                         &entry.display_name,
+                        texture.as_ref(),
                     );
-                    let mut text =
-                        ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_max(
-                            rect.left_top() + vec2(66.0, 12.0),
-                            rect.right_bottom() - vec2(12.0, 8.0),
-                        )));
-                    text.add(
-                        egui::Label::new(
-                            RichText::new(&entry.display_name)
-                                .size(14.0)
-                                .color(colors.text_primary),
-                        )
-                        .truncate(),
+                    super::row_text(
+                        ui,
+                        rect.left_top() + vec2(80.0, 15.0),
+                        (rect.width() - 100.0).max(0.0),
+                        &entry.display_name,
+                        egui::FontId::proportional(visuals::TEXT_BODY),
+                        colors.text_primary,
                     );
                     let subtitle = if entry.is_blocked == Some(true) {
                         "Đã chặn".into()
@@ -300,10 +420,13 @@ impl DirectoryView {
                     } else {
                         "Liên hệ đã lưu".into()
                     };
-                    text.label(
-                        RichText::new(subtitle)
-                            .size(visuals::TEXT_SMALL)
-                            .color(colors.text_secondary),
+                    super::row_text(
+                        ui,
+                        rect.left_top() + vec2(80.0, 41.0),
+                        (rect.width() - 100.0).max(0.0),
+                        &subtitle,
+                        egui::FontId::proportional(visuals::TEXT_SMALL),
+                        colors.text_secondary,
                     );
                     if response.clicked() && (!self.pending || !self.block_rows) {
                         action = Some(Action::Open(entry.clone()));
@@ -312,15 +435,17 @@ impl DirectoryView {
                 }
             });
         egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(12.0, 5.0))
+            .inner_margin(egui::Margin::symmetric(16.0, 10.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            !self.pending && !self.previous.is_empty(),
-                            egui::Button::new("Trước").small(),
-                        )
-                        .clicked()
+                    if visuals::chip(
+                        ui,
+                        "Trước",
+                        false,
+                        !self.pending && !self.previous.is_empty(),
+                        "Trang trước",
+                    )
+                    .clicked()
                     {
                         action = Some(Action::Previous);
                     }
@@ -334,14 +459,14 @@ impl DirectoryView {
                         .size(visuals::TEXT_SMALL)
                         .color(colors.text_secondary),
                     );
-                    if ui
-                        .add_enabled(
-                            !self.pending
-                                && self.next.is_some()
-                                && self.previous.len() < MAX_PREVIOUS,
-                            egui::Button::new("Tiếp").small(),
-                        )
-                        .clicked()
+                    if visuals::chip(
+                        ui,
+                        "Tiếp",
+                        false,
+                        !self.pending && self.next.is_some() && self.previous.len() < MAX_PREVIOUS,
+                        "Trang tiếp theo",
+                    )
+                    .clicked()
                     {
                         action = Some(Action::Next);
                     }
@@ -382,7 +507,10 @@ impl NativeApp {
         let Some(state) = &mut self.live else {
             return;
         };
-        let action = state.directory.show(ui, self.model.selected.as_deref());
+        let action =
+            state
+                .directory
+                .show(ui, self.model.selected.as_deref(), Some(&mut state.avatars));
         match action {
             Some(Action::Refresh) => {
                 state.ensure_worker(self._profile.clone());
@@ -570,7 +698,7 @@ mod tests {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::none())
                         .show(ctx, |ui| {
-                            view.show(ui, None);
+                            view.show(ui, None, None);
                         });
                 },
             );

@@ -442,6 +442,7 @@ mod tests {
                         Some("11"),
                         &name,
                         &name,
+                        None,
                         #[cfg(feature = "messaging")]
                         None,
                         #[cfg(feature = "messaging")]

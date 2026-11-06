@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 pub(crate) mod info;
 pub mod media;
 pub use media::{
-    CardButton, CardRow, MediaContentError, MediaDescriptor, MediaKind, MediaMessageContent,
-    MessageMediaBinding, PhotoDescriptor, PollDescriptor, WebContentDescriptor,
-    MAX_MEDIA_DESCRIPTOR_BYTES,
+    CardButton, CardRow, FileDescriptor, MediaContentError, MediaDescriptor, MediaKind,
+    MediaMessageContent, MessageMediaBinding, PhotoDescriptor, PollDescriptor,
+    WebContentDescriptor, MAX_MEDIA_DESCRIPTOR_BYTES,
 };
 
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;

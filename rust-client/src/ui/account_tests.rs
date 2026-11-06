@@ -210,16 +210,8 @@ fn popup_blocks_submit_and_outside_click_then_restores_the_scoped_editor() {
     assert_eq!(app.drafts.active.text, DRAFT);
     tap(&mut app, &ctx, size, gear(size));
     assert!(app.account_popup.is_some());
-    let submit = || {
-        key(
-            egui::Key::Enter,
-            egui::Modifiers {
-                ctrl: true,
-                command: true,
-                ..Default::default()
-            },
-        )
-    };
+    // Enter is the send key (Ctrl+Enter is a line break).
+    let submit = || key(egui::Key::Enter, egui::Modifiers::NONE);
     let output = frame(&mut app, &ctx, size, submit());
     app.send_local();
     assert!(!app.drafts.active.in_flight());
@@ -344,7 +336,7 @@ fn removed_status_bars_reclaim_content_while_avatar_keeps_recovery_and_offline_i
         let ordinary = settle(&mut app, &ctx, size);
         assert!(!texts(&ordinary).contains(&account_label.as_str()));
         assert!(text_rect(&ordinary, "Kết nối lại").is_none());
-        assert!(ordinary.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Rect(r) if r.rect.height()==68.0 && r.rect.top()==0.0 && r.rect.left()>=64.0)),"The chat header must start at the top, without a persistent status panel");
+        assert!(ordinary.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Rect(r) if r.rect.height()==76.0 && r.rect.top()==0.0 && r.rect.left()>=68.0)),"The chat header must start at the top, without a persistent status panel");
         frame(
             &mut app,
             &ctx,

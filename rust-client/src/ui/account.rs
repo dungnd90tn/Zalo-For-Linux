@@ -1,5 +1,5 @@
 //! Account presence and anchored menus. Rendering never starts authentication or I/O.
-use super::{avatar, visuals, ModalFocus, NativeApp, RAIL_WIDTH};
+use super::{visuals, ModalFocus, NativeApp, RAIL_WIDTH};
 use eframe::egui::{self, pos2, vec2, Align, Align2, FontId, Layout, RichText, Sense, Stroke};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,7 +130,12 @@ impl NativeApp {
         let colors = crate::theme::palette(ui.ctx());
         let (row, response) = ui.allocate_exact_size(vec2(RAIL_WIDTH, 44.0), Sense::click());
         let rect = egui::Rect::from_center_size(row.center(), vec2(40.0, 40.0));
-        avatar(ui, rect, self.account_label());
+        let identity = self
+            .account_id()
+            .map(|id| format!("d:{id}"))
+            .unwrap_or_default();
+        let title = self.account_label().to_owned();
+        self.profile_avatar(ui, rect, &title, &identity);
         let (status, color) = self.account_status_with_palette(colors);
         let badge = rect.right_bottom() - vec2(4.0, 4.0);
         ui.painter().circle_filled(badge, 7.0, colors.status_ring);

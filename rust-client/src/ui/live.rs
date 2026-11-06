@@ -53,6 +53,8 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub media: super::media::MediaCache,
     #[cfg(feature = "messaging")]
+    pub avatars: super::avatars::Avatars,
+    #[cfg(feature = "messaging")]
     pub review_dialog: bool,
     #[cfg(feature = "messaging")]
     pub open_dialog: bool,
@@ -106,6 +108,8 @@ impl LiveState {
             #[cfg(feature = "messaging")]
             media: Default::default(),
             #[cfg(feature = "messaging")]
+            avatars: Default::default(),
+            #[cfg(feature = "messaging")]
             review_dialog: false,
             #[cfg(feature = "messaging")]
             open_dialog: false,
@@ -153,6 +157,7 @@ impl LiveState {
         self.sender_names = Default::default();
         self.hydration = Default::default();
         self.media = Default::default();
+        self.avatars = Default::default();
         self.stickers = Default::default();
         self.directory.privacy_reset(&self.context, false);
         match LiveWorker::start(
@@ -415,6 +420,9 @@ impl NativeApp {
         self.quarantine_privacy(&mut state, ctx, false);
         #[cfg(feature = "messaging")]
         if let Some(account) = state.account.as_ref() {
+            if state.privacy.ready() {
+                state.avatars.scope(&account.id, state.privacy.revision);
+            }
             state.sender_names.sync_scope(&account.id, &self.model, ctx);
             state.hydration.sync_scope(&account.id, &self.model, ctx);
             if let Some(thread) = self.model.selected.as_deref() {
@@ -480,6 +488,7 @@ impl NativeApp {
                         state.directory = Default::default();
                         state.stickers = Default::default();
                         state.media = Default::default();
+                        state.avatars = Default::default();
                         state.sender_names = Default::default();
                         state.hydration = Default::default();
                         state.session = Some(session);
@@ -502,6 +511,7 @@ impl NativeApp {
                         state.directory = Default::default();
                         state.stickers = Default::default();
                         state.media = Default::default();
+                        state.avatars = Default::default();
                         state.sender_names = Default::default();
                         state.hydration = Default::default();
                         state.privacy.reset_worker();
@@ -563,6 +573,9 @@ impl NativeApp {
         #[cfg(feature = "messaging")]
         if state.privacy.ready() {
             state.media.poll(ctx, deadline, &mut remaining);
+            state
+                .avatars
+                .poll(state.worker.as_ref(), ctx, deadline, &mut remaining);
         }
         if !state.controller.events.is_empty() {
             ctx.request_repaint();
@@ -678,10 +691,13 @@ impl NativeApp {
         state.privacy.observe_conversation(&event);
         self.quarantine_privacy(state, ctx, false);
         state.sender_names.apply(&event, &account_id, &self.model);
+        state.avatars.scope(&account_id, state.privacy.revision);
+        state.avatars.apply(&event);
         state
             .hydration
             .apply(&event, &account_id, &mut self.model, ctx);
         if matches!(&event, LiveEvent::DirectoryChanged { .. }) {
+            state.avatars.invalidate_metadata();
             state.hydration.invalidate(&account_id, &self.model, ctx);
         }
         let refresh_senders = matches!(
@@ -791,6 +807,7 @@ impl NativeApp {
                             state.directory = Default::default();
                             state.stickers = Default::default();
                             state.media = Default::default();
+                            state.avatars = Default::default();
                             state.sender_names = Default::default();
                             state.hydration = Default::default();
                             state.privacy.reset_worker();
@@ -1797,14 +1814,18 @@ pub(in crate::ui) mod tests {
                 },
             );
         }
-        fn shortcut(repeat: bool) -> egui::Event {
+        fn key(repeat: bool, modifiers: egui::Modifiers) -> egui::Event {
             egui::Event::Key {
                 key: egui::Key::Enter,
                 physical_key: None,
                 pressed: true,
                 repeat,
-                modifiers: egui::Modifiers::COMMAND,
+                modifiers,
             }
+        }
+        // Enter is the send key; Ctrl+Enter is a line break.
+        fn shortcut(repeat: bool) -> egui::Event {
+            key(repeat, egui::Modifiers::NONE)
         }
         frame(&mut app, &ctx, vec![]);
         frame(
@@ -1844,13 +1865,83 @@ pub(in crate::ui) mod tests {
                 physical_key: None,
                 pressed: false,
                 repeat: false,
-                modifiers: egui::Modifiers::COMMAND,
+                modifiers: egui::Modifiers::NONE,
             }],
+        );
+        assert!(
+            !app.drafts.active.text.contains('\n'),
+            "Enter swallowed during composition must not leave a line break"
         );
         frame(&mut app, &ctx, vec![shortcut(false)]);
         assert!(
             app.drafts.active.in_flight(),
-            "fresh shortcut outside composition must still submit"
+            "fresh Enter outside composition must still submit"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ctrl_or_shift_enter_inserts_a_line_break_and_never_sends() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        app.live = None;
+        app.demo = true;
+        app.worker = Some(
+            crate::app::Worker::demo(root.join("newline-demo.sqlite"), Arc::new(|| {})).unwrap(),
+        );
+        app.model.selected = Some("welcome".into());
+        app.drafts.select("welcome").unwrap();
+        app.drafts.active.text = "một".into();
+        app.focus_composer = true;
+        let frame = |app: &mut NativeApp, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.composer(ui, ctx, 150.0));
+                },
+            );
+        };
+        // egui treats a second press without a release as a held, repeating key.
+        let key = |modifiers| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let release = || egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        for modifiers in [egui::Modifiers::COMMAND, egui::Modifiers::SHIFT] {
+            let before = app.drafts.active.text.matches('\n').count();
+            frame(&mut app, vec![key(modifiers)]);
+            frame(&mut app, vec![release()]);
+            assert_eq!(
+                app.drafts.active.text.matches('\n').count(),
+                before + 1,
+                "{modifiers:?}+Enter must insert exactly one line break"
+            );
+            assert!(
+                !app.drafts.active.in_flight(),
+                "{modifiers:?}+Enter must not send"
+            );
+        }
+        frame(&mut app, vec![key(egui::Modifiers::NONE)]);
+        assert!(app.drafts.active.in_flight(), "plain Enter sends");
+        assert_eq!(
+            app.drafts.active.text.matches('\n').count(),
+            2,
+            "sending with Enter must not add a line break"
         );
         drop(app);
         let _ = std::fs::remove_dir_all(root);
@@ -1958,6 +2049,7 @@ pub(in crate::ui) mod tests {
         struct MeasuredFixture {
             app: NativeApp,
             geometry: Option<[f32; 4]>,
+            grab: crate::ui::shot_fixture::Grabber,
         }
         impl eframe::App for MeasuredFixture {
             fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -1972,7 +2064,16 @@ pub(in crate::ui) mod tests {
                     eprintln!("UI_FIXTURE_DPI native_ppp={} effective_ppp={} logical_width={} logical_height={}", geometry[0], geometry[1], geometry[2], geometry[3]);
                     self.geometry = Some(geometry);
                 }
+                if std::env::var_os("ZALO_UI_FIXTURE_READY").is_some() {
+                    // Synthetic visual state only: the offline worker cannot verify privacy, so
+                    // keep the fixture in the verified state to show the contact rows.
+                    if let Some(live) = self.app.live.as_mut() {
+                        live.privacy = super::super::privacy::Privacy::fixture_ready();
+                        live.directory.fixture_rows();
+                    }
+                }
                 self.app.update(ctx, frame);
+                self.grab.tick(ctx);
             }
         }
         let width = std::env::var("ZALO_UI_FIXTURE_WIDTH")
@@ -2025,6 +2126,7 @@ pub(in crate::ui) mod tests {
                         Box::new(MeasuredFixture {
                             app,
                             geometry: None,
+                            grab: Default::default(),
                         }) as Box<dyn eframe::App>
                     })
                     .map_err(Into::into);
@@ -2338,6 +2440,14 @@ pub(in crate::ui) mod tests {
                 if let Some(mode) = media_mode.as_deref() {
                     fixture_media(&mut app, &cc.egui_ctx, mode);
                 }
+                if std::env::var_os("ZALO_UI_FIXTURE_AVATARS").is_some() {
+                    fixture_avatars(&mut app, &cc.egui_ctx);
+                }
+                if media_mode.as_deref() == Some("files")
+                    || std::env::var_os("ZALO_UI_FIXTURE_AVATARS").is_some()
+                {
+                    fixture_content_worker(&mut app, &cc.egui_ctx);
+                }
                 fixture_theme(&mut app, &cc.egui_ctx);
                 if let Ok(modal) = std::env::var("ZALO_UI_FIXTURE_MODAL") {
                     match modal.as_str() {
@@ -2362,6 +2472,7 @@ pub(in crate::ui) mod tests {
                 Ok(Box::new(MeasuredFixture {
                     app,
                     geometry: None,
+                    grab: Default::default(),
                 }))
             }),
         )
@@ -2414,13 +2525,34 @@ pub(in crate::ui) mod tests {
                 false,
             )],
             "failure" => vec![(MediaKind::Photo, content("photo_object"), true)],
+            "files" => vec![
+                (
+                    MediaKind::File,
+                    serde_json::json!({"title":"Báo cáo kế hoạch triển khai tháng mười một và kiểm tra giao diện.pdf", "params":{"fileSize":12_345_678,"fileExt":"pdf"}, "href":"https://f12-zpcloud.zdn.vn/synthetic-report.pdf"}),
+                    false,
+                ),
+                (
+                    MediaKind::File,
+                    serde_json::json!({"title":"Tài liệu chưa có liên kết.docx", "params":{"fileSize":2048,"fileExt":"docx"}}),
+                    false,
+                ),
+                (
+                    MediaKind::File,
+                    serde_json::json!({"title":"Tệp mã hóa.zip", "params":{"fileSize":4096,"fileExt":"zip"}, "href":"https://f12-zpcloud.zdn.vn/synthetic-secure.zip", "secureKey":"synthetic-key"}),
+                    false,
+                ),
+            ],
             "mixed" => vec![
                 (MediaKind::Photo, content("photo_object"), false),
                 (MediaKind::WebContent, content("webcontent_object"), false),
             ],
             _ => vec![(MediaKind::Photo, content("photo_object"), false)],
         };
-        let thread = if mode == "poll" { "g:90" } else { "d:22" };
+        let thread = if matches!(mode, "poll" | "files") {
+            "g:90"
+        } else {
+            "d:22"
+        };
         let records: Vec<_> = sources
             .into_iter()
             .enumerate()
@@ -2442,10 +2574,27 @@ pub(in crate::ui) mod tests {
         let mut store =
             crate::store::MessageStore::open(&app._profile.paths.data_dir.join("messages.sqlite"))
                 .unwrap();
-        let messages: Vec<_> = records
+        let mut messages: Vec<_> = records
             .iter()
             .map(|(m, content, _)| (m.clone(), None, None, Some(content.clone())))
             .collect();
+        if mode == "files" {
+            messages.push((
+                Message {
+                    account_id: "11".into(),
+                    thread_id: thread.into(),
+                    id: "fixture-short-own".into(),
+                    sender: "11".into(),
+                    text: "Đã rõ.".into(),
+                    sent_at_ms: 1700000000600,
+                    sticker: None,
+                    media: None,
+                },
+                None,
+                None,
+                None,
+            ));
+        }
         store
             .receive_batch_with_media("11", &messages, None)
             .unwrap();
@@ -2469,7 +2618,7 @@ pub(in crate::ui) mod tests {
                 MediaDescriptor::WebContent(c) | MediaDescriptor::Recommended(c) => {
                     c.image_url.as_ref()
                 }
-                MediaDescriptor::Poll(_) => None,
+                MediaDescriptor::Poll(_) | MediaDescriptor::File(_) => None,
             };
             if let Some(url) = url {
                 let key = crate::app::media::MediaKey {
@@ -2487,6 +2636,106 @@ pub(in crate::ui) mod tests {
                 }
             }
         }
+    }
+
+    fn fixture_avatars(app: &mut NativeApp, ctx: &egui::Context) {
+        for thread in &mut app.model.conversations {
+            thread.title = match thread.id.as_str() {
+                "d:22" => "Nguyễn Minh".into(),
+                "d:33" => "Lê Hoài An".into(),
+                "g:90" => "Datanomics".into(),
+                _ => thread.title.clone(),
+            };
+        }
+        let state = app.live.as_mut().unwrap();
+        state.account.as_mut().unwrap().name = "Nguyễn An".into();
+        for (identity, color) in [
+            ("d:11", [25, 120, 210]),
+            ("d:22", [65, 150, 90]),
+            ("d:33", [170, 80, 130]),
+            ("g:90", [210, 120, 30]),
+        ] {
+            let side = 96_u32;
+            let mut rgba = Vec::with_capacity((side * side * 4) as usize);
+            for y in 0..side {
+                for x in 0..side {
+                    let stripe = if (x / 12 + y / 12) % 2 == 0 {
+                        1.0
+                    } else {
+                        0.65
+                    };
+                    rgba.extend([
+                        (color[0] as f32 * stripe) as u8,
+                        (color[1] as f32 * stripe) as u8,
+                        (color[2] as f32 * stripe) as u8,
+                        255,
+                    ]);
+                }
+            }
+            state
+                .avatars
+                .seed(ctx, "11", state.privacy.revision, identity, rgba, side);
+        }
+    }
+
+    fn fixture_content_worker(app: &mut NativeApp, ctx: &egui::Context) {
+        let (worker, mut commands, events) = LiveWorker::presentation_fixture("11");
+        app.live.as_mut().unwrap().worker = Some(worker);
+        let database = app._profile.paths.data_dir.join("messages.sqlite");
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let store = crate::store::MessageStore::open(&database).unwrap();
+            while let Some(command) = commands.blocking_recv() {
+                let event = match command {
+                    LiveCommand::Load {
+                        generation,
+                        thread,
+                        before,
+                    } => Some(LiveEvent::Page {
+                        account_id: "11".into(),
+                        generation,
+                        messages: store.page("11", &thread, before.as_ref(), 50).unwrap(),
+                        thread,
+                        has_older: false,
+                    }),
+                    LiveCommand::ResolveSenders {
+                        generation,
+                        thread,
+                        sender_ids,
+                    } => Some(LiveEvent::SenderNames {
+                        account_id: "11".into(),
+                        generation,
+                        thread,
+                        names: sender_ids
+                            .into_iter()
+                            .filter_map(|id| {
+                                let name = match id.as_str() {
+                                    "22" => "Nguyễn Minh",
+                                    "33" => "Lê Hoài An",
+                                    _ => return None,
+                                };
+                                Some(crate::store::directory::SenderName {
+                                    sender_id: id,
+                                    display_name: name.into(),
+                                })
+                            })
+                            .collect(),
+                    }),
+                    LiveCommand::ResolveAvatars { generation, .. } => Some(LiveEvent::Avatars {
+                        account_id: "11".into(),
+                        generation,
+                        avatars: vec![],
+                    }),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    if events.blocking_send(event).is_err() {
+                        break;
+                    }
+                    repaint.request_repaint();
+                }
+            }
+        });
     }
 
     fn fixture_theme(app: &mut NativeApp, ctx: &egui::Context) {

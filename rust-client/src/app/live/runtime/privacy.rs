@@ -28,6 +28,9 @@ impl Projection {
     }
     pub fn event(&self, mut event: LiveEvent) -> Option<LiveEvent> {
         match &mut event {
+            LiveEvent::Avatars { avatars, .. } => {
+                avatars.retain(|entry| self.permits(&entry.thread_id))
+            }
             LiveEvent::Ready { conversations, .. }
             | LiveEvent::DirectoryChanged { conversations, .. } => conversations.retain(|c| {
                 self.status == LivePrivacyStatus::Ready && !self.hidden.contains(&c.id)
@@ -478,5 +481,46 @@ impl Privacy {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod avatar_tests {
+    use super::*;
+    #[test]
+    fn late_avatar_metadata_is_filtered_against_current_hidden_lease() {
+        let mut state = Projection {
+            status: LivePrivacyStatus::Checking,
+            revision: 1,
+            hidden: ["g:22".into()].into_iter().collect(),
+            unlocked: None,
+        };
+        let event = || LiveEvent::Avatars {
+            account_id: "11".into(),
+            generation: 7,
+            avatars: vec![
+                crate::app::live::AvatarIdentity {
+                    thread_id: "d:22".into(),
+                    url: "https://s120.avatar.talk.zdn.vn/user.png".into(),
+                },
+                crate::app::live::AvatarIdentity {
+                    thread_id: "g:22".into(),
+                    url: "https://s120.avatar.talk.zdn.vn/group.png".into(),
+                },
+            ],
+        };
+        let count = |state: &Projection| match state.event(event()).unwrap() {
+            LiveEvent::Avatars { avatars, .. } => avatars.len(),
+            _ => panic!(),
+        };
+        assert_eq!(count(&state), 0);
+        state.status = LivePrivacyStatus::Ready;
+        assert_eq!(count(&state), 1);
+        state.unlocked = Some("g:22".into());
+        assert_eq!(count(&state), 2);
+        state.unlocked = None;
+        assert_eq!(count(&state), 1);
+        state.status = LivePrivacyStatus::Failed;
+        assert_eq!(count(&state), 0);
     }
 }

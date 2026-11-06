@@ -257,6 +257,7 @@ pub enum FrameMessageKind {
     WebContent,
     Recommended,
     Poll,
+    File,
     Sticker,
     Other,
 }
@@ -694,6 +695,7 @@ fn incoming_with_reason(
                 "chat.webcontent" => FrameMessageKind::WebContent,
                 "chat.recommended" => FrameMessageKind::Recommended,
                 "group.poll" => FrameMessageKind::Poll,
+                "share.file" => FrameMessageKind::File,
                 _ => FrameMessageKind::Other,
             });
             let sticker = sticker_descriptor(v);
@@ -878,79 +880,193 @@ pub fn send_ack(payload: &Value) -> Result<SendAck, WireError> {
     })
 }
 
-/// A complete, request-correlated server snapshot; partial/unknown schemas confer no permission.
+/// Closed diagnostic labels, never peer IDs or arbitrary payload field names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EligibilityReason {
+    EncryptedTarget,
+    Schema,
+    Correlation,
+    Timeout,
+    StateChanged,
+    Pagination,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EligibilityField {
+    Envelope,
+    Request,
+    Status,
+    More,
+    Threads,
+    Waiting,
+    Uids,
+    Pending,
+    Cursor,
+    Group,
+    Encryption,
+    Visibility,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EligibilityFailure {
+    pub error: WireError,
+    pub reason: EligibilityReason,
+    pub field: Option<EligibilityField>,
+    pub value_type: FrameValueType,
+    pub command: Option<u16>,
+}
+impl EligibilityFailure {
+    pub fn new(
+        reason: EligibilityReason,
+        field: Option<EligibilityField>,
+        value: Option<&Value>,
+    ) -> Self {
+        Self {
+            error: WireError::Unsupported,
+            reason,
+            field,
+            value_type: FrameValueType::of(value),
+            command: None,
+        }
+    }
+}
+impl std::fmt::Display for EligibilityFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Conversation encryption eligibility was not established")
+    }
+}
+impl std::error::Error for EligibilityFailure {}
+fn eligibility_schema(field: EligibilityField, value: Option<&Value>) -> EligibilityFailure {
+    EligibilityFailure::new(EligibilityReason::Schema, Some(field), value)
+}
+fn eligibility_status(payload: &Value) -> Result<(), EligibilityFailure> {
+    service_code(payload).map_err(|error| EligibilityFailure {
+        error,
+        ..eligibility_schema(EligibilityField::Status, payload.get("error_code"))
+    })
+}
+/// Compatibility wrapper; runtime consumes detailed, content-free rejection reasons.
 pub fn legacy_direct_allowed(
     payload: &Value,
     request_id: &str,
     target: &str,
 ) -> Result<(bool, Option<String>), WireError> {
-    service_code(payload)?;
+    legacy_direct_allowed_detailed(payload, request_id, target).map_err(|failure| failure.error)
+}
+/// Source GET_LIST terminal logging dereferences all four arrays. Only falsey
+/// pagination flags are optional; missing arrays never establish eligibility.
+pub fn legacy_direct_allowed_detailed(
+    payload: &Value,
+    request_id: &str,
+    target: &str,
+) -> Result<(bool, Option<String>), EligibilityFailure> {
+    eligibility_status(payload)?;
     let response = payload
         .get("data")
         .and_then(Value::as_object)
-        .ok_or(WireError::Invalid)?;
+        .ok_or_else(|| eligibility_schema(EligibilityField::Envelope, payload.get("data")))?;
     if response.get("reqId").and_then(Value::as_str) != Some(request_id) {
-        return Err(WireError::Invalid);
+        return Err(EligibilityFailure::new(
+            EligibilityReason::Correlation,
+            Some(EligibilityField::Request),
+            response.get("reqId"),
+        ));
     }
     let data = response
         .get("data")
         .and_then(Value::as_object)
-        .ok_or(WireError::Invalid)?;
-    if data.get("err").and_then(Value::as_i64).unwrap_or(-1) != 0 {
-        return Err(WireError::Unsupported);
+        .ok_or_else(|| eligibility_schema(EligibilityField::Envelope, response.get("data")))?;
+    if data.get("err").and_then(Value::as_i64) != Some(0) {
+        return Err(eligibility_schema(
+            EligibilityField::Status,
+            data.get("err"),
+        ));
     }
-    let has_more = data
-        .get("hasMore")
-        .and_then(Value::as_bool)
-        .ok_or(WireError::Unsupported)?;
+    let has_more = match data.get("hasMore") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(Value::Number(number)) if number.as_u64() == Some(0) => false,
+        Some(Value::Number(number)) if number.as_u64() == Some(1) => true,
+        value => return Err(eligibility_schema(EligibilityField::More, value)),
+    };
     let mut encrypted = false;
-    for name in ["threads", "waitUids", "uids", "pendingUids"] {
-        let entries = data
-            .get(name)
+    for (name, field) in [
+        ("threads", EligibilityField::Threads),
+        ("waitUids", EligibilityField::Waiting),
+        ("uids", EligibilityField::Uids),
+        ("pendingUids", EligibilityField::Pending),
+    ] {
+        let value = data.get(name);
+        let entries = value
             .and_then(Value::as_array)
-            .filter(|a| a.len() <= 100_000)
-            .ok_or(WireError::Unsupported)?;
+            .filter(|entries| entries.len() <= 100_000)
+            .ok_or_else(|| eligibility_schema(field, value))?;
         for entry in entries {
-            let uid = match name {
-                "threads" | "pendingUids" => {
-                    id_string(entry.get("uid").ok_or(WireError::Invalid)?)?
-                }
-                _ => id_string(entry)?,
+            let uid = if matches!(name, "threads" | "pendingUids") {
+                entry.get("uid")
+            } else {
+                Some(entry)
             };
-            if uid == target {
-                encrypted = true;
-            }
+            let uid = id_string(uid.ok_or_else(|| eligibility_schema(field, Some(entry)))?)
+                .map_err(|_| eligibility_schema(field, Some(entry)))?;
+            encrypted |= uid == target;
         }
     }
     let next = if has_more {
-        Some(id_string(data.get("lastId").ok_or(WireError::Invalid)?)?)
+        Some(
+            id_string(
+                data.get("lastId")
+                    .ok_or_else(|| eligibility_schema(EligibilityField::Cursor, None))?,
+            )
+            .map_err(|_| eligibility_schema(EligibilityField::Cursor, data.get("lastId")))?,
+        )
     } else {
         None
     };
     Ok((!encrypted, next))
 }
 pub fn legacy_group_allowed(payload: &Value, target: &str) -> Result<u64, WireError> {
-    service_code(payload)?;
-    let data = payload.get("data").ok_or(WireError::Invalid)?;
-    let group = data
-        .get("groupId")
-        .map(id_string)
-        .transpose()?
-        .ok_or(WireError::Unsupported)?;
+    legacy_group_allowed_detailed(payload, target).map_err(|failure| failure.error)
+}
+pub fn legacy_group_allowed_detailed(
+    payload: &Value,
+    target: &str,
+) -> Result<u64, EligibilityFailure> {
+    eligibility_status(payload)?;
+    let data = payload
+        .get("data")
+        .ok_or_else(|| eligibility_schema(EligibilityField::Envelope, None))?;
+    let group = id_string(
+        data.get("groupId")
+            .ok_or_else(|| eligibility_schema(EligibilityField::Group, None))?,
+    )
+    .map_err(|_| eligibility_schema(EligibilityField::Group, data.get("groupId")))?;
     if group != target {
-        return Err(WireError::Invalid);
+        return Err(EligibilityFailure::new(
+            EligibilityReason::Correlation,
+            Some(EligibilityField::Group),
+            data.get("groupId"),
+        ));
     }
     let visibility = match data.get("visibility") {
         None => 0,
-        Some(v) => v
+        Some(value) => value
             .as_u64()
-            .filter(|v| *v <= 255)
-            .ok_or(WireError::Unsupported)?,
+            .filter(|value| *value <= 255)
+            .ok_or_else(|| eligibility_schema(EligibilityField::Visibility, Some(value)))?,
     };
     match data.get("e2ee") {
         Some(Value::Bool(false)) => Ok(visibility),
-        Some(Value::Number(n)) if n.as_u64() == Some(0) => Ok(visibility),
-        _ => Err(WireError::Unsupported),
+        Some(Value::Number(number)) if number.as_u64() == Some(0) => Ok(visibility),
+        Some(Value::Bool(true)) => Err(EligibilityFailure::new(
+            EligibilityReason::EncryptedTarget,
+            Some(EligibilityField::Encryption),
+            data.get("e2ee"),
+        )),
+        Some(Value::Number(number)) if number.as_u64() == Some(1) => Err(EligibilityFailure::new(
+            EligibilityReason::EncryptedTarget,
+            Some(EligibilityField::Encryption),
+            data.get("e2ee"),
+        )),
+        value => Err(eligibility_schema(EligibilityField::Encryption, value)),
     }
 }
 
@@ -981,11 +1097,15 @@ mod tests {
             "../../tests/fixtures/messaging/rich_cards.json"
         ))
         .unwrap();
+        let files: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/messaging/files.json"))
+                .unwrap();
         for case in fixture["cases"]
             .as_array()
             .unwrap()
             .iter()
             .chain(cards["cases"].as_array().unwrap())
+            .chain(files["cases"].as_array().unwrap())
         {
             let mut payload = incoming_fixture();
             let message = &mut payload["data"]["msgs"][0];
@@ -1552,6 +1672,115 @@ mod tests {
         }
     }
     #[test]
+    fn direct_eligibility_matches_original_terminal_flags_without_accepting_incomplete_snapshots() {
+        let oracle: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/messaging/eligibility.json"
+        ))
+        .unwrap();
+        for case in oracle["cases"].as_array().unwrap().iter().take(8) {
+            let envelope = json!({"error_code":0,"data":{"reqId":"r1","data":case["pages"][0]}});
+            assert_eq!(
+                legacy_direct_allowed_detailed(&envelope, "r1", "22").is_ok(),
+                case["accepted"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+        let complete = json!({"error_code":0,"data":{"reqId":"r1","data":{"err":0,"threads":[],"waitUids":[],"uids":[],"pendingUids":[]}}});
+        for (name, field) in [
+            ("threads", EligibilityField::Threads),
+            ("waitUids", EligibilityField::Waiting),
+            ("uids", EligibilityField::Uids),
+            ("pendingUids", EligibilityField::Pending),
+        ] {
+            for value in [None, Some(Value::Null), Some(json!({})), Some(json!(false))] {
+                let mut bad = complete.clone();
+                if let Some(value) = value {
+                    bad["data"]["data"][name] = value;
+                } else {
+                    bad["data"]["data"].as_object_mut().unwrap().remove(name);
+                }
+                let failure = legacy_direct_allowed_detailed(&bad, "r1", "22").unwrap_err();
+                assert_eq!(failure.reason, EligibilityReason::Schema);
+                assert_eq!(failure.field, Some(field));
+            }
+        }
+        for flag in [
+            json!("false"),
+            json!("0"),
+            json!({}),
+            json!([]),
+            json!(2),
+            json!(-1),
+        ] {
+            let mut bad = complete.clone();
+            bad["data"]["data"]["hasMore"] = flag;
+            assert_eq!(
+                legacy_direct_allowed_detailed(&bad, "r1", "22")
+                    .unwrap_err()
+                    .field,
+                Some(EligibilityField::More)
+            );
+        }
+        for flag in [json!(true), json!(1)] {
+            let mut next = complete.clone();
+            next["data"]["data"]["hasMore"] = flag;
+            next["data"]["data"]["lastId"] = json!(90);
+            assert_eq!(
+                legacy_direct_allowed_detailed(&next, "r1", "22").unwrap(),
+                (true, Some("90".into()))
+            );
+            next["data"]["data"]["lastId"] = json!("40");
+            assert_eq!(
+                legacy_direct_allowed_detailed(&next, "r1", "22").unwrap(),
+                (true, Some("40".into())),
+                "cursor values are opaque; source forwards them without assuming ascending IDs"
+            );
+        }
+        let unknown = json!({"error_code":0,"data":{"reqId":"r1","data":{}}});
+        assert!(legacy_direct_allowed_detailed(&unknown, "r1", "22").is_err());
+        assert_eq!(
+            legacy_direct_allowed_detailed(&complete, "other", "22")
+                .unwrap_err()
+                .reason,
+            EligibilityReason::Correlation
+        );
+    }
+    #[test]
+    fn group_eligibility_distinguishes_confirmed_encryption_from_unknown_metadata() {
+        for flag in [json!(true), json!(1)] {
+            assert_eq!(
+                legacy_group_allowed_detailed(
+                    &json!({"error_code":0,"data":{"groupId":"22","e2ee":flag}}),
+                    "22"
+                )
+                .unwrap_err()
+                .reason,
+                EligibilityReason::EncryptedTarget
+            );
+        }
+        for metadata in [
+            json!({"groupId":"22"}),
+            json!({"groupId":"22","e2ee":null}),
+            json!({"groupId":"22","e2ee":"false"}),
+        ] {
+            let failure =
+                legacy_group_allowed_detailed(&json!({"error_code":0,"data":metadata}), "22")
+                    .unwrap_err();
+            assert_eq!(failure.reason, EligibilityReason::Schema);
+            assert_eq!(failure.field, Some(EligibilityField::Encryption));
+        }
+        assert_eq!(
+            legacy_group_allowed_detailed(
+                &json!({"error_code":0,"data":{"groupId":"33","e2ee":false}}),
+                "22"
+            )
+            .unwrap_err()
+            .reason,
+            EligibilityReason::Correlation
+        );
+    }
+    #[test]
     fn capability_requires_correlated_complete_explicit_schema_and_rejects_encrypted_members() {
         let complete = json!({"error_code":0,"data":{"reqId":"r1","data":{"err":0,"hasMore":false,"uids":[],"waitUids":[],"threads":[],"pendingUids":[]}}});
         assert_eq!(
@@ -1570,7 +1799,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("hasMore");
-        assert!(legacy_direct_allowed(&partial, "r1", "22").is_err());
+        assert_eq!(
+            legacy_direct_allowed(&partial, "r1", "22").unwrap(),
+            (true, None)
+        );
         partial = complete.clone();
         partial["data"]["data"]["hasMore"] = json!(true);
         assert!(legacy_direct_allowed(&partial, "r1", "22").is_err());

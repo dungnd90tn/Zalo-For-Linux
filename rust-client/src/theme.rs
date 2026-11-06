@@ -1,6 +1,7 @@
 //! Native Zalo theme roles, original token/icon catalogs, and asynchronous profile preferences.
 pub mod catalog;
 mod preferences;
+mod redesign;
 pub use preferences::ThemeController;
 
 use eframe::egui::{self, Color32, Id, Stroke};
@@ -119,7 +120,13 @@ pub struct Palette {
     pub error: Color32,
     pub date_background: Color32,
     pub date_text: Color32,
-    pub avatar_accents: [Color32; 5],
+    pub text_tertiary: Color32,
+    pub border_strong: Color32,
+    pub accent_soft: Color32,
+    pub accent_ink: Color32,
+    pub chip_on_bg: Color32,
+    pub chip_on_text: Color32,
+    pub avatar_accents: [Color32; 6],
     pub on_color: Color32,
     pub status_online: Color32,
     pub status_connecting: Color32,
@@ -173,13 +180,20 @@ impl Palette {
             focus: color("--border-focused"),
             error: color("--text-errors"),
             date_background: color("--bg-message-info"),
-            date_text: color("--text-secondary"),
+            date_text: color("--redesign-text-tertiary"),
+            text_tertiary: color("--redesign-text-tertiary"),
+            border_strong: color("--redesign-border-strong"),
+            accent_soft: color("--redesign-accent-soft"),
+            accent_ink: color("--redesign-accent-ink"),
+            chip_on_bg: color("--redesign-chip-on-bg"),
+            chip_on_text: color("--redesign-chip-on-text"),
             avatar_accents: [
-                color("--accent-blue-bg"),
-                color("--accent-green-bg"),
-                color("--accent-orange-bg"),
-                color("--accent-purple-bg"),
-                color("--accent-stealblue-bg"),
+                color("--redesign-avatar-1"),
+                color("--redesign-avatar-2"),
+                color("--redesign-avatar-3"),
+                color("--redesign-avatar-4"),
+                color("--redesign-avatar-5"),
+                color("--redesign-avatar-6"),
             ],
             on_color: color("--text-on-color"),
             // Original .avatar-online-dot:after uses G60 with a WA100 ring.
@@ -263,11 +277,25 @@ fn apply_custom(ctx: &egui::Context, mode: ThemeMode, overrides: &BTreeMap<Strin
         widget.weak_bg_fill = background;
         widget.fg_stroke = Stroke::new(1.0_f32, text);
         widget.bg_stroke = Stroke::new(1.0_f32, border);
-        widget.rounding = egui::Rounding::same(5.0_f32);
+        widget.rounding = egui::Rounding::same(12.0_f32);
     }
     ctx.set_style(style);
     ctx.data_mut(|data| data.insert_temp(Id::new("zalo-native-palette"), colors));
     ctx.data_mut(|data| data.insert_temp(Id::new("zalo-native-gradients"), gradients));
+}
+
+/// The value a token has before any Custom override: the approved redesign value when there is
+/// one, otherwise the original declaration. Settings shows this as the token's default.
+pub fn default_value(name: &str, dark: bool) -> Option<String> {
+    redesign::value(name, dark).map(str::to_owned).or_else(|| {
+        catalog::token(name).map(|token| {
+            if dark {
+                token.dark.clone()
+            } else {
+                token.light.clone()
+            }
+        })
+    })
 }
 
 fn resolve_color(
@@ -279,11 +307,20 @@ fn resolve_color(
     if depth > 12 {
         return None;
     }
-    let token = catalog::token(name)?;
+    // Custom override first, then the approved redesign value, then the original token.
     let raw = custom
         .and_then(|m| m.get(name))
         .map(String::as_str)
-        .unwrap_or(if dark { &token.dark } else { &token.light });
+        .or_else(|| redesign::value(name, dark))
+        .or_else(|| {
+            catalog::token(name).map(|token| {
+                if dark {
+                    token.dark.as_str()
+                } else {
+                    token.light.as_str()
+                }
+            })
+        })?;
     if let Some(reference) = raw.strip_prefix("var(").and_then(|s| s.strip_suffix(')')) {
         return resolve_color(reference.trim(), dark, custom, depth + 1);
     }
@@ -385,8 +422,8 @@ mod tests {
         let light = Palette::from_mode(ThemeMode::Light, false, &BTreeMap::new());
         let dark = Palette::from_mode(ThemeMode::Dark, false, &BTreeMap::new());
         assert_eq!(light.primary, Color32::from_rgb(0, 104, 255));
-        assert_eq!(dark.canvas, Color32::from_rgb(18, 20, 22));
-        assert_eq!(dark.text_primary, Color32::from_rgb(223, 226, 231));
+        assert_eq!(dark.canvas, Color32::from_rgb(14, 20, 32));
+        assert_eq!(dark.text_primary, Color32::from_rgb(234, 240, 250));
         assert_ne!(light.button_primary_hover, light.button_primary_pressed);
         assert_ne!(dark.button_primary_disabled, dark.primary);
         assert_eq!(
@@ -402,6 +439,101 @@ mod tests {
             light
         );
     }
+    fn luminance(color: Color32) -> f32 {
+        let channel = |value: u8| {
+            let v = f32::from(value) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (hi, lo) = {
+            let (x, y) = (luminance(a), luminance(b));
+            if x > y {
+                (x, y)
+            } else {
+                (y, x)
+            }
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+    #[test]
+    fn approved_redesign_values_back_light_and_dark() {
+        let light = Palette::from_mode(ThemeMode::Light, false, &BTreeMap::new());
+        let dark = Palette::from_mode(ThemeMode::Dark, false, &BTreeMap::new());
+        assert_eq!(light.canvas, Color32::from_rgb(0xf3, 0xf5, 0xf9));
+        assert_eq!(light.surface, Color32::WHITE);
+        assert_eq!(light.text_primary, Color32::from_rgb(0x12, 0x18, 0x26));
+        assert_eq!(light.nav_background, Color32::from_rgb(0x0a, 0x25, 0x40));
+        assert_eq!(dark.surface, Color32::from_rgb(0x15, 0x1d, 0x2b));
+        assert_eq!(dark.nav_background, Color32::from_rgb(0x07, 0x0b, 0x12));
+        assert_eq!(dark.focus, Color32::from_rgb(0x8d, 0xb8, 0xff));
+        for palette in [light, dark] {
+            // Own plain text is white on the accent; incoming bubbles share the surface.
+            assert_eq!(palette.bubble_own, palette.primary);
+            assert_eq!(palette.bubble_own, Color32::from_rgb(0, 0x68, 0xff));
+            assert_eq!(palette.bubble_incoming, palette.surface);
+            assert_eq!(palette.on_color, Color32::WHITE);
+            assert_eq!(palette.avatar_accents.len(), 6);
+        }
+        // Custom still layers over the Light redesign values, not the original catalog.
+        let mut overrides = BTreeMap::new();
+        overrides.insert("--text-primary".into(), "#123456".into());
+        let custom = Palette::from_mode(ThemeMode::Custom, false, &overrides);
+        assert_eq!(custom.canvas, light.canvas);
+        assert_eq!(custom.text_primary, Color32::from_rgb(0x12, 0x34, 0x56));
+    }
+
+    #[test]
+    fn redesign_text_pairs_meet_aa_contrast_in_light_and_dark() {
+        for dark in [false, true] {
+            let p = Palette::from_mode(
+                if dark {
+                    ThemeMode::Dark
+                } else {
+                    ThemeMode::Light
+                },
+                false,
+                &BTreeMap::new(),
+            );
+            let mut pairs = vec![
+                ("text on canvas", p.text_primary, p.canvas),
+                ("text on surface", p.text_primary, p.surface),
+                ("secondary on canvas", p.text_secondary, p.canvas),
+                ("secondary on surface", p.text_secondary, p.surface),
+                ("secondary on selected", p.text_secondary, p.selected),
+                ("tertiary on date chip", p.date_text, p.date_background),
+                ("tertiary on surface", p.text_tertiary, p.surface),
+                ("on-color on own bubble", p.on_color, p.bubble_own),
+                ("chip text", p.chip_on_text, p.chip_on_bg),
+                ("accent ink on soft", p.accent_ink, p.accent_soft),
+                ("rail icons", p.nav_text, p.nav_background),
+                ("primary button label", p.button_primary_text, p.primary),
+            ];
+            for accent in p.avatar_accents {
+                pairs.push(("initials on avatar", p.on_color, accent));
+            }
+            for (name, fg, bg) in pairs {
+                let ratio = contrast(fg, bg);
+                assert!(
+                    ratio >= 4.5,
+                    "{name} ({}): {ratio:.2} < 4.5",
+                    if dark { "dark" } else { "light" }
+                );
+            }
+            // Non-text boundaries and focus only need 3:1 against what they sit on.
+            assert!(contrast(p.focus, p.surface) >= 3.0, "focus ring");
+            assert!(
+                contrast(p.border_strong, p.surface) >= 1.2,
+                "field edge visible"
+            );
+        }
+    }
+
     #[test]
     fn custom_overlay_changes_only_requested_tokens_and_reset_inherits_original() {
         let mut overrides = BTreeMap::new();

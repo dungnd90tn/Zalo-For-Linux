@@ -41,7 +41,7 @@ pub(super) fn show<R>(
             egui::Frame::none()
                 .fill(colors.surface)
                 .stroke(Stroke::new(1.0_f32, colors.border))
-                .rounding(4.0),
+                .rounding(16.0),
         )
         .anchor(
             if top_aligned {
@@ -58,18 +58,20 @@ pub(super) fn show<R>(
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let (rect, _) =
-                ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::hover());
+                ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::hover());
             let close_rect = egui::Rect::from_center_size(
-                egui::pos2(rect.right() - 20.0, rect.center().y),
+                egui::pos2(rect.right() - 30.0, rect.center().y),
                 vec2(24.0, 24.0),
             );
-            let close_hit_rect = close_rect.expand(3.0);
+            // 44 px hit target around the 24 px glyph.
+            let close_hit_rect =
+                egui::Rect::from_center_size(close_rect.center(), vec2(44.0, 44.0));
             let close = ui.interact(close_hit_rect, Id::new((id, "close")), Sense::click());
             if close.hovered() || close.has_focus() {
-                ui.painter().rect_filled(close_hit_rect, 4.0, colors.hover);
+                ui.painter().rect_filled(close_hit_rect, 12.0, colors.hover);
             }
             super::visuals::source_icon(ui, close_rect, "fa-close_24", colors.text_secondary);
-            super::visuals::focus_outline(ui, &close, close_hit_rect, 4.0);
+            super::visuals::focus_outline(ui, &close, close_hit_rect, 12.0);
             closed |= close.clicked();
             close.on_hover_text("Đóng");
             let mut heading = ui.new_child(
@@ -100,7 +102,7 @@ pub(super) fn show<R>(
 }
 
 pub(super) fn body<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let height = (ui.ctx().screen_rect().height() - 48.0 - 64.0 - 64.0).max(80.0);
+    let height = (ui.ctx().screen_rect().height() - 56.0 - 72.0 - 72.0).max(80.0);
     egui::ScrollArea::vertical()
         .id_salt("dialog_body")
         .auto_shrink([false, true])
@@ -132,9 +134,9 @@ pub(super) fn footer<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) 
         .inner_margin(egui::Margin::symmetric(16.0, 14.0))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            ui.spacing_mut().interact_size.y = 32.0;
+            ui.spacing_mut().interact_size.y = 44.0;
             ui.allocate_ui_with_layout(
-                vec2(ui.available_width(), 32.0),
+                vec2(ui.available_width(), 44.0),
                 Layout::right_to_left(Align::Center),
                 contents,
             )

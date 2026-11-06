@@ -157,6 +157,11 @@ fn wire_error(error: &anyhow::Error) -> Option<&WireError> {
         .downcast_ref::<wire::FrameFailure>()
         .map(|failure| &failure.error)
         .or_else(|| error.downcast_ref::<WireError>())
+        .or_else(|| {
+            error
+                .downcast_ref::<wire::EligibilityFailure>()
+                .map(|failure| &failure.error)
+        })
 }
 fn diagnostic(error: &anyhow::Error, stage: LiveStage) -> LiveDiagnostic {
     if let Some(storage) = error.downcast_ref::<StorageContext>() {
@@ -178,6 +183,14 @@ fn diagnostic(error: &anyhow::Error, stage: LiveStage) -> LiveDiagnostic {
         Some(WireError::Service(_)) => LiveCategory::Server,
         None => LiveCategory::Storage,
     };
+    let category = if error
+        .downcast_ref::<wire::EligibilityFailure>()
+        .is_some_and(|failure| failure.reason == wire::EligibilityReason::Timeout)
+    {
+        LiveCategory::Timeout
+    } else {
+        category
+    };
     let result = LiveDiagnostic {
         stage,
         category,
@@ -188,8 +201,99 @@ fn diagnostic(error: &anyhow::Error, stage: LiveStage) -> LiveDiagnostic {
             _ => None,
         },
     };
-    record_failure(result, frame_failure.map(|failure| failure.context));
+    if let Some(failure) = error.downcast_ref::<wire::EligibilityFailure>() {
+        crate::diagnostics::record(eligibility_failure_event(failure));
+    } else {
+        record_failure(result, frame_failure.map(|failure| failure.context));
+    }
     result
+}
+fn eligibility_failure_event(failure: &wire::EligibilityFailure) -> crate::diagnostics::Event {
+    use crate::diagnostics::{CapabilityField as Field, Event, Kind, Reason, Stage};
+    let reason = match failure.reason {
+        wire::EligibilityReason::EncryptedTarget => Reason::CapabilityEncrypted,
+        wire::EligibilityReason::Schema => Reason::CapabilitySchema,
+        wire::EligibilityReason::Correlation => Reason::CapabilityCorrelation,
+        wire::EligibilityReason::Timeout => Reason::CapabilityTimeout,
+        wire::EligibilityReason::StateChanged => Reason::CapabilityChanged,
+        wire::EligibilityReason::Pagination => Reason::CapabilityPagination,
+    };
+    let field = failure.field.map(|field| match field {
+        wire::EligibilityField::Envelope => Field::Envelope,
+        wire::EligibilityField::Request => Field::Request,
+        wire::EligibilityField::Status => Field::Status,
+        wire::EligibilityField::More => Field::More,
+        wire::EligibilityField::Threads => Field::Threads,
+        wire::EligibilityField::Waiting => Field::Waiting,
+        wire::EligibilityField::Uids => Field::Uids,
+        wire::EligibilityField::Pending => Field::Pending,
+        wire::EligibilityField::Cursor => Field::Cursor,
+        wire::EligibilityField::Group => Field::Group,
+        wire::EligibilityField::Encryption => Field::Encryption,
+        wire::EligibilityField::Visibility => Field::Visibility,
+    });
+    let mut event = Event::new(Kind::Failure, Stage::Send, reason)
+        .capability_field(field)
+        .field_type(Some(diagnostic_value_type(failure.value_type)))
+        .server_code(match failure.error {
+            WireError::Service(code) => Some(code),
+            _ => None,
+        });
+    if let Some(command) = failure.command {
+        event = event.frame(command, 0, None);
+    }
+    event
+}
+fn eligibility_message(reason: wire::EligibilityReason) -> &'static str {
+    match reason {
+        wire::EligibilityReason::EncryptedTarget=>"Hội thoại này đã bật mã hóa đầu cuối. Client chưa hỗ trợ gửi ở chế độ này; bản nháp được giữ lại.",
+        wire::EligibilityReason::Schema=>"Chưa xác minh được trạng thái mã hóa do định dạng phản hồi máy chủ chưa được hỗ trợ. Bản nháp được giữ lại.",
+        wire::EligibilityReason::Correlation=>"Phản hồi xác minh hội thoại không khớp yêu cầu. Hãy thử lại; bản nháp được giữ lại.",
+        wire::EligibilityReason::Timeout=>"Quá thời gian xác minh trạng thái mã hóa. Hãy thử lại; bản nháp được giữ lại.",
+        wire::EligibilityReason::StateChanged=>"Có sự kiện mã hóa trong lúc xác minh. Hãy thử lại; bản nháp được giữ lại.",
+        wire::EligibilityReason::Pagination=>"Chưa lấy đủ trạng thái mã hóa của hội thoại. Hãy thử lại; bản nháp được giữ lại.",
+    }
+}
+#[test]
+fn eligibility_diagnostics_keep_only_fixed_reasons_fields_and_types() {
+    use wire::{
+        EligibilityFailure as Failure, EligibilityField as Field, EligibilityReason as Reason,
+    };
+    for (reason, name) in [
+        (Reason::EncryptedTarget, "capability_encrypted"),
+        (Reason::Schema, "capability_schema"),
+        (Reason::Correlation, "capability_correlation"),
+        (Reason::Timeout, "capability_timeout"),
+        (Reason::StateChanged, "capability_changed"),
+        (Reason::Pagination, "capability_pagination"),
+    ] {
+        let private = json!("synthetic private account message cookie URL");
+        let mut failure = Failure::new(reason, Some(Field::Pending), Some(&private));
+        failure.command = Some(563);
+        let value = serde_json::to_value(eligibility_failure_event(&failure)).unwrap();
+        assert_eq!(value["reason"], name);
+        assert_eq!(value["capability_field"], "pending");
+        assert_eq!(value["field_type"], "string");
+        assert_eq!(value["command_id"], 563);
+        assert!(!value.to_string().contains("private"));
+        assert!(!format!("{failure:?}").contains("private"));
+        assert!(value.as_object().unwrap().keys().all(|key| matches!(
+            key.as_str(),
+            "kind"
+                | "stage"
+                | "reason"
+                | "capability_field"
+                | "field_type"
+                | "command"
+                | "command_id"
+                | "subcommand"
+        )));
+        let message = eligibility_message(reason);
+        assert!(message.contains("bản nháp") || message.contains("Bản nháp"));
+        if reason != Reason::EncryptedTarget {
+            assert!(!message.contains("đã bật mã hóa đầu cuối"));
+        }
+    }
 }
 fn diagnostic_reason(reason: wire::FrameReason) -> crate::diagnostics::Reason {
     use crate::diagnostics::Reason;
@@ -250,6 +354,7 @@ fn diagnostic_message_kind(value: wire::FrameMessageKind) -> crate::diagnostics:
         wire::FrameMessageKind::WebContent => crate::diagnostics::MessageKind::WebContent,
         wire::FrameMessageKind::Recommended => crate::diagnostics::MessageKind::Recommended,
         wire::FrameMessageKind::Poll => crate::diagnostics::MessageKind::Poll,
+        wire::FrameMessageKind::File => crate::diagnostics::MessageKind::File,
         wire::FrameMessageKind::Sticker => crate::diagnostics::MessageKind::Sticker,
         wire::FrameMessageKind::Other => crate::diagnostics::MessageKind::Other,
     }
@@ -310,6 +415,7 @@ fn directory_failure_event(failure: &DirectoryFailure) -> crate::diagnostics::Ev
     use crate::diagnostics::{DirectoryCategory as LogCategory, DirectoryStage as LogStage};
     use crate::diagnostics::{Event, Kind, Reason, Stage};
     let stage = match failure.stage {
+        DirectoryStage::Account => LogStage::Account,
         DirectoryStage::Friends => LogStage::Friends,
         DirectoryStage::Groups => LogStage::Groups,
         DirectoryStage::Previews => LogStage::Previews,
@@ -1344,19 +1450,46 @@ impl Connection {
             loop {
                 let frame = tokio::time::timeout_at(deadline, self.next())
                     .await
-                    .map_err(|_| WireError::Unsupported)??;
+                    .map_err(|_| {
+                        let mut failure = wire::EligibilityFailure::new(
+                            wire::EligibilityReason::Timeout,
+                            None,
+                            None,
+                        );
+                        failure.command = Some(563);
+                        failure
+                    })??;
                 let Some(frame) = frame else { continue };
                 if frame.cmd == 563 {
-                    let (allowed, next) =
-                        wire::legacy_direct_allowed(&frame.payload, &request, &target.remote_id)?;
+                    let (allowed, next) = wire::legacy_direct_allowed_detailed(
+                        &frame.payload,
+                        &request,
+                        &target.remote_id,
+                    )
+                    .map_err(|mut failure| {
+                        failure.command = Some(563);
+                        failure
+                    })?;
                     if !allowed {
-                        return Err(WireError::Unsupported.into());
+                        let mut failure = wire::EligibilityFailure::new(
+                            wire::EligibilityReason::EncryptedTarget,
+                            None,
+                            None,
+                        );
+                        failure.command = Some(563);
+                        return Err(failure.into());
                     }
                     match next {
                         None => return Ok(()),
                         Some(id) => {
                             if !seen.insert(id.clone()) {
-                                return Err(WireError::Invalid.into());
+                                let mut failure = wire::EligibilityFailure::new(
+                                    wire::EligibilityReason::Pagination,
+                                    Some(wire::EligibilityField::Cursor),
+                                    None,
+                                );
+                                failure.command = Some(563);
+                                return Err(failure.into());
                             }
                             last = Some(id);
                             break;
@@ -1365,12 +1498,24 @@ impl Connection {
                 }
                 // Process all intervening data before checking the final capability snapshot.
                 if [551, 552, 535, 543, 544, 548, 561, 580, 581, 582].contains(&frame.cmd) {
-                    return Err(WireError::Unsupported.into());
+                    let mut failure = wire::EligibilityFailure::new(
+                        wire::EligibilityReason::StateChanged,
+                        None,
+                        None,
+                    );
+                    failure.command = Some(frame.cmd);
+                    return Err(failure.into());
                 }
                 self.process(frame, db, events).await?;
             }
         }
-        Err(WireError::Oversize.into())
+        let mut failure = wire::EligibilityFailure::new(
+            wire::EligibilityReason::Pagination,
+            Some(wire::EligibilityField::Cursor),
+            None,
+        );
+        failure.command = Some(563);
+        Err(failure.into())
     }
 }
 async fn read_response(
@@ -1459,8 +1604,12 @@ async fn verify_group(
         Duration::from_secs(15),
         authenticated_request(client, session, url, None),
     )
-    .await??;
-    Ok(wire::legacy_group_allowed(&payload, &target.remote_id)?)
+    .await
+    .map_err(|_| wire::EligibilityFailure::new(wire::EligibilityReason::Timeout, None, None))??;
+    Ok(wire::legacy_group_allowed_detailed(
+        &payload,
+        &target.remote_id,
+    )?)
 }
 async fn send_text(
     client: &reqwest::Client,
@@ -1605,6 +1754,31 @@ async fn handle_command(
                 }
             };
             events.emit(event).await?;
+        }
+        LiveCommand::ResolveAvatars {
+            generation,
+            thread_ids,
+        } => {
+            let account = events.account.clone();
+            let avatars = db
+                .call_with(StorageOperation::DirectoryRead, move |store| {
+                    store.avatars(&account, &thread_ids)
+                })
+                .await;
+            let avatars = match avatars {
+                Ok(avatars) => avatars,
+                Err(error) => {
+                    record_storage_failure(&error, StorageOperation::DirectoryRead);
+                    Vec::new()
+                }
+            };
+            events
+                .emit(LiveEvent::Avatars {
+                    account_id: events.account.clone(),
+                    generation,
+                    avatars,
+                })
+                .await?;
         }
         LiveCommand::ResolveSenders {
             generation,
@@ -1785,10 +1959,12 @@ async fn handle_command(
                     }
                     let message = if storage_failed {
                         "Chưa lưu được dữ liệu nhận trên thiết bị. Kết nối đã tạm dừng; bản nháp được giữ lại."
+                    } else if let Some(failure) = error.downcast_ref::<wire::EligibilityFailure>() {
+                        eligibility_message(failure.reason)
                     } else if wire_error(&error)
                         .is_some_and(|e| matches!(e, WireError::Unsupported))
                     {
-                        "Hội thoại mã hóa đầu cuối hoặc chưa xác minh được trạng thái mã hóa. Bản nháp được giữ lại."
+                        "Chưa xác minh được trạng thái mã hóa của hội thoại. Bản nháp được giữ lại."
                     } else {
                         "Chưa xác minh được hội thoại. Hãy kiểm tra kết nối; bản nháp được giữ lại."
                     };

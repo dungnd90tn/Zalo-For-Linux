@@ -11,6 +11,13 @@ use std::collections::{HashMap, HashSet};
 pub const DIRECTORY_LIMIT: usize = 200;
 pub const MAX_DIRECTORY_ROWS: usize = 30_000;
 pub const MAX_SENDER_NAMES: usize = 64;
+/// Account is carried by the containing event. The prefix distinguishes a user from a group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvatarIdentity {
+    pub thread_id: String,
+    pub url: String,
+}
+pub const MAX_AVATARS: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderName {
     pub sender_id: String,
@@ -91,6 +98,47 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
     Ok(())
 }
 impl MessageStore {
+    /// Bounded primary-key snapshots; never scan the complete directory for visible avatars.
+    #[cfg(feature = "messaging")]
+    pub fn avatars(&self, account: &str, threads: &[String]) -> Result<Vec<AvatarIdentity>> {
+        validate_id(account)?;
+        if threads.len() > MAX_AVATARS {
+            bail!("Avatar request exceeds its resource limit");
+        }
+        let mut seen = HashSet::with_capacity(threads.len());
+        let mut result = Vec::with_capacity(threads.len());
+        let mut query = self.conn.prepare_cached("SELECT CASE WHEN length(CAST(avatar_url AS BLOB))<=2048 THEN avatar_url END FROM directory_entries WHERE account_id=?1 AND thread_id=?2")?;
+        for thread in threads {
+            validate_id(thread)?;
+            let Some((kind, remote)) = thread.split_once(':') else {
+                bail!("Invalid avatar identity");
+            };
+            if !matches!(kind, "d" | "g")
+                || remote.is_empty()
+                || remote.starts_with('0')
+                || remote.len() > 24
+                || !remote.bytes().all(|b| b.is_ascii_digit())
+            {
+                bail!("Invalid avatar identity");
+            }
+            if !seen.insert(thread) || !self.live_thread_visible(account, thread)? {
+                continue;
+            }
+            let address: Option<Option<String>> = query
+                .query_row(params![account, thread], |row| row.get(0))
+                .optional()?;
+            if let Some(url) = address
+                .flatten()
+                .and_then(|url| crate::protocol::directory::avatar_url(&url))
+            {
+                result.push(AvatarIdentity {
+                    thread_id: thread.clone(),
+                    url,
+                });
+            }
+        }
+        Ok(result)
+    }
     /// Resolve only the requested user identities via the account/thread primary
     /// key. Group records with the same remote ID never name a message sender.
     pub fn sender_names(&self, account: &str, sender_ids: &[String]) -> Result<Vec<SenderName>> {
@@ -280,7 +328,7 @@ impl MessageStore {
             bail!("Invalid directory cursor");
         }
         let mut statement = self.conn.prepare_cached("SELECT remote_id,is_group,display_name,avatar_url,is_friend,is_blocked,member_count FROM directory_entries
-            WHERE account_id=?1 AND is_group=?2 AND NOT EXISTS(SELECT 1 FROM temp.live_privacy p WHERE p.account_id=directory_entries.account_id AND p.ready=0) AND NOT EXISTS(SELECT 1 FROM temp.live_hidden h WHERE h.account_id=directory_entries.account_id AND h.thread_id=directory_entries.thread_id) AND (display_name,thread_id)>(?3,?4) AND (?5='' OR instr(search_name,?5)>0 OR instr(remote_id,?5)>0)
+            WHERE account_id=?1 AND is_group=?2 AND NOT (is_group=0 AND remote_id=account_id) AND NOT EXISTS(SELECT 1 FROM temp.live_privacy p WHERE p.account_id=directory_entries.account_id AND p.ready=0) AND NOT EXISTS(SELECT 1 FROM temp.live_hidden h WHERE h.account_id=directory_entries.account_id AND h.thread_id=directory_entries.thread_id) AND (display_name,thread_id)>(?3,?4) AND (?5='' OR instr(search_name,?5)>0 OR instr(remote_id,?5)>0)
             ORDER BY display_name,thread_id LIMIT ?6")?;
         let records = statement
             .query_map(
@@ -322,6 +370,60 @@ impl MessageStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn avatar_point_snapshots_bind_account_user_group_url_and_live_policy() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let mut user = entry("Người dùng");
+        user.avatar_url = Some("https://s120.avatar.talk.zdn.vn/user.png".into());
+        let mut group = user.clone();
+        group.is_group = true;
+        group.avatar_url = Some("https://s120.avatar.talk.zdn.vn/group.png".into());
+        let batch = |account: &str, entries: Vec<DirectoryRecord>, observed| DirectoryBatch {
+            account_id: account.into(),
+            entries,
+            messages: vec![],
+            message_info: vec![],
+            message_media: vec![],
+            observed_at_ms: observed,
+        };
+        store
+            .apply_directory_batch(&batch("11", vec![user.clone(), group], 1))
+            .unwrap();
+        user.avatar_url = Some("https://s120.avatar.talk.zdn.vn/other-account.png".into());
+        store
+            .apply_directory_batch(&batch("33", vec![user.clone()], 1))
+            .unwrap();
+        let ids = vec!["d:12".into(), "g:12".into(), "d:12".into(), "d:99".into()];
+        let pictures = store.avatars("11", &ids).unwrap();
+        assert_eq!(pictures.len(), 2);
+        assert!(pictures[0].url.ends_with("/user.png") && pictures[1].url.ends_with("/group.png"));
+        assert!(store.avatars("33", &ids).unwrap()[0]
+            .url
+            .ends_with("/other-account.png"));
+        store.begin_live_privacy("11").unwrap();
+        assert!(store.avatars("11", &ids).unwrap().is_empty());
+        store
+            .replace_live_privacy("11", &["g:12".into()], None)
+            .unwrap();
+        assert_eq!(store.avatars("11", &ids).unwrap().len(), 1);
+        store.unlock_live_thread("11", Some("g:12")).unwrap();
+        assert_eq!(store.avatars("11", &ids).unwrap().len(), 2);
+        store.unlock_live_thread("11", None).unwrap();
+        assert_eq!(store.avatars("11", &ids).unwrap().len(), 1);
+        store
+            .apply_directory_batch(&batch("11", vec![user], 2))
+            .unwrap();
+        assert!(store.avatars("11", &ids).unwrap()[0]
+            .url
+            .ends_with("/other-account.png"));
+        assert!(store
+            .avatars("11", &vec!["d:12".into(); MAX_AVATARS + 1])
+            .is_err());
+        for bad in ["12", "d:0", "g:012", "other:12", "d:private"] {
+            assert!(store.avatars("11", &[bad.into()]).is_err());
+        }
+    }
     #[test]
     fn sender_names_are_bounded_account_scoped_user_records_not_group_titles() {
         let mut store = MessageStore::in_memory().unwrap();
@@ -772,7 +874,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            7
+            8
         );
         assert_eq!(
             store.page("11", "d:12", None, 10).unwrap()[0].text,

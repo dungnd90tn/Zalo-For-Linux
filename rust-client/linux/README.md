@@ -54,3 +54,11 @@ The same release was run only in a disposable offline demo for QA. Actual X11
 `_NET_WM_ICON` matched every original 512×512 RGBA pixel, and `WM_CLASS` matched
 `zalo-linux-rust-preview`. Native Wayland grouping and an actual desktop-menu
 launch remain unverified; those actions may start automatic live authentication.
+
+## Conflict with the system packages
+
+The `.deb`/`.rpm` install the same desktop ID (`zalo-linux-rust-preview`) under `/usr/share`. A per-user entry created
+by `install-desktop.py` lives in `~/.local/share/applications` and takes precedence, so it keeps launching its own,
+possibly older, executable. When moving to a system package, delete the per-user files first (see the release notes for
+the exact commands) and regenerate the user icon cache with `gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor`:
+a stale user cache can still resolve the icon to the deleted per-user path and show a blank icon.

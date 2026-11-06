@@ -21,7 +21,7 @@ This repository contains the Electron Linux port and independent Rust native pre
 - `scripts/rust/`: developer helpers and Python tooling tests; `rust-client/examples/`: synthetic benchmarks.
 - Root packaging writes ignored `dist/`; `changelogs/` records releases; `reverse-engineering/` holds research.
 
-For native UI changes in `rust-client/src/ui.rs`, `rust-client/src/ui/`, or UI-facing `rust-client/src/app.rs` and `rust-client/src/app/`, read [UI_DESIGN.md](rust-client/UI_DESIGN.md) and [UI agent rules](rust-client/src/ui/AGENTS.md).
+For native UI changes in `rust-client/src/ui.rs`, `rust-client/src/ui/`, or UI-facing `rust-client/src/app.rs` and `rust-client/src/app/`, read [UI_DESIGN.md](rust-client/UI_DESIGN.md), the [redesign guide](rust-client/UI_REDESIGN_GUIDE.md) and [UI agent rules](rust-client/src/ui/AGENTS.md).
 
 ## Build, Test, and Development Commands
 
@@ -35,6 +35,7 @@ For native UI changes in `rust-client/src/ui.rs`, `rust-client/src/ui/`, or UI-f
 - `./scripts/rust/run.sh --demo`: launch offline synthetic conversations.
 - `./scripts/rust/run.sh --live`: build/launch optional login/messaging.
 - `./scripts/rust/check.sh`: Rust formatting, tests, Clippy, and displayless CLI/tooling checks.
+- `./scripts/rust/package.sh`: build `dist/rust/zalo-native_*.deb` and `*.rpm` in pinned containers (needs Docker); `./scripts/rust/package/verify.sh` installs them in clean containers.
 - `python3 scripts/rust/smoke-release.py`: verify binary using disposable profiles.
 
 See `README.md` and `rust-client/VALIDATION.md` for prerequisites. Root `package.json` has no npm workflow.

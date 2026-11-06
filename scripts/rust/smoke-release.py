@@ -52,7 +52,7 @@ def main():
         require(results[0]["messages_loaded"] == results[1]["messages_loaded"] == 2, "restart duplicated or lost seeded messages")
         data = root / "release-smoke/data"
         with sqlite3.connect(f"file:{data / 'messages.sqlite3'}?mode=ro", uri=True) as conn:
-            require(conn.execute("PRAGMA user_version").fetchone()[0] == 7, "release did not initialize the compatible schema-seven database")
+            require(conn.execute("PRAGMA user_version").fetchone()[0] == 8, "release did not initialize the schema-eight database")
             count, accounts = conn.execute("SELECT count(*), count(DISTINCT account_id) FROM messages").fetchone()
             threads = conn.execute("SELECT count(*) FROM conversations").fetchone()[0]
             originals = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()
@@ -111,7 +111,7 @@ def main():
         require(json.loads(unavailable.stdout)["network_used"] is False, "unavailable logging prevented local operation")
         require("Diagnostic log unavailable: private path or I/O failure. Intended log: " + str(log_path) in unavailable.stderr, "unavailable logging did not report its fixed warning and intended path")
         require(log_path.parent.read_bytes() == sentinel and sentinel.decode() not in unavailable.stderr, "logger fallback exposed or changed the obstructing path contents")
-        print(json.dumps({"binary_bytes": binary.stat().st_size, "live_features_compiled": args.expect_live, "informational_commands_no_writes": True, "diagnostic_log_path_absolute": True, "diagnostic_lifecycle_and_build_identity": True, "diagnostic_files_private_and_bounded": True, "diagnostic_failure_keeps_local_app_usable": True, "schema_version": 7, "restart_idempotent": True, "seeded_messages": count, "conversations": threads, "legacy_upgrade_preserved_originals_and_local_history": True, "external_lock_refused": True, "profile_permissions_private": True, "network_used": False}))
+        print(json.dumps({"binary_bytes": binary.stat().st_size, "live_features_compiled": args.expect_live, "informational_commands_no_writes": True, "diagnostic_log_path_absolute": True, "diagnostic_lifecycle_and_build_identity": True, "diagnostic_files_private_and_bounded": True, "diagnostic_failure_keeps_local_app_usable": True, "schema_version": 8, "restart_idempotent": True, "seeded_messages": count, "conversations": threads, "legacy_upgrade_preserved_originals_and_local_history": True, "external_lock_refused": True, "profile_permissions_private": True, "network_used": False}))
 
 
 if __name__ == "__main__":

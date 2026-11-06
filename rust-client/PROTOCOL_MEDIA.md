@@ -1,4 +1,4 @@
-# Native photo, OA, shared-content and poll messages
+# Native photos, files, cards, polls and avatars
 
 ## Source contracts
 
@@ -31,9 +31,20 @@ poll updates belong to a separate authenticated detail API and are not invented
 from the notice. Voting remains unavailable. The exact-source
 `rich_cards_oracle.cjs` exercises six synthetic original-reader cases.
 
+`share.file` maps to the original file type. Its card reads `content.title`,
+`content.href` and string/object `params.fileSize`, `fileExt`, `fType`; `fType=2`
+identifies a folder. String-param title normalization follows the original
+extension handling, including its unsupported-extension list. Unknown size stays
+unknown; zero is a valid size. `files_oracle.cjs` retains eight synthetic original
+reader cases. File URLs are exposed only as an explicit HTTPS browser action;
+HTTP links upgrade to HTTPS. No file is automatically downloaded, opened locally
+or executed. Nonempty `secureKey`/`e2eeKey` markers withhold the plaintext action.
+Native upload, download management/resume, folder extraction and E2EE attachment
+decryption remain unavailable.
+
 ## Durable content and replay
 
-**Schema seven** retains the entire canonical source content in scoped
+**Schema eight** retains the entire canonical source content in scoped
 `message_media`, plus a separate validated presentation snapshot of at most
 16 KiB. The original params string and unknown nested fields survive restart.
 Full rich content is limited to 4 MiB per item and to a combined 4 MiB of
@@ -47,7 +58,7 @@ recipient membership. Empty/control-only preview objects and nullable source
 collections do not fail synchronization. Rich metadata,
 messages, conversations and the owning socket cursor commit atomically. Identical replay
 is idempotent; changed raw content conflicts even if its label is unchanged.
-Photo, OA, recommended, poll and information events never acknowledge an outgoing text intent.
+Photo, file, OA, recommended, poll and information events never acknowledge an outgoing text intent.
 
 An already stored exact legacy placeholder can gain a sidecar only when its
 account, thread, server ID, sender and timestamp match, with no existing rich
@@ -59,11 +70,12 @@ refreshes only its bounded displayed IDs through the worker. Exact immutable
 identity, account/thread and request epochs gate media-only merges; current page,
 message order and drafts remain intact. Stale results, saturation and read failure
 do not publish partial history or mark a failed refresh complete.
-The v6→v7 migration extends only the media-kind CHECK constraint in the existing
-transaction, copying every stored metadata/projection/preview byte unchanged.
-History, information/sticker sidecars, account/thread keys, foreign keys, cursors
-and outbox survive; a failed copy rolls back the table and schema version.
-Pre-v7 executables cannot reopen the migrated database and provide no downgrade.
+The v6/v7→v8 migration extends only the media-kind CHECK constraint to include
+`share.file`, within the existing transaction. It copies every stored
+metadata/projection/preview byte unchanged. History, information/sticker sidecars,
+account/thread keys, foreign keys, cursors and outbox survive; a failed copy rolls
+back the table and schema version. Older executables reject schema eight;
+no binary/database downgrade is provided.
 
 ## Native images and explicit actions
 
@@ -89,6 +101,31 @@ Cached thumbnails open a native viewer without downloading an original. Opening
 an original image or an available external link requires an explicit click.
 Upload, full-resolution in-app viewing and universal OA actions remain pending.
 
+## Identity avatars
+
+Friends use the original `userId`/`avatar` contract; groups use `groupId`/`avt`.
+The authenticated account profile uses the original encrypted
+`GET /api/social/profile/me-v2` request with `{avatar_size:120, imei}` and the
+outer Linux `os=8`; only a matching `data.profile.userId` is accepted. This
+optional metadata step follows directory synchronization and may wait behind
+other discovery requests. Its failure does not invalidate messaging or a verified
+hidden policy. The account record does not become an extra ordinary contact.
+
+Visible identities request at most 64 account-scoped primary-key lookups per
+snapshot, using distinct `d:` user and `g:` group keys. A group image never
+supplies a member image. Unknown or failed privacy checks suppress metadata;
+hidden images require the current authorized thread. UI epochs and URL binding
+reject stale account, policy and photo results. There is no complete-directory
+scan per frame.
+
+Avatars reuse the media transport, CDN policy, decoder limits and process-wide
+decode permit, with output capped at 256 physical pixels and no upscaling of
+small sources. Their worker cache remains bounded at 32 entries/16 MiB; the
+separate UI avatar cache holds at most 64 textures/4 MiB, with at most 256 metadata
+entries. Logout or privacy-scope changes clear presentation state and cancel the
+loader. Initials remain the fallback when a verified image is missing or cannot
+be loaded. Demo fixtures use prepared pixels and do not fetch remote avatars.
+
 ## Verification boundary
 
 Synthetic tests cover source projections, complete raw retention, both HTTP/WS
@@ -97,4 +134,6 @@ conflicts, storage rollback/retry, outgoing isolation, malformed/budgeted codecs
 stale results, bounded texture uploads, cancellation and closed-worker recovery. Native
 Light/Dark, compact/wide, cached-viewer, failure and opaque-template screenshots
 are recorded in [VALIDATION.md](VALIDATION.md). Production CDN compatibility and
-every real OA template require separate acceptance.
+every real OA template require separate acceptance. File actions and the account
+profile/avatar path likewise require real-account acceptance; synthetic source
+fixtures and local TLS do not establish production availability.

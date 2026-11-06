@@ -15,10 +15,48 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 - **Tôn trọng hội thoại đã ẩn trên Zalo:** loại khỏi danh sách thông thường; tìm tên và nhập PIN Zalo hiện có để mở riêng hội thoại được chọn.
 - **Hiển thị nội dung nhận được:** văn bản, thông báo hệ thống, ảnh xem trước của sticker tĩnh, ảnh và một số thẻ OA/nội dung được chia sẻ. Hỗ trợ PNG/JPEG/WebP và một phần JPEG XL tĩnh; ảnh đã tải có thể mở trong khung xem của ứng dụng.
 - **Thích ứng với kích thước cửa sổ:** bố cục rộng và gọn giữ lại hội thoại đang chọn cùng bản nháp. Cỡ chữ và giới hạn khung ảnh được giữ nhất quán khi thay đổi kích thước.
-- **Dùng giao diện quen thuộc của Zalo:** có chế độ sáng, tối, theo hệ thống và tùy chỉnh; lựa chọn giao diện được lưu theo từng hồ sơ.
+- **Giao diện thiết kế lại, sáng và tối:** có chế độ sáng, tối, theo hệ thống và tùy chỉnh; nút **Sáng/Tối** ở thanh bên đổi nhanh, lựa chọn được lưu theo từng hồ sơ. Phông chữ và biểu tượng vẫn là bộ Zalo có sẵn.
+- **Phím tắt soạn tin:** `Enter` gửi, `Ctrl+Enter` (hoặc `Shift+Enter`) xuống dòng. Ứng dụng không gửi khi bộ gõ tiếng Việt đang soạn chữ.
 - **Có thông tin chẩn đoán:** lỗi kết nối hiển thị giai đoạn/nhóm lỗi, kèm nhật ký có giới hạn dung lượng để hỗ trợ điều tra.
 
 Tin nhắn bình chọn hiện hiển thị thông báo/câu hỏi đính kèm; chưa có chi tiết, kết quả hay thao tác bỏ phiếu. Với mẫu thẻ chưa hỗ trợ, ứng dụng thông báo rõ thay vì hiển thị các thao tác không hoạt động.
+
+## Ảnh chụp giao diện
+
+Các ảnh dưới đây là **ảnh giả lập**: chụp từ chế độ `--demo` với hội thoại tự tạo, không có tài khoản hay tin nhắn thật. Ảnh lấy từ chính cửa sổ ứng dụng (xem [VALIDATION.md](rust-client/VALIDATION.md) để tái tạo).
+
+| Sáng | Tối |
+| --- | --- |
+| ![Hội thoại, chế độ sáng](rust-client/docs/screenshots/chat-light.png) | ![Hội thoại, chế độ tối](rust-client/docs/screenshots/chat-dark.png) |
+
+| Danh bạ | Thông tin hội thoại |
+| --- | --- |
+| ![Danh bạ](rust-client/docs/screenshots/directory-light.png) | ![Thông tin hội thoại](rust-client/docs/screenshots/info-light.png) |
+
+| Cài đặt giao diện | Đăng nhập QR | Cửa sổ nhỏ (640×480) |
+| --- | --- | --- |
+| ![Cài đặt giao diện](rust-client/docs/screenshots/settings-dark.png) | ![Đăng nhập QR](rust-client/docs/screenshots/login-qr.png) | ![Cửa sổ nhỏ, chế độ tối](rust-client/docs/screenshots/compact-dark.png) |
+
+## Cài đặt nhanh bằng gói `.deb` / `.rpm`
+
+Tải gói của [bản phát hành](changelogs/RELEASE-v2.0.0.md) rồi cài bằng trình quản lý gói của bản phân phối. Gói dành cho **x86_64**, cần glibc 2.31 trở lên. Đã cài, chạy `--doctor` và gỡ thử bằng `apt`/`dnf` trong container sạch trên Ubuntu 20.04/22.04/24.04, Debian 12, Fedora 42 và AlmaLinux 9; các bản khác cùng họ nhiều khả năng chạy được nhưng chưa được kiểm:
+
+```bash
+# Ubuntu / Debian
+sudo apt install ./zalo-native_2.0.0-1_amd64.deb
+
+# Fedora / RHEL / AlmaLinux / Rocky (yum dùng cùng lệnh)
+sudo dnf install ./zalo-native-2.0.0-1.x86_64.rpm
+```
+
+Mở **Zalo Native** từ menu ứng dụng hoặc chạy `zalo-native --live`; `zalo-native --demo` mở bản dùng thử. Gỡ cài đặt bằng `sudo apt remove zalo-native` hoặc `sudo dnf remove zalo-native`. Gói độc lập với gói Electron `zalo` và có thể cài cùng lúc. Hiện chưa có kho `apt`/`dnf` để tự cập nhật: muốn nâng cấp, cài gói mới hơn theo cùng lệnh.
+
+Tự đóng gói (cần Docker và kết nối mạng; mọi thành phần tải về đều được ghim phiên bản và mã băm):
+
+```bash
+./scripts/rust/package.sh            # tạo dist/rust/*.deb, *.rpm và SHA256SUMS
+./scripts/rust/package/verify.sh     # cài thử bằng apt/dnf trong container sạch
+```
 
 ## Biên dịch và chạy
 
@@ -132,7 +170,7 @@ Sau mỗi lần biên dịch bản mới, chạy lại trình cài đặt để 
 | Bình chọn và tìm kiếm | Chi tiết/kết quả/bỏ phiếu và tìm kiếm toàn bộ tin nhắn |
 | Tích hợp Linux | Khay hệ thống, thông báo, chụp màn hình và kiểm tra trên nhiều môi trường desktop |
 | Đăng nhập và mã hóa | Đăng nhập số điện thoại và nhắn tin Signal/E2EE trong bản sử dụng thực tế |
-| Phân phối | Gói cài đặt native, cập nhật tự động và nhập bản sao lưu/lịch sử |
+| Phân phối | Kho `apt`/`dnf` và cập nhật tự động (đã có gói `.deb`/`.rpm` cài thủ công), nhập bản sao lưu/lịch sử |
 
 Chưa hỗ trợ gọi thoại/video. Nội dung có cơ chế mã hóa chưa được hỗ trợ sẽ không bị xử lý như văn bản thông thường. Thẻ chia sẻ, bình chọn và các mẫu OA còn lại vẫn cần kiểm tra bằng tài khoản thực; bộ dữ liệu kiểm thử không chứng minh ứng dụng hỗ trợ mọi mẫu thẻ hay đã hoàn thiện toàn bộ tính năng.
 
@@ -204,7 +242,7 @@ Chạy khối lệnh trên từ thư mục gốc. Kiểm tra release không đă
 | `rust-client/src/` | Mô hình dữ liệu, lưu trữ SQLite, tác vụ nền, giao thức, hồ sơ và giao diện native |
 | `rust-client/src/ui/` | Đăng nhập, hội thoại, nội dung đa phương tiện, cài đặt và thành phần giao diện dùng chung |
 | `rust-client/examples/` | Công cụ đo hiệu năng và lưu trữ với dữ liệu giả lập |
-| `scripts/rust/` | Script biên dịch/chạy/kiểm tra, trình cài desktop và kiểm thử công cụ |
+| `scripts/rust/` | Script biên dịch/chạy/kiểm tra, trình cài desktop, đóng gói `.deb`/`.rpm` (`package.sh`) và kiểm thử công cụ |
 | `rust-client/vendor/egui-winit/` | Các thay đổi tích hợp IME trên Linux của phiên bản đang cố định |
 | `pc-dist/` | Phông chữ, biểu tượng, giao diện Zalo và các bundle tham chiếu giao thức có sẵn |
 
@@ -220,6 +258,8 @@ Xử lý mạng, truy cập dữ liệu và giải mã ảnh phải chạy ngoà
 - [Quy ước nội dung đa phương tiện](rust-client/PROTOCOL_MEDIA.md): định dạng hỗ trợ, giải mã và giới hạn tài nguyên.
 - [Kiểm chứng](rust-client/VALIDATION.md): lệnh kiểm thử và bằng chứng kiểm tra trên desktop.
 - [Tiến độ phát triển](rust-client/MIGRATION_STATUS.md): các mốc triển khai và lịch sử kiểm chứng.
+- [Nhật ký thay đổi](rust-client/CHANGELOG.md) và [ghi chú phát hành 2.0.0](changelogs/RELEASE-v2.0.0.md).
+- [Hướng dẫn áp dụng thiết kế mới](rust-client/UI_REDESIGN_GUIDE.md): màu, kích thước và các điểm lệch có chủ ý so với bản thiết kế.
 
 Thương hiệu Zalo và tài nguyên đi kèm thuộc về chủ sở hữu tương ứng. Việc tích hợp không thể hiện sự liên kết hay bảo chứng; mã bên thứ ba giữ nguyên các thông báo bản quyền/giấy phép của mình.
 

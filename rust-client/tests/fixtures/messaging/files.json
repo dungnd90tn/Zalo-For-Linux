@@ -1,0 +1,167 @@
+{
+  "provenance": "Exact original MSG_FILE title normalizer and getFileMessageUrl, including original unsupported-extension list. Synthetic payloads only. Native URL policy, decoding limits, encrypted-file handling and metadata bounds are separate tests.",
+  "cases": [
+    {
+      "name": "append_extension",
+      "kind": "share.file",
+      "content": {
+        "title": "Báo cáo quý",
+        "href": "https://files.zdn.vn/synthetic-report?token=fake",
+        "params": "{\"fileSize\":12345,\"fileExt\":\"PDF\",\"unknown\":{\"retained\":true}}",
+        "unrecognized": {
+          "keep": [
+            "entire",
+            "source",
+            "payload"
+          ]
+        }
+      },
+      "expected": {
+        "title": "Báo cáo quý.pdf",
+        "href": "https://files.zdn.vn/synthetic-report?token=fake"
+      }
+    },
+    {
+      "name": "existing_extension",
+      "kind": "share.file",
+      "content": {
+        "title": "Tài liệu.PDF",
+        "href": "https://files.zdn.vn/synthetic.pdf",
+        "params": "{\"fileSize\":\"1048576\",\"fileExt\":\"pdf\"}",
+        "unrecognized": {
+          "keep": [
+            "entire",
+            "source",
+            "payload"
+          ]
+        }
+      },
+      "expected": {
+        "title": "Tài liệu.PDF",
+        "href": "https://files.zdn.vn/synthetic.pdf"
+      }
+    },
+    {
+      "name": "zero_size",
+      "kind": "share.file",
+      "content": {
+        "title": "Rỗng",
+        "href": "https://files.zdn.vn/empty.txt",
+        "params": "{\"fileSize\":0,\"fileExt\":\"txt\"}",
+        "unrecognized": {
+          "keep": [
+            "entire",
+            "source",
+            "payload"
+          ]
+        }
+      },
+      "expected": {
+        "title": "Rỗng.txt",
+        "href": "https://files.zdn.vn/empty.txt"
+      }
+    },
+    {
+      "name": "unsupported_extension",
+      "kind": "share.file",
+      "content": {
+        "title": "Cài đặt",
+        "href": "https://files.zdn.vn/setup",
+        "params": "{\"fileSize\":16,\"fileExt\":\"EXE\"}",
+        "unrecognized": {
+          "keep": [
+            "entire",
+            "source",
+            "payload"
+          ]
+        }
+      },
+      "expected": {
+        "title": "Cài đặt",
+        "href": "https://files.zdn.vn/setup"
+      }
+    },
+    {
+      "name": "object_params",
+      "kind": "share.file",
+      "content": {
+        "title": "Đã có tên.txt",
+        "href": "https://files.zdn.vn/synthetic.txt",
+        "params": {
+          "fileSize": 512,
+          "fileExt": "txt"
+        },
+        "unrecognized": {
+          "keep": [
+            "entire",
+            "source",
+            "payload"
+          ]
+        }
+      },
+      "expected": {
+        "title": "Đã có tên.txt",
+        "href": "https://files.zdn.vn/synthetic.txt"
+      }
+    },
+    {
+      "name": "folder",
+      "kind": "share.file",
+      "content": {
+        "title": "Thư mục",
+        "href": "https://files.zdn.vn/folder.zip",
+        "params": "{\"fileSize\":2048,\"fileExt\":\"zip\",\"fType\":2}",
+        "unrecognized": {
+          "keep": [
+            "entire",
+            "source",
+            "payload"
+          ]
+        }
+      },
+      "expected": {
+        "title": "Thư mục.zip",
+        "href": "https://files.zdn.vn/folder.zip"
+      }
+    },
+    {
+      "name": "encrypted",
+      "kind": "share.file",
+      "content": {
+        "title": "Mã hóa.pdf",
+        "href": "https://files.zdn.vn/ciphertext",
+        "params": "{\"fileSize\":640,\"fileExt\":\"pdf\",\"secureKey\":\"synthetic-not-a-key\"}",
+        "unrecognized": {
+          "keep": [
+            "entire",
+            "source",
+            "payload"
+          ]
+        }
+      },
+      "expected": {
+        "title": "Mã hóa.pdf",
+        "href": "https://files.zdn.vn/ciphertext"
+      }
+    },
+    {
+      "name": "missing_url",
+      "kind": "share.file",
+      "content": {
+        "title": "Tệp chưa khả dụng.docx",
+        "params": "{\"fileExt\":\"docx\"}",
+        "unrecognized": {
+          "keep": [
+            "entire",
+            "source",
+            "payload"
+          ]
+        }
+      },
+      "expected": {
+        "title": "Tệp chưa khả dụng.docx",
+        "href": null
+      }
+    }
+  ]
+}

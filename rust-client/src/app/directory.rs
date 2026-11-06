@@ -15,6 +15,7 @@ const MAX_BODY: usize = wire::MAX_DIRECTORY_BODY;
 const TOTAL_DEADLINE: Duration = Duration::from_secs(90);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectoryStage {
+    Account,
     Friends,
     Groups,
     Previews,
@@ -108,6 +109,7 @@ pub trait DirectorySink: Send {
 }
 #[derive(Debug, Clone, Default)]
 pub struct DirectoryReport {
+    pub completed_profile: bool,
     pub contacts: usize,
     pub unsupported_contact_names: usize,
     pub groups: usize,
@@ -415,6 +417,29 @@ impl DirectoryFetcher {
                 report.completed_previews = unsupported == 0;
             }
             Err(error) => report.failures.push(error),
+        }
+        // Independent optional metadata: a profile failure must never stop messaging
+        // or turn a verified hidden policy into an unknown policy.
+        if !report
+            .failures
+            .iter()
+            .any(|failure| failure.category == DirectoryCategory::Storage)
+        {
+            let profile = async {
+                let stage = DirectoryStage::Account;
+                let request = wire::self_profile_request(session.imei())
+                    .map_err(|e| wire_failure(stage, e))?;
+                let data = self.fetch(session, request, stage).await?;
+                let entry = wire::parse_self_profile(&data, session.account_id())
+                    .map_err(|e| wire_failure(stage, e))?;
+                let mut ignored = 0;
+                apply_entries(sink, session, vec![entry], observed_at_ms, &mut ignored).await
+            }
+            .await;
+            match profile {
+                Ok(()) => report.completed_profile = true,
+                Err(error) => report.failures.push(error),
+            }
         }
         report
     }

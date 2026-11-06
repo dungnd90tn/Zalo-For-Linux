@@ -67,6 +67,7 @@ struct State {
     privacy_requests: AtomicUsize,
     privacy_hold: AtomicBool,
     privacy_policy: AtomicUsize,
+    eligibility_mode: AtomicUsize,
 }
 struct Fixture {
     addr: SocketAddr,
@@ -500,7 +501,36 @@ fn serve(
                                 ws.send(tungstenite::Message::Binary(bytes)).unwrap();
                             }
                         }
-                        let response = json!({"error_code":0,"data":{"reqId":data["reqId"],"data":{"err":0,"hasMore":false,"uids":[],"threads":[],"waitUids":[],"pendingUids":[]}}});
+                        let mode = state.eligibility_mode.load(Ordering::SeqCst);
+                        let mut page = json!({"err":0,"hasMore":false,"uids":[],"threads":[],"waitUids":[],"pendingUids":[]});
+                        match mode {
+                            1 => {
+                                page.as_object_mut().unwrap().remove("hasMore");
+                            }
+                            2 => page["hasMore"] = Value::Null,
+                            3 => page["hasMore"] = json!(0),
+                            10..=13 => {
+                                page.as_object_mut().unwrap().remove(
+                                    ["threads", "waitUids", "uids", "pendingUids"][mode - 10],
+                                );
+                            }
+                            14 => page["threads"] = json!({}),
+                            20 => page["threads"] = json!([{"uid":"22"}]),
+                            21 => page["waitUids"] = json!(["22"]),
+                            22 => page["uids"] = json!(["22"]),
+                            23 => page["pendingUids"] = json!([{"uid":"22","deviceId":1}]),
+                            30 => {
+                                // Arrives after eligibility request, before its answer.
+                                let changed = json!({"error_code":0,"encrypt":0,"data":{"error_code":0,"data":{}}});
+                                ws.send(tungstenite::Message::Binary(
+                                    wire::encode_frame(551, 0, &changed).unwrap(),
+                                ))
+                                .unwrap();
+                            }
+                            _ => {}
+                        }
+                        let response =
+                            json!({"error_code":0,"data":{"reqId":data["reqId"],"data":page}});
                         ws.send(tungstenite::Message::Binary(
                             wire::encode_frame(563, 0, &json!({"error_code":0,"encrypt":0,"data":serde_json::to_string(&response).unwrap()})).unwrap(),
                         ))
@@ -620,6 +650,7 @@ fn serve(
         "/api/hiddenconvers/get-all",
         "/api/group/getlg/v3",
         "/api/social/friend/getfriends",
+        "/api/social/profile/me-v2",
         "/api/preloadconvers/get-last-msgs",
     ]
     .contains(&route)
@@ -653,6 +684,15 @@ fn serve(
             Reply::Directory | Reply::DirectoryFail | Reply::DirectoryStall
         );
         let data = match route {
+            "/api/social/profile/me-v2" => {
+                assert_eq!(parameters["avatar_size"], 120);
+                let query = url::form_urlencoded::parse(path.split_once('?').unwrap().1.as_bytes());
+                assert_eq!(
+                    query.into_iter().find(|(name, _)| name == "os").unwrap().1,
+                    "8"
+                );
+                json!({"profile":{"userId":"11","displayName":"Synthetic","avatar":"https://s120.avatar.talk.zdn.vn/self.png"}})
+            }
             "/api/hiddenconvers/get-all" => {
                 assert_eq!(parameters, json!({"imei":"native-fixture"}));
                 state.privacy_requests.fetch_add(1, Ordering::SeqCst);
@@ -3390,10 +3430,10 @@ async fn actual_runtime_discovers_named_cached_directory_and_previews_without_we
             assert_eq!(hidden, 2);
             assert_eq!(
                 requests.len() - hidden,
-                6,
-                "two complete friend/group/preview discovery passes"
+                8,
+                "two complete friend/group/preview/self-profile discovery passes"
             );
-            assert_eq!(requests.len(), 8);
+            assert_eq!(requests.len(), 10);
         }
         stop.send(true).unwrap();
         tokio::time::timeout(Duration::from_millis(500), task)
@@ -3609,7 +3649,7 @@ async fn directory_refresh_keeps_only_the_newest_pending_generation_and_never_fi
     }
     assert_eq!(
         f.state.requests.lock().unwrap().len(),
-        6,
+        8,
         "one auto sync plus the newest coalesced refresh"
     );
 }
@@ -4532,4 +4572,148 @@ async fn hidden_policy_real_tls_search_pin_cancel_scope_and_remote_revoke() {
         "failed policy cannot expose even a cached previously-visible conversation"
     );
     assert!(f.state.privacy_requests.load(Ordering::SeqCst) >= 6);
+}
+
+// Exercise source flag compatibility through the real socket, command dispatcher,
+// durable actor and HTTP send path, rather than testing the parser alone.
+async fn eligibility_send_case(mode: usize, accepted: bool) {
+    let f = Fixture::new(Reply::Runtime);
+    f.state.eligibility_mode.store(mode, Ordering::SeqCst);
+    let (commands, rx) = mpsc::channel(16);
+    let (tx, mut events) = mpsc::channel(32);
+    let (stop, cancel) = watch::channel(false);
+    let task = tokio::spawn(run_with_transports(
+        f.profile.clone(),
+        f.session(),
+        rx,
+        tx,
+        Arc::new(|| {}),
+        cancel,
+        f.transports(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut received = 0;
+        while received < 2 {
+            match events.recv().await.unwrap() {
+                LiveEvent::Received { .. } => received += 1,
+                LiveEvent::Fault { error, .. } => panic!("synthetic startup failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    commands
+        .send(LiveCommand::Send {
+            generation: 101,
+            thread: "d:22".into(),
+            text: "Xin chào Linux".into(),
+            request_id: 91,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap() {
+                LiveEvent::Sent {
+                    request_id: 91,
+                    message,
+                    ..
+                } => {
+                    assert!(accepted, "mode {mode} must not send plaintext");
+                    assert_eq!(message.text, "Xin chào Linux");
+                    break;
+                }
+                LiveEvent::SendFailed {
+                    request_id: 91,
+                    error,
+                    unknown_delivery,
+                    server_accepted,
+                    ..
+                } => {
+                    assert!(
+                        !accepted,
+                        "mode {mode} should be source-compatible: {error}"
+                    );
+                    assert!(!unknown_delivery && !server_accepted);
+                    assert!(error.to_lowercase().contains("bản nháp"));
+                    if mode == 30 {
+                        assert!(error.contains("sự kiện mã hóa"));
+                    }
+                    if (10..=14).contains(&mode) {
+                        assert!(error.contains("định dạng"));
+                    }
+                    if (20..=23).contains(&mode) {
+                        assert!(error.contains("đã bật mã hóa"));
+                    }
+                    break;
+                }
+                LiveEvent::Fault { error, .. } => {
+                    panic!("eligibility must not stop local actor: {error}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.split('?').next() == Some("/api/message/sms"))
+            .count(),
+        usize::from(accepted),
+        "mode {mode}"
+    );
+    let conn = rusqlite::Connection::open_with_flags(
+        f.profile.paths.data_dir.join("messages.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM outgoing", [], |row| row
+            .get::<_, usize>(0))
+            .unwrap(),
+        usize::from(accepted),
+        "blocked eligibility must not prepare an outgoing row"
+    );
+    if mode == 30 {
+        assert!(
+            !f.state
+                .observed_commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|cmd| [532, 545, 557, 558].contains(cmd)),
+            "intervening encrypted commands must not be acknowledged"
+        );
+    }
+    drop(conn);
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_millis(500), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn source_terminal_pagination_flags_allow_real_plaintext_send() {
+    for mode in [1, 2, 3] {
+        eligibility_send_case(mode, true).await;
+    }
+}
+
+#[tokio::test]
+async fn incomplete_or_encrypted_capability_never_sends_or_prepares_outbox() {
+    for mode in [10, 11, 12, 13, 14, 20, 21, 22, 23] {
+        eligibility_send_case(mode, false).await;
+    }
+}
+
+#[tokio::test]
+async fn encrypted_state_change_during_verification_keeps_draft_without_send_or_ack() {
+    eligibility_send_case(30, false).await;
 }
