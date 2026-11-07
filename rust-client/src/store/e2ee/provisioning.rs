@@ -149,6 +149,32 @@ pub struct PublicUploadReceipt {
     payload_hash: [u8; 32],
     attempt_hash: [u8; 32],
 }
+/// What a confirmed registration must prove before the store activates it. Built only from a
+/// reconciliation proof in the live transport (`pub(crate)` fields), never from caller booleans.
+pub struct ActivationEvidence {
+    pub(crate) account: String,
+    pub(crate) operation_id: u64,
+    pub(crate) attempt_id: u64,
+    pub(crate) generation: u64,
+    pub(crate) payload_hash: [u8; 32],
+    pub(crate) attempt_hash: [u8; 32],
+    pub(crate) identity_confirmed: bool,
+    /// A real server timestamp when one was returned; otherwise the activation time is recorded.
+    pub(crate) timestamp: Option<u64>,
+}
+/// Proof (from a read-only look at the account) that an unresolved upload was not installed.
+pub struct AbandonEvidence {
+    pub(crate) account: String,
+    pub(crate) operation_id: u64,
+    pub(crate) payload_hash: [u8; 32],
+    pub(crate) attempt_hash: [u8; 32],
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 impl PublicUploadReceipt {
     pub fn account(&self) -> &str {
         &self.account
@@ -648,6 +674,256 @@ impl MessageStore {
             payload_hash,
             attempt_hash,
         })
+    }
+    /// The registration id of a local epoch's identity. Read-only.
+    pub fn e2ee_local_registration(&self, owner: &str, local_epoch: u64) -> Result<Option<u16>> {
+        account(owner)?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT registration_id FROM e2ee_local_epochs WHERE account=?1 AND epoch=?2",
+                params![owner, integer(local_epoch)?],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    /// The current local epoch, if any. Read-only.
+    pub fn e2ee_current_local(&self, owner: &str) -> Result<Option<u64>> {
+        account(owner)?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT current_local FROM e2ee_accounts WHERE account=?1",
+                [owner],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten()
+            .map(|value| value as u64))
+    }
+    /// A query-only handle for an upload whose outcome is unknown (the process died or the socket
+    /// dropped after the request left). It can only be reconciled by reading; the outbox row stays
+    /// `unknown`, so no second upload can be claimed for it.
+    pub fn e2ee_restore_unknown_upload(&self, owner: &str) -> Result<Option<PublicUploadReceipt>> {
+        account(owner)?;
+        type Row = (
+            i64,
+            i64,
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+            i64,
+            i64,
+            String,
+            Vec<u8>,
+            i64,
+        );
+        let row: Option<Row> = self.conn.query_row(
+            "SELECT o.operation_id,o.epoch,o.payload,o.payload_hash,o.attempt_counter,o.attempt_generation,o.socket_epoch,o.request_id,o.attempt_hash,c.platform FROM e2ee_public_outbox o JOIN e2ee_local_candidates c ON c.account=o.account AND c.operation_id=o.operation_id WHERE o.account=?1 AND o.state='unknown' AND o.request_id IS NOT NULL AND o.attempt_hash IS NOT NULL",
+            [owner],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)),
+        ).optional()?;
+        let Some((
+            operation,
+            local_epoch,
+            payload,
+            payload_hash,
+            attempt,
+            generation,
+            socket,
+            request_id,
+            attempt_hash,
+            platform,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let payload_hash: [u8; 32] = payload_hash
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid public payload hash"))?;
+        ensure!(
+            payload_hash == Sha256::digest(&payload).as_slice() && platform == 2,
+            "Stored upload changed"
+        );
+        let attempt_hash: [u8; 32] = attempt_hash
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid attempt hash"))?;
+        Ok(Some(PublicUploadReceipt {
+            account: owner.into(),
+            local: LocalNamespace {
+                epoch: local_epoch.to_string(),
+                platform: Platform::Pc,
+            },
+            operation_id: operation as u64,
+            generation: generation as u64,
+            attempt_id: attempt as u64,
+            socket_epoch: socket as u64,
+            request_id,
+            payload,
+            payload_hash,
+            attempt_hash,
+        }))
+    }
+    /// Installs a confirmed pending bundle as the account's current local identity.
+    ///
+    /// One transaction: the sealed outbox row, the pending private records and the staged digest must
+    /// still match the evidence; the records move into the active namespace; the new epoch becomes
+    /// current only if the epoch that was current at planning time still is. The candidate and its
+    /// outbox row are then retired, so a later rotation can reserve a new candidate. Requires
+    /// `identity_confirmed` (the own 541 bundle matched), never just an upload ACK.
+    pub fn e2ee_activate_pending(
+        &mut self,
+        owner: &str,
+        evidence: &ActivationEvidence,
+        gate: &GenerationGate,
+    ) -> Result<LocalNamespace> {
+        account(owner)?;
+        ensure!(
+            evidence.identity_confirmed && evidence.account == owner,
+            "Registration is not confirmed"
+        );
+        gate.check(evidence.generation)?;
+        let tx = self.conn.transaction()?;
+        let stored = load_plan(&tx, owner, evidence.operation_id, evidence.generation)?;
+        let plan = stored.plan;
+        ensure!(
+            matches!(stored.state.as_str(), "sending" | "unknown")
+                && current(&tx, owner)? == plan.expected_current,
+            "Registration is not safely activatable"
+        );
+        type Outbox = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<Vec<u8>>, String);
+        let (public, payload_hash, bundle_hash, attempt, attempt_hash, state): Outbox = tx.query_row(
+            "SELECT payload,payload_hash,bundle_hash,attempt_counter,attempt_hash,state FROM e2ee_public_outbox WHERE account=?1 AND operation_id=?2 AND epoch=?3 AND codec=1 AND command=540",
+            params![owner, integer(evidence.operation_id)?, epoch(&plan.local.epoch)?],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )?;
+        let bundle_hash: [u8; 32] = bundle_hash
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid bundle hash"))?;
+        ensure!(
+            matches!(state.as_str(), "sending" | "unknown")
+                && payload_hash == Sha256::digest(&public).as_slice()
+                && payload_hash == evidence.payload_hash
+                && attempt as u64 == evidence.attempt_id
+                && attempt_hash.as_deref() == Some(evidence.attempt_hash.as_slice()),
+            "Upload evidence does not match the staged registration"
+        );
+        let records = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT key,value FROM e2ee_pending_records WHERE account=?1 AND epoch=?2 ORDER BY key",
+            )?;
+            let rows = stmt.query_map(params![owner, epoch(&plan.local.epoch)?], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?;
+            rows.collect::<std::result::Result<BTreeSet<_>, _>>()?
+        };
+        ensure!(
+            records.len() == usize::from(plan.prekey_count) + 2
+                && stored.stage_digest.as_deref()
+                    == Some(private_digest(&plan, &records, &public, &bundle_hash).as_slice()),
+            "Pending public/private bundle binding changed"
+        );
+        let identity =
+            crate::protocol::signal::provisioning::CandidateIdentity::from_public_payload(&public)
+                .map_err(|_| anyhow::anyhow!("Staged public bundle is invalid"))?;
+        ensure!(
+            identity.payload_hash() == evidence.payload_hash.as_slice(),
+            "Staged public bundle changed"
+        );
+        let registration = identity.registration_id();
+        let session_ts = evidence.timestamp.unwrap_or_else(now_ms);
+        ensure!(
+            session_ts > 0 && session_ts <= MAX_SAFE_INTEGER,
+            "Invalid activation timestamp"
+        );
+        let local = epoch(&plan.local.epoch)?;
+        let moved = tx.execute(
+            "INSERT INTO e2ee_records(account,key,value) SELECT account,key,value FROM e2ee_pending_records WHERE account=?1 AND epoch=?2",
+            params![owner, local],
+        )?;
+        ensure!(
+            moved == records.len(),
+            "Pending records changed during activation"
+        );
+        tx.execute(
+            "DELETE FROM e2ee_pending_records WHERE account=?1 AND epoch=?2",
+            params![owner, local],
+        )?;
+        tx.execute(
+            "INSERT INTO e2ee_local_epochs VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                owner,
+                local,
+                plan.local.platform.wire(),
+                registration,
+                Sha256::digest(identity.identity_key()).as_slice(),
+                session_ts as i64,
+                u64::from(registration) + 3 + u64::from(plan.prekey_count)
+            ],
+        )?;
+        ensure!(
+            tx.execute(
+                "UPDATE e2ee_accounts SET current_local=?2,revision=revision+1 WHERE account=?1",
+                params![owner, local]
+            )? == 1,
+            "Account state changed during activation"
+        );
+        tx.execute(
+            "DELETE FROM e2ee_public_outbox WHERE account=?1 AND operation_id=?2",
+            params![owner, integer(evidence.operation_id)?],
+        )?;
+        tx.execute(
+            "DELETE FROM e2ee_local_candidates WHERE account=?1 AND operation_id=?2",
+            params![owner, integer(evidence.operation_id)?],
+        )?;
+        let lease = gate.linearize(evidence.generation)?;
+        tx.commit()?;
+        drop(lease);
+        Ok(plan.local)
+    }
+    /// Discards an `unknown` registration that a read of the account showed was never installed, so a
+    /// fresh candidate can be reserved. Only the staged pending keys, their outbox row and the candidate
+    /// go; the active epoch, its records and every history table are untouched.
+    pub fn e2ee_abandon_unknown_candidate(
+        &mut self,
+        owner: &str,
+        evidence: &AbandonEvidence,
+    ) -> Result<()> {
+        account(owner)?;
+        ensure!(
+            evidence.account == owner,
+            "Evidence belongs to another account"
+        );
+        let tx = self.conn.transaction()?;
+        type Row = (i64, Vec<u8>, Option<Vec<u8>>, String);
+        let (local, payload_hash, attempt_hash, state): Row = tx.query_row(
+            "SELECT epoch,payload_hash,attempt_hash,state FROM e2ee_public_outbox WHERE account=?1 AND operation_id=?2",
+            params![owner, integer(evidence.operation_id)?],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        ensure!(
+            state == "unknown"
+                && payload_hash == evidence.payload_hash
+                && attempt_hash.as_deref() == Some(evidence.attempt_hash.as_slice()),
+            "Only an unknown upload matching the evidence can be abandoned"
+        );
+        tx.execute(
+            "DELETE FROM e2ee_pending_records WHERE account=?1 AND epoch=?2",
+            params![owner, local],
+        )?;
+        tx.execute(
+            "DELETE FROM e2ee_public_outbox WHERE account=?1 AND operation_id=?2",
+            params![owner, integer(evidence.operation_id)?],
+        )?;
+        ensure!(
+            tx.execute(
+                "DELETE FROM e2ee_local_candidates WHERE account=?1 AND operation_id=?2 AND state='unknown'",
+                params![owner, integer(evidence.operation_id)?],
+            )? == 1,
+            "The candidate is not abandonable"
+        );
+        tx.commit()?;
+        Ok(())
     }
     pub fn e2ee_recover_bundle_uploads(&mut self, owner: &str) -> Result<usize> {
         account(owner)?;

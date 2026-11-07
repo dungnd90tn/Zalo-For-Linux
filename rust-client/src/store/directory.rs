@@ -98,6 +98,33 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
     Ok(())
 }
 impl MessageStore {
+    /// Direct contacts whose (alias-aware) display name contains `query`, accent- and case-insensitive,
+    /// limited to `among`. Used to pick a peer by the name the user knows, not by UID.
+    #[cfg(feature = "messaging")]
+    pub fn direct_uids_matching(
+        &self,
+        account: &str,
+        query: &str,
+        among: &[String],
+    ) -> Result<Vec<String>> {
+        validate_id(account)?;
+        let folded = crate::domain::fold_search(query);
+        let escaped = folded
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let mut statement = self.conn.prepare_cached(
+            "SELECT remote_id FROM directory_entries WHERE account_id=?1 AND is_group=0 AND search_name LIKE ?2 ESCAPE '\\' LIMIT 50",
+        )?;
+        let found: Vec<String> = statement
+            .query_map(params![account, format!("%{escaped}%")], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let allowed: HashSet<&String> = among.iter().collect();
+        Ok(found
+            .into_iter()
+            .filter(|uid| allowed.contains(uid))
+            .collect())
+    }
     /// Bounded primary-key snapshots; never scan the complete directory for visible avatars.
     #[cfg(feature = "messaging")]
     pub fn avatars(&self, account: &str, threads: &[String]) -> Result<Vec<AvatarIdentity>> {

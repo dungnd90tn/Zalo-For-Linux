@@ -46,6 +46,9 @@ impl CandidateIdentity {
     pub fn registration_id(&self) -> u16 {
         self.registration_id
     }
+    pub fn identity_key(&self) -> &[u8; 33] {
+        self.identity.bytes()
+    }
     pub fn matches(&self, bundle: &PublicBundle) -> bool {
         bundle.device == DevicePlatform::Pc
             && bundle.registration_id == self.registration_id
@@ -76,6 +79,10 @@ pub struct Reconciliation {
     acknowledged: bool,
     before: Option<(u16, Option<u64>)>,
     full_identity: bool,
+    /// Set only when a read of the account showed it does not hold this candidate.
+    not_installed: bool,
+    /// Whether the 540 ACK's `iid` equalled the candidate's registration id (learned, not relied on).
+    ack_iid_matches: Option<bool>,
 }
 impl Reconciliation {
     pub(crate) fn new(candidate: CandidateIdentity) -> Self {
@@ -85,7 +92,17 @@ impl Reconciliation {
             acknowledged: false,
             before: None,
             full_identity: false,
+            not_installed: false,
+            ack_iid_matches: None,
         }
+    }
+    pub(crate) fn ack_iid_matches(&self) -> Option<bool> {
+        self.ack_iid_matches
+    }
+    /// True after a read showed the account holds a different PC key (or none): the candidate was
+    /// not installed, so its staged keys may be discarded and a fresh registration attempted.
+    pub(crate) fn proves_not_installed(&self) -> bool {
+        self.state == UploadState::NeedsRecovery && self.not_installed
     }
     pub fn state(&self) -> UploadState {
         self.state
@@ -132,6 +149,10 @@ impl Reconciliation {
             None | Some(Value::Null) => None,
             Some(value) => Some(number(value)?).filter(|ts| *ts > 0),
         };
+        self.ack_iid_matches = data
+            .get("iid")
+            .and_then(Value::as_u64)
+            .map(|iid| iid == u64::from(self.candidate.registration_id));
         self.acknowledged = true;
         self.state = UploadState::AcceptedNeedsMetadata;
         Ok(timestamp)
@@ -149,10 +170,12 @@ impl Reconciliation {
         } = own
         else {
             self.fail_recovery();
+            self.not_installed = true;
             return Err(SignalError::Incomplete);
         };
         if registration_id != self.candidate.registration_id || submitted_at == Some(0) {
             self.fail_recovery();
+            self.not_installed = registration_id != self.candidate.registration_id;
             return Err(SignalError::Scope);
         }
         self.before = Some((registration_id, submitted_at));
@@ -173,9 +196,20 @@ impl Reconciliation {
             .iter()
             .filter(|bundle| bundle.device == DevicePlatform::Pc)
             .collect();
-        if own.peer != account || pc.len() != 1 || !self.candidate.matches(pc[0]) {
+        if own.peer != account || pc.len() > 1 {
             self.fail_recovery();
             return Err(SignalError::Scope);
+        }
+        // The live service leaves the *asking* device out of its own 541 list (observed: only web and
+        // mobile come back although a PC key is registered), so an absent PC bundle is expected and
+        // the 564 `keyId` check carries the weight. If a PC bundle is listed it must be ours.
+        if let Some(listed) = pc.first() {
+            if !self.candidate.matches(listed) {
+                self.fail_recovery();
+                // Same registration id but another identity (a 14-bit id collision): not ours.
+                self.not_installed = true;
+                return Err(SignalError::Scope);
+            }
         }
         self.full_identity = true;
         Ok(())

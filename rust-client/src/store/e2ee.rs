@@ -867,6 +867,14 @@ fn advance_cursor(conn: &Connection, owner: &str, queue: &str, cursor: u64) -> R
     conn.execute("INSERT INTO receive_cursors(account_id,queue,last_id) VALUES(?1,?2,?3) ON CONFLICT(account_id,queue) DO UPDATE SET last_id=CASE WHEN length(excluded.last_id)>length(last_id) OR (length(excluded.last_id)=length(last_id) AND excluded.last_id>last_id) THEN excluded.last_id ELSE last_id END",params![owner,queue,cursor])?;
     Ok(())
 }
+/// A peer device's currently trusted identity binding.
+pub struct ActivePeer {
+    pub namespace: PeerNamespace,
+    pub registration_id: u16,
+    /// SHA-256 of the identity public key.
+    pub fingerprint: Vec<u8>,
+    pub session_timestamp: u64,
+}
 impl MessageStore {
     /// Check the immutable verified DB binding before trusting opaque engine
     /// identity bytes. This performs no transition or implicit first-use trust.
@@ -990,6 +998,43 @@ impl MessageStore {
             epoch: next.to_string(),
             platform: binding.platform,
         })
+    }
+    /// The active binding for one peer device in a local epoch. Read-only.
+    pub fn e2ee_active_peer(
+        &self,
+        owner: &str,
+        local: &LocalNamespace,
+        uid: &str,
+        platform: Platform,
+    ) -> Result<Option<ActivePeer>> {
+        account(owner)?;
+        account(uid)?;
+        let row: Option<(i64, u16, Vec<u8>, i64)> = self.conn.query_row(
+            "SELECT peer_epoch,registration_id,fingerprint,session_ts FROM e2ee_peer_epochs WHERE account=?1 AND local_epoch=?2 AND uid=?3 AND platform=?4 AND active=1",
+            params![owner, epoch(&local.epoch)?, uid, platform.wire()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).optional()?;
+        Ok(row.map(
+            |(peer_epoch, registration_id, fingerprint, ts)| ActivePeer {
+                namespace: PeerNamespace {
+                    uid: uid.into(),
+                    platform,
+                    epoch: peer_epoch.to_string(),
+                },
+                registration_id,
+                fingerprint,
+                session_timestamp: ts as u64,
+            },
+        ))
+    }
+    /// Removes a draft that was reserved but never committed (nothing was encrypted or sent).
+    pub fn e2ee_discard_reserved(&mut self, owner: &str, client_id: u64) -> Result<bool> {
+        account(owner)?;
+        integer(client_id)?;
+        Ok(self.conn.execute(
+            "DELETE FROM e2ee_outbox WHERE account=?1 AND client_id=?2 AND state='reserved'",
+            params![owner, client_id as i64],
+        )? == 1)
     }
     pub fn e2ee_register_peer(
         &mut self,
@@ -1799,6 +1844,21 @@ impl MessageStore {
         integer(client_id)?;
         validate_id(server_id)?;
         ensure!(self.conn.execute("UPDATE e2ee_outbox SET server_id=?3,state=CASE WHEN state='committed' THEN state ELSE 'acknowledged' END WHERE account=?1 AND client_id=?2 AND state IN ('sending','unknown','acknowledged','committed') AND (server_id IS NULL OR server_id=?3)",params![owner,client_id as i64,server_id])?==1,"Conflicting encrypted acknowledgement");
+        Ok(())
+    }
+    /// Closes a session-initialization send (command 543). It carries no chat message, so no echo will
+    /// ever arrive to commit it; without this the draft guard would block the next init for the same
+    /// thread. Only an acknowledged row whose server id marks it as an init can be retired this way.
+    pub fn e2ee_retire_init(&mut self, owner: &str, client_id: u64) -> Result<()> {
+        account(owner)?;
+        integer(client_id)?;
+        ensure!(
+            self.conn.execute(
+                "UPDATE e2ee_outbox SET state='committed' WHERE account=?1 AND client_id=?2 AND state='acknowledged' AND server_id LIKE 'init-%'",
+                params![owner, client_id as i64],
+            )? == 1,
+            "Only an acknowledged init send can be retired"
+        );
         Ok(())
     }
     /// ACK and echo both call this reconciliation path. A unique server ID and

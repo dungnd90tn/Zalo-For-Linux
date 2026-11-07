@@ -217,6 +217,7 @@ impl Fixture {
             last_pong: tokio::time::Instant::now(),
             last_ping: None,
             authenticated_at: None,
+            list_encrypted: false,
         }
     }
 }

@@ -969,6 +969,27 @@ pub fn legacy_direct_allowed_detailed(
     request_id: &str,
     target: &str,
 ) -> Result<(bool, Option<String>), EligibilityFailure> {
+    let page = e2ee_list_page(payload, request_id)?;
+    let encrypted = page
+        .enabled
+        .iter()
+        .chain(&page.others)
+        .any(|uid| uid == target);
+    Ok((!encrypted, page.next))
+}
+/// One validated page of the account's E2EE list (command 563).
+pub struct E2eeListPage {
+    /// `threads` and `uids`: peers with end-to-end encryption enabled.
+    pub enabled: Vec<String>,
+    /// `waitUids` and `pendingUids`: peers in a transitional state. Sending is refused for them too.
+    others: Vec<String>,
+    pub next: Option<String>,
+}
+/// Validates the whole page exactly as the eligibility check always has, and keeps the peer ids.
+pub fn e2ee_list_page(
+    payload: &Value,
+    request_id: &str,
+) -> Result<E2eeListPage, EligibilityFailure> {
     eligibility_status(payload)?;
     let response = payload
         .get("data")
@@ -993,7 +1014,7 @@ pub fn legacy_direct_allowed_detailed(
         Some(Value::Number(number)) if number.as_u64() == Some(1) => true,
         value => return Err(eligibility_schema(EligibilityField::More, value)),
     };
-    let mut encrypted = false;
+    let (mut enabled, mut others) = (Vec::new(), Vec::new());
     for (name, field) in [
         ("threads", EligibilityField::Threads),
         ("waitUids", EligibilityField::Waiting),
@@ -1013,7 +1034,10 @@ pub fn legacy_direct_allowed_detailed(
             };
             let uid = id_string(uid.ok_or_else(|| eligibility_schema(field, Some(entry)))?)
                 .map_err(|_| eligibility_schema(field, Some(entry)))?;
-            encrypted |= uid == target;
+            match name {
+                "threads" | "uids" => enabled.push(uid),
+                _ => others.push(uid),
+            }
         }
     }
     let next = if has_more {
@@ -1027,7 +1051,11 @@ pub fn legacy_direct_allowed_detailed(
     } else {
         None
     };
-    Ok((!encrypted, next))
+    Ok(E2eeListPage {
+        enabled,
+        others,
+        next,
+    })
 }
 pub fn legacy_group_allowed(payload: &Value, target: &str) -> Result<u64, WireError> {
     legacy_group_allowed_detailed(payload, target).map_err(|failure| failure.error)

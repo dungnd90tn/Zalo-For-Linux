@@ -35,6 +35,27 @@ pub(super) fn claim() -> bool {
     !DONE.swap(true, Ordering::SeqCst)
 }
 
+/// For builds without the engine: say so in the requested report instead of silently doing nothing.
+#[cfg(not(feature = "signal-crypto"))]
+pub(super) fn replace_requested() -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(std::env::var_os("ZALO_E2EE_REPLACE_PC_KEY")?);
+    path.is_absolute().then_some(path)
+}
+#[cfg(not(feature = "signal-crypto"))]
+pub(super) fn claim_replace() -> bool {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    !DONE.swap(true, Ordering::SeqCst)
+}
+#[cfg(not(feature = "signal-crypto"))]
+pub(super) fn note_unavailable(path: &std::path::Path) {
+    if let Ok(mut file) = create(path) {
+        let _ = writeln!(
+            file,
+            "RESULT: not run. This build has no E2EE engine; rebuild with --features live,signal-crypto."
+        );
+    }
+}
+
 fn key_name(name: &str) -> String {
     name.chars()
         .take(40)

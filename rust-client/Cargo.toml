@@ -50,6 +50,10 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 
+[[example]]
+name = "decode_ws_capture"
+required-features = ["messaging"]
+
 [features]
 default = []
 signal-store = ["dep:zalo-signal-engine"]

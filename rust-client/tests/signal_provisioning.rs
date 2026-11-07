@@ -86,7 +86,7 @@ async fn actual_csprng_bundle_stages_atomically_and_reopens_without_activation()
         )
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&public).unwrap();
-    assert_eq!(json["delSS"], 0);
+    assert_eq!(json["delSS"], 1);
     assert_eq!(json["key"]["deviceId"], 2);
     assert_eq!(json["key"]["opKeys"].as_array().unwrap().len(), 20);
     assert!(json.get("reqId").is_none());

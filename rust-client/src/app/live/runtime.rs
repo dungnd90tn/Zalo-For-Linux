@@ -16,7 +16,12 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+#[cfg(feature = "signal-crypto")]
+mod e2ee_init_devices;
 mod e2ee_probe;
+#[cfg(feature = "signal-crypto")]
+mod e2ee_send_probe;
+mod e2ee_threads;
 #[cfg(test)]
 mod integration_tests;
 mod privacy;
@@ -1013,6 +1018,9 @@ struct Connection {
     last_pong: tokio::time::Instant,
     last_ping: Option<i64>,
     authenticated_at: Option<tokio::time::Instant>,
+    /// Ask for the E2EE conversation list after authenticating. On for real connections only, so
+    /// scripted test sockets that expect an exact frame sequence are unaffected.
+    list_encrypted: bool,
 }
 impl Connection {
     async fn send(&mut self, cmd: u16, sub: u8, data: Value) -> Result<()> {
@@ -1109,7 +1117,9 @@ impl Connection {
         .await
         .map_err(|_| NetworkFailure::new(LiveStage::Connect, LiveCategory::Timeout))?
         .map_err(|e| NetworkFailure::socket(LiveStage::Connect, e))?;
-        Ok(Self::connected(socket, session.account_id()))
+        let mut connection = Self::connected(socket, session.account_id());
+        connection.list_encrypted = true;
+        Ok(connection)
     }
     fn connected(socket: Socket, account: &str) -> Self {
         Self {
@@ -1122,6 +1132,7 @@ impl Connection {
             last_pong: tokio::time::Instant::now(),
             last_ping: None,
             authenticated_at: None,
+            list_encrypted: false,
         }
     }
     fn request(&mut self) -> String {
@@ -1237,6 +1248,36 @@ impl Connection {
                 // Opt-in and read-only (E2EE_LIVE_PLAN.md stage 1); runs before any queue is requested.
                 if let Some(path) = e2ee_probe::target().filter(|_| e2ee_probe::claim()) {
                     self.e2ee_probe(&path).await;
+                }
+                // Opt-in account change (E2EE_LIVE_PLAN.md stage 2): replace this account's PC key.
+                #[cfg(feature = "signal-crypto")]
+                if let Some(path) =
+                    signal_transport::replace_target().filter(|_| signal_transport::claim_run())
+                {
+                    signal_transport::replace_pc_key(self, db, &events.account, &path).await;
+                }
+                // Session init with this account's other devices (what the original does after a new bundle).
+                #[cfg(feature = "signal-crypto")]
+                if let Some(path) =
+                    e2ee_init_devices::target().filter(|_| e2ee_init_devices::claim())
+                {
+                    self.e2ee_init_subdevices(db, &path).await;
+                }
+                #[cfg(feature = "signal-crypto")]
+                if let Some((path, peer)) =
+                    e2ee_send_probe::target().filter(|_| e2ee_send_probe::claim())
+                {
+                    self.e2ee_send_probe(db, &path, peer.as_deref()).await;
+                }
+                #[cfg(not(feature = "signal-crypto"))]
+                if let Some(path) =
+                    e2ee_probe::replace_requested().filter(|_| e2ee_probe::claim_replace())
+                {
+                    e2ee_probe::note_unavailable(&path);
+                }
+                // Show end-to-end encrypted conversations (locked, unreadable here) instead of hiding them.
+                if self.list_encrypted {
+                    self.sync_encrypted_threads(db, events).await;
                 }
                 for (cmd, sub) in self.queues.clone() {
                     self.offline(db, &events.account, cmd, sub, true, None)

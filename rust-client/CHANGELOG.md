@@ -63,6 +63,38 @@ Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../chang
   khóa, mã hay nội dung). Không thay đổi gì trên tài khoản. Đây là bước 1 của
   [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md); gửi/nhận E2EE vẫn chưa hỗ trợ.
 
+- **Thay khóa E2EE PC của tài khoản (tùy chọn, mặc định tắt, chưa thử với máy chủ thật):** đặt
+  `ZALO_E2EE_REPLACE_PC_KEY=/đường/dẫn/tuyệt/đối.txt` khi chạy `./scripts/rust/run.sh --live`. Tạo khóa mới,
+  lưu bền rồi gửi lệnh 540, xác nhận bằng 564/541 chỉ-đọc và kích hoạt cục bộ trong một giao dịch SQL. Nếu
+  chết giữa chừng, lần chạy sau chỉ đọc để xác nhận, không bao giờ gửi 540 lần hai. Sau bước này client
+  giữ khóa nhưng vẫn chưa gửi/nhận được tin E2EE. Xem [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md).
+
+- **Hội thoại E2EE hiện trong danh sách (dạng khóa, chưa đọc được):** sau khi đăng nhập, bản live lấy danh
+  sách E2EE của tài khoản (lệnh 563, chỉ đọc) và thêm mỗi người bật E2EE (`threads` và `uids`) vào danh sách
+  hội thoại với dòng "[Cuộc trò chuyện mã hóa đầu cuối]", lấy tên từ danh bạ nếu có. Hội thoại đã có tin
+  được giữ nguyên; khi có tin thật thì xem trước thật thay thế. Tin trong các hội thoại này vẫn chưa đọc/gửi
+  được (xem [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md)).
+
+- **Chạy thử mã hóa gửi tin E2EE (tùy chọn, không gửi gì):** đặt `ZALO_E2EE_SEND_PROBE=/đường/dẫn/tuyệt/đối.txt`
+  khi chạy `run.sh --live`; đối tác tự chọn từ danh sách E2EE (người đầu tiên, hoặc thêm `ZALO_E2EE_PEER="tên"` để
+  chọn theo tên như hiển thị trong ứng dụng, không cần UID). Lấy bundle thật của đối tác và các thiết bị khác của
+  bạn (chỉ đọc), cho engine mã hóa thử một đoạn văn cho mọi thiết bị rồi bỏ kết quả, không gửi, không lưu. Xem
+  [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md).
+
+- **Khởi tạo phiên E2EE với các thiết bị khác của tài khoản (tùy chọn, mặc định tắt, chưa chạy thật):** theo bước
+  `INIT_SUBDEVICE` của bản gốc. Đặt `ZALO_E2EE_INIT_SUBDEVICES=/đường/dẫn/tuyệt/đối.txt` khi chạy
+  `run.sh --live`: với mỗi thiết bị còn lại (mobile, web) lấy bundle (541 `isReInit`), tạo phiên bằng engine, lưu
+  bền rồi gửi tin khởi tạo bằng lệnh 543. Thiết bị đã có phiên thì bỏ qua; không bao giờ gửi lại khi kết quả không
+  rõ. Xem [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md).
+
+- **Công cụ ghi lại bản Electron gốc:** `reverse-engineering/tools/electron_cdp_capture.mjs` ghi log console và
+  mọi khung websocket của Electron qua DevTools protocol; `cargo run --features live --example decode_ws_capture`
+  giải mã chúng (chỉ in hình dạng, mã người dùng được ẩn danh). Kết quả đối chiếu nằm trong
+  [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md).
+- Thay khóa E2EE nay gửi `delSS: 1` như bản gốc, và nếu khóa PC trên máy chủ đã bị client khác thay thì khóa cục
+  bộ được coi là cũ và thay lại (epoch mới) thay vì tin nó. Lấy bundle của người khác nay hỏi lệnh 560 rồi 541
+  từng thiết bị với `isReInit`, đúng như bản gốc.
+
 ### Sửa
 - **Gửi tin 1-1 báo "Chưa xác minh được trạng thái mã hóa do định dạng phản hồi máy chủ chưa được hỗ
   trợ":** phản hồi kiểm tra mã hóa (lệnh 563) của máy chủ bỏ trường `err` khi nó bằng 0, còn client đòi

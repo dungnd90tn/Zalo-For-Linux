@@ -98,7 +98,7 @@ const CURSOR_PAGE_SQL: &str =
     WHERE m.account_id=?1 AND m.thread_id=?2 AND (m.sent_at_ms,m.message_id)<(?3,?4)
     ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?5";
 const CONVERSATIONS_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
-    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),'') END,COALESCE(m.sender,'') FROM conversations c
+    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,'') FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
@@ -109,7 +109,7 @@ const CONVERSATIONS_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms
     AND NOT EXISTS(SELECT 1 FROM temp.live_hidden h WHERE h.account_id=c.account_id AND h.thread_id=c.thread_id)
     ORDER BY c.last_message_at_ms DESC,c.thread_id LIMIT ?2";
 const CONVERSATION_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
-    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),'') END,COALESCE(m.sender,'') FROM conversations c
+    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,'') FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
@@ -224,6 +224,9 @@ impl MessageStore {
             CREATE TABLE IF NOT EXISTS conversations (
                 account_id TEXT NOT NULL, thread_id TEXT NOT NULL, title TEXT NOT NULL,
                 last_message_at_ms INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (account_id, thread_id));
+            CREATE TABLE IF NOT EXISTS e2ee_threads (
+                account_id TEXT NOT NULL, thread_id TEXT NOT NULL,
                 PRIMARY KEY (account_id, thread_id));
             CREATE TABLE IF NOT EXISTS messages (
                 account_id TEXT NOT NULL, thread_id TEXT NOT NULL, message_id TEXT NOT NULL,
@@ -846,6 +849,42 @@ impl MessageStore {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Lists peers whose conversation is end-to-end encrypted (command 563) so they are not missing
+    /// from the conversation list, though their messages cannot be read here yet. Creates only an
+    /// empty conversation row (title from the directory when known) and a marker the list query turns
+    /// into a preview; an existing conversation and its messages are never changed. Returns how many
+    /// were newly marked.
+    pub fn record_encrypted_threads(&mut self, account: &str, peers: &[String]) -> Result<usize> {
+        validate_id(account)?;
+        if peers.len() > 5000 {
+            bail!("Too many encrypted conversations");
+        }
+        let tx = self.conn.transaction()?;
+        let mut added = 0;
+        for peer in peers {
+            if peer.is_empty()
+                || peer.len() > 24
+                || peer.starts_with('0')
+                || !peer.bytes().all(|b| b.is_ascii_digit())
+            {
+                continue;
+            }
+            let thread = format!("d:{peer}");
+            added += tx.execute(
+                "INSERT INTO e2ee_threads(account_id,thread_id) VALUES(?1,?2) ON CONFLICT DO NOTHING",
+                params![account, thread],
+            )?;
+            tx.execute(
+                "INSERT INTO conversations(account_id,thread_id,title,last_message_at_ms)
+                 VALUES(?1,?2,COALESCE((SELECT display_name FROM directory_entries WHERE account_id=?1 AND thread_id=?2),?3),0)
+                 ON CONFLICT DO NOTHING",
+                params![account, thread, peer],
+            )?;
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
     pub fn delete(&mut self, account: &str, thread: &str, id: &str) -> Result<bool> {
         validate_id(account)?;
         validate_id(thread)?;
@@ -876,6 +915,58 @@ mod tests {
             media: None,
             sent_at_ms: ts,
         }
+    }
+    #[test]
+    fn encrypted_threads_appear_as_empty_locked_conversations_without_touching_existing_ones() {
+        let mut store = MessageStore::in_memory().unwrap();
+        // An existing conversation with a message keeps its own preview, whatever the E2EE list says.
+        store
+            .insert_with_conversation(&m("11", "d:200", "1", 5))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO directory_entries(account_id,thread_id,remote_id,is_group,display_name,search_name,observed_at_ms) VALUES('11','d:100','100',0,'Bạn thân','ban than',1)",
+                [],
+            )
+            .unwrap();
+        let peers: Vec<String> = ["100", "200", "300", "0123", "12x", ""]
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        // 100 and 300 are new; 200 already exists; the three malformed ids are skipped.
+        assert_eq!(store.record_encrypted_threads("11", &peers).unwrap(), 3);
+        let list = store.conversations("11", 20).unwrap();
+        let by_id = |id: &str| list.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(by_id("d:100").title, "Bạn thân");
+        assert_eq!(
+            by_id("d:100").last_text,
+            "[Cuộc trò chuyện mã hóa đầu cuối]"
+        );
+        assert_eq!(by_id("d:300").title, "300");
+        assert_eq!(by_id("d:300").last_message_at_ms, 0);
+        assert_eq!(by_id("d:200").last_text, "Message 1");
+        assert_eq!(list.len(), 3);
+        // Idempotent, and another account is unaffected.
+        assert_eq!(store.record_encrypted_threads("11", &peers).unwrap(), 0);
+        assert!(store.conversations("12", 20).unwrap().is_empty());
+        // Once a message arrives the real preview replaces the placeholder.
+        store
+            .insert_with_conversation(&m("11", "d:100", "9", 50))
+            .unwrap();
+        assert_eq!(
+            store
+                .conversations("11", 20)
+                .unwrap()
+                .iter()
+                .find(|c| c.id == "d:100")
+                .unwrap()
+                .last_text,
+            "Message 9"
+        );
+        assert!(store
+            .record_encrypted_threads("11", &vec!["1".to_string(); 5001])
+            .is_err());
     }
     #[test]
     fn deep_page_query_seeks_composite_range_without_temporary_sort() {
