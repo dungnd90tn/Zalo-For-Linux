@@ -110,6 +110,52 @@ impl Connection {
                 candidates.len().min(MAX_TRIES)
             );
         };
+        self.handshake_devices(db, &owner, &local, &peer, found, report)
+            .await
+    }
+
+    /// The handshake with a contact, for the app's normal send: ask the service for the contact's devices and
+    /// bundles, then create the sessions and send the init. The original does this inside `sendE2eeMsg`
+    /// (`checkSessionThenInit`) whenever a device has no session yet.
+    pub(super) async fn handshake_with(
+        &mut self,
+        db: &Database,
+        peer: &str,
+        sequence: u64,
+    ) -> Result<&'static str> {
+        let owner = self.account.clone();
+        let scope = Scope::new(&owner, GENERATION)?;
+        let epoch = {
+            let owner = owner.clone();
+            db.call(move |s| s.e2ee_current_local(&owner)).await?
+        }
+        .ok_or_else(|| anyhow::anyhow!("this client holds no E2EE key yet"))?;
+        let local = e2ee::LocalNamespace {
+            epoch: epoch.to_string(),
+            platform: e2ee::Platform::Pc,
+        };
+        let mut report = Report::discard();
+        let found = self
+            .fetch_peer_devices(&scope, peer, sequence, &mut report, false)
+            .await?;
+        anyhow::ensure!(
+            !found.bundles.is_empty(),
+            "the service handed out no device bundle for this contact"
+        );
+        self.handshake_devices(db, &owner, &local, peer, found, &mut report)
+            .await
+    }
+
+    async fn handshake_devices(
+        &mut self,
+        db: &Database,
+        owner: &str,
+        local: &e2ee::LocalNamespace,
+        peer: &str,
+        found: signal::FetchedBundles,
+        report: &mut Report,
+    ) -> Result<&'static str> {
+        let (owner, local, peer) = (owner.to_owned(), local.clone(), peer.to_owned());
         report.line(&format!(
             "contact devices: {:?}",
             found
@@ -552,6 +598,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "sending");
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    /// The composer's path: no report, no contact list walk; just 560, 541 per device, one 543.
+    #[tokio::test]
+    async fn the_composer_handshake_asks_for_the_devices_then_sends_one_543() {
+        let bundle = wire_bundle(engine::SignalPlatform::Mobile, 0).await;
+        let scratch =
+            std::env::temp_dir().join(format!("zalo-initpeer-{:x}", rand::random::<u64>()));
+        std::fs::create_dir(&scratch).unwrap();
+        let profile = Arc::new(crate::profile::Profile::at_root(&scratch, "fixture").unwrap());
+        let db_path = profile.paths.data_dir.join("messages.sqlite");
+        seed_identity(&db_path);
+        let db = Database::open(profile, "11".into()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(listener, bundle, 3, false));
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let mut connection = Connection::connected(socket, "11");
+        assert_eq!(connection.next().await.unwrap().unwrap().cmd, 1);
+        connection
+            .handshake_with(&db, "22", 9_400_000)
+            .await
+            .unwrap();
+        let seen = server.await.unwrap();
+        assert_eq!(
+            seen.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+            [560, 541, 543],
+            "{seen:?}"
+        );
+        assert!(!super::super::e2ee_send::has_session(&db, "11", "21")
+            .await
+            .unwrap());
+        assert!(super::super::e2ee_send::has_session(&db, "11", "22")
+            .await
+            .unwrap());
         std::fs::remove_dir_all(scratch).unwrap();
     }
 }

@@ -880,6 +880,25 @@ pub fn send_ack(payload: &Value) -> Result<SendAck, WireError> {
     })
 }
 
+/// The reply to an end-to-end encrypted send, read as the original's `parseE2eeResp` does
+/// (`pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js`, line 547494):
+/// the server's message id is `minGlobalMsgId` (a plain send answers `msgId`), plus `ts`. The per-device results
+/// the reply may carry are not read, exactly as in the original.
+pub fn e2ee_send_ack(payload: &Value) -> Result<SendAck, WireError> {
+    service_code(payload)?;
+    let data = payload.get("data").ok_or(WireError::Invalid)?;
+    let id = data
+        .get("minGlobalMsgId")
+        .or_else(|| data.get("msgId"))
+        .ok_or(WireError::Invalid)?;
+    let mut shaped = serde_json::Map::new();
+    shaped.insert("msgId".into(), id.clone());
+    if let Some(ts) = data.get("ts") {
+        shaped.insert("ts".into(), ts.clone());
+    }
+    send_ack(&serde_json::json!({"error_code": 0, "data": shaped}))
+}
+
 /// Closed diagnostic labels, never peer IDs or arbitrary payload field names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EligibilityReason {
@@ -1112,6 +1131,21 @@ mod tests {
             key: (0..32).collect(),
             authenticated: true,
         }
+    }
+    #[test]
+    fn an_encrypted_send_reply_is_read_from_min_global_msg_id_and_ts() {
+        let ack = e2ee_send_ack(&json!({"error_code":0,"data":{
+            "clientId":"1760000000001","minGlobalMsgId":"9001","ts":1700000000123u64,
+            "results":[{"deviceId":0,"err":0}]}}))
+        .unwrap();
+        assert_eq!(ack.server_id, "9001");
+        assert_eq!(ack.timestamp_ms, Some(1_700_000_000_123));
+        // A numeric id, a string timestamp and the plain `msgId` spelling all work.
+        let ack = e2ee_send_ack(&json!({"error_code":0,"data":{"msgId":77,"ts":"5"}})).unwrap();
+        assert_eq!((ack.server_id.as_str(), ack.timestamp_ms), ("77", Some(5)));
+        // No id at all, or a service error, is refused.
+        assert!(e2ee_send_ack(&json!({"error_code":0,"data":{"ts":1}})).is_err());
+        assert!(e2ee_send_ack(&json!({"error_code":5,"data":{"minGlobalMsgId":"1"}})).is_err());
     }
     fn frame(cmd: u16, value: Value) -> Vec<u8> {
         encode_frame(cmd, 0, &value).unwrap()

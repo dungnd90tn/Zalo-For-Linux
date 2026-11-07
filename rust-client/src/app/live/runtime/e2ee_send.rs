@@ -79,6 +79,30 @@ fn existing_recipient(
     }))
 }
 
+/// Whether this device already has a session with any device of `peer` (the original's `_getSession`).
+pub(super) async fn has_session(db: &Database, owner: &str, peer: &str) -> Result<bool> {
+    let (o, u) = (owner.to_owned(), peer.to_owned());
+    db.call(move |s| {
+        let Some(epoch) = s.e2ee_current_local(&o)? else {
+            return Ok(false);
+        };
+        let local = e2ee::LocalNamespace {
+            epoch: epoch.to_string(),
+            platform: e2ee::Platform::Pc,
+        };
+        let mut any = false;
+        for device in [
+            DevicePlatform::Mobile,
+            DevicePlatform::Web,
+            DevicePlatform::Pc,
+        ] {
+            any |= existing_recipient(s, &o, &local, &u, device)?.is_some();
+        }
+        Ok(any)
+    })
+    .await
+}
+
 /// A committed, authorized send that has not been transmitted.
 pub(super) struct Prepared {
     pub client_id: u64,
@@ -172,6 +196,93 @@ pub(super) async fn prepare_authorized(
     })
 }
 
+/// POST a committed, authorized send to the encrypted endpoint and store the service's acknowledgement.
+/// A reply the code cannot read, or none, leaves the row `unknown`; the message is never sent again.
+pub(super) async fn post_prepared(
+    db: &Database,
+    http: &E2eeHttp,
+    owner: &str,
+    prepared: &Prepared,
+    report: &mut Report,
+) -> Result<(Message, Conversation)> {
+    let owner = owner.to_owned();
+    let client_id = prepared.client_id;
+    let parameters = prepared.authorized.parameters();
+    // The encrypted endpoints live on their own service (`chat_e2e`), not on the plain chat service.
+    let mut url = root_for(&http.session, "chat_e2e")?;
+    url.set_path(parameters.path);
+    url.query_pairs_mut()
+        .append_pair("zpw_ver", wire::API_VERSION)
+        .append_pair("zpw_type", http.session.client_type().api_type());
+    let params = http
+        .session
+        .encrypt_payload(prepared.authorized.exact_json())?;
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("params", &params)
+        .finish();
+    let response = tokio::time::timeout(
+        Duration::from_secs(20),
+        authenticated_request(&http.client, &http.session, url, Some(body)),
+    )
+    .await;
+    let (o, id) = (owner.clone(), client_id);
+    let response = match response {
+        Ok(Ok(response)) => response,
+        other => {
+            // Whether it arrived is not known; never resend.
+            let _ = db.call(move |s| s.e2ee_send_failed(&o, id, false)).await;
+            let cause = match other {
+                Ok(Err(error)) => format!("{error:#}"),
+                _ => "timed out".to_owned(),
+            };
+            anyhow::bail!(
+                "no readable reply from the service ({cause}); the message may or may not have been delivered and is not resent"
+            );
+        }
+    };
+    report.line("## reply to the message post");
+    for line in super::e2ee_probe::shape(&response) {
+        report.line(&line);
+    }
+    let ack = match wire::e2ee_send_ack(&response) {
+        Ok(ack) => ack,
+        Err(_) => {
+            let _ = db.call(move |s| s.e2ee_send_failed(&o, id, false)).await;
+            // Field names and kinds of `data` only (names are the service's, never message content).
+            let fields = response
+                .get("data")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .take(12)
+                        .map(|(k, v)| {
+                            let kind = match v {
+                                Value::Null => "null",
+                                Value::Bool(_) => "bool",
+                                Value::Number(_) => "number",
+                                Value::String(_) => "string",
+                                Value::Array(_) => "array",
+                                Value::Object(_) => "object",
+                            };
+                            format!("{}:{kind}", k.chars().take(24).collect::<String>())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_else(|| "no data object".into());
+            anyhow::bail!(
+                "the reply has an unexpected shape (data: {fields}); the message is not resent"
+            );
+        }
+    };
+    let (o, server, ts) = (owner, ack.server_id.clone(), ack.timestamp_ms);
+    db.call(move |s| {
+        s.e2ee_record_ack(&o, id, &server)?;
+        s.e2ee_commit_echo(&o, id, &server, ts)
+    })
+    .await
+}
+
 impl Connection {
     /// Best effort; the outcome is in the report.
     pub(super) async fn e2ee_send_text(
@@ -246,60 +357,7 @@ impl Connection {
             "encrypted for {} device(s) and committed; posting to the service",
             prepared.devices
         ));
-        let client_id = prepared.client_id;
-        let parameters = prepared.authorized.parameters();
-        // The encrypted endpoints live on their own service (`chat_e2e`), not on the plain chat service.
-        let mut url = root_for(&http.session, "chat_e2e")?;
-        url.set_path(parameters.path);
-        url.query_pairs_mut()
-            .append_pair("zpw_ver", wire::API_VERSION)
-            .append_pair("zpw_type", http.session.client_type().api_type());
-        let params = http
-            .session
-            .encrypt_payload(prepared.authorized.exact_json())?;
-        let body = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("params", &params)
-            .finish();
-        let response = tokio::time::timeout(
-            Duration::from_secs(20),
-            authenticated_request(&http.client, &http.session, url, Some(body)),
-        )
-        .await;
-        let (o, id) = (owner.clone(), client_id);
-        let response = match response {
-            Ok(Ok(response)) => response,
-            other => {
-                // Whether it arrived is not known; never resend.
-                let _ = db.call(move |s| s.e2ee_send_failed(&o, id, false)).await;
-                let cause = match other {
-                    Ok(Err(error)) => format!("{error:#}"),
-                    _ => "timed out".to_owned(),
-                };
-                anyhow::bail!(
-                    "no readable reply from the service ({cause}); the message may or may not have been delivered and is not resent"
-                );
-            }
-        };
-        report.line("## reply to the message post");
-        for line in super::e2ee_probe::shape(&response) {
-            report.line(&line);
-        }
-        let ack = match wire::send_ack(&response) {
-            Ok(ack) => ack,
-            Err(_) => {
-                let _ = db.call(move |s| s.e2ee_send_failed(&o, id, false)).await;
-                anyhow::bail!(
-                    "the reply has an unexpected shape (see the report); the message is not resent"
-                );
-            }
-        };
-        let (o, server, ts) = (owner.clone(), ack.server_id.clone(), ack.timestamp_ms);
-        let (message, conversation) = db
-            .call(move |s| {
-                s.e2ee_record_ack(&o, id, &server)?;
-                s.e2ee_commit_echo(&o, id, &server, ts)
-            })
-            .await?;
+        let (message, conversation) = post_prepared(db, &http, &owner, &prepared, report).await?;
         events
             .emit(LiveEvent::Received {
                 account_id: owner,

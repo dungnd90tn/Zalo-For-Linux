@@ -91,9 +91,8 @@ impl Connection {
         db: &Database,
         events: &Events,
     ) {
-        let Some(path) = self.e2ee_receive_report.clone() else {
-            return;
-        };
+        // A report file is optional (`ZALO_E2EE_RECEIVE`); without one the work is the same and nothing is logged.
+        let path = self.e2ee_receive_report.clone();
         let Some(messages) = frame
             .payload
             .pointer("/data/msgs")
@@ -106,10 +105,10 @@ impl Connection {
         }
         let mut receiver = match self.e2ee_receive.take() {
             Some(receiver) => receiver,
-            None => match Receiver::open(&path, db, &self.account).await {
+            None => match Receiver::open(path.as_deref(), db, &self.account).await {
                 Ok(receiver) => receiver,
                 Err(error) => {
-                    if let Some(mut report) = Report::open(&path) {
+                    if let Some(mut report) = path.as_deref().and_then(Report::open) {
                         report.line(&format!("receive: cannot start: {error}"));
                     }
                     return;
@@ -134,8 +133,11 @@ impl Connection {
 }
 
 impl Receiver {
-    async fn open(path: &std::path::Path, db: &Database, account: &str) -> Result<Self> {
-        let mut report = Report::open(path).ok_or_else(|| anyhow::anyhow!("report file"))?;
+    async fn open(path: Option<&std::path::Path>, db: &Database, account: &str) -> Result<Self> {
+        let mut report = match path {
+            Some(path) => Report::open(path).ok_or_else(|| anyhow::anyhow!("report file"))?,
+            None => Report::discard(),
+        };
         let owner = account.to_owned();
         let epoch = db
             .call(move |s| s.e2ee_current_local(&owner))

@@ -637,7 +637,8 @@ pub(super) fn claim_run() -> bool {
     !DONE.swap(true, Ordering::SeqCst)
 }
 
-pub(super) struct Report(std::fs::File);
+pub(super) struct Report(Option<std::fs::File>);
+
 impl Report {
     pub(super) fn open(path: &std::path::Path) -> Option<Self> {
         use std::io::Write;
@@ -653,12 +654,18 @@ impl Report {
             file,
             "# zalo-native PC key replacement. Stages and shapes only; no keys or ids."
         );
-        Some(Self(file))
+        Some(Self(Some(file)))
+    }
+    /// A report that records nothing (the app's normal flow, where there is no report file).
+    pub(super) fn discard() -> Self {
+        Self(None)
     }
     pub(super) fn line(&mut self, text: &str) {
         use std::io::Write;
-        let _ = writeln!(self.0, "{text}");
-        let _ = self.0.flush();
+        if let Some(file) = self.0.as_mut() {
+            let _ = writeln!(file, "{text}");
+            let _ = file.flush();
+        }
     }
 }
 

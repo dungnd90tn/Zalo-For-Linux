@@ -13,6 +13,11 @@ Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../chang
 - Số phiên bản đổi từ `0.1.0` sang `2.0.0`; `zalo-rust --version` và các gói cài đặt dùng cùng số này.
 
 ### Thêm mới
+- **E2EE trong luồng gửi/nhận bình thường (cần bản dựng có `signal-crypto`)**: soạn tin trong hội thoại mã hóa đầu cuối
+  không còn bị từ chối. Nếu thiết bị chưa có phiên với người nhận, ứng dụng làm bắt tay (560, 541 `isReInit`, 543) rồi
+  mã hóa và gửi qua `chat_e2e`, giống `sendE2eeMsg` của bản Electron (thử lại tối đa 3 lần; lỗi -3/-5 không thử lại).
+  Tin mã hóa đẩy về (551) được giải mã và lưu mà không cần biến môi trường. Bảng đối chiếu từng hành vi gốc:
+  [E2EE_PARITY.md](E2EE_PARITY.md).
 - **Giao diện thiết kế lại, chế độ Sáng và Tối** ([hướng dẫn](UI_REDESIGN_GUIDE.md)):
   - bảng màu mới trong `src/theme/redesign.rs`, đặt trên danh mục token gốc; Tùy chỉnh vẫn ghi đè được;
   - rail 68 px với nút bo tròn 48 px và nút đổi nhanh **Sáng/Tối** (nhãn chữ, vì chưa có glyph gốc);

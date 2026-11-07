@@ -17,6 +17,8 @@ use tokio_tungstenite::{
 use url::Url;
 
 #[cfg(feature = "signal-crypto")]
+mod e2ee_compose;
+#[cfg(feature = "signal-crypto")]
 mod e2ee_init_devices;
 #[cfg(feature = "signal-crypto")]
 mod e2ee_init_peer;
@@ -1504,13 +1506,15 @@ impl Connection {
                     .await?;
                 }
             }
-            // Opt-in passive receive: decrypt and store pushed chat messages, acknowledge nothing.
+            // Encrypted chat messages: decrypt with the engine and store them (needs this client's E2EE key).
             #[cfg(feature = "signal-crypto")]
-            551 if self.e2ee_receive_report.is_some() => {
+            551 => {
                 self.e2ee_receive_push(&frame, db, events).await;
             }
             // These encrypted queues are intentionally not consumed or acknowledged.
-            551 | 552 | 535 | 543 | 544 | 548 | 561 | 580 | 581 | 582 => {}
+            #[cfg(not(feature = "signal-crypto"))]
+            551 => {}
+            552 | 535 | 543 | 544 | 548 | 561 | 580 | 581 | 582 => {}
             _ => {}
         }
         Ok(())
@@ -2065,6 +2069,22 @@ async fn handle_command(
                 },
                 _ => Err(anyhow::anyhow!("offline")),
             };
+            // An end-to-end encrypted 1-1 conversation: the original's `sendE2eeMsg` (handshake when a device has
+            // no session yet, then the encrypted send). Needs the crypto engine; without it the draft is kept.
+            #[cfg(feature = "signal-crypto")]
+            if let Err(error) = &eligible {
+                if error
+                    .downcast_ref::<wire::EligibilityFailure>()
+                    .is_some_and(|f| f.reason == wire::EligibilityReason::EncryptedTarget)
+                    && target.kind == ThreadKind::Direct
+                {
+                    if let Some(c) = connection.as_mut() {
+                        c.send_e2ee(db, events, generation, thread, request_id, &text)
+                            .await?;
+                        return Ok(CommandOutcome::Continue);
+                    }
+                }
+            }
             let visibility = match eligible {
                 Ok(visibility) => visibility,
                 Err(error) => {

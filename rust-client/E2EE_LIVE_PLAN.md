@@ -437,3 +437,10 @@ N331488, `_enrichE2eeVersion`/`_enrichAdditionalParams` N331497–331510, `VERSI
 
 No remaining difference found in the request. The reply handling (`msgId`, `ts`) is still unobserved, so the report prints
 its shape.
+
+### Correction (from the parity catalogs, `E2EE_PARITY.md`)
+
+An earlier note in this file said pushed chat messages are acknowledged with `545/1`. That is wrong: `545` acknowledges **session events only**
+(543/544/547-548/549/580/581). A received chat message is acknowledged with **`532 VERIFY_MSG`** `{nretry, queueName, ids:[{actionId}],
+reqId}` (batched 20 ids / 30 s), and a *delivered receipt* goes out over HTTP (`/api/e2ee/pc/t/message/delivered`). Use `E2EE_PARITY.md` as
+the checklist; this file stays as the chronological log.

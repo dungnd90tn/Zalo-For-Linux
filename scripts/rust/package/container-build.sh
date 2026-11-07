@@ -25,7 +25,7 @@ cargo --version
 # Separate target dir per base release: reusing objects built against another glibc would
 # silently raise the minimum version.
 TARGET="/cache/target-$(. /etc/os-release; echo "$VERSION_ID")"
-cargo build --release --locked --features live --target-dir "$TARGET"
+cargo build --release --locked --features "${PKG_FEATURES:-live}" --target-dir "$TARGET"
 install -m 0755 "$TARGET/release/zalo-rust" /out/zalo-rust
 strip --strip-unneeded /out/zalo-rust
 
