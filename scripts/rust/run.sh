@@ -22,7 +22,7 @@ for option in "$@"; do
     fi
 done
 # Replacing the account's E2EE key needs the embedded Signal engine (E2EE_LIVE_PLAN.md, stage 2).
-if [[ ( -n "${ZALO_E2EE_REPLACE_PC_KEY:-}" || -n "${ZALO_E2EE_SEND_PROBE:-}" || -n "${ZALO_E2EE_INIT_SUBDEVICES:-}" ) && "${#BUILD_FEATURES[@]}" -gt 0 ]]; then
+if [[ ( -n "${ZALO_E2EE_REPLACE_PC_KEY:-}" || -n "${ZALO_E2EE_SEND_PROBE:-}" || -n "${ZALO_E2EE_INIT_SUBDEVICES:-}" || -n "${ZALO_E2EE_RECEIVE:-}" || -n "${ZALO_E2EE_INIT_PEER:-}" || -n "${ZALO_E2EE_SEND:-}" ) && "${#BUILD_FEATURES[@]}" -gt 0 ]]; then
     BUILD_FEATURES=(--features live,signal-crypto)
 fi
 cargo build --locked --manifest-path "$REPO_ROOT/rust-client/Cargo.toml" --release "${BUILD_FEATURES[@]}"

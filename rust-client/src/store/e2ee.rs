@@ -1242,6 +1242,15 @@ impl MessageStore {
         })
         .transpose()
     }
+    /// Has this exact ciphertext already been committed? (A redelivered push is skipped, never decrypted twice.)
+    pub fn e2ee_ciphertext_seen(&self, owner: &str, ciphertext_digest: &[u8; 32]) -> Result<bool> {
+        account(owner)?;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM e2ee_inputs WHERE account=?1 AND cipher_digest=?2)",
+            params![owner, ciphertext_digest.as_slice()],
+            |r| r.get(0),
+        )?)
+    }
     pub fn e2ee_lookup_committed_input(
         &self,
         owner: &str,

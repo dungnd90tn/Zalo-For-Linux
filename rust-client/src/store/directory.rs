@@ -116,14 +116,55 @@ impl MessageStore {
         let mut statement = self.conn.prepare_cached(
             "SELECT remote_id FROM directory_entries WHERE account_id=?1 AND is_group=0 AND search_name LIKE ?2 ESCAPE '\\' LIMIT 50",
         )?;
-        let found: Vec<String> = statement
+        let mut found: Vec<String> = statement
             .query_map(params![account, format!("%{escaped}%")], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        // The name the conversation list shows (an alias the directory may not carry) counts too.
+        let mut title = self.conn.prepare_cached(
+            "SELECT title FROM conversations WHERE account_id=?1 AND thread_id=?2",
+        )?;
+        for uid in among.iter().take(500) {
+            let shown: Option<String> = title
+                .query_row(params![account, format!("d:{uid}")], |row| row.get(0))
+                .optional()?;
+            if shown.is_some_and(|name| crate::domain::fold_search(&name).contains(&folded))
+                && !found.contains(uid)
+            {
+                found.push(uid.clone());
+            }
+        }
         let allowed: HashSet<&String> = among.iter().collect();
         Ok(found
             .into_iter()
             .filter(|uid| allowed.contains(uid))
             .collect())
+    }
+    /// The names to show for contacts, in the order given: the conversation title if there is one, else the
+    /// directory name, else none. Only for listing choices to the person who owns this data.
+    #[cfg(feature = "messaging")]
+    pub fn direct_names(&self, account: &str, uids: &[String]) -> Result<Vec<Option<String>>> {
+        validate_id(account)?;
+        let mut title = self.conn.prepare_cached(
+            "SELECT title FROM conversations WHERE account_id=?1 AND thread_id=?2",
+        )?;
+        let mut named = self.conn.prepare_cached(
+            "SELECT display_name FROM directory_entries WHERE account_id=?1 AND thread_id=?2",
+        )?;
+        uids.iter()
+            .take(500)
+            .map(|uid| {
+                let thread = format!("d:{uid}");
+                let from_title: Option<String> = title
+                    .query_row(params![account, &thread], |row| row.get(0))
+                    .optional()?;
+                let from_directory: Option<String> = named
+                    .query_row(params![account, &thread], |row| row.get(0))
+                    .optional()?;
+                Ok(from_title
+                    .filter(|name| name.chars().any(|c| !c.is_ascii_digit()))
+                    .or(from_directory))
+            })
+            .collect()
     }
     /// Bounded primary-key snapshots; never scan the complete directory for visible avatars.
     #[cfg(feature = "messaging")]

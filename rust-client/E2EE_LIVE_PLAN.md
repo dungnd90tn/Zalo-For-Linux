@@ -270,3 +270,170 @@ Findings that change this client:
 Next, in this order (receive first, because peers that reset their sessions after `delSS: 1` already wait in
 `pendingUids`): (4) receive init messages (545 and 551 pushes), create sessions, answer with 544; decrypt chat
 messages; then (3) send via `/api/e2ee/pc/message/sms`, then the composer and the lock UI.
+
+### Stage 4a: receive pipeline (implemented offline; not wired to the live socket)
+
+`Coordinator::plan_receive` → `prepare_receive` → `MessageStore::e2ee_commit_receive`, mirroring the send pipeline:
+one committed snapshot is read, the engine decrypts one personal ciphertext (prekey type 3 or ordinary type 1),
+and the ratchet change, the consumed one-time prekey, the queue cursor and the plaintext message commit in one SQL
+transaction. A first-contact sender is recorded from the prekey header (`prekey_sender`) before decrypting; the
+header identity is unauthenticated until the engine verifies the message. `personal_ciphertext_from_wire` parses
+`base64(type || body)`. Test `tests/signal_receive.rs` runs the real send pipeline in one store and the receive
+pipeline in another: plaintext equals the original, the conversation appears with the real preview, and the
+same ciphertext cannot be accepted again.
+
+Not done yet (live wiring, each account-affecting): reading the 551 pushes (`msgs[]`: `content` ciphertext,
+`e2ee` extension string, `uidFrom`, `paramsExt.platformType`, `msgId`, `ts`) and the `eesession` init pushes
+(543/544/545) from the socket; trust for ordinary messages (needs the stored peer identity key); answering
+`pendingUids` with 544; acknowledging queues (545/1 `info[]`) only after the commit; groups.
+
+### Wire facts for the live receive wiring (from the Electron capture, `decode_ws_capture`; ids anonymized)
+
+- **Pushed chat messages (`<- 551/0`, `data.msgs[]`)**: the ciphertext is `msgs[].content` (base64). Its leading
+  byte is **2**, then `0x33`, then a protobuf (`0a`…): an ordinary message, 67/83/99 bytes (16-byte steps). The
+  original treats `type == 3` as a prekey message and **anything else as ordinary**; `personal_ciphertext_from_wire`
+  now does the same (it used to accept only 1 and 3, which would have rejected every phone message). The sender
+  is `uidFrom`, the sender device is `paramsExt.platformType` (0 mobile, 1 web, 2 PC), the sender's registration id
+  is in `msgs[].e2ee` (a JSON string: `{"version":1,"compat_version":0,"iid":<registration id>}`; this client
+  writes `version 0`). `msgType` is `webchat` for text; a sticker arrives as `chat.sticker` with empty content.
+  `msgs[].propertyExt.ext` (string) carries the separately encrypted text properties.
+- **Receipts** (`<- 553/0`, `data.delivereds[]`) carry `deviceId`, `err`, `msgId`, `threadId`, `seen`; no cipher.
+- **Session events** are acknowledged with **`545/1`** `{info:[{cmd, deviceId, gid, sid, subCmd}], queueName:""}`
+  where `cmd` is the event's command (543, 544 or 548), `deviceId` is *this* device (2), `gid` is the event's id
+  (11-digit) and `sid` the sending user id. The reply is `{err 0, reqId}`.
+- **Pending sessions are acknowledged with 544** `{type:0, uidTo, data:[{deviceId, iid, ts}]}`: no ciphertext, just
+  the peer device, its registration id (`iid`) and the `ts` from the `pendingUids` entry. The reply is
+  `{err 0, reqId, ts}`.
+- **The empty queues**: at 2.8 s the original requested 513, 516 and 518 (`{first:true, lastId, preIds:[], reqId}`);
+  replies carry `eesession`, `msgs`, `delivereds`, `queueStatus.<cmd>_<sub>{evict,ids,lastId}`.
+
+Remaining wiring, in order (each acknowledging step only after the commit): (1) handle `<- 551` pushes and the
+`eesession` events: record the sender, decrypt, commit, emit the message; (2) send `545/1` acks for session
+events and `544` for `pendingUids`; (3) ordinary messages need the stored peer identity key (read the
+engine's `PeerIdentity` record); (4) the queues 513/516/518 on connect.
+
+### Stage 4b: passive live receive (implemented; not yet run for real)
+
+`src/app/live/runtime/e2ee_receive.rs`, off unless `ZALO_E2EE_RECEIVE` is an absolute report path:
+
+```sh
+ZALO_E2EE_RECEIVE="$HOME/e2ee-receive.txt" ./scripts/rust/run.sh --live
+```
+
+Each pushed `551` message from a peer is decrypted with the engine and committed in one SQL transaction, then
+appears in the conversation list/chat like any received message. **It never sends an acknowledgement** (no 544,
+no 545/1), so the service keeps redelivering; a redelivered ciphertext is recognised (`e2ee_ciphertext_seen`)
+and skipped. A first-contact sender is recorded from the prekey header; a device already trusted with a
+*different* identity is refused (identity-change handling is stage 5). Own-device messages, non-text messages
+and the `eesession` init events are reported and left alone. For ordinary (type 1/2) messages the sender's
+identity key is read back from the engine's `PeerIdentity` record (`stored_peer_identity`). The report lists only
+outcomes (decrypted, skipped with a reason, not decrypted with the reason) and never content or ids.
+
+How to try it: run the command above, then ask a contact who has E2EE with you to send you a text. Messages
+sent before this client's key was registered (epoch 3) were encrypted to other keys and cannot be read; only new
+ones can. Offline test: real engine and SQLite, a local socket pushing five frames; it asserts two messages are
+shown in order with their text, a redelivery, an own-device message and a sticker are skipped, and the client
+writes nothing back.
+
+### Stage 4b, first real run: `uidFrom "0"` is a message from this account's own phone
+
+The first run reported `message skipped: not a text message` and `message not decrypted: Invalid crypto account`.
+The second was the sender id: in the Electron capture every pushed message that this account sent from another
+device has **`uidFrom: "0"`** with the conversation's peer in **`idTo`** (messages from peers carry their own
+uid). `"0"` is not a valid account id, hence the error. Handled now: `uidFrom "0"` means the sender is this
+account (device from `paramsExt.platformType`, normally the phone), and the conversation is `d:<idTo>`; the
+message is stored with this account as sender. `plan_receive` takes the conversation `thread` explicitly and only
+refuses a message from *this device itself*. Own-device sessions were created by the init step, so they decrypt
+with the existing session. The report now also prints a safe descriptor per message (`msgType`, id lengths,
+platform, cipher kind, extension field names) and the whole error chain, to show what an unhandled message was.
+
+### Stage 4b, second real run: `iid` is the recipient's registration id
+
+The own-phone message (`uidFrom "0"`, an ordinary cipher of 132 chars) was refused with "this device presents a
+different identity than the trusted one". Cause: the handler compared the extension's `iid` with the *sender's*
+registration id. `iid` in `msgs[].e2ee` is the registration id of the key the message was encrypted **for** (the
+recipient's, i.e. this device's; this client writes it the same way, plus `sender_iid` for its own). It is now
+compared with this device's registration id instead: a mismatch is reported as "encrypted for a different key of
+this device" (typically a message sent before the current key existed), not as an identity change. The sender's
+own registration id comes from the prekey header or from the stored binding.
+
+### Stage 3c: the handshake that starts a conversation (implemented; not yet run for real)
+
+Receiving works because the peer opens the session: its init message reaches us and we answer. Starting a
+conversation ourselves needs the other half, which the original sends before the first message to a new peer and
+which this client lacked. `src/app/live/runtime/e2ee_init_peer.rs`, off unless `ZALO_E2EE_INIT_PEER` is an
+absolute report path (`ZALO_E2EE_PEER="name"` picks the contact as the app shows it; unset means the first usable
+contact of the account's E2EE list):
+
+```sh
+ZALO_E2EE_INIT_PEER="$HOME/e2ee-peer.txt" ZALO_E2EE_PEER="ban than" ./scripts/rust/run.sh --live
+```
+
+As captured from the original: 560 for the contact's devices, one 541 per device with `isReInit`, the engine
+creates a session with every device while encrypting `{"subDevice":[]}`, sessions and exact bytes commit in one
+SQL transaction, then **one 543** `{type:0, uidTo: contact, data:[{deviceId, data}]}` (one entry per device). The
+contact's devices answer with a 544 push. A device that already has a session is left alone, so a repeat sends
+nothing; a refused or unanswered 543 leaves the row `unknown` and is never resent. The init text never becomes a
+chat message. This is the account-touching step the send probe deliberately avoided (the probe's `isReInit`
+requests start sessions on the service without ever sending this 543).
+
+Still missing for sending chat messages themselves: the signed HTTP POST to `/api/e2ee/pc/message/sms`, its reply
+shape, the local echo, the composer routing and the lock UI.
+
+### Stage 3c, first real run: a refused device must not drop the whole contact
+
+Contact #1 answered `-7` for one device (the service's "user inactive for a long time"; the original ignores such
+a device) and the run stopped with "no usable device", because the first service error ended the contact. A
+refused device is now skipped with a report line and the contact's other devices still get the handshake; only a
+contact with no usable device fails. Test: one device answers `-7`, the handshake carries only the other.
+
+### Stage 3d: send one encrypted text (implemented; not yet run for real)
+
+`src/app/live/runtime/e2ee_send.rs`, off unless `ZALO_E2EE_SEND` (report path) **and** `ZALO_E2EE_SEND_TEXT` are
+set. **The text really goes to the chosen contact.** `ZALO_E2EE_PEER` selects the contact (name or `#number`);
+without it the first contact that already has a session is used. It needs sessions with the contact's devices
+(run `ZALO_E2EE_INIT_PEER` first; one run can set both, the handshake goes first):
+
+```sh
+ZALO_E2EE_INIT_PEER="$HOME/e2ee-peer.txt" ZALO_E2EE_SEND="$HOME/e2ee-send-text.txt" \
+ZALO_E2EE_SEND_TEXT="Xin chào" ZALO_E2EE_PEER="#1" ./scripts/rust/run.sh --live
+```
+
+Pipeline: reserve the draft → plan one snapshot → the engine encrypts for every device that has a session (the
+contact's, plus this account's other devices so the phone shows the message) → one SQL commit → authorize the
+durable dispatch → POST the exact committed bytes, form-encoded as `params` (the session's AES layer, like the
+legacy send), to `/api/e2ee/pc/message/sms` on the chat service → read `data.msgId`/`data.ts` → record the ack and
+the local echo, then show the message. No reply, an unreadable reply or an unexpected shape leaves the row
+`unknown`; the message is never encrypted or sent again. The report prints the reply's shape, which has never
+been observed for this endpoint. Offline tests cover everything up to the POST (real engine and SQLite): sessions
+come from the handshake, the plan covers the contact's device, the authorized path is
+`/api/e2ee/pc/message/sms`, `destType 3`, `threadId`, one record, and the row is `sending`.
+
+Not done: routing the composer to this path, the lock indicator, identity-change prompts, acknowledgements
+(544, 545/1) and E2EE groups/files.
+
+### Stage 3d, first real run: the post went to the wrong service
+
+The report said the post failed with no readable reply. The original serves the E2EE endpoints from their own
+service-map entries (`CHAT_E2EE: "chat_e2e"`, `CHAT_E2EE_GROUP: "group_e2e"`, N470113), not from `chat`; this
+client posted to the plain chat service, and its config parser also dropped those two keys. They are now parsed
+like the other optional services (validated origin, no effect when absent) and the post goes to `chat_e2e`; the
+failure report now names the cause. Note: that first attempt left its row `unknown` (it is never resent), and
+the duplicate-draft guard refuses the *same text* again in that conversation: use a different text for the retry.
+
+### Parity read of the original's E2EE text send (so the next run is not a guess)
+
+Read from the bundle (`sendZText` N331625–331650, `sendMsgE2ee` N399769, `_request`/`_post` N398344, `buildMsgParams`
+N331488, `_enrichE2eeVersion`/`_enrichAdditionalParams` N331497–331510, `VERSION_MSG` N103754) and compared field by field:
+
+| Original | This client |
+|---|---|
+| URL = domain of `CHAT_E2EE` (`chat_e2e`) + `/api/e2ee/pc/message/sms` + `?` + common params (`zpw_ver`, `zpw_type`) | same since the `chat_e2e` fix |
+| body `params=` + `encodeURIComponent(encodeAES(JSON.stringify(u)))`, `Content-Type: application/x-www-form-urlencoded`, credentials | same (session AES layer, cookie) |
+| `u = {listParams: JSON.stringify(records), destType: 3, threadId, clientId}` | same (`personal_sms`) |
+| record = `{message, textProperties?, e2eeExt, toId, platform}` (`buildMsgParams`) | same |
+| `e2eeExt` = `{version:0, compat_version:0}` for text, plus `iid` (recipient registration id) and `sender_iid` when the setting is on | same (always writes `sender_iid`) |
+| encrypts `[text, stylesJSON-or-""]`; empty styles omitted | same |
+
+No remaining difference found in the request. The reply handling (`msgId`, `ts`) is still unobserved, so the report prints
+its shape.

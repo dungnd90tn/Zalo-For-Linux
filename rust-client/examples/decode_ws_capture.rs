@@ -26,7 +26,10 @@ const VALUES: &[&str] = &[
     "reqIid",
     "di",
 ];
-const SIGNAL: std::ops::RangeInclusive<u16> = 540..=564;
+/// The end-to-end encrypted command family: signal commands plus the encrypted queues and their acks.
+fn is_signal(cmd: u16) -> bool {
+    (540..=564).contains(&cmd) || matches!(cmd, 513 | 516..=519)
+}
 
 fn shape(
     value: &Value,
@@ -85,12 +88,66 @@ fn shape(
     }
 }
 
+/// How an encrypted message record is laid out: which field carries the ciphertext, its framing (wire type byte
+/// then the 0x33 version byte) and the extension string, with ids anonymized and no ciphertext printed.
+fn describe_message(message: &Value, labels: &mut BTreeMap<String, usize>) -> String {
+    let text = |name: &str| message.get(name).and_then(Value::as_str);
+    let mut label = |uid: &str| {
+        let next = labels.len() + 1;
+        format!("uid#{}", *labels.entry(uid.to_owned()).or_insert(next))
+    };
+    let from = text("uidFrom").map(&mut label).unwrap_or_default();
+    let content = text("content").unwrap_or("");
+    let framing = match STANDARD.decode(content) {
+        Ok(raw) if raw.len() > 10 && raw[1] == 0x33 && matches!(raw[0], 1 | 3) => {
+            format!("cipher type {} ({} bytes)", raw[0], raw.len())
+        }
+        Ok(raw) => format!(
+            "base64 but not type||0x33 framing ({} bytes, first bytes {:02x?})",
+            raw.len(),
+            &raw[..raw.len().min(3)]
+        ),
+        Err(_) => format!("not base64 (string of {})", content.len()),
+    };
+    let ext = text("e2ee")
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .map(|value| {
+            value
+                .as_object()
+                .map(|map| {
+                    map.iter()
+                        .map(|(k, v)| {
+                            if v.is_number() || v.is_boolean() {
+                                format!("{k}={v}")
+                            } else {
+                                format!("{k}:{}", if v.is_string() { "string" } else { "value" })
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_else(|| "none".into());
+    let platform = message
+        .pointer("/paramsExt/platformType")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    format!(
+        "from {from} platform {platform} msgType {} | {framing} | e2ee ext [{ext}]",
+        text("msgType").unwrap_or("?")
+    )
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let file = args
         .next()
         .expect("usage: decode_ws_capture <frames.jsonl> [--all]");
-    let all = args.any(|a| a == "--all");
+    let rest: Vec<String> = args.collect();
+    let all = rest.iter().any(|a| a == "--all");
+    // Local debugging aid only: raw ack bookkeeping ids (never message content or ciphertext).
+    let ids = rest.iter().any(|a| a == "--ids");
     let text = std::fs::read_to_string(&file).expect("cannot read the capture");
     let mut decoder = FrameDecoder::default();
     let mut labels = BTreeMap::new();
@@ -128,7 +185,7 @@ fn main() {
         let cmd = u16::from_le_bytes([bytes[1], bytes[2]]);
         let sub = bytes[3];
         let outgoing = record["dir"] == "out";
-        let interesting = SIGNAL.contains(&cmd);
+        let interesting = is_signal(cmd);
         if !outgoing {
             // Server frame: decode through the production decoder (it keeps the session key from cmd 1).
             let outer: Value = serde_json::from_slice(&bytes[4..]).unwrap_or(Value::Null);
@@ -147,6 +204,56 @@ fn main() {
                     let mut out = Vec::new();
                     shape(&frame.payload, "", "", &mut labels, &mut out);
                     println!("{when} <- {cmd}/{sub}{latency}");
+                    if ids && matches!(cmd, 551 | 553) {
+                        for key in ["msgs", "delivereds"] {
+                            for message in frame
+                                .payload
+                                .pointer(&format!("/data/{key}"))
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                            {
+                                let pick: serde_json::Map<String, Value> = [
+                                    "msgId",
+                                    "cliMsgId",
+                                    "actionId",
+                                    "realMsgId",
+                                    "uidFrom",
+                                    "idTo",
+                                    "ts",
+                                    "cmd",
+                                    "st",
+                                    "status",
+                                    "threadId",
+                                    "deviceId",
+                                ]
+                                .iter()
+                                .filter_map(|k| message.get(*k).map(|v| (k.to_string(), v.clone())))
+                                .collect();
+                                println!("        {key} ids (raw): {}", Value::Object(pick));
+                            }
+                        }
+                        println!(
+                            "        lastActionId (raw): {}",
+                            frame
+                                .payload
+                                .pointer("/data/lastActionId")
+                                .map(|v| v.to_string())
+                                .unwrap_or_default()
+                        );
+                    }
+                    if let Some(messages) = frame
+                        .payload
+                        .pointer("/data/msgs")
+                        .and_then(Value::as_array)
+                    {
+                        for message in messages {
+                            println!(
+                                "        message: {}",
+                                describe_message(message, &mut labels)
+                            );
+                        }
+                    }
                     if interesting {
                         for l in out.iter().take(60) {
                             println!("        {l}");
@@ -174,6 +281,17 @@ fn main() {
                 .to_owned();
             sent.insert(id, (t, cmd));
             println!("{when} -> {cmd}/{sub}");
+            if ids && cmd == 545 {
+                println!(
+                    "        ack info (raw): {} queueName {}",
+                    body.pointer("/data/info")
+                        .map(|v| v.to_string())
+                        .unwrap_or_default(),
+                    body.pointer("/data/queueName")
+                        .map(|v| v.to_string())
+                        .unwrap_or_default()
+                );
+            }
             if interesting {
                 let mut out = Vec::new();
                 shape(&body, "", "", &mut labels, &mut out);

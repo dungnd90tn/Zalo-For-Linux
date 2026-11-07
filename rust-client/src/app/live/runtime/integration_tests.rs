@@ -218,6 +218,12 @@ impl Fixture {
             last_ping: None,
             authenticated_at: None,
             list_encrypted: false,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_receive_report: None,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_receive: None,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_http: None,
         }
     }
 }

@@ -21,7 +21,7 @@ use zalo_signal_engine as engine;
 pub(super) const GENERATION: u64 = 1;
 const PROBE_TEXT: &str = "e2ee probe";
 const WAIT: Duration = Duration::from_secs(12);
-const MAX_TRIES: usize = 10;
+pub(super) const MAX_TRIES: usize = 10;
 
 /// The report path and the optional peer selector (a name fragment or a numeric UID).
 pub(super) fn target() -> Option<(std::path::PathBuf, Option<String>)> {
@@ -274,8 +274,9 @@ impl Connection {
     }
     /// A contact's bundles the way the original gets them (live capture): 560 for the device list, then one
     /// 541 per device with `isReInit` set. Note `isReInit` is not read-only: it asks the service to begin
-    /// a fresh session with that device. The first service error ends the attempt.
-    async fn fetch_peer_devices(
+    /// a fresh session with that device. A device the service refuses is skipped; only a contact with no
+    /// usable device at all fails.
+    pub(super) async fn fetch_peer_devices(
         &mut self,
         scope: &Scope,
         uid: &str,
@@ -287,8 +288,9 @@ impl Connection {
             .compatible_devices(scope, uid, sequence, report, verbose)
             .await?;
         let mut bundles = Vec::new();
+        let mut first_error = None;
         for (n, device) in devices.into_iter().enumerate() {
-            let found = self
+            let outcome = self
                 .fetch_selected(
                     scope,
                     uid,
@@ -300,8 +302,27 @@ impl Connection {
                     },
                     report,
                 )
-                .await?;
-            bundles.extend(found.bundles);
+                .await;
+            match outcome {
+                Ok(found) => bundles.extend(found.bundles),
+                // A device the service refuses (for instance `-7`, a user inactive for a long time) is
+                // skipped, as the original does; the contact's other devices still count.
+                Err(error) => match error.downcast_ref::<signal::SignalError>() {
+                    Some(signal::SignalError::Service(code)) => {
+                        report.line(&format!(
+                            "device {}: the service answered error {code}; skipping this device",
+                            device.wire()
+                        ));
+                        first_error.get_or_insert(error);
+                    }
+                    _ => return Err(error),
+                },
+            }
+        }
+        if bundles.is_empty() {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
         }
         Ok(signal::FetchedBundles {
             peer: uid.to_owned(),
@@ -387,7 +408,7 @@ impl Connection {
     /// Candidate peers in the order to try: a UID if given as digits; a name fragment matched among
     /// this account's E2EE contacts; otherwise every E2EE contact in list order. Never prints names or
     /// UIDs, only how it chose.
-    async fn choose_peers(
+    pub(super) async fn choose_peers(
         &mut self,
         db: &Database,
         selector: Option<&str>,
@@ -403,20 +424,35 @@ impl Connection {
             report.line("peer: given as a numeric id");
             return Ok(vec![text.to_owned()]);
         }
-        let candidates = self.encrypted_peers().await?;
+        let mut candidates = self.encrypted_peers().await?;
+        // The list repeats a contact (it is in `threads` and in `uids`); each is one contact.
+        let mut unique = std::collections::HashSet::new();
+        candidates.retain(|uid| unique.insert(uid.clone()));
         anyhow::ensure!(
             !candidates.is_empty(),
             "this account has no end-to-end encrypted contact in its E2EE list"
         );
         report.line(&format!(
-            "the account's E2EE list has {} contact(s)",
+            "the account's E2EE list has {} distinct contact(s)",
             candidates.len()
         ));
         let Some(name) = selector else {
             report.line("peer: no name given; trying the E2EE contacts in list order");
             return Ok(candidates);
         };
-        let (owner, query, among) = (self.account.clone(), name.to_owned(), candidates);
+        // `#3` picks the third contact of the numbered list this report prints when a name does not match.
+        if let Some(number) = name
+            .strip_prefix('#')
+            .and_then(|n| n.trim().parse::<usize>().ok())
+        {
+            let uid = number
+                .checked_sub(1)
+                .and_then(|index| candidates.get(index))
+                .ok_or_else(|| anyhow::anyhow!("there is no contact number {number}"))?;
+            report.line("peer: chosen by number");
+            return Ok(vec![uid.clone()]);
+        }
+        let (owner, query, among) = (self.account.clone(), name.to_owned(), candidates.clone());
         let matches = db
             .call(move |s| s.direct_uids_matching(&owner, &query, &among))
             .await?;
@@ -425,11 +461,27 @@ impl Connection {
                 report.line("peer: matched by name");
                 Ok(vec![one.clone()])
             }
-            [] => anyhow::bail!("no E2EE contact has a name containing that text"),
-            many => anyhow::bail!(
-                "{} E2EE contacts match that name; use a longer part of it",
-                many.len()
-            ),
+            other => {
+                // Show the choices (names appear only here, in this private file) so one can be picked by
+                // name or by `#number`.
+                let (owner, among) = (self.account.clone(), candidates);
+                let names = db.call(move |s| s.direct_names(&owner, &among)).await?;
+                report.line("E2EE contacts (this private file shows names so you can choose; use ZALO_E2EE_PEER=\"#number\" or part of a name):");
+                for (index, name) in names.iter().enumerate() {
+                    report.line(&format!(
+                        "  #{} {}",
+                        index + 1,
+                        name.as_deref().unwrap_or("(no name known)")
+                    ));
+                }
+                if other.is_empty() {
+                    anyhow::bail!("no E2EE contact has a name containing that text")
+                }
+                anyhow::bail!(
+                    "{} E2EE contacts match that name; use a longer part of it or #number",
+                    other.len()
+                )
+            }
         }
     }
     async fn send_probe_inner(
@@ -873,11 +925,24 @@ mod tests {
         );
         assert!(!text.contains("encrypted:"), "{text}");
     }
+    /// `#2` picks the second contact of the numbered list, no name needed.
+    #[tokio::test]
+    async fn a_contact_can_be_chosen_by_its_number() {
+        let (seen, text) = scenario(Some("#2"), 4, false, false).await;
+        assert_eq!(seen, [563, 560, 541, 541]);
+        assert!(text.contains("peer: chosen by number"), "{text}");
+        assert_encrypted_for_both(&text);
+    }
     #[tokio::test]
     async fn an_unknown_name_stops_before_any_bundle_request() {
         let (_seen, text) = scenario(Some("Không có ai"), 1, true, false).await;
         assert!(
             text.contains("no E2EE contact has a name containing that text"),
+            "{text}"
+        );
+        // The choices are listed (numbered, with the names the app shows) so one can be picked next time.
+        assert!(
+            text.contains("  #1 ") && text.contains("  #2 Bạn thân"),
             "{text}"
         );
         assert!(!text.contains("encrypted:"), "{text}");

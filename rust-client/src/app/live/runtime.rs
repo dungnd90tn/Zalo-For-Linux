@@ -18,7 +18,13 @@ use url::Url;
 
 #[cfg(feature = "signal-crypto")]
 mod e2ee_init_devices;
+#[cfg(feature = "signal-crypto")]
+mod e2ee_init_peer;
 mod e2ee_probe;
+#[cfg(feature = "signal-crypto")]
+mod e2ee_receive;
+#[cfg(feature = "signal-crypto")]
+mod e2ee_send;
 #[cfg(feature = "signal-crypto")]
 mod e2ee_send_probe;
 mod e2ee_threads;
@@ -1021,6 +1027,13 @@ struct Connection {
     /// Ask for the E2EE conversation list after authenticating. On for real connections only, so
     /// scripted test sockets that expect an exact frame sequence are unaffected.
     list_encrypted: bool,
+    /// Opt-in live decryption of pushed E2EE chat messages (report path); real connections only.
+    #[cfg(feature = "signal-crypto")]
+    e2ee_receive_report: Option<std::path::PathBuf>,
+    #[cfg(feature = "signal-crypto")]
+    e2ee_receive: Option<e2ee_receive::Receiver>,
+    #[cfg(feature = "signal-crypto")]
+    e2ee_http: Option<e2ee_send::E2eeHttp>,
 }
 impl Connection {
     async fn send(&mut self, cmd: u16, sub: u8, data: Value) -> Result<()> {
@@ -1119,6 +1132,10 @@ impl Connection {
         .map_err(|e| NetworkFailure::socket(LiveStage::Connect, e))?;
         let mut connection = Self::connected(socket, session.account_id());
         connection.list_encrypted = true;
+        #[cfg(feature = "signal-crypto")]
+        {
+            connection.e2ee_receive_report = e2ee_receive::target();
+        }
         Ok(connection)
     }
     fn connected(socket: Socket, account: &str) -> Self {
@@ -1133,6 +1150,12 @@ impl Connection {
             last_ping: None,
             authenticated_at: None,
             list_encrypted: false,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_receive_report: None,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_receive: None,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_http: None,
         }
     }
     fn request(&mut self) -> String {
@@ -1262,6 +1285,20 @@ impl Connection {
                     e2ee_init_devices::target().filter(|_| e2ee_init_devices::claim())
                 {
                     self.e2ee_init_subdevices(db, &path).await;
+                }
+                // Handshake with one contact (what the original does before the first message to a new peer).
+                #[cfg(feature = "signal-crypto")]
+                if let Some((path, peer)) =
+                    e2ee_init_peer::target().filter(|_| e2ee_init_peer::claim())
+                {
+                    self.e2ee_init_peer(db, &path, peer.as_deref()).await;
+                }
+                // Send one real encrypted text (opt-in; the text goes to the chosen contact).
+                #[cfg(feature = "signal-crypto")]
+                if let Some((path, text, peer)) = e2ee_send::target().filter(|_| e2ee_send::claim())
+                {
+                    self.e2ee_send_text(db, events, &path, &text, peer.as_deref())
+                        .await;
                 }
                 #[cfg(feature = "signal-crypto")]
                 if let Some((path, peer)) =
@@ -1466,6 +1503,11 @@ impl Connection {
                     )
                     .await?;
                 }
+            }
+            // Opt-in passive receive: decrypt and store pushed chat messages, acknowledge nothing.
+            #[cfg(feature = "signal-crypto")]
+            551 if self.e2ee_receive_report.is_some() => {
+                self.e2ee_receive_push(&frame, db, events).await;
             }
             // These encrypted queues are intentionally not consumed or acknowledged.
             551 | 552 | 535 | 543 | 544 | 548 | 561 | 580 | 581 | 582 => {}
@@ -2296,6 +2338,15 @@ async fn run_inner(
                 };
                 match result {
                     Ok(c) => {
+                        #[cfg(feature = "signal-crypto")]
+                        let c = {
+                            let mut c = c;
+                            c.e2ee_http = Some(e2ee_send::E2eeHttp {
+                                client: client.clone(),
+                                session: session.clone(),
+                            });
+                            c
+                        };
                         connection = Some(c);
                         next_ping = tokio::time::Instant::now() + Duration::from_secs(15);
                     },

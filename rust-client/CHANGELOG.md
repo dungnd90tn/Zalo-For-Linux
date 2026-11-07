@@ -95,6 +95,31 @@ Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../chang
   bộ được coi là cũ và thay lại (epoch mới) thay vì tin nó. Lấy bundle của người khác nay hỏi lệnh 560 rồi 541
   từng thiết bị với `isReInit`, đúng như bản gốc.
 
+- **Đường nhận tin E2EE (ngoại tuyến, chưa nối vào socket thật):** `plan_receive` → `prepare_receive` → commit
+  trong một giao dịch SQL (ratchet, khóa dùng một lần, con trỏ hàng đợi, tin nhắn). Có test gửi bằng đường gửi
+  thật ở một kho rồi nhận bằng đường nhận ở kho khác. Xem [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md).
+
+- **Nhận tin E2EE trực tiếp, thụ động (tùy chọn, mặc định tắt, chưa chạy thật):** đặt
+  `ZALO_E2EE_RECEIVE=/đường/dẫn/tuyệt/đối.txt` khi chạy `run.sh --live`. Tin 551 từ người khác được giải mã bằng
+  engine, lưu bền trong một giao dịch rồi hiện như tin thường. **Không gửi bất kỳ xác nhận nào**; tin gửi lại được
+  nhận ra và bỏ qua. Xem [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md).
+
+- **Tin nhắn bắt tay E2EE để tự khởi tạo cuộc trò chuyện (tùy chọn, mặc định tắt, chưa chạy thật):** đặt
+  `ZALO_E2EE_INIT_PEER=/đường/dẫn/tuyệt/đối.txt` (và tùy ý `ZALO_E2EE_PEER="tên"`) khi chạy `run.sh --live`: hỏi 560
+  và 541 từng thiết bị với `isReInit`, tạo phiên bằng engine, lưu bền rồi gửi **một** lệnh 543 `type 0` có một mục
+  cho mỗi thiết bị của người đó, đúng như bản gốc. Thiết bị đã có phiên thì bỏ qua; không bao giờ gửi lại khi kết
+  quả không rõ. Xem [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md).
+
+- Chọn người cho các lệnh E2EE thử/bắt tay: tên khớp với cả tên trong danh bạ lẫn tên hiển thị trong danh sách hội
+  thoại; khi không khớp, báo cáo (tệp riêng 0600) liệt kê các liên hệ E2EE đánh số kèm tên để chọn lại bằng tên
+  hoặc bằng `ZALO_E2EE_PEER="#số"`.
+
+- **Gửi một tin văn bản E2EE thật (tùy chọn, mặc định tắt, chưa chạy thật; tin thật sự đi tới người nhận):** đặt
+  `ZALO_E2EE_SEND=/đường/dẫn.txt` và `ZALO_E2EE_SEND_TEXT="…"` (cùng `ZALO_E2EE_PEER`) khi chạy `run.sh --live`.
+  Mã hóa cho các thiết bị của người đó và các thiết bị khác của bạn, lưu bền, rồi POST có ký tới
+  `/api/e2ee/pc/message/sms`. Không bao giờ gửi lại khi phản hồi không rõ. Xem
+  [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md).
+
 ### Sửa
 - **Gửi tin 1-1 báo "Chưa xác minh được trạng thái mã hóa do định dạng phản hồi máy chủ chưa được hỗ
   trợ":** phản hồi kiểm tra mã hóa (lệnh 563) của máy chủ bỏ trường `err` khi nó bằng 0, còn client đòi

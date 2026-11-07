@@ -19,7 +19,7 @@ use crate::{
 use std::sync::Arc;
 use zalo_signal_engine as engine;
 
-const INIT_TEXT: &str = r#"{"subDevice":[]}"#;
+pub(super) const INIT_TEXT: &str = r#"{"subDevice":[]}"#;
 const WAIT: Duration = Duration::from_secs(15);
 
 pub(super) fn target() -> Option<std::path::PathBuf> {
@@ -203,7 +203,7 @@ impl Connection {
         Ok("session initialization with the account's other devices finished")
     }
 
-    async fn send_init(
+    pub(super) async fn send_init(
         &mut self,
         request_id: &str,
         body: Value,
