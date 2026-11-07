@@ -43,7 +43,34 @@ Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../chang
   thay cho bản build AppImage Electron; có kiểm tra thẻ phát hành khớp phiên bản và kiểm cài đặt bằng
   `apt`/`dnf` trước khi tải lên.
 
+- **Đính kèm tệp (giao diện và xử lý cục bộ):** nút ghim giấy mở hộp thoại chọn tệp của desktop
+  (`zenity`/`kdialog`), hoặc kéo-thả một tệp vào cửa sổ; khay phía trên ô soạn cho thấy tên, loại, dung
+  lượng và nút bỏ. Tệp hợp lệ khi là tệp thông thường, không rỗng, tối đa 100 MB (như bản gốc), tên hợp
+  lệ; tệp thuộc về bản nháp của từng hội thoại. Ở chế độ demo, tin tệp được lưu cục bộ. **Chưa gửi được
+  tới Zalo**: giao thức tải lên chưa được kiểm chứng với máy chủ thật, nên bản live giữ nút tắt kèm lý
+  do. Luồng gốc đã được ghi lại trong [PROTOCOL_FILES.md](PROTOCOL_FILES.md).
+
+- **Tải tệp đã nhận (bản live):** thẻ tệp có nút **Tải về** (chỉ khi bạn bấm). Liên kết phải là HTTPS trên
+  CDN Zalo (`*.zdn.vn`/`*.zadn.vn`), không cookie, không theo chuyển hướng; tối đa 100 MB. Tệp được ghi
+  theo luồng vào `Tải xuống/Zalo Native` (theo `XDG_DOWNLOAD_DIR`), qua tệp `.part` rồi đổi tên, không bao
+  giờ ghi đè (thêm ` (1)`, ` (2)`…), quyền `0600` không có bit thực thi, tên được làm sạch (bỏ đường dẫn,
+  ký tự điều khiển/đảo chiều). Có thanh tiến độ, nút Hủy (xóa phần đã tải), Thử lại và mở thư mục chứa
+  tệp. Lỗi máy chủ hiện rõ mã HTTP và được ghi vào nhật ký chẩn đoán (chỉ mã trạng thái và số byte), để
+  đối chiếu chiều tải tệp với máy chủ thật. Tệp mã hóa đầu cuối và thư mục vẫn chưa hỗ trợ.
+
+- **Thăm dò E2EE chỉ-đọc (tùy chọn, mặc định tắt):** đặt `ZALO_E2EE_PROBE=/đường/dẫn/tuyệt/đối.txt` khi chạy
+  `--live` để ghi cấu trúc phản hồi lệnh 564/541 của chính tài khoản (tên trường, kiểu, độ dài; không có
+  khóa, mã hay nội dung). Không thay đổi gì trên tài khoản. Đây là bước 1 của
+  [E2EE_LIVE_PLAN.md](E2EE_LIVE_PLAN.md); gửi/nhận E2EE vẫn chưa hỗ trợ.
+
 ### Sửa
+- **Gửi tin 1-1 báo "Chưa xác minh được trạng thái mã hóa do định dạng phản hồi máy chủ chưa được hỗ
+  trợ":** phản hồi kiểm tra mã hóa (lệnh 563) của máy chủ bỏ trường `err` khi nó bằng 0, còn client đòi
+  `err` phải có và bằng 0. Bản gốc chỉ từ chối khi `err` khác rỗng/0; client nay làm như vậy (thiếu,
+  null, false hoặc 0 là thành công, mọi giá trị khác vẫn chặn gửi). Các kiểm tra tương quan `reqId`, các
+  mảng danh sách và đối tác đã bật mã hóa giữ nguyên. Nguyên nhân suy ra từ nhật ký chẩn đoán
+  (`capability_field=status`, `field_type=absent`, lệnh 563) và từ mã gốc; chưa thử với máy chủ thật nên
+  nếu còn lỗi, nhật ký sẽ cho biết trường khác.
 - Sticker động từng có nguy cơ làm ứng dụng thoát vì vượt giới hạn kích thước texture của egui; nay mọi
   animation được xếp thành atlas ≤ 2048 px mỗi cạnh (xuống hàng khi cần) và kiểm tra thêm giới hạn thật
   của driver đồ họa.

@@ -943,6 +943,17 @@ fn eligibility_status(payload: &Value) -> Result<(), EligibilityFailure> {
         ..eligibility_schema(EligibilityField::Status, payload.get("error_code"))
     })
 }
+/// The original rejects a list only when `err` is truthy, and the signal service leaves
+/// zero-valued fields out, so a missing, null, false or zero `err` is success. Anything else,
+/// including a non-empty string, is a refusal. (The frame decoder has already required a zero
+/// `error_code` on the envelope, so only this inner status can be absent.)
+fn signal_list_status(data: &serde_json::Map<String, Value>) -> Result<(), EligibilityFailure> {
+    match data.get("err") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(()),
+        Some(Value::Number(number)) if number.as_f64() == Some(0.0) => Ok(()),
+        value => Err(eligibility_schema(EligibilityField::Status, value)),
+    }
+}
 /// Compatibility wrapper; runtime consumes detailed, content-free rejection reasons.
 pub fn legacy_direct_allowed(
     payload: &Value,
@@ -974,12 +985,7 @@ pub fn legacy_direct_allowed_detailed(
         .get("data")
         .and_then(Value::as_object)
         .ok_or_else(|| eligibility_schema(EligibilityField::Envelope, response.get("data")))?;
-    if data.get("err").and_then(Value::as_i64) != Some(0) {
-        return Err(eligibility_schema(
-            EligibilityField::Status,
-            data.get("err"),
-        ));
-    }
+    signal_list_status(data)?;
     let has_more = match data.get("hasMore") {
         None | Some(Value::Null) | Some(Value::Bool(false)) => false,
         Some(Value::Bool(true)) => true,
@@ -1744,6 +1750,78 @@ mod tests {
                 .unwrap_err()
                 .reason,
             EligibilityReason::Correlation
+        );
+    }
+    #[test]
+    fn a_missing_zero_err_is_success_but_any_truthy_err_still_refuses_the_send() {
+        let complete = |err: Option<Value>| {
+            let mut data = json!({"threads":[],"waitUids":[],"uids":[],"pendingUids":[]});
+            if let Some(err) = err {
+                data["err"] = err;
+            }
+            json!({"error_code":0,"data":{"reqId":"r1","data":data}})
+        };
+        // The signal service omits `err` when it is zero; the original treats that as success.
+        for ok in [
+            None,
+            Some(json!(null)),
+            Some(json!(0)),
+            Some(json!(false)),
+            Some(json!(0.0)),
+        ] {
+            assert_eq!(
+                legacy_direct_allowed_detailed(&complete(ok.clone()), "r1", "22")
+                    .unwrap_or_else(|f| panic!("{ok:?} must be accepted: {f:?}")),
+                (true, None)
+            );
+        }
+        for bad in [
+            json!(1),
+            json!(-1),
+            json!(true),
+            json!("0"),
+            json!("err"),
+            json!({}),
+            json!([]),
+        ] {
+            let failure = legacy_direct_allowed_detailed(&complete(Some(bad.clone())), "r1", "22")
+                .expect_err(&format!("{bad} must be refused"));
+            assert_eq!(failure.reason, EligibilityReason::Schema, "{bad}");
+            assert_eq!(failure.field, Some(EligibilityField::Status), "{bad}");
+        }
+        // Dropping `err` never relaxes the rest: arrays, correlation and encrypted peers.
+        let mut missing_array = complete(None);
+        missing_array["data"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("uids");
+        assert_eq!(
+            legacy_direct_allowed_detailed(&missing_array, "r1", "22")
+                .unwrap_err()
+                .field,
+            Some(EligibilityField::Uids)
+        );
+        assert_eq!(
+            legacy_direct_allowed_detailed(&complete(None), "other", "22")
+                .unwrap_err()
+                .reason,
+            EligibilityReason::Correlation
+        );
+        let mut encrypted = complete(None);
+        encrypted["data"]["data"]["uids"] = json!(["22"]);
+        assert_eq!(
+            legacy_direct_allowed_detailed(&encrypted, "r1", "22").unwrap(),
+            (false, None),
+            "a peer in the encrypted list is still refused when err is absent"
+        );
+        // A nonzero envelope code is still a refusal.
+        let mut refused = complete(None);
+        refused["error_code"] = json!(7);
+        assert_eq!(
+            legacy_direct_allowed_detailed(&refused, "r1", "22")
+                .unwrap_err()
+                .error,
+            WireError::Service(7)
         );
     }
     #[test]

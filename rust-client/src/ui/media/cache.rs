@@ -1,9 +1,11 @@
 //! Bounded GPU presentation cache. Decoding/downloads are delegated to app::media.
+use crate::app::download::{DownloadEvent, DownloadFailure, FileDownloader, Progress};
 use crate::app::media::{MediaEvent, MediaFailure, MediaKey, MediaLoader, MAX_THUMBNAIL_SIDE};
 use eframe::egui;
 use lru::LruCache;
 use std::{
     num::NonZeroUsize,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -19,6 +21,18 @@ enum State {
     Pending,
     Failed { at: Instant, reason: MediaFailure },
     Deferred { until: Instant },
+}
+enum Download {
+    Running(Arc<Progress>),
+    Saved(PathBuf),
+    Failed(DownloadFailure),
+}
+/// What a file card shows; owned so the cache is not borrowed while drawing.
+pub(super) enum DownloadView {
+    Idle,
+    Running { received: u64, total: Option<u64> },
+    Saved(PathBuf),
+    Failed(DownloadFailure),
 }
 pub(super) enum Presentation {
     Image(egui::TextureHandle),
@@ -37,6 +51,8 @@ pub(crate) struct MediaCache {
     startup_retry: Option<Instant>,
     textures: LruCache<MediaKey, Texture>,
     states: LruCache<MediaKey, State>,
+    downloader: Option<FileDownloader>,
+    downloads: LruCache<MediaKey, Download>,
     bytes: usize,
     pub(super) viewer: Option<Viewer>,
     #[cfg(test)]
@@ -51,6 +67,8 @@ impl Default for MediaCache {
             startup_retry: None,
             textures: LruCache::new(NonZeroUsize::new(TEXTURES).unwrap()),
             states: LruCache::new(NonZeroUsize::new(STATES).unwrap()),
+            downloader: None,
+            downloads: LruCache::new(NonZeroUsize::new(STATES).unwrap()),
             bytes: 0,
             viewer: None,
             #[cfg(test)]
@@ -182,12 +200,92 @@ impl MediaCache {
         if *remaining == 0 || Instant::now() >= deadline {
             return;
         }
+        self.retire_closed_downloader();
+        if let Some(event) = self.downloader.as_mut().and_then(FileDownloader::try_event) {
+            *remaining -= 1;
+            self.apply_download(event);
+            ctx.request_repaint();
+            return;
+        }
         let Some(event) = self.loader.as_mut().and_then(MediaLoader::try_event) else {
             return;
         };
         *remaining -= 1;
         self.apply(ctx, event);
         ctx.request_repaint();
+    }
+    pub(super) fn download_view(&mut self, key: &MediaKey) -> DownloadView {
+        match self.downloads.get(key) {
+            None => DownloadView::Idle,
+            Some(Download::Running(progress)) => DownloadView::Running {
+                received: progress.received(),
+                total: progress.total(),
+            },
+            Some(Download::Saved(path)) => DownloadView::Saved(path.clone()),
+            Some(Download::Failed(reason)) => DownloadView::Failed(*reason),
+        }
+    }
+    /// Explicit user action only. A refused start (queue full, worker gone) is shown as a failure.
+    pub(super) fn start_download(&mut self, ctx: &egui::Context, key: MediaKey, name: &str) {
+        self.retire_closed_downloader();
+        if self.downloader.is_none() {
+            let repaint = ctx.clone();
+            self.downloader = FileDownloader::new(
+                key.account_id.clone(),
+                Arc::new(move || repaint.request_repaint()),
+            )
+            .ok();
+        }
+        let started = self
+            .downloader
+            .as_mut()
+            .and_then(|downloader| downloader.start(key.clone(), name));
+        self.downloads.put(
+            key,
+            match started {
+                Some(progress) => Download::Running(progress),
+                None => Download::Failed(DownloadFailure::Network),
+            },
+        );
+    }
+    pub(super) fn cancel_download(&mut self, key: &MediaKey) {
+        if let Some(Download::Running(progress)) = self.downloads.get(key) {
+            progress.cancel();
+        }
+    }
+    pub(super) fn forget_download(&mut self, key: &MediaKey) {
+        self.downloads.pop(key);
+    }
+    pub(super) fn apply_download(&mut self, event: DownloadEvent) {
+        match event {
+            DownloadEvent::Done { key, path, .. } => {
+                self.downloads.put(key, Download::Saved(path));
+            }
+            // A cancelled transfer returns to the button; any other failure keeps its reason.
+            DownloadEvent::Failed {
+                key,
+                reason: DownloadFailure::Cancelled,
+            } => {
+                self.downloads.pop(&key);
+            }
+            DownloadEvent::Failed { key, reason } => {
+                self.downloads.put(key, Download::Failed(reason));
+            }
+        }
+    }
+    fn retire_closed_downloader(&mut self) {
+        if self
+            .downloader
+            .as_ref()
+            .is_some_and(FileDownloader::is_closed)
+        {
+            self.downloader = None;
+            for (_, download) in self.downloads.iter_mut() {
+                if matches!(download, Download::Running(_)) {
+                    *download = Download::Failed(DownloadFailure::Network);
+                }
+            }
+        }
     }
     fn apply(&mut self, ctx: &egui::Context, event: MediaEvent) {
         match event {

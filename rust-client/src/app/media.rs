@@ -231,7 +231,7 @@ impl Drop for MediaLoader {
 
 /// Literal image origins present in the original client: photolink and cloud/CDN resources.
 /// Host suffix matching includes a dot boundary; redirect targets are never followed.
-fn thumbnail_url(raw: &str) -> std::result::Result<url::Url, MediaFailure> {
+pub(crate) fn thumbnail_url(raw: &str) -> std::result::Result<url::Url, MediaFailure> {
     if raw.len() > 8192 {
         return Err(MediaFailure::Resource);
     }

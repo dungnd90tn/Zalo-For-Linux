@@ -2,6 +2,8 @@
 #[cfg(feature = "messaging")]
 pub mod directory;
 #[cfg(feature = "messaging")]
+pub mod download;
+#[cfg(feature = "messaging")]
 pub mod live;
 #[cfg(feature = "messaging")]
 pub mod media;
@@ -39,6 +41,16 @@ pub enum Command {
         generation: u64,
         thread: String,
         text: String,
+        request_id: u64,
+    },
+    /// Store a file message locally in the offline demo. The file is not read or uploaded:
+    /// only its name, extension and size become a stored message.
+    SendDemoFile {
+        generation: u64,
+        thread: String,
+        name: String,
+        extension: String,
+        size_bytes: u64,
         request_id: u64,
     },
     /// Counts and the newest pictures, files and links of one conversation's saved history.
@@ -189,6 +201,25 @@ impl Worker {
                             );
                             (generation, thread, Some(request_id), result)
                         }
+                        Command::SendDemoFile {
+                            generation,
+                            thread,
+                            name,
+                            extension,
+                            size_bytes,
+                            request_id,
+                        } => {
+                            let result =
+                                store_demo_file(&mut store, &thread, &name, &extension, size_bytes)
+                                    .map(|(id, conversation)| Event::DemoStored {
+                                        generation,
+                                        thread: thread.clone(),
+                                        id,
+                                        request_id,
+                                        conversation,
+                                    });
+                            (generation, thread, Some(request_id), result)
+                        }
                         Command::Overview { generation, thread } => {
                             let event = match store.conversation_overview(
                                 DEMO_ACCOUNT,
@@ -243,6 +274,20 @@ fn submit(
         }
         Command::SendDemo { thread, text, .. } => {
             validate_id(thread).is_ok() && !text.trim().is_empty() && text.len() <= MAX_TEXT_BYTES
+        }
+        Command::SendDemoFile {
+            thread,
+            name,
+            extension,
+            size_bytes,
+            ..
+        } => {
+            validate_id(thread).is_ok()
+                && !name.is_empty()
+                && name.len() <= crate::domain::attachment::MAX_FILE_NAME_BYTES
+                && extension.chars().count() <= 32
+                && *size_bytes > 0
+                && *size_bytes <= crate::domain::MAX_DIRECT_FILE_BYTES
         }
         Command::Overview { thread, .. } => validate_id(thread).is_ok(),
         Command::Shutdown => true,
@@ -323,6 +368,46 @@ pub fn seed_demo(store: &mut MessageStore) -> Result<()> {
     store.insert_batch(&additional)?;
     Ok(())
 }
+/// Persist a file message in the offline demo. Only metadata is stored; there is no upload and no
+/// download address, so the card says the file is not available to open.
+fn store_demo_file(
+    store: &mut MessageStore,
+    thread: &str,
+    name: &str,
+    extension: &str,
+    size_bytes: u64,
+) -> Result<(String, Conversation)> {
+    use crate::domain::{MediaKind, MediaMessageContent};
+    let id = local_message_id()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let params = serde_json::json!({"fileExt": extension, "fileSize": size_bytes.to_string()});
+    let content = MediaMessageContent::new(
+        MediaKind::File,
+        &serde_json::json!({"title": name, "params": params.to_string()}),
+    )?;
+    let message = Message {
+        account_id: DEMO_ACCOUNT.into(),
+        thread_id: thread.into(),
+        id: id.clone(),
+        sender: "You (local demo)".into(),
+        text: format!("[Tin nhắn {} chưa được hỗ trợ]", MediaKind::File.as_str()),
+        sticker: None,
+        media: Some(content.descriptor().clone()),
+        sent_at_ms: i64::try_from(now)?,
+    };
+    let stored = store.receive_batch_with_media(
+        DEMO_ACCOUNT,
+        &[(message, None, None, Some(content))],
+        None,
+    )?;
+    let (_, conversation) = stored
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("The file message was not stored"))?;
+    Ok((id, conversation))
+}
 fn store_demo_message(
     store: &mut MessageStore,
     thread: &str,
@@ -352,11 +437,25 @@ fn store_demo_message(
 #[derive(Default)]
 pub struct Composer {
     pub text: String,
+    /// A file chosen to be sent with the next send; it belongs to this draft like the text does.
+    attachment: Option<crate::domain::Attachment>,
     next_request_id: u64,
     pending: Option<(u64, u64)>,
     revision: u64,
 }
 impl Composer {
+    pub fn attachment(&self) -> Option<&crate::domain::Attachment> {
+        self.attachment.as_ref()
+    }
+    pub fn set_attachment(&mut self, attachment: crate::domain::Attachment) {
+        self.attachment = Some(attachment);
+        self.edited();
+    }
+    pub fn clear_attachment(&mut self) {
+        if self.attachment.take().is_some() {
+            self.edited();
+        }
+    }
     pub fn in_flight(&self) -> bool {
         self.pending.is_some()
     }
@@ -375,6 +474,19 @@ impl Composer {
         }
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let request_id = self.next_request_id;
+        // A chosen file is sent on its own; the typed text stays in the editor for next time.
+        if let Some(file) = &self.attachment {
+            enqueue(Command::SendDemoFile {
+                generation,
+                thread,
+                name: file.name.clone(),
+                extension: file.extension.clone(),
+                size_bytes: file.size_bytes,
+                request_id,
+            })?;
+            self.pending = Some((request_id, self.revision));
+            return Ok(());
+        }
         enqueue(Command::SendDemo {
             generation,
             thread,
@@ -391,7 +503,10 @@ impl Composer {
         match event {
             Event::DemoStored { request_id, .. } if request_id == pending_id => {
                 if self.revision == *submitted_revision {
-                    self.text.clear();
+                    // Whatever was submitted is gone from the draft; the other half is untouched.
+                    if self.attachment.take().is_none() {
+                        self.text.clear();
+                    }
                     self.revision = self.revision.wrapping_add(1);
                 }
                 self.pending = None;
@@ -1142,5 +1257,25 @@ mod tests {
         );
         model.messages.push(message("c"));
         assert!(model.overview_stale("welcome"));
+    }
+    #[test]
+    fn a_demo_file_message_is_stored_as_a_file_card_without_an_address() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let (id, conversation) =
+            store_demo_file(&mut store, "welcome", "bao-cao.pdf", "pdf", 2048).unwrap();
+        assert_eq!(conversation.id, "welcome");
+        assert_eq!(conversation.last_text, "bao-cao.pdf");
+        let page = store.page(DEMO_ACCOUNT, "welcome", None, 10).unwrap();
+        let stored = page.iter().find(|message| message.id == id).unwrap();
+        match stored.media.as_ref().unwrap() {
+            crate::domain::MediaDescriptor::File(file) => {
+                assert_eq!(file.title, "bao-cao.pdf");
+                assert_eq!(file.extension, "pdf");
+                assert_eq!(file.size_bytes, Some(2048));
+                assert!(file.url.is_none() && !file.encrypted);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(stored.sender, "You (local demo)");
     }
 }

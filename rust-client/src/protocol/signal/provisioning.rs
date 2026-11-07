@@ -74,7 +74,7 @@ pub struct Reconciliation {
     candidate: CandidateIdentity,
     state: UploadState,
     acknowledged: bool,
-    before: Option<(u16, u64)>,
+    before: Option<(u16, Option<u64>)>,
     full_identity: bool,
 }
 impl Reconciliation {
@@ -151,7 +151,7 @@ impl Reconciliation {
             self.fail_recovery();
             return Err(SignalError::Incomplete);
         };
-        if registration_id != self.candidate.registration_id || submitted_at == 0 {
+        if registration_id != self.candidate.registration_id || submitted_at == Some(0) {
             self.fail_recovery();
             return Err(SignalError::Scope);
         }
@@ -195,7 +195,7 @@ impl Reconciliation {
                 UploadState::Unknown | UploadState::AcceptedNeedsMetadata
             )
     }
-    pub(crate) fn finish_metadata(&mut self, own: OwnKey) -> Result<u64> {
+    pub(crate) fn finish_metadata(&mut self, own: OwnKey) -> Result<Option<u64>> {
         if !matches!(
             self.state,
             UploadState::Unknown | UploadState::AcceptedNeedsMetadata

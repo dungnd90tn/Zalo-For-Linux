@@ -16,6 +16,7 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+mod e2ee_probe;
 #[cfg(test)]
 mod integration_tests;
 mod privacy;
@@ -1233,6 +1234,10 @@ impl Connection {
                     return Err(WireError::Oversize.into());
                 }
                 events.connection(LiveConnection::Online).await?;
+                // Opt-in and read-only (E2EE_LIVE_PLAN.md stage 1); runs before any queue is requested.
+                if let Some(path) = e2ee_probe::target().filter(|_| e2ee_probe::claim()) {
+                    self.e2ee_probe(&path).await;
+                }
                 for (cmd, sub) in self.queues.clone() {
                     self.offline(db, &events.account, cmd, sub, true, None)
                         .await?;

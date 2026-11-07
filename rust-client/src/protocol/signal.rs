@@ -619,7 +619,8 @@ pub enum OwnKey {
     Missing,
     Present {
         registration_id: u16,
-        submitted_at: u64,
+        /// The real service omits `submitTs` (the original reads it as `undefined`); never invent one.
+        submitted_at: Option<u64>,
     },
 }
 pub fn own_key_reply(request: &SignalRequest, active: &Scope, reply: &Value) -> Result<OwnKey> {
@@ -632,7 +633,10 @@ pub fn own_key_reply(request: &SignalRequest, active: &Scope, reply: &Value) -> 
     match data {
         Ok(data) => Ok(OwnKey::Present {
             registration_id: registration(&data["keyId"])?,
-            submitted_at: number(&data["submitTs"])?,
+            submitted_at: match data.get("submitTs") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(number(value)?),
+            },
         }),
         Err(SignalError::Service(-1))
             if reply["error_code"].as_i64() == Some(0)
@@ -1569,6 +1573,24 @@ mod tests {
                 ..
             })
         ));
+        // The real service answers `{err:0,keyId}` without `submitTs` (observed on a live account).
+        assert!(matches!(
+            own_key_reply(
+                &request,
+                &s,
+                &response(&request, json!({"err":0,"keyId":7}))
+            ),
+            Ok(OwnKey::Present {
+                registration_id: 7,
+                submitted_at: None
+            })
+        ));
+        assert!(own_key_reply(
+            &request,
+            &s,
+            &response(&request, json!({"keyId":7,"submitTs":"x"}))
+        )
+        .is_err());
         assert!(matches!(
             own_key_reply(&request, &s, &response(&request, json!({"err":-1}))),
             Ok(OwnKey::Missing)

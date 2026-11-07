@@ -9,7 +9,7 @@
 //!   ZALO_UI_SHOT_SIZE=1200x780 cargo test --locked --offline --lib -- --ignored --exact ui::shot_fixture::demo_screenshot
 //! ```
 //!
-//! Optional: `ZALO_UI_SHOT_SCENE=settings|info`, `ZALO_UI_SHOT_POINTER=x,y` (hover),
+//! Optional: `ZALO_UI_SHOT_SCENE=settings|info|attach`, `ZALO_UI_SHOT_POINTER=x,y` (hover),
 //! `ZALO_UI_SHOT_PRESS=1` (hold the press at that point) and `ZALO_UI_SHOT_TABS=n` (keyboard focus).
 use super::*;
 use std::io::Write as _;
@@ -72,6 +72,14 @@ impl eframe::App for Shot {
         if self.frames == 15 {
             match self.scene.as_str() {
                 "settings" => self.app.settings_open = true,
+                "attach" => {
+                    // A synthetic file in the profile's temp root, attached to the open draft.
+                    let path = std::env::temp_dir().join("Bao-cao-thiet-ke-quy-4.pdf");
+                    std::fs::write(&path, vec![7u8; 1_843_200]).expect("synthetic file");
+                    if let Ok(attachment) = crate::domain::Attachment::inspect(&path) {
+                        self.app.drafts.active.set_attachment(attachment);
+                    }
+                }
                 "info" => {
                     self.app.conversation_details = self
                         .app

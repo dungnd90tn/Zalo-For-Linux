@@ -509,6 +509,12 @@ fn serve(
                             }
                             2 => page["hasMore"] = Value::Null,
                             3 => page["hasMore"] = json!(0),
+                            // The signal service omits zero-valued fields, so `err` may be absent.
+                            4 => {
+                                page.as_object_mut().unwrap().remove("err");
+                            }
+                            5 => page["err"] = Value::Null,
+                            15 => page["err"] = json!(1),
                             10..=13 => {
                                 page.as_object_mut().unwrap().remove(
                                     ["threads", "waitUids", "uids", "pendingUids"][mode - 10],
@@ -4640,7 +4646,7 @@ async fn eligibility_send_case(mode: usize, accepted: bool) {
                     if mode == 30 {
                         assert!(error.contains("sự kiện mã hóa"));
                     }
-                    if (10..=14).contains(&mode) {
+                    if (10..=15).contains(&mode) {
                         assert!(error.contains("định dạng"));
                     }
                     if (20..=23).contains(&mode) {
@@ -4701,14 +4707,14 @@ async fn eligibility_send_case(mode: usize, accepted: bool) {
 
 #[tokio::test]
 async fn source_terminal_pagination_flags_allow_real_plaintext_send() {
-    for mode in [1, 2, 3] {
+    for mode in [1, 2, 3, 4, 5] {
         eligibility_send_case(mode, true).await;
     }
 }
 
 #[tokio::test]
 async fn incomplete_or_encrypted_capability_never_sends_or_prepares_outbox() {
-    for mode in [10, 11, 12, 13, 14, 20, 21, 22, 23] {
+    for mode in [10, 11, 12, 13, 14, 15, 20, 21, 22, 23] {
         eligibility_send_case(mode, false).await;
     }
 }

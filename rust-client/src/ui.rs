@@ -2,6 +2,7 @@
 mod account;
 #[cfg(all(test, feature = "messaging"))]
 mod account_tests;
+mod attachments;
 #[cfg(feature = "messaging")]
 mod avatars;
 #[cfg(test)]
@@ -92,6 +93,7 @@ pub struct NativeApp {
     latest_page: bool,
     ime_composing: bool,
     info_tab: information::InfoTab,
+    attachments: attachments::AttachmentPicker,
     #[cfg(feature = "live-login")]
     live: Option<live::LiveState>,
     // The worker shuts down before the profile lock is released.
@@ -149,6 +151,7 @@ impl NativeApp {
             latest_page: true,
             ime_composing: false,
             info_tab: Default::default(),
+            attachments: Default::default(),
             #[cfg(feature = "live-login")]
             live: None,
             _profile: Arc::new(profile),
@@ -476,7 +479,10 @@ impl NativeApp {
         else {
             return;
         };
-        if self.drafts.active.in_flight() || self.drafts.active.text.trim().is_empty() {
+        if self.drafts.active.in_flight()
+            || (self.drafts.active.text.trim().is_empty()
+                && self.drafts.active.attachment().is_none())
+        {
             return;
         }
         if let Err(error) = self
@@ -1102,6 +1108,22 @@ impl NativeApp {
         ui.painter().rect_filled(rect, 16.0, colors.surface);
         ui.painter()
             .rect_stroke(rect, 16.0, Stroke::new(1.0_f32, colors.border_strong));
+        // Files can only be attached offline, in the demo: sending one to Zalo needs the upload
+        // protocol, which has not been verified against the real server (PROTOCOL_FILES.md).
+        let attach_here = enabled && self.demo;
+        self.poll_attachments(
+            ctx,
+            attach_here,
+            "Gửi tệp tới Zalo chưa được hỗ trợ: giao thức tải lên chưa được kiểm chứng với máy chủ thật.",
+        );
+        let tray_height = self.attachment_tray_height();
+        if tray_height > 0.0 {
+            self.attachment_tray(ui, rect);
+        }
+        if attach_here && ctx.input(|input| !input.raw.hovered_files.is_empty()) {
+            ui.painter()
+                .rect_stroke(rect.shrink(1.0), 16.0, Stroke::new(2.0_f32, colors.primary));
+        }
         let mut send = false;
         let ime_active = self.ime_composing
             || ctx.input(|input| {
@@ -1112,7 +1134,10 @@ impl NativeApp {
             });
         positioned_ui(
             ui,
-            egui::UiBuilder::new().max_rect(rect.shrink2(vec2(8.0, 4.0))),
+            egui::UiBuilder::new().max_rect(
+                egui::Rect::from_min_max(pos2(rect.left(), rect.top() + tray_height), rect.max)
+                    .shrink2(vec2(8.0, 4.0)),
+            ),
             |ui| {
                 ui.horizontal(|ui| {
                     icon_button(
@@ -1127,12 +1152,21 @@ impl NativeApp {
                         "Gửi ảnh · chưa hỗ trợ trong bản xem trước",
                         false,
                     );
-                    icon_button(
+                    if icon_button(
                         ui,
                         Icon::Paperclip,
-                        "Đính kèm · chưa hỗ trợ trong bản xem trước",
-                        false,
-                    );
+                        if self.demo {
+                            "Đính kèm tệp · chỉ lưu cục bộ trong bản demo"
+                        } else {
+                            "Đính kèm · chưa hỗ trợ: giao thức tải tệp lên Zalo chưa được kiểm chứng"
+                        },
+                        attach_here && !self.attachments.busy(),
+                    )
+                    .clicked()
+                    {
+                        let thread = self.model.selected.clone();
+                        self.attachments.open_dialog(ctx, thread.as_deref());
+                    }
                     if rect.width() >= 480.0 {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(8.0);
@@ -1153,7 +1187,7 @@ impl NativeApp {
                     vec2(72.0, 44.0),
                 );
                 let editor_rect = egui::Rect::from_min_max(
-                    pos2(rect.left() + 16.0, rect.top() + 52.0),
+                    pos2(rect.left() + 16.0, rect.top() + 52.0 + tray_height),
                     pos2(send_rect.left() - 12.0, rect.bottom() - 10.0),
                 );
                 positioned_ui(ui, egui::UiBuilder::new().max_rect(editor_rect), |ui| {
@@ -1241,7 +1275,8 @@ impl NativeApp {
                     && !ime_active
                     && (self.demo || self.live_can_send())
                     && !self.drafts.active.in_flight()
-                    && !self.drafts.active.text.trim().is_empty();
+                    && (!self.drafts.active.text.trim().is_empty()
+                        || self.drafts.active.attachment().is_some());
                 let response = ui
                     .add_enabled_ui(can_send, |ui| {
                         ui.interact(send_rect, ui.id().with("send_local"), Sense::click())
@@ -1281,8 +1316,10 @@ impl NativeApp {
                     "Hoàn tất phần nhập đang soạn trước khi gửi."
                 } else if self.drafts.active.in_flight() {
                     "Đang chờ kết quả lượt gửi trước; bản nháp được giữ nguyên."
-                } else if self.drafts.active.text.trim().is_empty() {
-                    "Nhập nội dung tin nhắn."
+                } else if self.drafts.active.text.trim().is_empty()
+                    && self.drafts.active.attachment().is_none()
+                {
+                    "Nhập nội dung tin nhắn hoặc chọn một tệp."
                 } else {
                     "Chưa thể gửi. Kiểm tra kết nối và trạng thái lượt gửi trước."
                 };
@@ -1310,7 +1347,8 @@ impl NativeApp {
             ui.disable();
         }
         let composer_height =
-            composer_height(ui.available_height(), &self.drafts.active.text, compact);
+            composer_height(ui.available_height(), &self.drafts.active.text, compact)
+                + self.attachment_tray_height();
         let status = timeline_status(
             &self.model.status,
             self.model.pending,

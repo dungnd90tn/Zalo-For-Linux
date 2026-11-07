@@ -3,9 +3,11 @@ use anyhow::{bail, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+pub mod attachment;
 pub(crate) mod info;
 pub mod media;
 pub mod overview;
+pub use attachment::{Attachment, AttachmentError, MAX_DIRECT_FILE_BYTES};
 pub use media::{
     CardButton, CardRow, FileDescriptor, MediaContentError, MediaDescriptor, MediaKind,
     MediaMessageContent, MessageMediaBinding, PhotoDescriptor, PollDescriptor,

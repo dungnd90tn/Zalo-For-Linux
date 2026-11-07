@@ -44,10 +44,10 @@ Tải gói của [bản phát hành](changelogs/RELEASE-v2.0.0.md) rồi cài b�
 
 ```bash
 # Ubuntu / Debian
-sudo apt install ./zalo-native_2.0.0-2_amd64.deb
+sudo apt install ./zalo-native_2.0.0-3_amd64.deb
 
 # Fedora / RHEL / AlmaLinux / Rocky (yum dùng cùng lệnh)
-sudo dnf install ./zalo-native-2.0.0-2.x86_64.rpm
+sudo dnf install ./zalo-native-2.0.0-3.x86_64.rpm
 ```
 
 Mở **Zalo Native** từ menu ứng dụng hoặc chạy `zalo-native --live`; `zalo-native --demo` mở bản dùng thử. Gỡ cài đặt bằng `sudo apt remove zalo-native` hoặc `sudo dnf remove zalo-native`. Gói độc lập với gói Electron `zalo` và có thể cài cùng lúc. Hiện chưa có kho `apt`/`dnf` để tự cập nhật: muốn nâng cấp, cài gói mới hơn theo cùng lệnh.

@@ -501,7 +501,7 @@ impl Coordinator {
                     &upload,
                     &self.scope,
                     epoch,
-                    Some(timestamp),
+                    timestamp,
                     true,
                 )))
             }
@@ -783,6 +783,71 @@ mod tests {
             assert_eq!(proof.socket_epoch(), new.0);
         }
     }
+    /// The live service answers 564 with `{err:0,keyId}` only. Identity is still proven by the own 541
+    /// bundle; the proof simply carries no timestamp.
+    #[tokio::test]
+    async fn reconciliation_succeeds_without_a_server_timestamp_as_the_real_service_omits_it() {
+        let (mut c, gate, epoch) = coordinator();
+        let (_store, receipt, payload) = claimed(epoch.0).await;
+        c.upload(receipt, &gate, Instant::now()).unwrap();
+        c.disconnected();
+        let new = c.connected(&gate).unwrap();
+        let reg = payload["key"]["preKey"]["iKey"]["id"].clone();
+        let request = c.reconcile(&gate, Instant::now()).unwrap();
+        c.accept(reply(&request, json!({"err":0,"keyId":reg})), new, &gate)
+            .unwrap();
+        let request = c.identity_query(&gate, Instant::now()).unwrap();
+        let mut pc = payload["key"].clone();
+        pc["opKeys"] = json!([]);
+        c.accept(
+            reply(
+                &request,
+                json!({"err":0,"keys":[{"uid":"11","err":0,"keys":[pc]}]}),
+            ),
+            new,
+            &gate,
+        )
+        .unwrap();
+        let request = c.final_metadata_query(&gate, Instant::now()).unwrap();
+        let ReadOutcome::Proof(proof) = c
+            .accept(reply(&request, json!({"err":0,"keyId":reg})), new, &gate)
+            .unwrap()
+        else {
+            panic!("expected reconciled proof")
+        };
+        assert!(proof.identity_confirmed() && proof.timestamp().is_none());
+        // A different registration id on the second read still cannot confirm.
+        let (mut c, gate, epoch) = coordinator();
+        let (_store, receipt, payload) = claimed(epoch.0).await;
+        c.upload(receipt, &gate, Instant::now()).unwrap();
+        c.disconnected();
+        let new = c.connected(&gate).unwrap();
+        let reg = payload["key"]["preKey"]["iKey"]["id"].clone();
+        let request = c.reconcile(&gate, Instant::now()).unwrap();
+        c.accept(reply(&request, json!({"err":0,"keyId":reg})), new, &gate)
+            .unwrap();
+        let request = c.identity_query(&gate, Instant::now()).unwrap();
+        let mut pc = payload["key"].clone();
+        pc["opKeys"] = json!([]);
+        c.accept(
+            reply(
+                &request,
+                json!({"err":0,"keys":[{"uid":"11","err":0,"keys":[pc]}]}),
+            ),
+            new,
+            &gate,
+        )
+        .unwrap();
+        let request = c.final_metadata_query(&gate, Instant::now()).unwrap();
+        assert!(c
+            .accept(
+                reply(&request, json!({"err":0,"keyId":reg.as_u64().unwrap() + 1})),
+                new,
+                &gate
+            )
+            .is_err());
+        assert_eq!(c.state(), Some(UploadState::NeedsRecovery));
+    }
     #[tokio::test]
     async fn stale_socket_cancel_deadline_and_changed_metadata_cannot_mint_proofs() {
         let (mut c, gate, epoch) = coordinator();
@@ -811,7 +876,7 @@ mod tests {
         state
             .begin_metadata(signal::OwnKey::Present {
                 registration_id: 1234,
-                submitted_at: 1,
+                submitted_at: Some(1),
             })
             .unwrap();
         let request = signal::get_bundle(
@@ -839,14 +904,14 @@ mod tests {
         assert!(state
             .finish_metadata(signal::OwnKey::Present {
                 registration_id: 1234,
-                submitted_at: 2
+                submitted_at: Some(2)
             })
             .is_err());
         assert_eq!(state.state(), UploadState::NeedsRecovery);
         assert!(state
             .finish_metadata(signal::OwnKey::Present {
                 registration_id: 1234,
-                submitted_at: 1
+                submitted_at: Some(1)
             })
             .is_err());
         assert!(!state.needs_identity());

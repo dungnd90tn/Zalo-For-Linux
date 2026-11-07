@@ -13,7 +13,9 @@ Bản đầu tiên của ứng dụng **Zalo Native** (Rust, giao diện `egui`,
 - **Danh bạ, thông tin hội thoại, cài đặt và đăng nhập QR** cùng ngôn ngữ thiết kế; cửa sổ nhỏ (640×480) vẫn dùng được.
 - **Sticker động và đủ định dạng:** PNG, JPEG, WebP (tĩnh và động), GIF và sticker dạng sprite đều hiển thị đúng; tin sticker không còn bong bóng nền và chỉ rộng vừa hình.
 - **Thông tin hội thoại đầy đủ:** sao chép tên, số tin và khoảng thời gian đã lưu, và các tab **Ảnh / Tệp / Liên kết** liệt kê những gì từng xuất hiện trong lịch sử trò chuyện (bấm để mở trong trình duyệt).
-- **Cài bằng gói:** `zalo-native_2.0.0-2_amd64.deb` và `zalo-native-2.0.0-2.x86_64.rpm`. Gói độc lập với gói Electron `zalo`, cài cùng lúc được.
+- **Đính kèm tệp (đang làm):** chọn bằng hộp thoại hoặc kéo-thả, khay hiển thị tên/dung lượng, lưu cục bộ ở chế độ demo. Gửi tệp tới Zalo chưa hỗ trợ.
+- **Sửa lỗi gửi tin 1-1** báo "Chưa xác minh được trạng thái mã hóa…".
+- **Cài bằng gói:** `zalo-native_2.0.0-3_amd64.deb` và `zalo-native-2.0.0-3.x86_64.rpm`. Gói độc lập với gói Electron `zalo`, cài cùng lúc được.
 
 ## ⚠️ Thay đổi phím gửi tin
 
@@ -30,10 +32,10 @@ Tải gói tương ứng ở mục *Assets* của bản phát hành rồi cài t
 
 ```bash
 # Ubuntu / Debian
-sudo apt install ./zalo-native_2.0.0-2_amd64.deb
+sudo apt install ./zalo-native_2.0.0-3_amd64.deb
 
 # Fedora / RHEL / AlmaLinux / Rocky   (yum dùng cùng lệnh)
-sudo dnf install ./zalo-native-2.0.0-2.x86_64.rpm
+sudo dnf install ./zalo-native-2.0.0-3.x86_64.rpm
 ```
 
 Mở **Zalo Native** từ menu ứng dụng, hoặc chạy `zalo-native --live` (đăng nhập QR) / `zalo-native --demo` (dùng thử, không cần tài khoản). Gỡ cài đặt: `sudo apt remove zalo-native` hoặc `sudo dnf remove zalo-native`. Dữ liệu người dùng nằm ở hồ sơ trong thư mục XDG của bạn và không bị gỡ cùng gói.
@@ -56,20 +58,21 @@ Hồ sơ và tin nhắn nằm ở `~/.local/share/zalo-rust/` nên không bị x
 ### Mã băm SHA-256
 
 ```
-6b8c7c12b6ca2750e17b9f38804f93e9fe624366d848b7686df0e4c06f6b268a  zalo-native_2.0.0-2_amd64.deb
-82b05565533b8fca80d83a7c5fd886cc8400c6983aa83fb4ee73688ca2f38f3a  zalo-native-2.0.0-2.x86_64.rpm
+a5703591f846a92853a419718aa34bfd4a70dde7af790ea4b54cbcdbfc7af0a9  zalo-native_2.0.0-3_amd64.deb
+ad075734ba296a2e7dad4534c80f9d0f9d4207a4905a2e0fd7bd81893201e6f3  zalo-native-2.0.0-3.x86_64.rpm
 ```
 
 ## Đã kiểm chứng
 
 - Cài, chạy `zalo-native --version` và `--doctor`, rồi gỡ sạch bằng trình quản lý gói trong container sạch trên **Ubuntu 20.04, 22.04, 24.04, Debian 12** (`.deb`) và **Fedora 42, AlmaLinux 9** (`.rpm`, kèm `rpm -V`).
-- Bộ kiểm thử Rust (501 kiểm thử với mọi tính năng), Clippy không cảnh báo, kiểm thử độ tương phản chữ/nền ở cả hai chế độ, và kiểm thử phím `Enter`/`Ctrl+Enter` cùng các rào bộ gõ.
+- Bộ kiểm thử Rust (515 kiểm thử với mọi tính năng), Clippy không cảnh báo, kiểm thử độ tương phản chữ/nền ở cả hai chế độ, và kiểm thử phím `Enter`/`Ctrl+Enter` cùng các rào bộ gõ.
 - Ảnh giao diện chụp từ chính cửa sổ ứng dụng ở 1200×780 và 640×480, cả hai chế độ; ứng dụng cũng hiển thị đúng trên Wayland thuần.
 
 ## Giới hạn đã biết
 
 - **Chưa kiểm với tài khoản thật** và **chưa kiểm bộ gõ trên Wayland native**; mọi bằng chứng trên là dữ liệu giả lập, trong container hoặc cửa sổ demo. Hãy báo lỗi nếu gặp.
 - Sticker sprite phát với tốc độ cố định (chưa đọc được thời lượng thật từ máy chủ); sticker hiệu ứng dạng gói zip chưa hỗ trợ.
+- Gửi tệp tới Zalo chưa được hỗ trợ (giao thức tải lên chưa kiểm chứng với máy chủ thật); xem [PROTOCOL_FILES.md](../rust-client/PROTOCOL_FILES.md).
 - **Tắt thông báo** và **Ghim** trong thông tin hội thoại hiện tắt vì cài đặt đó nằm trên máy chủ Zalo.
 - Chip **Chưa đọc** đang tắt và chưa có huy hiệu số tin chưa đọc (dữ liệu hội thoại chưa lưu trạng thái này).
 - Chưa hỗ trợ gọi thoại/video, gửi ảnh/tệp, đăng nhập bằng số điện thoại; xem [bảng đối chiếu tính năng](../rust-client/FEATURE_PARITY.md).
