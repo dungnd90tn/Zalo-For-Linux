@@ -538,6 +538,18 @@ fn recommended(content: &Value) -> WebContentDescriptor {
         "recommened.calltime" => "[Cuộc gọi]",
         _ => RECOMMENDED_PREVIEW,
     };
+    if let Some((title, description)) = call_log(action, &params) {
+        // Call bubbles carry a placeholder title ("sendBubbleMessage"); the original builds the text from the
+        // action and params instead (STR_CALL_TITLE_* / STR_CALL_CONTENT_*).
+        return WebContentDescriptor {
+            title,
+            description,
+            image_url: None,
+            url: None,
+            rows: Vec::new(),
+            buttons: Vec::new(),
+        };
+    }
     let mut title = bounded(content.get("title"), 1024);
     if title.is_empty() && action == "recommened.link" {
         title = bounded(params.get("mediaTitle"), 1024);
@@ -568,6 +580,58 @@ fn recommended(content: &Value) -> WebContentDescriptor {
         rows: Vec::new(),
         buttons: Vec::new(),
     }
+}
+
+/// A call log (`chat.recommended` with a `recommened.*call*` action) as `(title, description)`.
+/// `calltype` 1 is video; `isCaller` 1 means this account placed the call.
+fn call_log(action: &str, params: &Value) -> Option<(String, String)> {
+    let number = |key: &str| {
+        params.get(key).and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        })
+    };
+    let video = number("calltype") == Some(1);
+    let caller = number("isCaller") == Some(1);
+    let kind = if video { "video" } else { "thoại" };
+    let direction = if caller { "đi" } else { "đến" };
+    let duration = number("duration").filter(|seconds| *seconds > 0);
+    let (title, description) = match action {
+        "recommened.misscall" if caller => (
+            format!("Cuộc gọi {kind} đi"),
+            "Người nhận không trả lời".to_owned(),
+        ),
+        "recommened.misscall" => (format!("Cuộc gọi {kind} nhỡ"), "Bạn bị nhỡ".to_owned()),
+        "recommened.calltime" | "recommened.calling" | "recommened.receivecall" => {
+            let direction = match action {
+                "recommened.calling" => "đi",
+                "recommened.receivecall" => "đến",
+                _ => direction,
+            };
+            (
+                format!("Cuộc gọi {kind} {direction}"),
+                duration.map(call_duration).unwrap_or_default(),
+            )
+        }
+        _ => return None,
+    };
+    Some((title, description))
+}
+
+fn call_duration(seconds: i64) -> String {
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    let mut parts = Vec::new();
+    if hours > 0 {
+        parts.push(format!("{hours} giờ"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes} phút"));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!("{seconds} giây"));
+    }
+    parts.join(" ")
 }
 
 fn poll(content: &Value) -> PollDescriptor {
@@ -703,6 +767,54 @@ mod tests {
                 *content.descriptor()
             );
         }
+    }
+
+    #[test]
+    fn call_logs_read_their_params_not_the_placeholder_title() {
+        let call = |action: &str, params: &str| {
+            let content = json!({"action":action,"childnumber":0,"description":"Cuộc gọi","href":"",
+                "params":params,"thumb":"","title":"sendBubbleMessage"});
+            match MediaMessageContent::new(MediaKind::Recommended, &content)
+                .unwrap()
+                .descriptor()
+                .clone()
+            {
+                MediaDescriptor::Recommended(card) => (card.title, card.description),
+                _ => panic!(),
+            }
+        };
+        assert_eq!(
+            call(
+                "recommened.calltime",
+                r#"{"callId":1,"duration":90,"isCaller":0,"isEnableCallback":1,"calltype":0}"#
+            ),
+            ("Cuộc gọi thoại đến".into(), "1 phút 30 giây".into())
+        );
+        assert_eq!(
+            call(
+                "recommened.calltime",
+                r#"{"duration":3725,"isCaller":1,"calltype":1}"#
+            ),
+            ("Cuộc gọi video đi".into(), "1 giờ 2 phút 5 giây".into())
+        );
+        assert_eq!(
+            call(
+                "recommened.misscall",
+                r#"{"callId":1,"duration":0,"reason":3,"isCaller":0,"calltype":0}"#
+            ),
+            ("Cuộc gọi thoại nhỡ".into(), "Bạn bị nhỡ".into())
+        );
+        assert_eq!(
+            call("recommened.misscall", r#"{"isCaller":1,"calltype":0}"#),
+            (
+                "Cuộc gọi thoại đi".into(),
+                "Người nhận không trả lời".into()
+            )
+        );
+        assert_eq!(
+            call("recommened.calltime", "malformed").0,
+            "Cuộc gọi thoại đến"
+        );
     }
 
     #[test]

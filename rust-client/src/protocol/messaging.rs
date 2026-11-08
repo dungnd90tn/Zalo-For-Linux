@@ -548,6 +548,9 @@ pub struct Incoming {
     pub info: Option<InfoMessageContent>,
     pub media: Option<MediaMessageContent>,
     pub unsupported: bool,
+    /// Kept in history but never creates or reorders a conversation-list entry (see
+    /// `domain::system::list_silent`). Only for messages from someone else.
+    pub list_silent: bool,
 }
 // Stickers carry a catalog address, never an image URL. Unknown/malformed media
 // stays an explicit placeholder without poisoning other messages in a batch.
@@ -802,7 +805,24 @@ fn incoming_with_reason(
             } else {
                 None
             };
-            let unsupported = message_type != "webchat" && sticker.is_none() && media.is_none();
+            let presented = (message_type != "webchat" && sticker.is_none() && media.is_none())
+                .then(|| {
+                    v.get("content").and_then(|content| {
+                        crate::domain::system::presentation(message_type, content)
+                    })
+                })
+                .flatten()
+                .filter(|text| !text.is_empty());
+            let unsupported = message_type != "webchat"
+                && sticker.is_none()
+                && media.is_none()
+                && presented.is_none();
+            // Official Account broadcasts only exist in 1-1 threads; birthday cards are skipped everywhere.
+            let list_silent = (kind == ThreadKind::Direct || message_type == "chat.ecard")
+                && sender != account
+                && v.get("content").is_some_and(|content| {
+                    crate::domain::system::list_silent(message_type, content)
+                });
             let message = Message {
                 account_id: account.into(),
                 thread_id: thread,
@@ -810,6 +830,8 @@ fn incoming_with_reason(
                 sender,
                 text: if info.is_some() {
                     info::presentation(account, v.get("content").ok_or(WireError::Invalid)?)
+                } else if let Some(text) = presented {
+                    text
                 } else if message_type != "webchat" {
                     format!("[Tin nhắn {message_type} chưa được hỗ trợ]")
                 } else {
@@ -839,13 +861,16 @@ fn incoming_with_reason(
             };
             // An information event is never an acknowledgement of a reserved
             // plain-text send, even when its server-supplied cliMsgId matches.
-            let client_id = client_id.filter(|_| info.is_none() && media.is_none());
+            // Only a plain text message can acknowledge a plain-text send.
+            let client_id = client_id
+                .filter(|_| info.is_none() && media.is_none() && message_type == "webchat");
             result.push(Incoming {
                 message,
                 client_id,
                 info,
                 media,
                 unsupported,
+                list_silent,
             });
         }
     }
@@ -1657,6 +1682,49 @@ mod tests {
                 .decode(&frame(501, json!({"error_code":-102})))
                 .unwrap_err(),
             WireError::Service(-102)
+        );
+    }
+    #[test]
+    fn readable_system_types_and_list_silent_flags() {
+        let item = |id: &str, from: &str, kind: &str, content: Value| json!({"uidFrom":from,"idTo":if from == "0" {"22"} else {"11"},"msgId":id,"cliMsgId":"5","ts":"7","msgType":kind,"content":content});
+        let payload = json!({"error_code":0,"data":{
+            "msgs":[
+                item("1","22","chat.ecard",json!({"title":"Hôm nay là sinh nhật của An","description":"","type":"1"})),
+                item("2","22","chat.gif",json!({"href":"https://example.test/a.gif"})),
+                item("3","22","chat.webcontent",json!({"title":"","params":"{\"item\":{\"zinstantdata_id\":\"templateId=1\"}}"})),
+                item("4","0","chat.ecard",json!({"title":"Thiệp","type":"1"})),
+                item("5","22","chat.ecard",json!({"title":"Hai bạn đã là bạn bè","type":"2"})),
+            ],
+            "groupMsgs":[item("6","22","chat.ecard",json!({"title":"Sinh nhật","type":"1"}))]
+        }});
+        let result = incoming_messages("11", &payload).unwrap();
+        let summary: Vec<_> = result
+            .iter()
+            .map(|i| {
+                (
+                    i.message.text.as_str(),
+                    i.list_silent,
+                    i.unsupported,
+                    i.client_id.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("Hôm nay là sinh nhật của An", true, false, false),
+                ("[GIF]", false, false, false),
+                (
+                    "[Tin nhắn chat.webcontent chưa được hỗ trợ]",
+                    true,
+                    false,
+                    false
+                ),
+                // Own messages are never silent; a group birthday card is.
+                ("Thiệp", false, false, false),
+                ("Hai bạn đã là bạn bè", false, false, false),
+                ("Sinh nhật", true, false, false),
+            ]
         );
     }
     #[test]

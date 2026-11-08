@@ -248,7 +248,7 @@ fn locked_receives_and_ack_keep_raw_history_cursors_and_outbox_without_projectio
 }
 
 #[test]
-fn privacy_tables_and_unlock_lease_are_not_persisted_on_reopen() {
+fn unlock_lease_is_not_persisted_and_only_hidden_ids_are_remembered_on_reopen() {
     struct Disposable(std::path::PathBuf);
     impl Drop for Disposable {
         fn drop(&mut self) {
@@ -283,8 +283,28 @@ fn privacy_tables_and_unlock_lease_are_not_persisted_on_reopen() {
             0
         );
     }
-    let store = MessageStore::open(&path.0).unwrap();
-    assert_eq!(persistent_rows(&store), before);
+    let mut store = MessageStore::open(&path.0).unwrap();
+    // Only the confirmed hidden thread IDs are remembered: no lease, no message or preview data.
+    let after: Vec<_> = persistent_rows(&store)
+        .into_iter()
+        .filter(|(table, _)| table != "privacy_hidden_cache")
+        .collect();
+    let before: Vec<_> = before
+        .into_iter()
+        .filter(|(table, _)| table != "privacy_hidden_cache")
+        .collect();
+    assert_eq!(after, before);
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT group_concat(account_id||'/'||thread_id) FROM privacy_hidden_cache",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "11/d:22"
+    );
     assert_eq!(
         store
             .conn
@@ -293,8 +313,12 @@ fn privacy_tables_and_unlock_lease_are_not_persisted_on_reopen() {
             .unwrap(),
         0
     );
-    // The runtime opts in before publishing cached history on every new worker.
-    store.begin_live_privacy("11").unwrap();
+    // The runtime opts in before publishing cached history on every new worker: the remembered set hides d:22
+    // at once and the earlier unlock does not carry over.
+    assert_eq!(
+        store.provisional_live_privacy("11").unwrap(),
+        vec!["d:22".to_owned()]
+    );
     assert!(store.page("11", "d:22", None, 1).unwrap().is_empty());
     assert!(store.conversations("11", 1).unwrap().is_empty());
 }

@@ -6,15 +6,40 @@ use crate::domain::fold_search;
 const MAX_HIDDEN: usize = 20_000;
 pub(super) fn initialize(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA temp_store=MEMORY; CREATE TEMP TABLE IF NOT EXISTS live_privacy(account_id TEXT PRIMARY KEY,ready INTEGER NOT NULL,unlocked_thread TEXT);
-        CREATE TEMP TABLE IF NOT EXISTS live_hidden(account_id TEXT NOT NULL,thread_id TEXT NOT NULL,PRIMARY KEY(account_id,thread_id));")?;
+        CREATE TEMP TABLE IF NOT EXISTS live_hidden(account_id TEXT NOT NULL,thread_id TEXT NOT NULL,PRIMARY KEY(account_id,thread_id));
+        CREATE TABLE IF NOT EXISTS privacy_hidden_cache(account_id TEXT NOT NULL,thread_id TEXT NOT NULL,PRIMARY KEY(account_id,thread_id));")?;
     Ok(())
 }
 impl MessageStore {
-    #[cfg(any(feature = "messaging", test))]
+    /// Fail-closed policy with nothing known (tests only; the runtime starts from `provisional_live_privacy`).
+    #[cfg(test)]
     pub(crate) fn begin_live_privacy(&self, account: &str) -> Result<()> {
         validate_id(account)?;
         self.conn.execute("INSERT INTO temp.live_privacy(account_id,ready) VALUES(?1,0) ON CONFLICT(account_id) DO UPDATE SET ready=0,unlocked_thread=NULL",[account])?;
         Ok(())
+    }
+    /// Applies the last hidden-thread set Zalo confirmed for this account (thread IDs only, kept on disk) as the
+    /// policy while a fresh check runs, so the interface is usable at once and those threads stay hidden. With no
+    /// earlier confirmation the set is empty. Any unlock lease is dropped.
+    #[cfg(any(feature = "messaging", test))]
+    pub(crate) fn provisional_live_privacy(&mut self, account: &str) -> Result<Vec<String>> {
+        validate_id(account)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM temp.live_hidden WHERE account_id=?1",
+            [account],
+        )?;
+        tx.execute("INSERT OR IGNORE INTO temp.live_hidden SELECT account_id,thread_id FROM privacy_hidden_cache WHERE account_id=?1",[account])?;
+        tx.execute("INSERT INTO temp.live_privacy(account_id,ready) VALUES(?1,1) ON CONFLICT(account_id) DO UPDATE SET ready=1,unlocked_thread=NULL",[account])?;
+        let threads = {
+            let mut statement = tx.prepare_cached(
+                "SELECT thread_id FROM temp.live_hidden WHERE account_id=?1 ORDER BY thread_id",
+            )?;
+            let rows = statement.query_map([account], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.commit()?;
+        Ok(threads)
     }
     #[cfg(any(feature = "messaging", test))]
     pub(crate) fn replace_live_privacy(
@@ -38,11 +63,18 @@ impl MessageStore {
             "DELETE FROM temp.live_hidden WHERE account_id=?1",
             [account],
         )?;
+        tx.execute(
+            "DELETE FROM privacy_hidden_cache WHERE account_id=?1",
+            [account],
+        )?;
         {
             let mut insert =
                 tx.prepare_cached("INSERT OR IGNORE INTO temp.live_hidden VALUES(?1,?2)")?;
+            let mut remember =
+                tx.prepare_cached("INSERT OR IGNORE INTO privacy_hidden_cache VALUES(?1,?2)")?;
             for thread in threads {
                 insert.execute(params![account, thread])?;
+                remember.execute(params![account, thread])?;
             }
         }
         tx.execute("INSERT INTO temp.live_privacy VALUES(?1,1,?2) ON CONFLICT(account_id) DO UPDATE SET ready=1,unlocked_thread=excluded.unlocked_thread",params![account,unlocked])?;
@@ -178,6 +210,46 @@ mod tests {
                 .unwrap(),
             8
         );
+    }
+}
+
+#[cfg(test)]
+mod provisional_tests {
+    use super::*;
+    #[test]
+    fn last_confirmed_hidden_set_applies_at_once_on_the_next_start() {
+        let make = |thread: &str, id: &str| crate::domain::Message {
+            account_id: "11".into(),
+            thread_id: thread.into(),
+            id: id.into(),
+            sender: "22".into(),
+            text: "body".into(),
+            sticker: None,
+            media: None,
+            sent_at_ms: 1,
+        };
+        let mut s = MessageStore::in_memory().unwrap();
+        s.insert_batch(&[make("d:22", "1"), make("d:33", "2")])
+            .unwrap();
+        // Never confirmed: nothing is hidden, nothing blocks the list.
+        assert!(s.provisional_live_privacy("11").unwrap().is_empty());
+        assert_eq!(s.conversations("11", 50).unwrap().len(), 2);
+        s.replace_live_privacy("11", &["d:22".into()], Some("d:22"))
+            .unwrap();
+        // A later start: the remembered set hides d:22 before any network check, and the lease is gone.
+        assert_eq!(
+            s.provisional_live_privacy("11").unwrap(),
+            vec!["d:22".to_owned()]
+        );
+        let listed: Vec<_> = s
+            .conversations("11", 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(listed, vec!["d:33".to_owned()]);
+        assert!(!s.live_thread_visible("11", "d:22").unwrap());
+        assert!(s.provisional_live_privacy("33").unwrap().is_empty());
     }
 }
 

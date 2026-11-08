@@ -829,7 +829,13 @@ impl super::Model {
                 self.has_older = true;
             }
         }
-        self.upsert_live_conversation(conversation);
+        // A conversation with only list-silent messages (birthday cards, Official Account broadcasts) is not
+        // added to the list; one already shown is still updated.
+        if conversation.last_message_at_ms > 0
+            || self.conversations.iter().any(|c| c.id == conversation.id)
+        {
+            self.upsert_live_conversation(conversation);
+        }
     }
 }
 

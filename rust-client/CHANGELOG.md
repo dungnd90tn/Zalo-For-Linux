@@ -4,6 +4,27 @@ Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-clie
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
 Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../changelogs/RELEASE-v2.0.0.md).
 
+## [2.0.1] - 2026-11-08
+
+### Thay đổi
+- **Không còn màn hình "Đang xác minh trạng thái riêng tư" che giao diện.** Danh sách hội thoại ẩn (mã PIN) mà Zalo
+  xác nhận lần gần nhất được nhớ trên máy (chỉ mã hội thoại) và áp dụng ngay khi mở ứng dụng; kiểm tra lại chạy nền.
+  Kiểm tra lỗi không còn khóa giao diện và không còn chặn kết nối nhận tin. Lần chạy đầu tiên chưa có danh sách nhớ.
+- `scripts/rust/run.sh --live` dựng kèm `signal-crypto`, nên hội thoại mã hóa đầu cuối gửi/nhận được.
+  `ZALO_RUST_NO_E2EE=1` dựng bản `live` không có engine.
+
+### Sửa lỗi
+- **Hội thoại "lạ" trong lịch sử:** thiệp sinh nhật (`chat.ecard` loại 1) và tin quảng bá của Official Account
+  (ZInstant) không còn tạo/đẩy hội thoại lên danh sách, giống `skipUpdateConvListByPreviewItem` /
+  `shouldShowOAInConvList` của bản gốc; tin vẫn nằm trong lịch sử. Dữ liệu cũ được dọn một lần khi mở cơ sở dữ liệu.
+- Nhật ký cuộc gọi hiện "Cuộc gọi thoại đến · 1 phút 30 giây", "Cuộc gọi thoại nhỡ"… thay cho tiêu đề
+  `sendBubbleMessage`; bản ghi đã lưu được dựng lại từ nội dung gốc.
+
+### Thêm mới
+- Hiển thị chữ cho `chat.ecard`, `chat.gif`, `chat.voice`, `chat.video.msg`, `chat.location.new`, `chat.doodle`,
+  `chat.todo`, `chat.undo`, `chat.delete.everyone`, `chat.list.action` theo chuỗi xem trước của bản gốc. Tin đã lưu
+  dưới dạng "[Tin nhắn … chưa được hỗ trợ]" được thay khi máy chủ gửi lại.
+
 ## [2.0.0] - 2026-11-06
 
 ### Thay đổi có thể làm hỏng thói quen

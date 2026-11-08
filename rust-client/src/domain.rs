@@ -7,6 +7,8 @@ pub mod attachment;
 pub(crate) mod info;
 pub mod media;
 pub mod overview;
+#[cfg(feature = "messaging")]
+pub(crate) mod system;
 pub use attachment::{Attachment, AttachmentError, MAX_DIRECT_FILE_BYTES};
 pub use media::{
     CardButton, CardRow, FileDescriptor, MediaContentError, MediaDescriptor, MediaKind,

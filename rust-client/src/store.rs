@@ -1,6 +1,6 @@
 //! SQLite storage owned by one background thread. All pages have a fixed upper bound.
 use crate::domain::{
-    canonical_plain_text, validate_id, Conversation, Cursor, InfoMessageContent,
+    canonical_plain_text, validate_id, Conversation, Cursor, InfoMessageContent, MediaKind,
     MediaMessageContent, Message, MAX_INFO_BATCH_BYTES, MAX_PAGE_SIZE, MAX_PREVIEW_CHARS,
 };
 use anyhow::{bail, Result};
@@ -101,17 +101,20 @@ const CONVERSATIONS_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms
     CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,'') FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
+        AND NOT EXISTS(SELECT 1 FROM list_silent_messages q WHERE q.account_id=recent.account_id AND q.thread_id=recent.thread_id AND q.message_id=recent.message_id)
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
     LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
     LEFT JOIN message_media media ON media.account_id=m.account_id AND media.thread_id=m.thread_id AND media.message_id=m.message_id
     WHERE c.account_id=?1
     AND NOT EXISTS(SELECT 1 FROM temp.live_privacy p WHERE p.account_id=c.account_id AND p.ready=0)
     AND NOT EXISTS(SELECT 1 FROM temp.live_hidden h WHERE h.account_id=c.account_id AND h.thread_id=c.thread_id)
+    AND (m.rowid IS NOT NULL OR NOT EXISTS(SELECT 1 FROM messages x WHERE x.account_id=c.account_id AND x.thread_id=c.thread_id))
     ORDER BY c.last_message_at_ms DESC,c.thread_id LIMIT ?2";
 const CONVERSATION_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
     CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,'') FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
+        AND NOT EXISTS(SELECT 1 FROM list_silent_messages q WHERE q.account_id=recent.account_id AND q.thread_id=recent.thread_id AND q.message_id=recent.message_id)
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
     LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
     LEFT JOIN message_media media ON media.account_id=m.account_id AND media.thread_id=m.thread_id AND media.message_id=m.message_id
@@ -176,6 +179,23 @@ fn insert_validated_with_media<'a>(
                 })
                 .optional()?;
             if let Some(previous) = previous {
+                if previous.0 == m.sender
+                    && previous.2 == m.sent_at_ms
+                    && previous.1 != m.text
+                    && info.is_none()
+                    && media.is_none()
+                    && m.media.is_none()
+                    && m.sticker.is_none()
+                    && upgradable_placeholder(&previous.1)
+                {
+                    // A type this client now reads was stored earlier as its "not supported" placeholder; the
+                    // redelivered message replaces only that placeholder text.
+                    inserted += conn.execute(
+                        "UPDATE messages SET body=?4 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
+                        params![m.account_id, m.thread_id, m.id, m.text],
+                    )?;
+                    continue;
+                }
                 if previous != (m.sender.clone(), m.text.clone(), m.sent_at_ms) {
                     bail!(FailureReason::ConflictingMessage);
                 }
@@ -199,6 +219,50 @@ fn insert_validated_with_media<'a>(
         }
     }
     Ok(inserted)
+}
+
+/// History stored before list-silent messages were recognised: e-cards kept only as their placeholder (their
+/// type is gone, and in practice they are birthday and friend cards; in groups as well) and Official Account
+/// ZInstant broadcasts in 1-1 threads. Runs once per database.
+fn silence_legacy(conn: &Connection) -> Result<()> {
+    if conn.execute(
+        "INSERT OR IGNORE INTO store_markers(name) VALUES('list_silent_legacy_v1')",
+        [],
+    )? == 0
+    {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO list_silent_messages(account_id,thread_id,message_id)
+            SELECT account_id,thread_id,message_id FROM messages
+            WHERE sender<>account_id AND body='[Tin nhắn chat.ecard chưa được hỗ trợ]';
+        INSERT OR IGNORE INTO list_silent_messages(account_id,thread_id,message_id)
+            SELECT m.account_id,m.thread_id,m.message_id FROM message_media media
+            JOIN messages m ON m.account_id=media.account_id AND m.thread_id=media.thread_id AND m.message_id=media.message_id
+            WHERE media.kind='chat.webcontent' AND m.thread_id LIKE 'd:%' AND m.sender<>m.account_id
+            AND instr(media.metadata,'zinstantdata_id')>0;
+        UPDATE conversations SET last_message_at_ms=COALESCE((SELECT MAX(m.sent_at_ms) FROM messages m
+            WHERE m.account_id=conversations.account_id AND m.thread_id=conversations.thread_id
+            AND NOT EXISTS(SELECT 1 FROM list_silent_messages q WHERE q.account_id=m.account_id AND q.thread_id=m.thread_id AND q.message_id=m.message_id)),0)
+            WHERE EXISTS(SELECT 1 FROM list_silent_messages q WHERE q.account_id=conversations.account_id AND q.thread_id=conversations.thread_id);",
+    )?;
+    Ok(())
+}
+
+/// `[Tin nhắn <type> chưa được hỗ trợ]` for a type without a media or sticker sidecar (those keep the placeholder
+/// as their fallback body by design).
+fn upgradable_placeholder(body: &str) -> bool {
+    body.strip_prefix("[Tin nhắn ")
+        .and_then(|rest| rest.strip_suffix(" chưa được hỗ trợ]"))
+        .is_some_and(|kind| {
+            kind != "chat.sticker"
+                && kind != "webchat"
+                && MediaKind::from_wire(kind).is_none()
+                && !kind.is_empty()
+                && kind
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+        })
 }
 
 pub struct MessageStore {
@@ -244,12 +308,18 @@ impl MessageStore {
             CREATE TABLE IF NOT EXISTS outgoing_counters(account_id TEXT PRIMARY KEY,last_id INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS receive_cursors(account_id TEXT NOT NULL,queue TEXT NOT NULL,last_id TEXT NOT NULL,
                 PRIMARY KEY(account_id,queue));
+            CREATE TABLE IF NOT EXISTS list_silent_messages(account_id TEXT NOT NULL,thread_id TEXT NOT NULL,message_id TEXT NOT NULL,
+                PRIMARY KEY(account_id,thread_id,message_id),
+                FOREIGN KEY(account_id,thread_id,message_id) REFERENCES messages(account_id,thread_id,message_id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS store_markers(name TEXT PRIMARY KEY);
             ")?;
         directory::initialize(&conn)?;
         e2ee::initialize(&conn)?;
         message_content::initialize(&conn)?;
         message_info::initialize(&conn)?;
         message_media::initialize(&conn, version)?;
+        message_media::reproject(&conn)?;
+        silence_legacy(&conn)?;
         conn.execute_batch("PRAGMA user_version=8; COMMIT;")?;
         privacy::initialize(&conn)?;
         Ok(Self { conn })
@@ -836,6 +906,51 @@ impl MessageStore {
         Ok(result)
     }
 
+    /// Marks received messages as list-silent (see `domain::system::list_silent`): their conversation's list
+    /// position and preview are recomputed without them, and a conversation that has nothing else is left out of
+    /// the list. Returns each touched conversation as the list now sees it.
+    pub fn mark_list_silent(
+        &mut self,
+        account: &str,
+        messages: &[(String, String)],
+    ) -> Result<Vec<Conversation>> {
+        validate_id(account)?;
+        if messages.len() > MAX_PAGE_SIZE {
+            bail!(FailureReason::Validation);
+        }
+        let tx = self.conn.transaction()?;
+        let mut threads = std::collections::BTreeSet::new();
+        for (thread, id) in messages {
+            validate_id(thread)?;
+            validate_id(id)?;
+            if tx.execute(
+                "INSERT OR IGNORE INTO list_silent_messages(account_id,thread_id,message_id)
+                    SELECT account_id,thread_id,message_id FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
+                params![account, thread, id],
+            )? > 0
+            {
+                threads.insert(thread.clone());
+            }
+        }
+        let mut result = Vec::with_capacity(threads.len());
+        for thread in threads {
+            tx.execute(
+                "UPDATE conversations SET last_message_at_ms=COALESCE((SELECT MAX(m.sent_at_ms) FROM messages m
+                    WHERE m.account_id=?1 AND m.thread_id=?2
+                    AND NOT EXISTS(SELECT 1 FROM list_silent_messages q WHERE q.account_id=m.account_id AND q.thread_id=m.thread_id AND q.message_id=m.message_id)),0)
+                    WHERE account_id=?1 AND thread_id=?2",
+                params![account, thread],
+            )?;
+            result.push(tx.query_row(
+                CONVERSATION_SQL,
+                params![account, thread, MAX_PREVIEW_CHARS as i64],
+                conversation_row,
+            )?);
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub fn conversations(&self, account: &str, limit: usize) -> Result<Vec<Conversation>> {
         validate_id(account)?;
         if limit == 0 || limit > MAX_PAGE_SIZE {
@@ -1154,6 +1269,141 @@ mod tests {
         s.delete("a", "t", "new").unwrap();
         assert_eq!(s.conversations("a", 10).unwrap()[0].last_message_at_ms, 1);
         assert!(s.page("a", "t", None, MAX_PAGE_SIZE + 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod list_silence_tests {
+    use super::*;
+    fn incoming(thread: &str, id: &str, text: &str, ts: i64) -> Message {
+        Message {
+            account_id: "11".into(),
+            thread_id: thread.into(),
+            id: id.into(),
+            sender: "22".into(),
+            text: text.into(),
+            sticker: None,
+            media: None,
+            sent_at_ms: ts,
+        }
+    }
+    fn listed(s: &MessageStore) -> Vec<(String, i64, String)> {
+        s.conversations("11", 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.id, c.last_message_at_ms, c.last_text))
+            .collect()
+    }
+
+    #[test]
+    fn silent_messages_stay_in_history_but_out_of_the_list() {
+        let mut s = MessageStore::in_memory().unwrap();
+        s.receive_batch(
+            "11",
+            &[(incoming("d:22", "1", "Sinh nhật", 50), None)],
+            None,
+        )
+        .unwrap();
+        let refreshed = s
+            .mark_list_silent("11", &[("d:22".into(), "1".into())])
+            .unwrap();
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].last_message_at_ms, 0);
+        assert!(
+            listed(&s).is_empty(),
+            "a birthday card alone creates no entry"
+        );
+        assert_eq!(s.page("11", "d:22", None, 10).unwrap().len(), 1);
+        // A real message lists it; a later silent one neither reorders it nor replaces the preview.
+        s.receive_batch("11", &[(incoming("d:22", "2", "Chào", 60), None)], None)
+            .unwrap();
+        s.receive_batch("11", &[(incoming("d:22", "3", "Thiệp", 70), None)], None)
+            .unwrap();
+        s.mark_list_silent("11", &[("d:22".into(), "3".into())])
+            .unwrap();
+        assert_eq!(listed(&s), vec![("d:22".into(), 60, "Chào".into())]);
+        // Unknown ids are ignored.
+        assert!(s
+            .mark_list_silent("11", &[("d:22".into(), "404".into())])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn placeholder_from_an_older_reader_is_upgraded_on_redelivery_but_text_is_otherwise_immutable()
+    {
+        let mut s = MessageStore::in_memory().unwrap();
+        let old = incoming("d:22", "1", "[Tin nhắn chat.voice chưa được hỗ trợ]", 50);
+        s.receive_batch("11", &[(old, None)], None).unwrap();
+        let new = incoming("d:22", "1", "[Tin nhắn thoại]", 50);
+        let received = s.receive_batch("11", &[(new.clone(), None)], None).unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(s.page("11", "d:22", None, 10).unwrap(), vec![new.clone()]);
+        // Replay of the same text is a no-op; a different text is still a conflict.
+        assert!(s
+            .receive_batch("11", &[(new, None)], None)
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .receive_batch("11", &[(incoming("d:22", "1", "other", 50), None)], None)
+            .is_err());
+        // Media placeholders are fallbacks by design and never rewritten this way.
+        assert!(!upgradable_placeholder(
+            "[Tin nhắn chat.photo chưa được hỗ trợ]"
+        ));
+        assert!(!upgradable_placeholder(
+            crate::domain::LEGACY_STICKER_PLACEHOLDER
+        ));
+        assert!(upgradable_placeholder(
+            "[Tin nhắn chat.ecard chưa được hỗ trợ]"
+        ));
+        assert!(!upgradable_placeholder("hello"));
+    }
+
+    #[test]
+    fn legacy_cards_and_broadcasts_leave_the_list_once_on_open() {
+        let path = std::env::temp_dir().join(format!(
+            "zalo-silence-{}.sqlite3",
+            crate::domain::local_message_id().unwrap()
+        ));
+        {
+            let mut s = MessageStore::open(&path).unwrap();
+            s.receive_batch(
+                "11",
+                &[
+                    (
+                        incoming("d:22", "1", "[Tin nhắn chat.ecard chưa được hỗ trợ]", 50),
+                        None,
+                    ),
+                    (incoming("d:33", "2", "Chào", 40), None),
+                    (
+                        incoming("d:44", "3", "[Tin nhắn chat.ecard chưa được hỗ trợ]", 30),
+                        None,
+                    ),
+                    (incoming("d:44", "4", "Tin thật", 20), None),
+                ],
+                None,
+            )
+            .unwrap();
+            // Simulate a database from before the marker existed.
+            s.conn
+                .execute_batch("DELETE FROM store_markers; DELETE FROM list_silent_messages;")
+                .unwrap();
+            assert_eq!(listed(&s).len(), 3);
+        }
+        let s = MessageStore::open(&path).unwrap();
+        assert_eq!(
+            listed(&s),
+            vec![
+                ("d:33".into(), 40, "Chào".into()),
+                ("d:44".into(), 20, "Tin thật".into())
+            ]
+        );
+        assert_eq!(s.page("11", "d:22", None, 10).unwrap().len(), 1);
+        drop(s);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }
 

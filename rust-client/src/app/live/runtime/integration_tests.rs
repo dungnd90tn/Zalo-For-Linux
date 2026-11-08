@@ -3162,16 +3162,22 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
                 .await
                 .unwrap();
             tokio::time::timeout(Duration::from_millis(500), async {
-                match events.recv().await.unwrap() {
-                    LiveEvent::Opened {
-                        generation,
-                        conversation,
-                        ..
-                    } => {
-                        assert_eq!(generation, 7);
-                        assert_eq!(conversation.id, "d:22");
+                loop {
+                    match events.recv().await.unwrap() {
+                        LiveEvent::Opened {
+                            generation,
+                            conversation,
+                            ..
+                        } => {
+                            assert_eq!(generation, 7);
+                            assert_eq!(conversation.id, "d:22");
+                            break;
+                        }
+                        // The interface no longer waits for the hidden-thread check, so its (failed) result may
+                        // arrive at any point; it keeps the remembered policy and must not block local work.
+                        LiveEvent::PrivacyChanged { .. } | LiveEvent::Ready { .. } => {}
+                        event => panic!("local Open failed: {event:?}"),
                     }
-                    event => panic!("local Open failed: {event:?}"),
                 }
             })
             .await
@@ -4577,13 +4583,17 @@ async fn hidden_policy_real_tls_search_pin_cancel_scope_and_remote_revoke() {
             ..
         })
     ));
+    // A failed re-check keeps the last confirmed set in force: the hidden thread stays hidden, any lease is
+    // gone, and ordinary history stays usable.
     assert!(
-        db.call(|s| s.page("11", "d:44", None, 50))
+        db.call(|s| s.page("11", "d:22", None, 50))
             .await
             .unwrap()
             .is_empty(),
-        "failed policy cannot expose even a cached previously-visible conversation"
+        "failed policy keeps the remembered hidden thread closed"
     );
+    assert!(output.privacy.read().unwrap().hidden.contains("d:22"));
+    assert!(output.privacy.read().unwrap().unlocked.is_none());
     assert!(f.state.privacy_requests.load(Ordering::SeqCst) >= 6);
 }
 

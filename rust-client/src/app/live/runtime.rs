@@ -1357,6 +1357,11 @@ impl Connection {
                         error.context.subcommand = Some(frame.sub_cmd);
                         error
                     })?;
+                let silent: Vec<(String, String)> = parsed
+                    .iter()
+                    .filter(|i| i.list_silent)
+                    .map(|i| (i.message.thread_id.clone(), i.message.id.clone()))
+                    .collect();
                 let messages: Vec<_> = parsed
                     .into_iter()
                     .map(|i| (i.message, i.client_id, i.info, i.media))
@@ -1467,11 +1472,23 @@ impl Connection {
                 let cursor = cursors.first().cloned();
                 let stored = db
                     .call_with(StorageOperation::ReceiveBatch, move |s| {
-                        s.receive_batch_with_media(
+                        let mut stored = s.receive_batch_with_media(
                             &account,
                             &messages,
                             cursor.as_ref().map(|(q, id)| (q.as_str(), id.as_str())),
-                        )
+                        )?;
+                        if !silent.is_empty() {
+                            // Birthday cards and Official Account broadcasts never move a conversation in the list.
+                            let refreshed = s.mark_list_silent(&account, &silent)?;
+                            for (_, conversation) in &mut stored {
+                                if let Some(update) =
+                                    refreshed.iter().find(|c| c.id == conversation.id)
+                                {
+                                    *conversation = update.clone();
+                                }
+                            }
+                        }
+                        Ok(stored)
                     })
                     .await?;
                 for (queue, id) in cursors.into_iter().skip(1) {
@@ -2237,7 +2254,11 @@ async fn run_inner(
 ) -> Result<()> {
     let db = Database::open(profile, events.account.clone()).await?;
     let account = events.account.clone();
-    db.call(move |s| s.begin_live_privacy(&account)).await?;
+    // The last confirmed hidden set applies at once; the interface does not wait for the network check.
+    let remembered = db
+        .call(move |s| s.provisional_live_privacy(&account))
+        .await?;
+    privacy::Privacy::provisional(events, remembered, LivePrivacyStatus::Ready)?;
     privacy::Privacy::announce(events).await?;
     let mut privacy = privacy::Privacy::new();
     privacy.start(session.clone(), transports);
@@ -2255,7 +2276,7 @@ async fn run_inner(
         let privacy_ready = events
             .privacy
             .read()
-            .is_ok_and(|state| state.status == LivePrivacyStatus::Ready);
+            .is_ok_and(|state| state.status != LivePrivacyStatus::Checking);
         tokio::select! {
             biased;
             result = async { (&mut directory.running.as_mut().expect("guarded directory sync").task).await }, if directory.running.is_some() => {
