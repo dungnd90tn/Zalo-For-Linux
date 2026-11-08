@@ -7,6 +7,7 @@ pub mod download;
 pub mod live;
 #[cfg(feature = "messaging")]
 pub mod media;
+pub mod search;
 #[cfg(feature = "live-login")]
 pub mod stickers;
 
@@ -58,6 +59,12 @@ pub enum Command {
         generation: u64,
         thread: String,
     },
+    /// Saved messages of one conversation containing `query`.
+    Search {
+        request: u64,
+        thread: String,
+        query: String,
+    },
     Shutdown,
 }
 #[derive(Debug)]
@@ -84,6 +91,15 @@ pub enum Event {
     /// The summary could not be read; the conversation itself is unaffected.
     OverviewFailed {
         generation: u64,
+        thread: String,
+    },
+    SearchResults {
+        request: u64,
+        thread: String,
+        search: Box<crate::domain::MessageSearch>,
+    },
+    SearchFailed {
+        request: u64,
         thread: String,
     },
     Fault(String),
@@ -238,6 +254,29 @@ impl Worker {
                             }
                             continue;
                         }
+                        Command::Search {
+                            request,
+                            thread,
+                            query,
+                        } => {
+                            let event = match store.search_messages(
+                                DEMO_ACCOUNT,
+                                &thread,
+                                &query,
+                                crate::domain::SEARCH_RESULT_LIMIT,
+                            ) {
+                                Ok(search) => Event::SearchResults {
+                                    request,
+                                    thread,
+                                    search: Box::new(search),
+                                },
+                                Err(_) => Event::SearchFailed { request, thread },
+                            };
+                            if !emit(event) {
+                                break;
+                            }
+                            continue;
+                        }
                         Command::Shutdown => break,
                     };
                     let event = result.unwrap_or_else(|e| Event::RequestFailed {
@@ -290,6 +329,9 @@ fn submit(
                 && *size_bytes <= crate::domain::MAX_DIRECT_FILE_BYTES
         }
         Command::Overview { thread, .. } => validate_id(thread).is_ok(),
+        Command::Search { thread, query, .. } => {
+            validate_id(thread).is_ok() && crate::domain::search::search_query(query) == Some(query)
+        }
         Command::Shutdown => true,
     };
     if !valid {
@@ -604,6 +646,7 @@ pub struct Model {
     pub pending: bool,
     pub status: String,
     pub(crate) overview: OverviewState,
+    pub(crate) search: search::SearchState,
 }
 impl Model {
     fn message_signature(&self) -> (usize, Option<String>) {
@@ -771,6 +814,12 @@ impl Model {
                 self.overview_failed(generation, &thread);
                 false
             }
+            Event::SearchResults {
+                request,
+                thread,
+                search,
+            } => self.apply_search(request, &thread, *search),
+            Event::SearchFailed { request, thread } => self.apply_search_failed(request, &thread),
             Event::Fault(error) => {
                 self.pending = false;
                 self.status = error;
@@ -978,6 +1027,44 @@ mod tests {
         assert!(model.pending);
         assert!(model.status.is_empty());
     }
+    #[test]
+    fn demo_worker_searches_saved_history_and_refuses_invalid_queries() {
+        let root =
+            std::env::temp_dir().join(format!("zalo-search-test-{}", local_message_id().unwrap()));
+        let profile = crate::profile::Profile::at_root(&root, "demo").unwrap();
+        profile.bind_account(DEMO_ACCOUNT).unwrap();
+        let path = profile.paths.data_dir.join("messages.sqlite3");
+        let mut worker = Worker::demo(path, Arc::new(|| {})).unwrap();
+        let mut model = Model::default();
+        assert!(model.apply(worker.events.blocking_recv().unwrap()));
+        assert_eq!(
+            worker.submit(Command::Search {
+                request: 1,
+                thread: "welcome".into(),
+                query: " untrimmed ".into(),
+            }),
+            Err(SubmitError::Invalid)
+        );
+        model
+            .request_search("welcome", "OFFLINE", |request, query| {
+                worker.submit(Command::Search {
+                    request,
+                    thread: "welcome".into(),
+                    query,
+                })
+            })
+            .unwrap();
+        assert!(model.apply(worker.events.blocking_recv().unwrap()));
+        let results = model.search_results("welcome").unwrap();
+        assert_eq!(results.query, "OFFLINE");
+        assert_eq!(results.hits.len(), 1);
+        assert_eq!(results.hits[0].message_id, "demo-1");
+        assert_eq!(results.hits[0].jump, None);
+        drop(worker);
+        drop(profile);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn background_worker_round_trip_and_saturated_shutdown() {
         let root =

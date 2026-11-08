@@ -373,6 +373,8 @@ impl Privacy {
             LiveEvent::Page { thread, .. }
             | LiveEvent::Overview { thread, .. }
             | LiveEvent::OverviewFailed { thread, .. }
+            | LiveEvent::SearchResults { thread, .. }
+            | LiveEvent::SearchFailed { thread, .. }
             | LiveEvent::SenderNames { thread, .. }
             | LiveEvent::MessagesRefreshed { thread, .. }
             | LiveEvent::MessagesRefreshFailed { thread, .. }

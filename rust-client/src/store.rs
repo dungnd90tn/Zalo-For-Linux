@@ -13,6 +13,7 @@ mod message_info;
 mod message_media;
 mod overview;
 mod privacy;
+mod search;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
 

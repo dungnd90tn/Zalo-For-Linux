@@ -1819,6 +1819,7 @@ async fn handle_command(
         | LiveCommand::ResolveSenders { thread, .. }
         | LiveCommand::Load { thread, .. }
         | LiveCommand::Overview { thread, .. }
+        | LiveCommand::Search { thread, .. }
         | LiveCommand::Send { thread, .. } => Some(thread.clone()),
         LiveCommand::Open {
             kind, remote_id, ..
@@ -2083,6 +2084,38 @@ async fn handle_command(
                 Err(_) => LiveEvent::OverviewFailed {
                     account_id: events.account.clone(),
                     generation,
+                    thread,
+                },
+            };
+            events.emit(event).await?;
+        }
+        LiveCommand::Search {
+            request,
+            thread,
+            query,
+        } => {
+            let account = events.account.clone();
+            let requested = thread.clone();
+            let result = db
+                .call_with(StorageOperation::LoadHistory, move |s| {
+                    s.search_messages(
+                        &account,
+                        &requested,
+                        &query,
+                        crate::domain::SEARCH_RESULT_LIMIT,
+                    )
+                })
+                .await;
+            let event = match result {
+                Ok(search) => LiveEvent::SearchResults {
+                    account_id: events.account.clone(),
+                    request,
+                    thread,
+                    search: Box::new(search),
+                },
+                Err(_) => LiveEvent::SearchFailed {
+                    account_id: events.account.clone(),
+                    request,
                     thread,
                 },
             };

@@ -9,7 +9,8 @@
 //!   ZALO_UI_SHOT_SIZE=1200x780 cargo test --locked --offline --lib -- --ignored --exact ui::shot_fixture::demo_screenshot
 //! ```
 //!
-//! Optional: `ZALO_UI_SHOT_SCENE=settings|info|attach`, `ZALO_UI_SHOT_POINTER=x,y` (hover),
+//! Optional: `ZALO_UI_SHOT_SCENE=settings|info|attach|search` (`search` types `ZALO_UI_SHOT_QUERY`,
+//! default `demo`; `ZALO_UI_SHOT_JUMP=1` opens the oldest hit), `ZALO_UI_SHOT_POINTER=x,y` (hover),
 //! `ZALO_UI_SHOT_PRESS=1` (hold the press at that point) and `ZALO_UI_SHOT_TABS=n` (keyboard focus).
 use super::*;
 use std::io::Write as _;
@@ -80,7 +81,7 @@ impl eframe::App for Shot {
                         self.app.drafts.active.set_attachment(attachment);
                     }
                 }
-                "info" => {
+                "info" | "search" => {
                     self.app.conversation_details = self
                         .app
                         .model
@@ -89,6 +90,29 @@ impl eframe::App for Shot {
                         .map(|thread| (crate::app::DEMO_ACCOUNT.into(), thread));
                 }
                 _ => {}
+            }
+        }
+        if self.frames == 25 && self.scene == "search" {
+            if let Some(thread) = self.app.model.selected.clone() {
+                self.app.message_search.text =
+                    std::env::var("ZALO_UI_SHOT_QUERY").unwrap_or_else(|_| "demo".into());
+                self.app.submit_message_search(&thread);
+            }
+        }
+        if self.frames == 40
+            && self.scene == "search"
+            && std::env::var_os("ZALO_UI_SHOT_JUMP").is_some()
+        {
+            if let Some(thread) = self.app.model.selected.clone() {
+                if let Some(hit) = self
+                    .app
+                    .model
+                    .search_results(&thread)
+                    .and_then(|results| results.hits.last().cloned())
+                {
+                    let compact = ctx.screen_rect().width() < COMPACT_BREAKPOINT;
+                    self.app.jump_to_hit(&thread, &hit, compact);
+                }
             }
         }
         // Let the demo worker deliver its conversations and the first frames settle.

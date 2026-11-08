@@ -76,6 +76,8 @@ impl Projection {
             LiveEvent::Page { thread, .. }
             | LiveEvent::Overview { thread, .. }
             | LiveEvent::OverviewFailed { thread, .. }
+            | LiveEvent::SearchResults { thread, .. }
+            | LiveEvent::SearchFailed { thread, .. }
             | LiveEvent::MessagesRefreshed { thread, .. }
             | LiveEvent::MessagesRefreshFailed { thread, .. }
             | LiveEvent::SenderNames { thread, .. }
@@ -453,9 +455,9 @@ impl Privacy {
                     self.start(session.clone(), transports);
                 }
                 let requested = match &command {
-                    LiveCommand::Load { thread, .. } | LiveCommand::Overview { thread, .. } => {
-                        Some(thread.clone())
-                    }
+                    LiveCommand::Load { thread, .. }
+                    | LiveCommand::Overview { thread, .. }
+                    | LiveCommand::Search { thread, .. } => Some(thread.clone()),
                     LiveCommand::Open {
                         kind, remote_id, ..
                     } => Some(Target::new(*kind, remote_id)?.thread_id()),
@@ -524,5 +526,38 @@ mod avatar_tests {
         // A failed re-check keeps the known policy in force: hidden stays hidden, the rest stays visible.
         state.status = LivePrivacyStatus::Failed;
         assert_eq!(count(&state), 1);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn search_replies_for_locked_threads_never_reach_the_ui() {
+        let mut state = Projection {
+            status: LivePrivacyStatus::Ready,
+            revision: 1,
+            hidden: ["d:22".into()].into_iter().collect(),
+            unlocked: None,
+        };
+        let results = |thread: &str| LiveEvent::SearchResults {
+            account_id: "11".into(),
+            request: 1,
+            thread: thread.into(),
+            search: Box::default(),
+        };
+        let failed = |thread: &str| LiveEvent::SearchFailed {
+            account_id: "11".into(),
+            request: 1,
+            thread: thread.into(),
+        };
+        assert!(state.event(results("d:22")).is_none());
+        assert!(state.event(failed("d:22")).is_none());
+        assert!(state.event(results("d:33")).is_some());
+        state.unlocked = Some("d:22".into());
+        assert!(state.event(results("d:22")).is_some());
+        state.status = LivePrivacyStatus::Checking;
+        assert!(state.event(results("d:33")).is_none());
     }
 }
