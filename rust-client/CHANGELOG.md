@@ -4,6 +4,12 @@ Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-clie
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
 Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../changelogs/RELEASE-v2.0.0.md).
 
+## [2.0.2] - 2026-11-08
+
+### Sửa lỗi
+- Tên và ảnh đại diện của nhóm và bạn bè cập nhật khi mở hội thoại, không cần khởi động
+  lại: mở hội thoại sẽ đồng bộ lại danh sách bạn bè và nhóm (tối đa một lần mỗi 2 phút, không chạy chồng).
+
 ## [2.0.1] - 2026-11-08
 
 ### Thay đổi

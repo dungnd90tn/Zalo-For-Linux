@@ -4740,3 +4740,38 @@ async fn incomplete_or_encrypted_capability_never_sends_or_prepares_outbox() {
 async fn encrypted_state_change_during_verification_keeps_draft_without_send_or_ack() {
     eligibility_send_case(30, false).await;
 }
+
+#[tokio::test]
+async fn opening_a_conversation_refreshes_names_and_avatars_at_most_every_two_minutes() {
+    let f = Fixture::new(Reply::Normal);
+    let db = Database::open(f.profile.clone(), "11".into())
+        .await
+        .unwrap();
+    let transports = f.transports();
+    let session = f.directory_session(false);
+    let friend_lists = || {
+        f.state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.starts_with("/api/social/friend/getfriends?"))
+            .count()
+    };
+    let mut directory = DirectorySync::new();
+    directory.refresh_on_open(session.clone(), db.handle().unwrap(), &transports);
+    let result = (&mut directory.running.as_mut().unwrap().task).await;
+    directory.completed(result, session.clone(), db.handle().unwrap(), &transports);
+    assert_eq!(friend_lists(), 1);
+    // Opening again right away does not fetch the lists again.
+    directory.refresh_on_open(session.clone(), db.handle().unwrap(), &transports);
+    assert!(directory.running.is_none());
+    assert_eq!(friend_lists(), 1);
+    // After the window it does.
+    directory.last_started =
+        Some(tokio::time::Instant::now() - DIRECTORY_REFRESH_ON_OPEN - Duration::from_secs(1));
+    directory.refresh_on_open(session.clone(), db.handle().unwrap(), &transports);
+    let result = (&mut directory.running.as_mut().unwrap().task).await;
+    directory.completed(result, session, db.handle().unwrap(), &transports);
+    assert_eq!(friend_lists(), 2);
+}

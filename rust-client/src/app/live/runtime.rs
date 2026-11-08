@@ -666,7 +666,10 @@ impl Drop for DirectoryRun {
         self.task.abort();
     }
 }
+/// Opening a conversation refreshes names and avatars (friends and groups) at most this often.
+const DIRECTORY_REFRESH_ON_OPEN: Duration = Duration::from_secs(120);
 struct DirectorySync {
+    last_started: Option<tokio::time::Instant>,
     running: Option<DirectoryRun>,
     pending: Option<u64>,
     updates_tx: watch::Sender<u64>,
@@ -678,6 +681,7 @@ impl DirectorySync {
     fn new() -> Self {
         let (updates_tx, updates_rx) = watch::channel(0);
         Self {
+            last_started: None,
             running: None,
             pending: None,
             updates_tx,
@@ -699,6 +703,21 @@ impl DirectorySync {
             return;
         }
         self.start(generation, session, db, transports);
+    }
+    /// A changed group name, group photo or contact avatar shows up when its conversation is opened: the same
+    /// friend and group lists as the startup sync, skipped while one runs or one started recently.
+    fn refresh_on_open(
+        &mut self,
+        session: Arc<VerifiedSession>,
+        db: DatabaseHandle,
+        transports: &Transports,
+    ) {
+        let recent = self
+            .last_started
+            .is_some_and(|at| at.elapsed() < DIRECTORY_REFRESH_ON_OPEN);
+        if self.running.is_none() && !recent {
+            self.start(0, session, db, transports);
+        }
     }
     fn start(
         &mut self,
@@ -736,6 +755,7 @@ impl DirectorySync {
                 return;
             }
         };
+        self.last_started = Some(tokio::time::Instant::now());
         let (cancel, rx) = watch::channel(false);
         let mut sink = RuntimeDirectorySink {
             account: session.account_id().into(),
@@ -2296,6 +2316,9 @@ async fn run_inner(
                     directory.request(generation,session.clone(),db.handle()?,transports);
                     continue;
                 }
+                if matches!(command, LiveCommand::Open { .. }) {
+                    directory.refresh_on_open(session.clone(),db.handle()?,transports);
+                }
                 if matches!(command, LiveCommand::Reconnect) {
                     trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
                     connection = None;
@@ -2347,6 +2370,9 @@ async fn run_inner(
                             if let LiveCommand::RefreshDirectory{generation}=command {
                                 directory.request(generation,session.clone(),db.handle()?,transports);
                                 continue;
+                            }
+                            if matches!(command, LiveCommand::Open { .. }) {
+                                directory.refresh_on_open(session.clone(),db.handle()?,transports);
                             }
                             if matches!(command, LiveCommand::Reconnect) {
                                 trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
