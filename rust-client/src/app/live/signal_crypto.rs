@@ -634,6 +634,321 @@ impl Coordinator {
         })
     }
 }
+
+/// A personal ciphertext from a trusted sender device, planned against one committed snapshot.
+pub struct PreparedReceiveInput {
+    sender: engine::TrustDecision,
+    message: engine::PersonalCiphertext,
+    message_timestamp: u64,
+    local: e2ee::LocalNamespace,
+    working: engine::Snapshot,
+    allowed_keys: Vec<e2ee::RecordKey>,
+    durable_id: u64,
+    input_digest: [u8; 32],
+    context: e2ee::InputContext,
+    ciphertext_digest: [u8; 32],
+    queue: String,
+    deadline: Instant,
+}
+/// Non-constructible result of a successful decrypt: the plaintext and the exact state change that the
+/// store's receive transaction must commit together (ratchet, consumed prekey, queue cursor, message).
+pub struct VerifiedReceive {
+    delta: e2ee::Delta,
+    plaintext: Vec<u8>,
+    context: e2ee::InputContext,
+    ciphertext_digest: [u8; 32],
+    queue: String,
+    cancellation: Cancellation,
+    deadline: Instant,
+}
+impl VerifiedReceive {
+    pub fn plaintext(&self) -> &[u8] {
+        &self.plaintext
+    }
+    pub fn delta(&self) -> &e2ee::Delta {
+        &self.delta
+    }
+    pub fn context(&self) -> &e2ee::InputContext {
+        &self.context
+    }
+    pub fn ciphertext_digest(&self) -> &[u8; 32] {
+        &self.ciphertext_digest
+    }
+    pub fn queue(&self) -> &str {
+        &self.queue
+    }
+    /// For the store's final check just before COMMIT.
+    pub fn check_preparation(&self) -> Result<()> {
+        self.cancellation.check()?;
+        ensure!(
+            Instant::now() < self.deadline,
+            "Crypto preparation deadline exceeded"
+        );
+        Ok(())
+    }
+}
+
+/// Stable digest of a ciphertext (type and body), the identity the store de-duplicates deliveries by.
+pub fn personal_ciphertext_digest(message: &engine::PersonalCiphertext) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    digest_part(&mut hash, b"zalo-personal-ciphertext-v1");
+    hash.update([match message.message_type {
+        engine::PersonalMessageType::PreKey => 3u8,
+        engine::PersonalMessageType::Whisper => 1u8,
+    }]);
+    digest_part(&mut hash, &message.body);
+    hash.finalize().into()
+}
+/// The identity public key the engine stored for a peer device (written when its session was created).
+/// An ordinary message has no header to take it from, so the trust decision reads it back from here.
+pub fn stored_peer_identity(
+    store: &MessageStore,
+    owner: &str,
+    local: &e2ee::LocalNamespace,
+    peer: &e2ee::PeerNamespace,
+) -> Result<[u8; 33]> {
+    let key = e2ee::RecordKey::PeerIdentity {
+        local: local.clone(),
+        peer: peer.clone(),
+    };
+    let snapshot = store.e2ee_snapshot(owner, std::slice::from_ref(&key))?;
+    let record = snapshot
+        .records
+        .first()
+        .ok_or_else(|| anyhow!("No stored identity for this peer device"))?;
+    let value: serde_json::Value = serde_json::from_slice(&record.value)?;
+    // The engine stores `{"basis":…, "identityKey":[33 bytes], …}` for a trusted peer device.
+    let bytes: Vec<u8> = value["identityKey"]
+        .as_array()
+        .ok_or_else(|| anyhow!("Unexpected stored identity format"))?
+        .iter()
+        .map(|b| b.as_u64().filter(|b| *b <= 255).map(|b| b as u8))
+        .collect::<Option<_>>()
+        .ok_or_else(|| anyhow!("Unexpected stored identity bytes"))?;
+    <[u8; 33]>::try_from(bytes.as_slice()).map_err(|_| anyhow!("Unexpected stored identity length"))
+}
+
+/// Splits a wire ciphertext (`base64(type || body)`) into the engine's form. Type 3 is a prekey message
+/// (a new session); every other type byte (1 from this client, 2 observed from phones) is an ordinary
+/// message. The body starts with the 0x33 version byte.
+pub fn personal_ciphertext_from_wire(value: &str) -> Result<engine::PersonalCiphertext> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    ensure!(
+        value.len() <= engine::MAX_CIPHERTEXT_BYTES * 2,
+        "Ciphertext exceeds its limit"
+    );
+    let raw = STANDARD
+        .decode(value)
+        .map_err(|_| anyhow!("Invalid ciphertext encoding"))?;
+    ensure!(
+        raw.len() > 10 && raw.len() <= engine::MAX_CIPHERTEXT_BYTES + 1 && raw[1] == 0x33,
+        "Invalid personal cipher framing"
+    );
+    // Like the original (`type == 3` is a prekey message, anything else is an ordinary one): the service's
+    // pushed messages from a phone carry type 2, while this client itself writes type 1.
+    let message_type = if raw[0] == 3 {
+        engine::PersonalMessageType::PreKey
+    } else {
+        engine::PersonalMessageType::Whisper
+    };
+    Ok(engine::PersonalCiphertext {
+        message_type,
+        body: raw[1..].to_vec(),
+    })
+}
+/// The sender's registration id and identity key as written in a prekey message header (fields 5 and 3).
+/// They are public and unauthenticated until the engine verifies the message; they only let a first-contact
+/// sender be recorded before decrypting. An ordinary message has no header and needs the stored identity.
+pub fn prekey_sender(body: &[u8]) -> Result<(u16, [u8; 33])> {
+    ensure!(
+        body.first() == Some(&0x33),
+        "Invalid personal cipher framing"
+    );
+    let mut cursor = 1usize;
+    let (mut registration, mut identity) = (None, None);
+    while cursor < body.len() {
+        let tag = read_varint(body, &mut cursor)?;
+        match (tag >> 3, tag & 7) {
+            (1 | 5 | 6, 0) => {
+                let value = read_varint(body, &mut cursor)?;
+                if tag >> 3 == 5 {
+                    registration = Some(u16::try_from(value).ok().filter(|v| *v <= 16383));
+                }
+            }
+            (2..=4, 2) => {
+                let length = usize::try_from(read_varint(body, &mut cursor)?)?;
+                let end = cursor
+                    .checked_add(length)
+                    .filter(|end| *end <= body.len())
+                    .ok_or_else(|| anyhow!("Truncated prekey header"))?;
+                if tag >> 3 == 3 {
+                    identity = Some(<[u8; 33]>::try_from(&body[cursor..end]).ok());
+                }
+                cursor = end;
+            }
+            _ => return Err(anyhow!("Unsupported prekey header wire type")),
+        }
+    }
+    match (registration.flatten(), identity.flatten()) {
+        (Some(registration), Some(identity)) if identity[0] == 5 => Ok((registration, identity)),
+        _ => Err(anyhow!("Incomplete prekey header")),
+    }
+}
+
+impl Coordinator {
+    /// Plans the decryption of ONE personal ciphertext into conversation `thread` (`d:<peer uid>`). The sender must already have an active, verified
+    /// binding in this local epoch (for a first-contact prekey message the caller records the identity
+    /// from `prekey_sender` first). Reads one committed snapshot; nothing is committed or acknowledged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_receive(
+        &self,
+        store: &mut MessageStore,
+        sender: engine::TrustDecision,
+        message: engine::PersonalCiphertext,
+        message_timestamp: u64,
+        thread: &str,
+        server_id: &str,
+        queue: &str,
+        gate: &e2ee::GenerationGate,
+        cancel: &Cancellation,
+    ) -> Result<PreparedReceiveInput> {
+        let deadline = Instant::now() + BATCH_TIMEOUT;
+        self.current(gate, cancel)?;
+        let local = store_local(&self.local)?;
+        let peer: e2ee::PeerNamespace =
+            serde_json::from_value(serde_json::to_value(&sender.peer)?)?;
+        // The sender may be a peer's device or one of this account's other devices (a message sent from the
+        // phone arrives here too, with the peer's conversation as `thread`); never this device itself.
+        ensure!(
+            !(peer.uid == self.account.as_str() && peer.platform == local.platform),
+            "A message cannot come from this device itself"
+        );
+        store.e2ee_validate_peer_identity(
+            self.account.as_str(),
+            &local,
+            &peer,
+            sender.registration_id,
+            &sender.identity_key,
+            sender.session_timestamp,
+        )?;
+        let allowed_keys = required_personal_records(&self.local, &sender, &message)?;
+        let ciphertext_digest = personal_ciphertext_digest(&message);
+        let context = e2ee::InputContext {
+            kind: e2ee::TargetKind::Personal,
+            thread: thread.into(),
+            server_id: server_id.into(),
+            sender: peer.clone(),
+            registration_id: sender.registration_id,
+        };
+        // The store recomputes this exact digest at commit; it binds account, queue, delivery identity
+        // (thread, server id, sender device) and the ciphertext.
+        let input_digest =
+            e2ee::receive_input_digest(self.account.as_str(), queue, &context, &ciphertext_digest)?;
+        let durable_id = store.e2ee_reserve_operation(
+            self.account.as_str(),
+            e2ee::OperationIdentity::Receive { context: &context },
+            &input_digest,
+        )?;
+        let snapshot = store.e2ee_snapshot(self.account.as_str(), &allowed_keys)?;
+        let working = e2ee::engine_adapter::into_engine_snapshot(snapshot)?;
+        required_record(
+            &working,
+            &engine::RecordKey::LocalIdentity {
+                local: self.local.clone(),
+            },
+        )?;
+        Ok(PreparedReceiveInput {
+            sender,
+            message,
+            message_timestamp,
+            local,
+            working,
+            allowed_keys,
+            durable_id,
+            input_digest,
+            context,
+            ciphertext_digest,
+            queue: queue.into(),
+            deadline,
+        })
+    }
+
+    /// Runs the engine on owned input. Failure (bad MAC, replay, wrong identity) leaves no state behind.
+    pub async fn prepare_receive(
+        &mut self,
+        plan: PreparedReceiveInput,
+        gate: &e2ee::GenerationGate,
+        cancel: &Cancellation,
+    ) -> Result<VerifiedReceive> {
+        self.current(gate, cancel)?;
+        let PreparedReceiveInput {
+            sender,
+            message,
+            message_timestamp,
+            local,
+            mut working,
+            allowed_keys,
+            durable_id,
+            input_digest,
+            context: input_context,
+            ciphertext_digest,
+            queue,
+            deadline,
+        } = plan;
+        ensure!(
+            local == store_local(&self.local)?,
+            "Crypto plan scope mismatch"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "Crypto preparation deadline exceeded"
+        );
+        let base_revision = working.revision();
+        let result = self
+            .run(
+                engine::Operation::DecryptPersonal {
+                    local: self.local.clone(),
+                    trust: copy_trust(&sender),
+                    message,
+                    message_timestamp,
+                },
+                &working,
+                gate,
+                cancel,
+                deadline,
+            )
+            .await?;
+        let mut aggregate = BTreeMap::new();
+        let output = merge_result(
+            result,
+            context(self, durable_id, base_revision, &allowed_keys, input_digest),
+            &mut working,
+            &mut aggregate,
+        )?;
+        let engine::Output::Plaintext(plaintext) = output else {
+            return Err(anyhow!("The engine returned no plaintext"));
+        };
+        self.current(gate, cancel)?;
+        Ok(VerifiedReceive {
+            delta: e2ee::Delta {
+                account: self.account.as_str().into(),
+                expected_revision: base_revision,
+                generation: self.generation,
+                operation_id: durable_id,
+                input_digest,
+                allowed_keys,
+                activate_peers: vec![],
+                mutations: aggregate.into_values().collect(),
+            },
+            plaintext,
+            context: input_context,
+            ciphertext_digest,
+            queue,
+            cancellation: cancel.clone(),
+            deadline,
+        })
+    }
+}
 fn copy_trust(value: &engine::TrustDecision) -> engine::TrustDecision {
     engine::TrustDecision {
         peer: value.peer.clone(),
@@ -674,8 +989,8 @@ fn merge_result(
     context: e2ee::engine_adapter::ExpectedJobContext,
     working: &mut engine::Snapshot,
     aggregate: &mut BTreeMap<e2ee::RecordKey, e2ee::Mutation>,
-) -> Result<()> {
-    let (_, delta) = e2ee::engine_adapter::into_store_delta_checked(result, context)?;
+) -> Result<engine::Output> {
+    let (output, delta) = e2ee::engine_adapter::into_store_delta_checked(result, context)?;
     let mut records: BTreeMap<_, _> = working
         .records()
         .iter()
@@ -707,7 +1022,7 @@ fn merge_result(
             .collect::<Result<_>>()?,
     )
     .map_err(crypto_error)?;
-    Ok(())
+    Ok(output)
 }
 fn recipients_for_keys(keys: &[e2ee::RecordKey]) -> Vec<e2ee::PeerNamespace> {
     keys.iter()
@@ -877,5 +1192,34 @@ mod account_worker_tests {
             .map(|thread| thread.join().unwrap())
             .collect();
         assert!(jobs.into_iter().eq(1..=6));
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    fn wire(kind: u8) -> String {
+        let mut raw = vec![kind, 0x33, 0x0a];
+        raw.extend_from_slice(&[7u8; 40]);
+        STANDARD.encode(raw)
+    }
+    #[test]
+    fn only_type_three_is_a_prekey_message_and_framing_is_checked() {
+        let kind = |value| personal_ciphertext_from_wire(&wire(value)).map(|c| c.message_type);
+        assert!(matches!(kind(3), Ok(engine::PersonalMessageType::PreKey)));
+        // 1 is what this client writes; 2 is what the service delivers from phones (seen on the wire).
+        for ordinary in [1u8, 2] {
+            assert!(matches!(
+                kind(ordinary),
+                Ok(engine::PersonalMessageType::Whisper)
+            ));
+        }
+        let mut no_version = vec![2u8, 0x34];
+        no_version.extend_from_slice(&[7u8; 40]);
+        assert!(personal_ciphertext_from_wire(&STANDARD.encode(no_version)).is_err());
+        assert!(personal_ciphertext_from_wire("not base64!").is_err());
+        assert!(personal_ciphertext_from_wire(&STANDARD.encode([3u8, 0x33])).is_err());
     }
 }

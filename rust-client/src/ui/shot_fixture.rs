@@ -9,7 +9,7 @@
 //!   ZALO_UI_SHOT_SIZE=1200x780 cargo test --locked --offline --lib -- --ignored --exact ui::shot_fixture::demo_screenshot
 //! ```
 //!
-//! Optional: `ZALO_UI_SHOT_SCENE=settings|info`, `ZALO_UI_SHOT_POINTER=x,y` (hover),
+//! Optional: `ZALO_UI_SHOT_SCENE=settings|info|attach`, `ZALO_UI_SHOT_POINTER=x,y` (hover),
 //! `ZALO_UI_SHOT_PRESS=1` (hold the press at that point) and `ZALO_UI_SHOT_TABS=n` (keyboard focus).
 use super::*;
 use std::io::Write as _;
@@ -72,6 +72,14 @@ impl eframe::App for Shot {
         if self.frames == 15 {
             match self.scene.as_str() {
                 "settings" => self.app.settings_open = true,
+                "attach" => {
+                    // A synthetic file in the profile's temp root, attached to the open draft.
+                    let path = std::env::temp_dir().join("Bao-cao-thiet-ke-quy-4.pdf");
+                    std::fs::write(&path, vec![7u8; 1_843_200]).expect("synthetic file");
+                    if let Ok(attachment) = crate::domain::Attachment::inspect(&path) {
+                        self.app.drafts.active.set_attachment(attachment);
+                    }
+                }
                 "info" => {
                     self.app.conversation_details = self
                         .app
@@ -147,6 +155,9 @@ fn demo_screenshot() {
         },
         Box::new(move |cc| {
             let profile = Profile::at_root(&profile_root, "fixture")?;
+            if std::env::var("ZALO_UI_SHOT_SCENE").as_deref() == Ok("info") {
+                seed_shared_items(&profile)?;
+            }
             let app = NativeApp::new(cc, profile, true)?;
             Ok(Box::new(Shot {
                 app,
@@ -209,4 +220,85 @@ impl Grabber {
         }
         ctx.request_repaint();
     }
+}
+
+/// Synthetic shared content for the information panel capture: a few pictures, files and links in
+/// the demo design room. Every address is under example.com.
+fn seed_shared_items(profile: &Profile) -> anyhow::Result<()> {
+    use crate::domain::{MediaKind, MediaMessageContent};
+    use serde_json::json;
+    let mut store =
+        crate::store::MessageStore::open(&profile.paths.data_dir.join("messages.sqlite3"))?;
+    let mut batch = Vec::new();
+    let mut text = |id: &str, body: &str, at: i64| {
+        batch.push((
+            crate::domain::Message {
+                account_id: crate::app::DEMO_ACCOUNT.into(),
+                thread_id: "demo-design".into(),
+                id: id.into(),
+                sender: "Xưởng thiết kế".into(),
+                text: body.into(),
+                sticker: None,
+                media: None,
+                sent_at_ms: at,
+            },
+            None,
+            None,
+            None,
+        ));
+    };
+    text(
+        "shot-link",
+        "Tài liệu hướng dẫn giao diện: https://example.com/huong-dan-giao-dien",
+        1_700_001_500_000,
+    );
+    let media = |id: &str, kind: MediaKind, content: serde_json::Value, at: i64| {
+        let content = MediaMessageContent::new(kind, &content).expect("synthetic content");
+        let message = crate::domain::Message {
+            account_id: crate::app::DEMO_ACCOUNT.into(),
+            thread_id: "demo-design".into(),
+            id: id.into(),
+            sender: "Xưởng thiết kế".into(),
+            text: format!("[Tin nhắn {} chưa được hỗ trợ]", kind.as_str()),
+            sticker: None,
+            media: Some(content.descriptor().clone()),
+            sent_at_ms: at,
+        };
+        (message, None::<String>, None, Some(content))
+    };
+    let items = [
+        media(
+            "shot-photo-1",
+            MediaKind::Photo,
+            json!({"title":"Ảnh","description":"Bản phác thảo màn hình danh bạ","href":"https://example.com/anh/phac-thao.jpg"}),
+            1_700_001_300_000,
+        ),
+        media(
+            "shot-photo-2",
+            MediaKind::Photo,
+            json!({"title":"Ảnh","href":"https://example.com/anh/mau-sac.jpg"}),
+            1_700_001_350_000,
+        ),
+        media(
+            "shot-file-1",
+            MediaKind::File,
+            json!({"title":"bao-cao-thiet-ke","params":"{\"fileExt\":\"pdf\",\"fileSize\":\"1843200\"}","href":"https://example.com/tep/bao-cao-thiet-ke.pdf"}),
+            1_700_001_400_000,
+        ),
+        media(
+            "shot-file-2",
+            MediaKind::File,
+            json!({"title":"bang-so-sanh","params":"{\"fileExt\":\"xlsx\",\"fileSize\":\"52000\"}","href":"https://example.com/tep/bang-so-sanh.xlsx"}),
+            1_700_001_450_000,
+        ),
+        media(
+            "shot-card",
+            MediaKind::Recommended,
+            json!({"action":"recommened.link","title":"Hướng dẫn thiết kế giao diện native","href":"https://example.com/bai-viet/thiet-ke-native"}),
+            1_700_001_550_000,
+        ),
+    ];
+    batch.extend(items);
+    store.receive_batch_with_media(crate::app::DEMO_ACCOUNT, &batch, None)?;
+    Ok(())
 }

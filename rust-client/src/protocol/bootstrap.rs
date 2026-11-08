@@ -392,7 +392,9 @@ impl ServerConfig {
         // Directory capabilities are optional. The bundle's merge ignores
         // unsupported modern values and falls back to the legacy string. Each
         // candidate is validated independently; discarded routes grant no cookies.
-        for name in ["profile", "conversation"] {
+        // `chat_e2e` / `group_e2e` serve the end-to-end encrypted send endpoints (`CHAT_E2EE` and
+        // `CHAT_E2EE_GROUP` in the original). They are optional like the directory services.
+        for name in ["profile", "conversation", "chat_e2e", "group_e2e"] {
             let mut endpoints =
                 endpoint_list(modern.and_then(|map| map.get(name)), false).unwrap_or_default();
             if endpoints.is_empty() {
@@ -765,6 +767,41 @@ mod tests {
             Some("profile-wpa.zaloapp.com")
         ); // Directory profile capability is now consumed.
         assert_eq!(parsed.config.websocket[0].scheme(), "wss");
+    }
+    #[test]
+    fn the_encrypted_send_services_are_kept_when_valid_and_never_fail_the_config() {
+        let value = serde_json::json!({
+            "zpw_service_map_v3": {
+                "chat": ["https://chat-wpa.zaloapp.com/"],
+                "chat_e2e": ["https://e2e-wpa.zaloapp.com/"],
+                "group_e2e": ["https://ge2e-wpa.zaloapp.com/"]
+            },
+            "zpw_ws": ["wss://ws1.zalo.me/socket"]
+        });
+        let parsed = ServerConfig::parse(&value).unwrap();
+        assert_eq!(
+            parsed.services["chat_e2e"][0].host_str(),
+            Some("e2e-wpa.zaloapp.com")
+        );
+        assert_eq!(
+            parsed.services["group_e2e"][0].host_str(),
+            Some("ge2e-wpa.zaloapp.com")
+        );
+        // An origin outside Zalo's domains is dropped (it gets no credentials), and absence is fine.
+        let bad = serde_json::json!({
+            "zpw_service_map_v3": {"chat": ["https://chat-wpa.zaloapp.com/"], "chat_e2e": ["https://evil.invalid/"]},
+            "zpw_ws": ["wss://ws1.zalo.me/socket"]
+        });
+        let parsed = ServerConfig::parse(&bad).unwrap();
+        assert!(!parsed.services.contains_key("chat_e2e"));
+        let none = serde_json::json!({
+            "zpw_service_map_v3": {"chat": ["https://chat-wpa.zaloapp.com/"]},
+            "zpw_ws": ["wss://ws1.zalo.me/socket"]
+        });
+        assert!(!ServerConfig::parse(&none)
+            .unwrap()
+            .services
+            .contains_key("chat_e2e"));
     }
     #[test]
     fn websocket_routes_are_preserved_while_unused_long_poll_cannot_grant_credentials() {

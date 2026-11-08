@@ -548,6 +548,9 @@ pub struct Incoming {
     pub info: Option<InfoMessageContent>,
     pub media: Option<MediaMessageContent>,
     pub unsupported: bool,
+    /// Kept in history but never creates or reorders a conversation-list entry (see
+    /// `domain::system::list_silent`). Only for messages from someone else.
+    pub list_silent: bool,
 }
 // Stickers carry a catalog address, never an image URL. Unknown/malformed media
 // stays an explicit placeholder without poisoning other messages in a batch.
@@ -802,7 +805,24 @@ fn incoming_with_reason(
             } else {
                 None
             };
-            let unsupported = message_type != "webchat" && sticker.is_none() && media.is_none();
+            let presented = (message_type != "webchat" && sticker.is_none() && media.is_none())
+                .then(|| {
+                    v.get("content").and_then(|content| {
+                        crate::domain::system::presentation(message_type, content)
+                    })
+                })
+                .flatten()
+                .filter(|text| !text.is_empty());
+            let unsupported = message_type != "webchat"
+                && sticker.is_none()
+                && media.is_none()
+                && presented.is_none();
+            // Official Account broadcasts only exist in 1-1 threads; birthday cards are skipped everywhere.
+            let list_silent = (kind == ThreadKind::Direct || message_type == "chat.ecard")
+                && sender != account
+                && v.get("content").is_some_and(|content| {
+                    crate::domain::system::list_silent(message_type, content)
+                });
             let message = Message {
                 account_id: account.into(),
                 thread_id: thread,
@@ -810,6 +830,8 @@ fn incoming_with_reason(
                 sender,
                 text: if info.is_some() {
                     info::presentation(account, v.get("content").ok_or(WireError::Invalid)?)
+                } else if let Some(text) = presented {
+                    text
                 } else if message_type != "webchat" {
                     format!("[Tin nhắn {message_type} chưa được hỗ trợ]")
                 } else {
@@ -839,13 +861,16 @@ fn incoming_with_reason(
             };
             // An information event is never an acknowledgement of a reserved
             // plain-text send, even when its server-supplied cliMsgId matches.
-            let client_id = client_id.filter(|_| info.is_none() && media.is_none());
+            // Only a plain text message can acknowledge a plain-text send.
+            let client_id = client_id
+                .filter(|_| info.is_none() && media.is_none() && message_type == "webchat");
             result.push(Incoming {
                 message,
                 client_id,
                 info,
                 media,
                 unsupported,
+                list_silent,
             });
         }
     }
@@ -878,6 +903,25 @@ pub fn send_ack(payload: &Value) -> Result<SendAck, WireError> {
         server_id,
         timestamp_ms,
     })
+}
+
+/// The reply to an end-to-end encrypted send, read as the original's `parseE2eeResp` does
+/// (`pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js`, line 547494):
+/// the server's message id is `minGlobalMsgId` (a plain send answers `msgId`), plus `ts`. The per-device results
+/// the reply may carry are not read, exactly as in the original.
+pub fn e2ee_send_ack(payload: &Value) -> Result<SendAck, WireError> {
+    service_code(payload)?;
+    let data = payload.get("data").ok_or(WireError::Invalid)?;
+    let id = data
+        .get("minGlobalMsgId")
+        .or_else(|| data.get("msgId"))
+        .ok_or(WireError::Invalid)?;
+    let mut shaped = serde_json::Map::new();
+    shaped.insert("msgId".into(), id.clone());
+    if let Some(ts) = data.get("ts") {
+        shaped.insert("ts".into(), ts.clone());
+    }
+    send_ack(&serde_json::json!({"error_code": 0, "data": shaped}))
 }
 
 /// Closed diagnostic labels, never peer IDs or arbitrary payload field names.
@@ -943,6 +987,17 @@ fn eligibility_status(payload: &Value) -> Result<(), EligibilityFailure> {
         ..eligibility_schema(EligibilityField::Status, payload.get("error_code"))
     })
 }
+/// The original rejects a list only when `err` is truthy, and the signal service leaves
+/// zero-valued fields out, so a missing, null, false or zero `err` is success. Anything else,
+/// including a non-empty string, is a refusal. (The frame decoder has already required a zero
+/// `error_code` on the envelope, so only this inner status can be absent.)
+fn signal_list_status(data: &serde_json::Map<String, Value>) -> Result<(), EligibilityFailure> {
+    match data.get("err") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(()),
+        Some(Value::Number(number)) if number.as_f64() == Some(0.0) => Ok(()),
+        value => Err(eligibility_schema(EligibilityField::Status, value)),
+    }
+}
 /// Compatibility wrapper; runtime consumes detailed, content-free rejection reasons.
 pub fn legacy_direct_allowed(
     payload: &Value,
@@ -958,6 +1013,27 @@ pub fn legacy_direct_allowed_detailed(
     request_id: &str,
     target: &str,
 ) -> Result<(bool, Option<String>), EligibilityFailure> {
+    let page = e2ee_list_page(payload, request_id)?;
+    let encrypted = page
+        .enabled
+        .iter()
+        .chain(&page.others)
+        .any(|uid| uid == target);
+    Ok((!encrypted, page.next))
+}
+/// One validated page of the account's E2EE list (command 563).
+pub struct E2eeListPage {
+    /// `threads` and `uids`: peers with end-to-end encryption enabled.
+    pub enabled: Vec<String>,
+    /// `waitUids` and `pendingUids`: peers in a transitional state. Sending is refused for them too.
+    others: Vec<String>,
+    pub next: Option<String>,
+}
+/// Validates the whole page exactly as the eligibility check always has, and keeps the peer ids.
+pub fn e2ee_list_page(
+    payload: &Value,
+    request_id: &str,
+) -> Result<E2eeListPage, EligibilityFailure> {
     eligibility_status(payload)?;
     let response = payload
         .get("data")
@@ -974,12 +1050,7 @@ pub fn legacy_direct_allowed_detailed(
         .get("data")
         .and_then(Value::as_object)
         .ok_or_else(|| eligibility_schema(EligibilityField::Envelope, response.get("data")))?;
-    if data.get("err").and_then(Value::as_i64) != Some(0) {
-        return Err(eligibility_schema(
-            EligibilityField::Status,
-            data.get("err"),
-        ));
-    }
+    signal_list_status(data)?;
     let has_more = match data.get("hasMore") {
         None | Some(Value::Null) | Some(Value::Bool(false)) => false,
         Some(Value::Bool(true)) => true,
@@ -987,7 +1058,7 @@ pub fn legacy_direct_allowed_detailed(
         Some(Value::Number(number)) if number.as_u64() == Some(1) => true,
         value => return Err(eligibility_schema(EligibilityField::More, value)),
     };
-    let mut encrypted = false;
+    let (mut enabled, mut others) = (Vec::new(), Vec::new());
     for (name, field) in [
         ("threads", EligibilityField::Threads),
         ("waitUids", EligibilityField::Waiting),
@@ -1007,7 +1078,10 @@ pub fn legacy_direct_allowed_detailed(
             };
             let uid = id_string(uid.ok_or_else(|| eligibility_schema(field, Some(entry)))?)
                 .map_err(|_| eligibility_schema(field, Some(entry)))?;
-            encrypted |= uid == target;
+            match name {
+                "threads" | "uids" => enabled.push(uid),
+                _ => others.push(uid),
+            }
         }
     }
     let next = if has_more {
@@ -1021,7 +1095,11 @@ pub fn legacy_direct_allowed_detailed(
     } else {
         None
     };
-    Ok((!encrypted, next))
+    Ok(E2eeListPage {
+        enabled,
+        others,
+        next,
+    })
 }
 pub fn legacy_group_allowed(payload: &Value, target: &str) -> Result<u64, WireError> {
     legacy_group_allowed_detailed(payload, target).map_err(|failure| failure.error)
@@ -1078,6 +1156,21 @@ mod tests {
             key: (0..32).collect(),
             authenticated: true,
         }
+    }
+    #[test]
+    fn an_encrypted_send_reply_is_read_from_min_global_msg_id_and_ts() {
+        let ack = e2ee_send_ack(&json!({"error_code":0,"data":{
+            "clientId":"1760000000001","minGlobalMsgId":"9001","ts":1700000000123u64,
+            "results":[{"deviceId":0,"err":0}]}}))
+        .unwrap();
+        assert_eq!(ack.server_id, "9001");
+        assert_eq!(ack.timestamp_ms, Some(1_700_000_000_123));
+        // A numeric id, a string timestamp and the plain `msgId` spelling all work.
+        let ack = e2ee_send_ack(&json!({"error_code":0,"data":{"msgId":77,"ts":"5"}})).unwrap();
+        assert_eq!((ack.server_id.as_str(), ack.timestamp_ms), ("77", Some(5)));
+        // No id at all, or a service error, is refused.
+        assert!(e2ee_send_ack(&json!({"error_code":0,"data":{"ts":1}})).is_err());
+        assert!(e2ee_send_ack(&json!({"error_code":5,"data":{"minGlobalMsgId":"1"}})).is_err());
     }
     fn frame(cmd: u16, value: Value) -> Vec<u8> {
         encode_frame(cmd, 0, &value).unwrap()
@@ -1592,6 +1685,49 @@ mod tests {
         );
     }
     #[test]
+    fn readable_system_types_and_list_silent_flags() {
+        let item = |id: &str, from: &str, kind: &str, content: Value| json!({"uidFrom":from,"idTo":if from == "0" {"22"} else {"11"},"msgId":id,"cliMsgId":"5","ts":"7","msgType":kind,"content":content});
+        let payload = json!({"error_code":0,"data":{
+            "msgs":[
+                item("1","22","chat.ecard",json!({"title":"Hôm nay là sinh nhật của An","description":"","type":"1"})),
+                item("2","22","chat.gif",json!({"href":"https://example.test/a.gif"})),
+                item("3","22","chat.webcontent",json!({"title":"","params":"{\"item\":{\"zinstantdata_id\":\"templateId=1\"}}"})),
+                item("4","0","chat.ecard",json!({"title":"Thiệp","type":"1"})),
+                item("5","22","chat.ecard",json!({"title":"Hai bạn đã là bạn bè","type":"2"})),
+            ],
+            "groupMsgs":[item("6","22","chat.ecard",json!({"title":"Sinh nhật","type":"1"}))]
+        }});
+        let result = incoming_messages("11", &payload).unwrap();
+        let summary: Vec<_> = result
+            .iter()
+            .map(|i| {
+                (
+                    i.message.text.as_str(),
+                    i.list_silent,
+                    i.unsupported,
+                    i.client_id.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("Hôm nay là sinh nhật của An", true, false, false),
+                ("[GIF]", false, false, false),
+                (
+                    "[Tin nhắn chat.webcontent chưa được hỗ trợ]",
+                    true,
+                    false,
+                    false
+                ),
+                // Own messages are never silent; a group birthday card is.
+                ("Thiệp", false, false, false),
+                ("Hai bạn đã là bạn bè", false, false, false),
+                ("Sinh nhật", true, false, false),
+            ]
+        );
+    }
+    #[test]
     fn routes_peer_self_echo_and_groups_without_numeric_id_collision_and_hides_unsupported_content()
     {
         let mut base = json!({"uidFrom":"22","idTo":"11","msgId":"1","cliMsgId":"2","ts":"7","msgType":"webchat","content":"plain"});
@@ -1744,6 +1880,78 @@ mod tests {
                 .unwrap_err()
                 .reason,
             EligibilityReason::Correlation
+        );
+    }
+    #[test]
+    fn a_missing_zero_err_is_success_but_any_truthy_err_still_refuses_the_send() {
+        let complete = |err: Option<Value>| {
+            let mut data = json!({"threads":[],"waitUids":[],"uids":[],"pendingUids":[]});
+            if let Some(err) = err {
+                data["err"] = err;
+            }
+            json!({"error_code":0,"data":{"reqId":"r1","data":data}})
+        };
+        // The signal service omits `err` when it is zero; the original treats that as success.
+        for ok in [
+            None,
+            Some(json!(null)),
+            Some(json!(0)),
+            Some(json!(false)),
+            Some(json!(0.0)),
+        ] {
+            assert_eq!(
+                legacy_direct_allowed_detailed(&complete(ok.clone()), "r1", "22")
+                    .unwrap_or_else(|f| panic!("{ok:?} must be accepted: {f:?}")),
+                (true, None)
+            );
+        }
+        for bad in [
+            json!(1),
+            json!(-1),
+            json!(true),
+            json!("0"),
+            json!("err"),
+            json!({}),
+            json!([]),
+        ] {
+            let failure = legacy_direct_allowed_detailed(&complete(Some(bad.clone())), "r1", "22")
+                .expect_err(&format!("{bad} must be refused"));
+            assert_eq!(failure.reason, EligibilityReason::Schema, "{bad}");
+            assert_eq!(failure.field, Some(EligibilityField::Status), "{bad}");
+        }
+        // Dropping `err` never relaxes the rest: arrays, correlation and encrypted peers.
+        let mut missing_array = complete(None);
+        missing_array["data"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("uids");
+        assert_eq!(
+            legacy_direct_allowed_detailed(&missing_array, "r1", "22")
+                .unwrap_err()
+                .field,
+            Some(EligibilityField::Uids)
+        );
+        assert_eq!(
+            legacy_direct_allowed_detailed(&complete(None), "other", "22")
+                .unwrap_err()
+                .reason,
+            EligibilityReason::Correlation
+        );
+        let mut encrypted = complete(None);
+        encrypted["data"]["data"]["uids"] = json!(["22"]);
+        assert_eq!(
+            legacy_direct_allowed_detailed(&encrypted, "r1", "22").unwrap(),
+            (false, None),
+            "a peer in the encrypted list is still refused when err is absent"
+        );
+        // A nonzero envelope code is still a refusal.
+        let mut refused = complete(None);
+        refused["error_code"] = json!(7);
+        assert_eq!(
+            legacy_direct_allowed_detailed(&refused, "r1", "22")
+                .unwrap_err()
+                .error,
+            WireError::Service(7)
         );
     }
     #[test]

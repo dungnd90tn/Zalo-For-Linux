@@ -131,6 +131,22 @@ impl CorrelatedReplyProof {
     pub(crate) fn current(&self, gate: &GenerationGate) -> bool {
         gate.is_current(self.scope.generation())
     }
+    /// Consumes the proof. Only an identity-confirmed proof yields activation evidence.
+    pub(crate) fn into_activation_evidence(
+        self,
+    ) -> Option<crate::store::e2ee::provisioning::ActivationEvidence> {
+        self.identity_confirmed
+            .then(|| crate::store::e2ee::provisioning::ActivationEvidence {
+                account: self.binding.account.clone(),
+                operation_id: self.binding.operation_id,
+                attempt_id: self.binding.attempt_id,
+                generation: self.scope.generation(),
+                payload_hash: self.binding.payload_hash,
+                attempt_hash: self.binding.attempt_hash,
+                identity_confirmed: true,
+                timestamp: self.timestamp,
+            })
+    }
 }
 struct AttemptBinding {
     account: String,
@@ -323,6 +339,41 @@ impl Coordinator {
         });
         Ok(write)
     }
+    /// Re-attaches a previously sent upload whose outcome is unknown. Query-only: nothing is sent,
+    /// the outbox row is `unknown` so no new claim is possible, and only reconciliation can follow.
+    fn restore(
+        &mut self,
+        receipt: PublicUploadReceipt,
+        gate: &GenerationGate,
+    ) -> Result<(), SignalError> {
+        self.current(gate)?;
+        if self.upload.is_some() || receipt.account() != self.scope.account() {
+            return Err(SignalError::Scope);
+        }
+        let identity = CandidateIdentity::from_public_payload(receipt.payload())?;
+        if identity.payload_hash() != receipt.payload_hash() {
+            return Err(SignalError::Invalid);
+        }
+        let mut reconciliation = Reconciliation::new(identity);
+        reconciliation.unknown();
+        self.upload = Some(Upload {
+            receipt,
+            reconciliation,
+        });
+        Ok(())
+    }
+    /// Authority to discard the staged candidate, minted only after a read showed it is not installed.
+    fn abandon_evidence(&self) -> Option<crate::store::e2ee::provisioning::AbandonEvidence> {
+        let upload = self.upload.as_ref()?;
+        upload.reconciliation.proves_not_installed().then(|| {
+            crate::store::e2ee::provisioning::AbandonEvidence {
+                account: upload.receipt.account().into(),
+                operation_id: upload.receipt.operation_id(),
+                payload_hash: *upload.receipt.payload_hash(),
+                attempt_hash: *upload.receipt.attempt_hash(),
+            }
+        })
+    }
     fn state(&self) -> Option<UploadState> {
         self.upload.as_ref().map(|u| u.reconciliation.state())
     }
@@ -370,6 +421,17 @@ impl Coordinator {
         epoch: SocketEpoch,
         gate: &GenerationGate,
     ) -> anyhow::Result<ReadOutcome> {
+        self.read_next_tapped(connection, epoch, gate, &mut |_| {})
+            .await
+    }
+    /// Like `read_next`, but shows each authenticated frame to `tap` first (shape logging only).
+    async fn read_next_tapped(
+        &mut self,
+        connection: &mut Connection,
+        epoch: SocketEpoch,
+        gate: &GenerationGate,
+        tap: &mut (dyn FnMut(&DecodedFrame) + Send),
+    ) -> anyhow::Result<ReadOutcome> {
         self.current(gate)?;
         if self.socket != Some(epoch) {
             return Err(SignalError::Scope.into());
@@ -392,6 +454,7 @@ impl Coordinator {
         let Some(frame) = frame else {
             return Ok(ReadOutcome::NoData);
         };
+        tap(&frame);
         self.accept(frame, epoch, gate).map_err(Into::into)
     }
     /// Private: reachable only after read_next obtains authenticated decoded data.
@@ -474,11 +537,15 @@ impl Coordinator {
                         return Err(error);
                     }
                 };
-                let evidence = proof(upload, &self.scope, epoch, timestamp, false);
-                if timestamp.is_some() {
-                    self.upload.take();
-                }
-                Ok(ReadOutcome::Proof(evidence))
+                // Keep the upload even when the ACK carries a timestamp: an ACK alone never activates
+                // a registration; the own 541 bundle must match first (see `e2ee_activate_pending`).
+                Ok(ReadOutcome::Proof(proof(
+                    upload,
+                    &self.scope,
+                    epoch,
+                    timestamp,
+                    false,
+                )))
             }
             QueryPurpose::MetadataBefore => {
                 upload
@@ -501,7 +568,7 @@ impl Coordinator {
                     &upload,
                     &self.scope,
                     epoch,
-                    Some(timestamp),
+                    timestamp,
                     true,
                 )))
             }
@@ -543,6 +610,369 @@ impl Coordinator {
         let request = wire::own_query(&self.scope, &id)?;
         self.enqueue(request, QueryPurpose::MetadataAfter, now)
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Opt-in live driver: replace this account's registered PC key (E2EE_LIVE_PLAN.md, stage 2).
+//
+// Off unless `ZALO_E2EE_REPLACE_PC_KEY` is an absolute path (it is also where the report goes). It
+// runs once per process, right after authentication and before any offline queue is requested.
+// Order: reserve → engine CreateBundle → stage durably → claim the upload (marks it `sending`) →
+// command 540 → read-only 564/541/564 reconciliation → activate locally. A failure after the claim
+// leaves the row `unknown`; a later run only *reads* the account to settle it and never uploads again.
+// ---------------------------------------------------------------------------------------------
+const DRIVER_GENERATION: u64 = 1;
+// The original uploads 20 one-time prekeys; 100 made the 540 frame exceed the server's limit (close 1009).
+const DRIVER_PREKEYS: u8 = 20;
+const DRIVER_INTENT: &str = "replace-pc-key";
+const DRIVER_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(super) fn replace_target() -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(std::env::var_os("ZALO_E2EE_REPLACE_PC_KEY")?);
+    path.is_absolute().then_some(path)
+}
+pub(super) fn claim_run() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    !DONE.swap(true, Ordering::SeqCst)
+}
+
+pub(super) struct Report(Option<std::fs::File>);
+
+impl Report {
+    pub(super) fn open(path: &std::path::Path) -> Option<Self> {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(path).ok()?;
+        let _ = writeln!(
+            file,
+            "# zalo-native PC key replacement. Stages and shapes only; no keys or ids."
+        );
+        Some(Self(Some(file)))
+    }
+    /// A report that records nothing (the app's normal flow, where there is no report file).
+    pub(super) fn discard() -> Self {
+        Self(None)
+    }
+    pub(super) fn line(&mut self, text: &str) {
+        use std::io::Write;
+        if let Some(file) = self.0.as_mut() {
+            let _ = writeln!(file, "{text}");
+            let _ = file.flush();
+        }
+    }
+}
+
+/// Replaces the account's PC key. Never returns an error to the caller: the outcome is in the report.
+pub(super) async fn replace_pc_key(
+    connection: &mut Connection,
+    db: &super::Database,
+    account: &str,
+    path: &std::path::Path,
+) {
+    let Some(mut report) = Report::open(path) else {
+        return;
+    };
+    match replace_inner(connection, db, account, &mut report).await {
+        Ok(message) => report.line(&format!("RESULT: {message}")),
+        Err(error) => {
+            // A claimed upload whose fate is unknown must never be re-sent; mark it so a later run
+            // only reads the account.
+            let owner = account.to_owned();
+            let _ = db
+                .call(move |s| s.e2ee_recover_bundle_uploads(&owner))
+                .await;
+            report.line(&format!("RESULT: stopped: {error}"));
+            report
+                .line("If an upload was sent, run again: it only reads the account to settle it.");
+        }
+    }
+}
+
+async fn pump(
+    coordinator: &mut Coordinator,
+    connection: &mut Connection,
+    epoch: SocketEpoch,
+    gate: &GenerationGate,
+    report: &mut Report,
+) -> anyhow::Result<Option<CorrelatedReplyProof>> {
+    let deadline = Instant::now() + DRIVER_STEP_TIMEOUT;
+    loop {
+        let outcome = tokio::time::timeout_at(
+            deadline,
+            coordinator.read_next_tapped(connection, epoch, gate, &mut |frame| {
+                if frame.payload.pointer("/data/reqId").is_some() {
+                    report.line(&format!(
+                        "## reply command {} sub {}",
+                        frame.cmd, frame.sub_cmd
+                    ));
+                    for line in super::e2ee_probe::shape(&frame.payload) {
+                        report.line(&line);
+                    }
+                }
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for the server"))??;
+        match outcome {
+            ReadOutcome::Progress => return Ok(None),
+            ReadOutcome::Proof(proof) => return Ok(Some(proof)),
+            ReadOutcome::Unhandled(_) | ReadOutcome::NoData => {}
+        }
+    }
+}
+async fn send_and_wait(
+    write: Write,
+    coordinator: &mut Coordinator,
+    connection: &mut Connection,
+    epoch: SocketEpoch,
+    gate: &GenerationGate,
+    report: &mut Report,
+) -> anyhow::Result<Option<CorrelatedReplyProof>> {
+    write.send(connection, coordinator, gate).await?;
+    pump(coordinator, connection, epoch, gate, report).await
+}
+/// Read-only: 564, then own 541, then 564 again. Yields the identity-confirmed proof.
+async fn reconcile_all(
+    coordinator: &mut Coordinator,
+    connection: &mut Connection,
+    epoch: SocketEpoch,
+    gate: &GenerationGate,
+    report: &mut Report,
+) -> anyhow::Result<CorrelatedReplyProof> {
+    let write = coordinator.reconcile(gate, Instant::now())?;
+    send_and_wait(write, coordinator, connection, epoch, gate, report).await?;
+    let write = coordinator.identity_query(gate, Instant::now())?;
+    send_and_wait(write, coordinator, connection, epoch, gate, report).await?;
+    let write = coordinator.final_metadata_query(gate, Instant::now())?;
+    send_and_wait(write, coordinator, connection, epoch, gate, report)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the server never confirmed the new identity"))
+}
+
+enum Outcome {
+    Done(&'static str),
+    /// An earlier attempt was proven not installed and discarded; start again with a fresh key.
+    Retry,
+}
+async fn replace_inner(
+    connection: &mut Connection,
+    db: &super::Database,
+    account: &str,
+    report: &mut Report,
+) -> anyhow::Result<&'static str> {
+    // At most one automatic fresh start per run, and only after a read proved the old one was not installed.
+    for _ in 0..2 {
+        match replace_once(connection, db, account, report).await? {
+            Outcome::Done(message) => return Ok(message),
+            Outcome::Retry => report.line("starting again with a fresh key"),
+        }
+    }
+    anyhow::bail!(
+        "the server did not install the new key after a fresh attempt; not retrying again"
+    )
+}
+/// Read-only: command 564, the PC key id the service holds for this account.
+async fn query_own_key(
+    connection: &mut Connection,
+    account: &str,
+    report: &mut Report,
+) -> anyhow::Result<signal::OwnKey> {
+    let scope = Scope::new(account, DRIVER_GENERATION)?;
+    let request = signal::own_key(&scope, 9_200_001, signal::DevicePlatform::Pc)?;
+    connection.send(564, 0, request.wire_data(&scope)?).await?;
+    let deadline = Instant::now() + DRIVER_STEP_TIMEOUT;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, connection.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for the key id"))??;
+        let Some(frame) = frame.filter(|f| {
+            f.cmd == 564
+                && f.payload
+                    .pointer("/data/reqId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(request.request_id())
+        }) else {
+            continue;
+        };
+        report.line("## own key id reply");
+        for line in super::e2ee_probe::shape(&frame.payload) {
+            report.line(&line);
+        }
+        return Ok(signal::own_key_reply(&request, &scope, &frame.payload)?);
+    }
+}
+async fn replace_once(
+    connection: &mut Connection,
+    db: &super::Database,
+    account: &str,
+    report: &mut Report,
+) -> anyhow::Result<Outcome> {
+    use crate::{
+        app::live::signal_crypto::{provisioning::PendingProvisioner, Cancellation},
+        store::e2ee::provisioning::{CandidateRequest, PendingState, PublicAttemptContext},
+    };
+    use anyhow::Context;
+    let gate = std::sync::Arc::new(GenerationGate::new(DRIVER_GENERATION)?);
+    let mut coordinator = Coordinator::new(Scope::new(account, DRIVER_GENERATION)?);
+    let epoch = coordinator.connected(&gate)?;
+    let owner = account.to_owned();
+    let (current, pending) = db
+        .call(move |s| {
+            Ok((
+                s.e2ee_current_local(&owner)?,
+                s.e2ee_pending_candidate(&owner)?
+                    .map(|c| (c.state(), c.operation_id())),
+            ))
+        })
+        .await?;
+    if pending.is_none() && current.is_some() {
+        // Is the PC key on the service still this client's? The original client (or another install) may
+        // have replaced it since; then the local key is stale and must be rotated, not trusted.
+        let local_registration = {
+            let owner = account.to_owned();
+            let epoch = current.unwrap_or_default();
+            db.call(move |s| s.e2ee_local_registration(&owner, epoch))
+                .await?
+        };
+        let server = query_own_key(connection, account, report).await?;
+        match (server, local_registration) {
+            (signal::OwnKey::Present { registration_id, .. }, Some(local))
+                if registration_id == local =>
+            {
+                return Ok(Outcome::Done(
+                    "this client already holds the account's PC key; nothing to do",
+                ));
+            }
+            _ => report.line(
+                "the PC key on the service is not this client's (another client replaced it); replacing it again",
+            ),
+        }
+    }
+    report.line(&format!(
+        "start: local epoch present={}, staged candidate={}",
+        current.is_some(),
+        pending.is_some()
+    ));
+    // A previous run that died mid-upload: settle by reading only.
+    let restored_run = matches!(
+        pending,
+        Some((PendingState::Sending | PendingState::Unknown, _))
+    );
+    if restored_run {
+        let owner = account.to_owned();
+        let restored = db
+            .call(move |s| {
+                s.e2ee_recover_bundle_uploads(&owner)?;
+                s.e2ee_restore_unknown_upload(&owner)
+            })
+            .await?
+            .context("the earlier upload cannot be restored")?;
+        coordinator.restore(restored, &gate)?;
+        report.line(
+            "an earlier upload attempt has an unknown outcome; checking the account (read-only)",
+        );
+    } else {
+        let operation = match pending {
+            Some((PendingState::Ready, operation)) => operation,
+            _ => {
+                let owner = account.to_owned();
+                let g = gate.clone();
+                let plan = db
+                    .call(move |s| {
+                        s.e2ee_reserve_local_candidate(
+                            &owner,
+                            &CandidateRequest {
+                                platform: crate::store::e2ee::Platform::Pc,
+                                expected_current: current,
+                                stable_intent: DRIVER_INTENT.into(),
+                                prekey_count: DRIVER_PREKEYS,
+                                generation: DRIVER_GENERATION,
+                            },
+                            &g,
+                        )
+                    })
+                    .await?;
+                let operation = plan.operation_id();
+                report.line("reserved a new local identity; generating keys");
+                let mut provisioner = PendingProvisioner::new(
+                    zalo_signal_engine::AccountId::new(account)
+                        .map_err(|_| anyhow::anyhow!("invalid account id"))?,
+                    DRIVER_GENERATION,
+                )?;
+                let candidate = provisioner
+                    .prepare(plan, &gate, &Cancellation::default())
+                    .await?;
+                let g = gate.clone();
+                db.call(move |s| s.e2ee_stage_verified_bundle(&candidate, &g))
+                    .await?;
+                report.line("keys generated and staged durably");
+                operation
+            }
+        };
+        let owner = account.to_owned();
+        let g = gate.clone();
+        let socket = epoch.value();
+        let receipt = db
+            .call(move |s| {
+                s.e2ee_claim_bundle_upload(
+                    &owner,
+                    operation,
+                    &PublicAttemptContext {
+                        generation: DRIVER_GENERATION,
+                        socket_epoch: socket,
+                    },
+                    &g,
+                )
+            })
+            .await?;
+        report.line("upload claimed; sending command 540 (this replaces the account's PC key)");
+        let write = coordinator.upload(receipt, &gate, Instant::now())?;
+        let acked = send_and_wait(write, &mut coordinator, connection, epoch, &gate, report)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no reply to command 540"))?;
+        report.line(&format!(
+            "540 acknowledged by the server (acknowledged={}, iid equals registration id: {:?})",
+            acked.acknowledged(),
+            coordinator
+                .upload
+                .as_ref()
+                .and_then(|u| u.reconciliation.ack_iid_matches())
+        ));
+    }
+    let proof = match reconcile_all(&mut coordinator, connection, epoch, &gate, report).await {
+        Ok(proof) => proof,
+        Err(error) => {
+            // Only a restored attempt may be discarded, and only on proof from a read of the account.
+            if let (true, Some(evidence)) = (restored_run, coordinator.abandon_evidence()) {
+                report.line("the account does not hold the staged key (the upload never took effect); discarding it");
+                let owner = account.to_owned();
+                db.call(move |s| s.e2ee_abandon_unknown_candidate(&owner, &evidence))
+                    .await?;
+                return Ok(Outcome::Retry);
+            }
+            return Err(error);
+        }
+    };
+    report.line("the server's own 541 bundle matches the new identity");
+    let evidence = proof
+        .into_activation_evidence()
+        .context("identity was not confirmed")?;
+    let owner = account.to_owned();
+    let g = gate.clone();
+    let local = db
+        .call(move |s| s.e2ee_activate_pending(&owner, &evidence, &g))
+        .await?;
+    report.line(&format!("activated local epoch {}", local.epoch));
+    Ok(Outcome::Done(
+        "the account's PC key was replaced and is now held by this client",
+    ))
 }
 
 #[cfg(test)]
@@ -783,6 +1213,638 @@ mod tests {
             assert_eq!(proof.socket_epoch(), new.0);
         }
     }
+    /// The live service answers 564 with `{err:0,keyId}` only. Identity is still proven by the own 541
+    /// bundle; the proof simply carries no timestamp.
+    #[tokio::test]
+    async fn reconciliation_succeeds_without_a_server_timestamp_as_the_real_service_omits_it() {
+        let (mut c, gate, epoch) = coordinator();
+        let (_store, receipt, payload) = claimed(epoch.0).await;
+        c.upload(receipt, &gate, Instant::now()).unwrap();
+        c.disconnected();
+        let new = c.connected(&gate).unwrap();
+        let reg = payload["key"]["preKey"]["iKey"]["id"].clone();
+        let request = c.reconcile(&gate, Instant::now()).unwrap();
+        c.accept(reply(&request, json!({"err":0,"keyId":reg})), new, &gate)
+            .unwrap();
+        let request = c.identity_query(&gate, Instant::now()).unwrap();
+        let mut pc = payload["key"].clone();
+        pc["opKeys"] = json!([]);
+        c.accept(
+            reply(
+                &request,
+                json!({"err":0,"keys":[{"uid":"11","err":0,"keys":[pc]}]}),
+            ),
+            new,
+            &gate,
+        )
+        .unwrap();
+        let request = c.final_metadata_query(&gate, Instant::now()).unwrap();
+        let ReadOutcome::Proof(proof) = c
+            .accept(reply(&request, json!({"err":0,"keyId":reg})), new, &gate)
+            .unwrap()
+        else {
+            panic!("expected reconciled proof")
+        };
+        assert!(proof.identity_confirmed() && proof.timestamp().is_none());
+        // A different registration id on the second read still cannot confirm.
+        let (mut c, gate, epoch) = coordinator();
+        let (_store, receipt, payload) = claimed(epoch.0).await;
+        c.upload(receipt, &gate, Instant::now()).unwrap();
+        c.disconnected();
+        let new = c.connected(&gate).unwrap();
+        let reg = payload["key"]["preKey"]["iKey"]["id"].clone();
+        let request = c.reconcile(&gate, Instant::now()).unwrap();
+        c.accept(reply(&request, json!({"err":0,"keyId":reg})), new, &gate)
+            .unwrap();
+        let request = c.identity_query(&gate, Instant::now()).unwrap();
+        let mut pc = payload["key"].clone();
+        pc["opKeys"] = json!([]);
+        c.accept(
+            reply(
+                &request,
+                json!({"err":0,"keys":[{"uid":"11","err":0,"keys":[pc]}]}),
+            ),
+            new,
+            &gate,
+        )
+        .unwrap();
+        let request = c.final_metadata_query(&gate, Instant::now()).unwrap();
+        assert!(c
+            .accept(
+                reply(&request, json!({"err":0,"keyId":reg.as_u64().unwrap() + 1})),
+                new,
+                &gate
+            )
+            .is_err());
+        assert_eq!(c.state(), Some(UploadState::NeedsRecovery));
+    }
+    /// Drives upload → ACK → reconcile with real-service shapes (no timestamps) and returns the
+    /// ACK-only proof and the identity-confirmed proof.
+    async fn confirmed(
+        c: &mut Coordinator,
+        gate: &GenerationGate,
+        epoch: SocketEpoch,
+        receipt: PublicUploadReceipt,
+        payload: &Value,
+    ) -> (CorrelatedReplyProof, CorrelatedReplyProof) {
+        let write = c.upload(receipt, gate, Instant::now()).unwrap();
+        let ReadOutcome::Proof(acked) = c
+            .accept(reply(&write, json!({"err": 0})), epoch, gate)
+            .unwrap()
+        else {
+            panic!("expected ACK proof")
+        };
+        let reg = payload["key"]["preKey"]["iKey"]["id"].clone();
+        let request = c.reconcile(gate, Instant::now()).unwrap();
+        c.accept(reply(&request, json!({"err":0,"keyId":reg})), epoch, gate)
+            .unwrap();
+        let request = c.identity_query(gate, Instant::now()).unwrap();
+        let mut pc = payload["key"].clone();
+        pc["opKeys"] = json!([]);
+        c.accept(
+            reply(
+                &request,
+                json!({"err":0,"keys":[{"uid":"11","err":0,"keys":[pc]}]}),
+            ),
+            epoch,
+            gate,
+        )
+        .unwrap();
+        let request = c.final_metadata_query(gate, Instant::now()).unwrap();
+        let ReadOutcome::Proof(proof) = c
+            .accept(reply(&request, json!({"err":0,"keyId":reg})), epoch, gate)
+            .unwrap()
+        else {
+            panic!("expected reconciled proof")
+        };
+        (acked, proof)
+    }
+    #[tokio::test]
+    async fn only_an_identity_confirmed_proof_activates_and_activation_is_atomic_and_one_shot() {
+        let (mut c, gate, epoch) = coordinator();
+        let (mut store, receipt, payload) = claimed(epoch.0).await;
+        let operation = receipt.operation_id();
+        let local = receipt.local().clone();
+        let (acked, proof) = confirmed(&mut c, &gate, epoch, receipt, &payload).await;
+        // An ACK alone (even a successful one) is not activation authority.
+        assert!(acked.acknowledged() && acked.into_activation_evidence().is_none());
+        assert_eq!(store.e2ee_current_local("11").unwrap(), None);
+        let evidence = proof.into_activation_evidence().unwrap();
+
+        // Tampered evidence is rejected and changes nothing.
+        let mut forged = crate::store::e2ee::provisioning::ActivationEvidence {
+            ..clone_evidence(&evidence)
+        };
+        forged.attempt_hash[0] ^= 1;
+        assert!(store.e2ee_activate_pending("11", &forged, &gate).is_err());
+        let mut forged = clone_evidence(&evidence);
+        forged.payload_hash[0] ^= 1;
+        assert!(store.e2ee_activate_pending("11", &forged, &gate).is_err());
+        assert_eq!(store.e2ee_current_local("11").unwrap(), None);
+        assert!(store.e2ee_pending_candidate("11").unwrap().is_some());
+
+        let activated = store.e2ee_activate_pending("11", &evidence, &gate).unwrap();
+        assert_eq!(activated.epoch, local.epoch);
+        assert_eq!(
+            store.e2ee_current_local("11").unwrap(),
+            Some(local.epoch.parse().unwrap())
+        );
+        let identity =
+            CandidateIdentity::from_public_payload(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        store
+            .e2ee_validate_local_identity(
+                "11",
+                &activated,
+                identity.registration_id(),
+                identity.identity_key(),
+            )
+            .unwrap();
+        assert!(store.e2ee_pending_candidate("11").unwrap().is_none());
+        assert!(store.e2ee_restore_unknown_upload("11").unwrap().is_none());
+        // One shot: the staged registration is gone, so replay cannot activate again or reclaim.
+        assert!(store.e2ee_activate_pending("11", &evidence, &gate).is_err());
+        assert!(store
+            .e2ee_claim_bundle_upload(
+                "11",
+                operation,
+                &PublicAttemptContext {
+                    generation: 7,
+                    socket_epoch: epoch.0
+                },
+                &gate
+            )
+            .is_err());
+        // A later rotation may reserve a new candidate against the new current epoch.
+        assert!(store
+            .e2ee_reserve_local_candidate(
+                "11",
+                &CandidateRequest {
+                    platform: crate::store::e2ee::Platform::Pc,
+                    expected_current: store.e2ee_current_local("11").unwrap(),
+                    stable_intent: "next-rotation".into(),
+                    prekey_count: 1,
+                    generation: 7,
+                },
+                &gate,
+            )
+            .is_ok());
+    }
+    fn clone_evidence(
+        e: &crate::store::e2ee::provisioning::ActivationEvidence,
+    ) -> crate::store::e2ee::provisioning::ActivationEvidence {
+        crate::store::e2ee::provisioning::ActivationEvidence {
+            account: e.account.clone(),
+            operation_id: e.operation_id,
+            attempt_id: e.attempt_id,
+            generation: e.generation,
+            payload_hash: e.payload_hash,
+            attempt_hash: e.attempt_hash,
+            identity_confirmed: e.identity_confirmed,
+            timestamp: e.timestamp,
+        }
+    }
+    /// Own 541 outcomes after a correct `keyId`: the live service omits the PC bundle (accepted);
+    /// a listed PC bundle must be ours; two PC bundles are never accepted.
+    #[tokio::test]
+    async fn own_541_may_omit_the_asking_device_but_a_listed_pc_bundle_must_match() {
+        for case in ["absent", "different", "duplicate"] {
+            let (mut c, gate, epoch) = coordinator();
+            let (_store, receipt, payload) = claimed(epoch.0).await;
+            c.upload(receipt, &gate, Instant::now()).unwrap();
+            c.disconnected();
+            let new = c.connected(&gate).unwrap();
+            let reg = payload["key"]["preKey"]["iKey"]["id"].clone();
+            let request = c.reconcile(&gate, Instant::now()).unwrap();
+            c.accept(reply(&request, json!({"err":0,"keyId":reg})), new, &gate)
+                .unwrap();
+            let request = c.identity_query(&gate, Instant::now()).unwrap();
+            let mut ours = payload["key"].clone();
+            ours["opKeys"] = json!([]);
+            let mut web = ours.clone();
+            web["deviceId"] = json!(1);
+            let mut other = ours.clone();
+            other["preKey"]["iKey"]["key"] = json!(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                [5u8; 33]
+            ));
+            let keys = match case {
+                "absent" => json!([web]),
+                "different" => json!([web, other]),
+                _ => json!([ours.clone(), ours]),
+            };
+            let outcome = c.accept(
+                reply(
+                    &request,
+                    json!({"err":0,"keys":[{"uid":"11","err":0,"keys":keys}]}),
+                ),
+                new,
+                &gate,
+            );
+            if case == "absent" {
+                outcome.unwrap();
+                let request = c.final_metadata_query(&gate, Instant::now()).unwrap();
+                assert!(matches!(
+                    c.accept(reply(&request, json!({"err":0,"keyId":reg})), new, &gate),
+                    Ok(ReadOutcome::Proof(p)) if p.identity_confirmed()
+                ));
+            } else {
+                assert!(outcome.is_err());
+                // A different listed identity proves "not installed"; a duplicate (rejected while
+                // parsing the reply) proves nothing and never confirms.
+                assert_eq!(c.abandon_evidence().is_some(), case == "different");
+                assert_ne!(c.state(), Some(UploadState::IdentityConfirmed));
+                if case == "different" {
+                    assert_eq!(c.state(), Some(UploadState::NeedsRecovery));
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn abandoning_requires_an_unknown_upload_and_matching_evidence_and_keeps_other_state() {
+        use crate::store::e2ee::provisioning::AbandonEvidence;
+        let (_c, gate, epoch) = coordinator();
+        let (mut store, receipt, _) = claimed(epoch.0).await;
+        let evidence = |hash_flip: bool| AbandonEvidence {
+            account: "11".into(),
+            operation_id: receipt.operation_id(),
+            payload_hash: *receipt.payload_hash(),
+            attempt_hash: {
+                let mut h = *receipt.attempt_hash();
+                h[0] ^= u8::from(hash_flip);
+                h
+            },
+        };
+        // Still `sending`: the request may be in flight, so it cannot be discarded.
+        assert!(store
+            .e2ee_abandon_unknown_candidate("11", &evidence(false))
+            .is_err());
+        store.e2ee_recover_bundle_uploads("11").unwrap();
+        assert!(store
+            .e2ee_abandon_unknown_candidate("11", &evidence(true))
+            .is_err());
+        let mut other = evidence(false);
+        other.account = "12".into();
+        assert!(store.e2ee_abandon_unknown_candidate("11", &other).is_err());
+        assert!(store.e2ee_pending_candidate("11").unwrap().is_some());
+        store
+            .e2ee_abandon_unknown_candidate("11", &evidence(false))
+            .unwrap();
+        assert!(store.e2ee_pending_candidate("11").unwrap().is_none());
+        assert_eq!(store.e2ee_current_local("11").unwrap(), None);
+        // The same intent can now be reserved again, and replaying the abandonment fails.
+        assert!(store
+            .e2ee_abandon_unknown_candidate("11", &evidence(false))
+            .is_err());
+        assert!(store
+            .e2ee_reserve_local_candidate(
+                "11",
+                &CandidateRequest {
+                    platform: crate::store::e2ee::Platform::Pc,
+                    expected_current: None,
+                    stable_intent: "fixture-new-pc".into(),
+                    prekey_count: 1,
+                    generation: 7,
+                },
+                &gate,
+            )
+            .is_ok());
+    }
+    #[tokio::test]
+    async fn restart_restores_an_unknown_upload_query_only_and_it_can_still_activate() {
+        let (c, gate, epoch) = coordinator();
+        drop(c);
+        let (mut store, receipt, payload) = claimed(epoch.0).await;
+        // Simulate the process dying after the request left: the row becomes `unknown`.
+        assert_eq!(store.e2ee_recover_bundle_uploads("11").unwrap(), 1);
+        let restored = store.e2ee_restore_unknown_upload("11").unwrap().unwrap();
+        assert_eq!(restored.attempt_hash(), receipt.attempt_hash());
+        // No second upload can be claimed for it.
+        assert!(store
+            .e2ee_claim_bundle_upload(
+                "11",
+                restored.operation_id(),
+                &PublicAttemptContext {
+                    generation: 7,
+                    socket_epoch: epoch.0
+                },
+                &gate
+            )
+            .is_err());
+        let (mut c, gate, new) = coordinator();
+        c.restore(restored, &gate).unwrap();
+        assert_eq!(c.state(), Some(UploadState::Unknown));
+        let reg = payload["key"]["preKey"]["iKey"]["id"].clone();
+        let request = c.reconcile(&gate, Instant::now()).unwrap();
+        c.accept(reply(&request, json!({"err":0,"keyId":reg})), new, &gate)
+            .unwrap();
+        let request = c.identity_query(&gate, Instant::now()).unwrap();
+        let mut pc = payload["key"].clone();
+        pc["opKeys"] = json!([]);
+        c.accept(
+            reply(
+                &request,
+                json!({"err":0,"keys":[{"uid":"11","err":0,"keys":[pc]}]}),
+            ),
+            new,
+            &gate,
+        )
+        .unwrap();
+        let request = c.final_metadata_query(&gate, Instant::now()).unwrap();
+        let ReadOutcome::Proof(proof) = c
+            .accept(reply(&request, json!({"err":0,"keyId":reg})), new, &gate)
+            .unwrap()
+        else {
+            panic!("expected reconciled proof")
+        };
+        let evidence = proof.into_activation_evidence().unwrap();
+        assert!(store.e2ee_activate_pending("11", &evidence, &gate).is_ok());
+    }
+    mod driver {
+        use super::*;
+        use crate::app::live::runtime::{wire, Database};
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+
+        /// A fake account service on plain websocket. It authenticates, then answers the commands the
+        /// driver sends, like the real service does for a PC registration. Returns the commands seen.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mode {
+            Normal,
+            /// The key is installed, then the connection dies before the reply.
+            DropAfterInstall,
+            /// The request is refused (like an oversize frame) and the connection closes.
+            RejectAndDrop,
+        }
+        async fn server(
+            key: Arc<Mutex<Option<Value>>>,
+            mode: Mode,
+        ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<u16>>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                use base64::{engine::general_purpose::STANDARD, Engine};
+                use std::io::Write;
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut z =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                z.write_all(br#"{"error_code":0,"data":{"qCmds":[{"cmd":510,"subCmd":0}]}}"#)
+                    .unwrap();
+                let auth = wire::encode_frame(
+                    1,
+                    0,
+                    &json!({"error_code":0,"key":STANDARD.encode([7u8; 32]),"encrypt":1,"data":STANDARD.encode(z.finish().unwrap())}),
+                )
+                .unwrap();
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Binary(auth))
+                    .await
+                    .unwrap();
+                let mut seen = Vec::new();
+                while let Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) =
+                    socket.next().await
+                {
+                    let cmd = u16::from(bytes[1]) | (u16::from(bytes[2]) << 8);
+                    let body: Value = serde_json::from_slice(&bytes[4..]).unwrap();
+                    seen.push(cmd);
+                    let reply = match cmd {
+                        540 => {
+                            if mode == Mode::RejectAndDrop {
+                                return seen;
+                            }
+                            *key.lock().unwrap() = Some(body["data"]["key"].clone());
+                            if mode == Mode::DropAfterInstall {
+                                return seen;
+                            }
+                            let id = body["data"]["key"]["preKey"]["iKey"]["id"].clone();
+                            json!({"err":0,"iid":id,"keyExists":0,"ts":1700000000000u64,"devices":[]})
+                        }
+                        564 => {
+                            // Before any install the account still holds an old PC key (id 4242).
+                            let id = key
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .map(|k| k["preKey"]["iKey"]["id"].clone())
+                                .unwrap_or(json!(4242));
+                            json!({"err": 0, "keyId": id})
+                        }
+                        // Like the live service: the asking device (PC) is left out of its own list.
+                        541 => match key.lock().unwrap().clone() {
+                            Some(mut web) => {
+                                web["opKeys"] = json!([]);
+                                web["deviceId"] = json!(1);
+                                json!({"err":0,"keys":[{"uid":"11","err":0,"keys":[web]}]})
+                            }
+                            None => json!({"err":0,"keys":[{"uid":"11","err":0,"keys":[]}]}),
+                        },
+                        _ => continue,
+                    };
+                    let frame = wire::encode_frame(
+                        cmd,
+                        0,
+                        &json!({"error_code":0,"encrypt":0,"data":{"error_code":0,"data":{"reqId":body["reqId"],"data":reply}}}),
+                    )
+                    .unwrap();
+                    if socket
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                seen
+            });
+            (address, task)
+        }
+        async fn connect(address: std::net::SocketAddr) -> Connection {
+            let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+                .await
+                .unwrap();
+            let mut connection = Connection::connected(socket, "11");
+            assert_eq!(connection.next().await.unwrap().unwrap().cmd, 1);
+            connection
+        }
+
+        #[tokio::test]
+        async fn replaces_the_pc_key_once_and_a_crash_mid_upload_is_only_ever_reconciled_by_reading(
+        ) {
+            let scratch =
+                std::env::temp_dir().join(format!("zalo-driver-{:x}", rand::random::<u64>()));
+            std::fs::create_dir(&scratch).unwrap();
+            let profile = Arc::new(crate::profile::Profile::at_root(&scratch, "fixture").unwrap());
+            let db = Database::open(profile, "11".into()).await.unwrap();
+            let report = scratch.join("report.txt");
+            let key = Arc::new(Mutex::new(None));
+
+            // Run 1: the process "dies" after command 540 left. Nothing may be activated.
+            let (address, task) = server(key.clone(), Mode::DropAfterInstall).await;
+            let mut connection = connect(address).await;
+            replace_pc_key(&mut connection, &db, "11", &report).await;
+            drop(connection);
+            assert_eq!(task.await.unwrap(), [540]);
+            let text = std::fs::read_to_string(&report).unwrap();
+            assert!(
+                text.contains("upload claimed") && text.contains("RESULT: stopped"),
+                "{text}"
+            );
+            assert_eq!(db.call(|s| s.e2ee_current_local("11")).await.unwrap(), None);
+            assert!(db
+                .call(|s| s.e2ee_restore_unknown_upload("11").map(|r| r.is_some()))
+                .await
+                .unwrap());
+
+            // Run 2: a new process settles it by reading only (564, 541, 564), with no second 540.
+            let (address, task) = server(key.clone(), Mode::Normal).await;
+            let mut connection = connect(address).await;
+            replace_pc_key(&mut connection, &db, "11", &report).await;
+            drop(connection);
+            assert_eq!(task.await.unwrap(), [564, 541, 564]);
+            let text = std::fs::read_to_string(&report).unwrap();
+            assert!(
+                text.contains("activated local epoch")
+                    && text.contains("RESULT: the account's PC key was replaced"),
+                "{text}"
+            );
+            assert!(db
+                .call(|s| s.e2ee_current_local("11"))
+                .await
+                .unwrap()
+                .is_some());
+
+            // Run 3: already held, so it does nothing at all on the wire.
+            let (address, task) = server(key.clone(), Mode::Normal).await;
+            let mut connection = connect(address).await;
+            replace_pc_key(&mut connection, &db, "11", &report).await;
+            drop(connection);
+            // Only a read of the key id (564) happens: it still matches, so nothing is sent or changed.
+            assert_eq!(task.await.unwrap(), [564]);
+            let text = std::fs::read_to_string(&report).unwrap();
+            assert!(text.contains("nothing to do"), "{text}");
+            // The report never carries key material: no long base64-looking token on any line.
+            for word in text.split_whitespace() {
+                assert!(
+                    word.len() < 32
+                        || !word
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)),
+                    "key-like token in report: {word}"
+                );
+            }
+            std::fs::remove_dir_all(scratch).unwrap();
+        }
+
+        #[tokio::test]
+        async fn an_upload_the_server_never_took_is_discarded_on_proof_and_retried_once_with_a_fresh_key(
+        ) {
+            let scratch =
+                std::env::temp_dir().join(format!("zalo-driver-{:x}", rand::random::<u64>()));
+            std::fs::create_dir(&scratch).unwrap();
+            let profile = Arc::new(crate::profile::Profile::at_root(&scratch, "fixture").unwrap());
+            let db = Database::open(profile, "11".into()).await.unwrap();
+            let report = scratch.join("report.txt");
+            let key = Arc::new(Mutex::new(None));
+
+            // Run 1: the server refuses the frame and closes (what close code 1009 looked like).
+            let (address, task) = server(key.clone(), Mode::RejectAndDrop).await;
+            let mut connection = connect(address).await;
+            replace_pc_key(&mut connection, &db, "11", &report).await;
+            drop(connection);
+            assert_eq!(task.await.unwrap(), [540]);
+            assert!(db
+                .call(|s| s.e2ee_restore_unknown_upload("11").map(|r| r.is_some()))
+                .await
+                .unwrap());
+            assert!(key.lock().unwrap().is_none());
+
+            // Run 2: a read shows the account holds a different key, so the stale candidate is discarded
+            // and exactly one new 540 follows.
+            let (address, task) = server(key.clone(), Mode::Normal).await;
+            let mut connection = connect(address).await;
+            replace_pc_key(&mut connection, &db, "11", &report).await;
+            drop(connection);
+            let seen = task.await.unwrap();
+            assert_eq!(seen, [564, 540, 564, 541, 564], "{seen:?}");
+            let text = std::fs::read_to_string(&report).unwrap();
+            assert!(
+                text.contains("discarding it") && text.contains("starting again with a fresh key"),
+                "{text}"
+            );
+            assert!(text.contains("activated local epoch"), "{text}");
+            assert!(db
+                .call(|s| s.e2ee_current_local("11"))
+                .await
+                .unwrap()
+                .is_some());
+            std::fs::remove_dir_all(scratch).unwrap();
+        }
+
+        /// The original client (or another install) replaced the PC key after this client activated its own:
+        /// the local epoch is stale, so the driver rotates to a new epoch instead of trusting it.
+        #[tokio::test]
+        async fn a_stale_local_key_is_replaced_again_with_a_new_epoch() {
+            let scratch =
+                std::env::temp_dir().join(format!("zalo-driver-{:x}", rand::random::<u64>()));
+            std::fs::create_dir(&scratch).unwrap();
+            let profile = Arc::new(crate::profile::Profile::at_root(&scratch, "fixture").unwrap());
+            let db = Database::open(profile, "11".into()).await.unwrap();
+            let report = scratch.join("report.txt");
+            let (address, task) = server(Arc::new(Mutex::new(None)), Mode::Normal).await;
+            let mut connection = connect(address).await;
+            replace_pc_key(&mut connection, &db, "11", &report).await;
+            drop(connection);
+            task.await.unwrap();
+            let first = db
+                .call(|s| s.e2ee_current_local("11"))
+                .await
+                .unwrap()
+                .unwrap();
+            // A fresh service state: it holds some other key (id 4242), not the one this client activated.
+            let (address, task) = server(Arc::new(Mutex::new(None)), Mode::Normal).await;
+            let mut connection = connect(address).await;
+            replace_pc_key(&mut connection, &db, "11", &report).await;
+            drop(connection);
+            let seen = task.await.unwrap();
+            assert_eq!(seen, [564, 540, 564, 541, 564], "{seen:?}");
+            let text = std::fs::read_to_string(&report).unwrap();
+            assert!(text.contains("another client replaced it"), "{text}");
+            let second = db
+                .call(|s| s.e2ee_current_local("11"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(second > first, "{first} -> {second}");
+            std::fs::remove_dir_all(scratch).unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_normal_run_sends_540_once_then_reads_and_activates() {
+            let scratch =
+                std::env::temp_dir().join(format!("zalo-driver-{:x}", rand::random::<u64>()));
+            std::fs::create_dir(&scratch).unwrap();
+            let profile = Arc::new(crate::profile::Profile::at_root(&scratch, "fixture").unwrap());
+            let db = Database::open(profile, "11".into()).await.unwrap();
+            let report = scratch.join("report.txt");
+            let (address, task) = server(Arc::new(Mutex::new(None)), Mode::Normal).await;
+            let mut connection = connect(address).await;
+            replace_pc_key(&mut connection, &db, "11", &report).await;
+            drop(connection);
+            assert_eq!(task.await.unwrap(), [540, 564, 541, 564]);
+            let text = std::fs::read_to_string(&report).unwrap();
+            assert!(
+                text.contains("## reply command 540") && text.contains("data.data.err: number = 0"),
+                "{text}"
+            );
+            assert!(text.contains("activated local epoch"), "{text}");
+            assert!(db
+                .call(|s| s.e2ee_current_local("11"))
+                .await
+                .unwrap()
+                .is_some());
+            std::fs::remove_dir_all(scratch).unwrap();
+        }
+    }
     #[tokio::test]
     async fn stale_socket_cancel_deadline_and_changed_metadata_cannot_mint_proofs() {
         let (mut c, gate, epoch) = coordinator();
@@ -811,7 +1873,7 @@ mod tests {
         state
             .begin_metadata(signal::OwnKey::Present {
                 registration_id: 1234,
-                submitted_at: 1,
+                submitted_at: Some(1),
             })
             .unwrap();
         let request = signal::get_bundle(
@@ -839,14 +1901,14 @@ mod tests {
         assert!(state
             .finish_metadata(signal::OwnKey::Present {
                 registration_id: 1234,
-                submitted_at: 2
+                submitted_at: Some(2)
             })
             .is_err());
         assert_eq!(state.state(), UploadState::NeedsRecovery);
         assert!(state
             .finish_metadata(signal::OwnKey::Present {
                 registration_id: 1234,
-                submitted_at: 1
+                submitted_at: Some(1)
             })
             .is_err());
         assert!(!state.needs_identity());

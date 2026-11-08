@@ -327,7 +327,9 @@ fn public_payload(plan: &ProvisionPlan, bundle: &engine::PublicBundle) -> Result
             .collect::<Result<_>>()?,
     };
     let scope = signal::Scope::new(plan.account(), plan.generation())?;
-    let wire = signal::submit_bundle(&scope, 0, &public, false)?.wire_data(&scope)?;
+    // `delSS: 1`, as the original client sends (observed on the wire): the service drops this device's old
+    // sessions and tells peers to initialize new ones toward the new key.
+    let wire = signal::submit_bundle(&scope, 0, &public, true)?.wire_data(&scope)?;
     let payload = serde_json::to_vec(&wire["data"])?;
     ensure!(
         !payload.is_empty() && payload.len() <= e2ee::provisioning::MAX_PUBLIC_BUNDLE_BYTES,

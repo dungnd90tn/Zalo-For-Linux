@@ -23,7 +23,7 @@ impl Default for Projection {
 }
 impl Projection {
     pub fn permits(&self, thread: &str) -> bool {
-        self.status == LivePrivacyStatus::Ready
+        self.status != LivePrivacyStatus::Checking
             && (!self.hidden.contains(thread) || self.unlocked.as_deref() == Some(thread))
     }
     pub fn event(&self, mut event: LiveEvent) -> Option<LiveEvent> {
@@ -33,13 +33,13 @@ impl Projection {
             }
             LiveEvent::Ready { conversations, .. }
             | LiveEvent::DirectoryChanged { conversations, .. } => conversations.retain(|c| {
-                self.status == LivePrivacyStatus::Ready && !self.hidden.contains(&c.id)
+                self.status != LivePrivacyStatus::Checking && !self.hidden.contains(&c.id)
             }),
             LiveEvent::DirectoryPage { entries, .. } => entries.retain(|e| {
-                self.status == LivePrivacyStatus::Ready && !self.hidden.contains(&e.thread_id())
+                self.status != LivePrivacyStatus::Checking && !self.hidden.contains(&e.thread_id())
             }),
             LiveEvent::HiddenMatches { candidates, .. } => candidates.retain(|c| {
-                self.status == LivePrivacyStatus::Ready && self.hidden.contains(&c.thread_id)
+                self.status != LivePrivacyStatus::Checking && self.hidden.contains(&c.thread_id)
             }),
             LiveEvent::Sent {
                 account_id,
@@ -74,6 +74,8 @@ impl Projection {
                 return None
             }
             LiveEvent::Page { thread, .. }
+            | LiveEvent::Overview { thread, .. }
+            | LiveEvent::OverviewFailed { thread, .. }
             | LiveEvent::MessagesRefreshed { thread, .. }
             | LiveEvent::MessagesRefreshFailed { thread, .. }
             | LiveEvent::SenderNames { thread, .. }
@@ -148,6 +150,22 @@ impl Privacy {
                 })
         }));
     }
+    /// Records the remembered hidden set as the current policy (see `MessageStore::provisional_live_privacy`).
+    pub fn provisional(
+        events: &Events,
+        hidden: Vec<String>,
+        status: LivePrivacyStatus,
+    ) -> Result<()> {
+        let mut state = events
+            .privacy
+            .write()
+            .map_err(|_| anyhow::anyhow!("Privacy state unavailable"))?;
+        state.status = status;
+        state.revision = state.revision.wrapping_add(1);
+        state.hidden = hidden.into_iter().collect();
+        state.unlocked = None;
+        Ok(())
+    }
     pub async fn announce(events: &Events) -> Result<()> {
         let state = events
             .privacy
@@ -218,17 +236,12 @@ impl Privacy {
                 if let Ok(Err(error)) = other {
                     record_directory_failure(&error);
                 }
+                // Keep the interface usable: the last confirmed hidden set stays in force, any unlock ends.
                 let account = events.account.clone();
-                db.call(move |s| s.begin_live_privacy(&account)).await?;
-                {
-                    let mut state = events
-                        .privacy
-                        .write()
-                        .map_err(|_| anyhow::anyhow!("Privacy state unavailable"))?;
-                    state.status = LivePrivacyStatus::Failed;
-                    state.revision = state.revision.wrapping_add(1);
-                    state.unlocked = None;
-                }
+                let remembered = db
+                    .call(move |s| s.provisional_live_privacy(&account))
+                    .await?;
+                Self::provisional(events, remembered, LivePrivacyStatus::Failed)?;
                 Self::announce(events).await?;
                 if let Some(attempt) = self.pending.take() {
                     self.unlock_result(events, &attempt, HiddenUnlockOutcome::Unavailable)
@@ -374,22 +387,8 @@ impl Privacy {
     ) -> Result<Option<LiveCommand>> {
         match command {
             LiveCommand::RefreshPrivacy => {
-                let changed = {
-                    let mut state = events
-                        .privacy
-                        .write()
-                        .map_err(|_| anyhow::anyhow!("Privacy state unavailable"))?;
-                    if state.status == LivePrivacyStatus::Failed {
-                        state.status = LivePrivacyStatus::Checking;
-                        state.revision = state.revision.wrapping_add(1);
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if changed {
-                    Self::announce(events).await?;
-                }
+                // The remembered policy stays in force while the check runs again, so the interface is not
+                // covered meanwhile; the result replaces it when it arrives.
                 self.start(session.clone(), transports);
             }
             LiveCommand::RelockHidden => self.relock(db, events).await?,
@@ -454,7 +453,9 @@ impl Privacy {
                     self.start(session.clone(), transports);
                 }
                 let requested = match &command {
-                    LiveCommand::Load { thread, .. } => Some(thread.clone()),
+                    LiveCommand::Load { thread, .. } | LiveCommand::Overview { thread, .. } => {
+                        Some(thread.clone())
+                    }
                     LiveCommand::Open {
                         kind, remote_id, ..
                     } => Some(Target::new(*kind, remote_id)?.thread_id()),
@@ -520,7 +521,8 @@ mod avatar_tests {
         assert_eq!(count(&state), 2);
         state.unlocked = None;
         assert_eq!(count(&state), 1);
+        // A failed re-check keeps the known policy in force: hidden stays hidden, the rest stays visible.
         state.status = LivePrivacyStatus::Failed;
-        assert_eq!(count(&state), 0);
+        assert_eq!(count(&state), 1);
     }
 }

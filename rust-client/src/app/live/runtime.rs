@@ -16,6 +16,20 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+#[cfg(feature = "signal-crypto")]
+mod e2ee_compose;
+#[cfg(feature = "signal-crypto")]
+mod e2ee_init_devices;
+#[cfg(feature = "signal-crypto")]
+mod e2ee_init_peer;
+mod e2ee_probe;
+#[cfg(feature = "signal-crypto")]
+mod e2ee_receive;
+#[cfg(feature = "signal-crypto")]
+mod e2ee_send;
+#[cfg(feature = "signal-crypto")]
+mod e2ee_send_probe;
+mod e2ee_threads;
 #[cfg(test)]
 mod integration_tests;
 mod privacy;
@@ -652,7 +666,10 @@ impl Drop for DirectoryRun {
         self.task.abort();
     }
 }
+/// Opening a conversation refreshes names and avatars (friends and groups) at most this often.
+const DIRECTORY_REFRESH_ON_OPEN: Duration = Duration::from_secs(120);
 struct DirectorySync {
+    last_started: Option<tokio::time::Instant>,
     running: Option<DirectoryRun>,
     pending: Option<u64>,
     updates_tx: watch::Sender<u64>,
@@ -664,6 +681,7 @@ impl DirectorySync {
     fn new() -> Self {
         let (updates_tx, updates_rx) = watch::channel(0);
         Self {
+            last_started: None,
             running: None,
             pending: None,
             updates_tx,
@@ -685,6 +703,21 @@ impl DirectorySync {
             return;
         }
         self.start(generation, session, db, transports);
+    }
+    /// A changed group name, group photo or contact avatar shows up when its conversation is opened: the same
+    /// friend and group lists as the startup sync, skipped while one runs or one started recently.
+    fn refresh_on_open(
+        &mut self,
+        session: Arc<VerifiedSession>,
+        db: DatabaseHandle,
+        transports: &Transports,
+    ) {
+        let recent = self
+            .last_started
+            .is_some_and(|at| at.elapsed() < DIRECTORY_REFRESH_ON_OPEN);
+        if self.running.is_none() && !recent {
+            self.start(0, session, db, transports);
+        }
     }
     fn start(
         &mut self,
@@ -722,6 +755,7 @@ impl DirectorySync {
                 return;
             }
         };
+        self.last_started = Some(tokio::time::Instant::now());
         let (cancel, rx) = watch::channel(false);
         let mut sink = RuntimeDirectorySink {
             account: session.account_id().into(),
@@ -1012,6 +1046,16 @@ struct Connection {
     last_pong: tokio::time::Instant,
     last_ping: Option<i64>,
     authenticated_at: Option<tokio::time::Instant>,
+    /// Ask for the E2EE conversation list after authenticating. On for real connections only, so
+    /// scripted test sockets that expect an exact frame sequence are unaffected.
+    list_encrypted: bool,
+    /// Opt-in live decryption of pushed E2EE chat messages (report path); real connections only.
+    #[cfg(feature = "signal-crypto")]
+    e2ee_receive_report: Option<std::path::PathBuf>,
+    #[cfg(feature = "signal-crypto")]
+    e2ee_receive: Option<e2ee_receive::Receiver>,
+    #[cfg(feature = "signal-crypto")]
+    e2ee_http: Option<e2ee_send::E2eeHttp>,
 }
 impl Connection {
     async fn send(&mut self, cmd: u16, sub: u8, data: Value) -> Result<()> {
@@ -1108,7 +1152,13 @@ impl Connection {
         .await
         .map_err(|_| NetworkFailure::new(LiveStage::Connect, LiveCategory::Timeout))?
         .map_err(|e| NetworkFailure::socket(LiveStage::Connect, e))?;
-        Ok(Self::connected(socket, session.account_id()))
+        let mut connection = Self::connected(socket, session.account_id());
+        connection.list_encrypted = true;
+        #[cfg(feature = "signal-crypto")]
+        {
+            connection.e2ee_receive_report = e2ee_receive::target();
+        }
+        Ok(connection)
     }
     fn connected(socket: Socket, account: &str) -> Self {
         Self {
@@ -1121,6 +1171,13 @@ impl Connection {
             last_pong: tokio::time::Instant::now(),
             last_ping: None,
             authenticated_at: None,
+            list_encrypted: false,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_receive_report: None,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_receive: None,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_http: None,
         }
     }
     fn request(&mut self) -> String {
@@ -1233,6 +1290,54 @@ impl Connection {
                     return Err(WireError::Oversize.into());
                 }
                 events.connection(LiveConnection::Online).await?;
+                // Opt-in and read-only (E2EE_LIVE_PLAN.md stage 1); runs before any queue is requested.
+                if let Some(path) = e2ee_probe::target().filter(|_| e2ee_probe::claim()) {
+                    self.e2ee_probe(&path).await;
+                }
+                // Opt-in account change (E2EE_LIVE_PLAN.md stage 2): replace this account's PC key.
+                #[cfg(feature = "signal-crypto")]
+                if let Some(path) =
+                    signal_transport::replace_target().filter(|_| signal_transport::claim_run())
+                {
+                    signal_transport::replace_pc_key(self, db, &events.account, &path).await;
+                }
+                // Session init with this account's other devices (what the original does after a new bundle).
+                #[cfg(feature = "signal-crypto")]
+                if let Some(path) =
+                    e2ee_init_devices::target().filter(|_| e2ee_init_devices::claim())
+                {
+                    self.e2ee_init_subdevices(db, &path).await;
+                }
+                // Handshake with one contact (what the original does before the first message to a new peer).
+                #[cfg(feature = "signal-crypto")]
+                if let Some((path, peer)) =
+                    e2ee_init_peer::target().filter(|_| e2ee_init_peer::claim())
+                {
+                    self.e2ee_init_peer(db, &path, peer.as_deref()).await;
+                }
+                // Send one real encrypted text (opt-in; the text goes to the chosen contact).
+                #[cfg(feature = "signal-crypto")]
+                if let Some((path, text, peer)) = e2ee_send::target().filter(|_| e2ee_send::claim())
+                {
+                    self.e2ee_send_text(db, events, &path, &text, peer.as_deref())
+                        .await;
+                }
+                #[cfg(feature = "signal-crypto")]
+                if let Some((path, peer)) =
+                    e2ee_send_probe::target().filter(|_| e2ee_send_probe::claim())
+                {
+                    self.e2ee_send_probe(db, &path, peer.as_deref()).await;
+                }
+                #[cfg(not(feature = "signal-crypto"))]
+                if let Some(path) =
+                    e2ee_probe::replace_requested().filter(|_| e2ee_probe::claim_replace())
+                {
+                    e2ee_probe::note_unavailable(&path);
+                }
+                // Show end-to-end encrypted conversations (locked, unreadable here) instead of hiding them.
+                if self.list_encrypted {
+                    self.sync_encrypted_threads(db, events).await;
+                }
                 for (cmd, sub) in self.queues.clone() {
                     self.offline(db, &events.account, cmd, sub, true, None)
                         .await?;
@@ -1272,6 +1377,11 @@ impl Connection {
                         error.context.subcommand = Some(frame.sub_cmd);
                         error
                     })?;
+                let silent: Vec<(String, String)> = parsed
+                    .iter()
+                    .filter(|i| i.list_silent)
+                    .map(|i| (i.message.thread_id.clone(), i.message.id.clone()))
+                    .collect();
                 let messages: Vec<_> = parsed
                     .into_iter()
                     .map(|i| (i.message, i.client_id, i.info, i.media))
@@ -1382,11 +1492,23 @@ impl Connection {
                 let cursor = cursors.first().cloned();
                 let stored = db
                     .call_with(StorageOperation::ReceiveBatch, move |s| {
-                        s.receive_batch_with_media(
+                        let mut stored = s.receive_batch_with_media(
                             &account,
                             &messages,
                             cursor.as_ref().map(|(q, id)| (q.as_str(), id.as_str())),
-                        )
+                        )?;
+                        if !silent.is_empty() {
+                            // Birthday cards and Official Account broadcasts never move a conversation in the list.
+                            let refreshed = s.mark_list_silent(&account, &silent)?;
+                            for (_, conversation) in &mut stored {
+                                if let Some(update) =
+                                    refreshed.iter().find(|c| c.id == conversation.id)
+                                {
+                                    *conversation = update.clone();
+                                }
+                            }
+                        }
+                        Ok(stored)
                     })
                     .await?;
                 for (queue, id) in cursors.into_iter().skip(1) {
@@ -1421,8 +1543,15 @@ impl Connection {
                     .await?;
                 }
             }
+            // Encrypted chat messages: decrypt with the engine and store them (needs this client's E2EE key).
+            #[cfg(feature = "signal-crypto")]
+            551 => {
+                self.e2ee_receive_push(&frame, db, events).await;
+            }
             // These encrypted queues are intentionally not consumed or acknowledged.
-            551 | 552 | 535 | 543 | 544 | 548 | 561 | 580 | 581 | 582 => {}
+            #[cfg(not(feature = "signal-crypto"))]
+            551 => {}
+            552 | 535 | 543 | 544 | 548 | 561 | 580 | 581 | 582 => {}
             _ => {}
         }
         Ok(())
@@ -1689,6 +1818,7 @@ async fn handle_command(
         LiveCommand::RefreshMessages { thread, .. }
         | LiveCommand::ResolveSenders { thread, .. }
         | LiveCommand::Load { thread, .. }
+        | LiveCommand::Overview { thread, .. }
         | LiveCommand::Send { thread, .. } => Some(thread.clone()),
         LiveCommand::Open {
             kind, remote_id, ..
@@ -1931,6 +2061,33 @@ async fn handle_command(
             };
             events.emit(event).await?;
         }
+        LiveCommand::Overview { generation, thread } => {
+            let account = events.account.clone();
+            let requested = thread.clone();
+            let result = db
+                .call_with(StorageOperation::LoadHistory, move |s| {
+                    s.conversation_overview(
+                        &account,
+                        &requested,
+                        crate::domain::OVERVIEW_ITEM_LIMIT,
+                    )
+                })
+                .await;
+            let event = match result {
+                Ok(overview) => LiveEvent::Overview {
+                    account_id: events.account.clone(),
+                    generation,
+                    thread,
+                    overview: Box::new(overview),
+                },
+                Err(_) => LiveEvent::OverviewFailed {
+                    account_id: events.account.clone(),
+                    generation,
+                    thread,
+                },
+            };
+            events.emit(event).await?;
+        }
         LiveCommand::Send {
             generation,
             thread,
@@ -1949,6 +2106,22 @@ async fn handle_command(
                 },
                 _ => Err(anyhow::anyhow!("offline")),
             };
+            // An end-to-end encrypted 1-1 conversation: the original's `sendE2eeMsg` (handshake when a device has
+            // no session yet, then the encrypted send). Needs the crypto engine; without it the draft is kept.
+            #[cfg(feature = "signal-crypto")]
+            if let Err(error) = &eligible {
+                if error
+                    .downcast_ref::<wire::EligibilityFailure>()
+                    .is_some_and(|f| f.reason == wire::EligibilityReason::EncryptedTarget)
+                    && target.kind == ThreadKind::Direct
+                {
+                    if let Some(c) = connection.as_mut() {
+                        c.send_e2ee(db, events, generation, thread, request_id, &text)
+                            .await?;
+                        return Ok(CommandOutcome::Continue);
+                    }
+                }
+            }
             let visibility = match eligible {
                 Ok(visibility) => visibility,
                 Err(error) => {
@@ -2101,7 +2274,11 @@ async fn run_inner(
 ) -> Result<()> {
     let db = Database::open(profile, events.account.clone()).await?;
     let account = events.account.clone();
-    db.call(move |s| s.begin_live_privacy(&account)).await?;
+    // The last confirmed hidden set applies at once; the interface does not wait for the network check.
+    let remembered = db
+        .call(move |s| s.provisional_live_privacy(&account))
+        .await?;
+    privacy::Privacy::provisional(events, remembered, LivePrivacyStatus::Ready)?;
     privacy::Privacy::announce(events).await?;
     let mut privacy = privacy::Privacy::new();
     privacy.start(session.clone(), transports);
@@ -2119,7 +2296,7 @@ async fn run_inner(
         let privacy_ready = events
             .privacy
             .read()
-            .is_ok_and(|state| state.status == LivePrivacyStatus::Ready);
+            .is_ok_and(|state| state.status != LivePrivacyStatus::Checking);
         tokio::select! {
             biased;
             result = async { (&mut directory.running.as_mut().expect("guarded directory sync").task).await }, if directory.running.is_some() => {
@@ -2138,6 +2315,9 @@ async fn run_inner(
                 if let LiveCommand::RefreshDirectory{generation}=command {
                     directory.request(generation,session.clone(),db.handle()?,transports);
                     continue;
+                }
+                if matches!(command, LiveCommand::Open { .. }) {
+                    directory.refresh_on_open(session.clone(),db.handle()?,transports);
                 }
                 if matches!(command, LiveCommand::Reconnect) {
                     trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
@@ -2191,6 +2371,9 @@ async fn run_inner(
                                 directory.request(generation,session.clone(),db.handle()?,transports);
                                 continue;
                             }
+                            if matches!(command, LiveCommand::Open { .. }) {
+                                directory.refresh_on_open(session.clone(),db.handle()?,transports);
+                            }
                             if matches!(command, LiveCommand::Reconnect) {
                                 trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
                                 break None;
@@ -2222,6 +2405,15 @@ async fn run_inner(
                 };
                 match result {
                     Ok(c) => {
+                        #[cfg(feature = "signal-crypto")]
+                        let c = {
+                            let mut c = c;
+                            c.e2ee_http = Some(e2ee_send::E2eeHttp {
+                                client: client.clone(),
+                                session: session.clone(),
+                            });
+                            c
+                        };
                         connection = Some(c);
                         next_ping = tokio::time::Instant::now() + Duration::from_secs(15);
                     },

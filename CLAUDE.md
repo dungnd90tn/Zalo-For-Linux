@@ -41,7 +41,7 @@ Every "restart the app" path in the bundles — post-update relaunch, database r
 ## Commands
 
 ```bash
-./start.sh                # Download/cache Electron v22.3.27 to ~/.local/electron-v22.3.27, then launch this directory
+./start.sh                # Verify/cache pinned Electron (ELECTRON_VERSION) in ~/.local/electron-<version>, then launch this directory
 ./toggle-devtools.sh      # Toggle devTools on/off by sed-patching main-dist/main.js and compact-app.js (off by default)
 ./install.sh              # Install to ~/.local/share/zalo + create .desktop entries
 ./update.sh               # git-clone latest and replace installed files (zenity GUI)
@@ -55,6 +55,21 @@ python3 generate-jxl-addon.py # Rebuild the Linux zjxl (JPEG XL) addon (needs li
 
 Electron bundle verification remains manual: launch with `./start.sh` and watch stdout (`ELECTRON_ENABLE_LOGGING=1` is set by `start.sh`); there is no npm workflow. For Rust, use `./scripts/rust/check.sh` (formatting, tests, strict Clippy, offline smoke), `./scripts/rust/build.sh --offline`, and `python3 scripts/rust/smoke-release.py`. Fetch locked dependencies first as described in `rust-client/VALIDATION.md`. Keep synthetic checks distinct from real-account integration evidence; optional `trust-wasm` has a separate test/lint gate.
 
+Rust commands (toolchain pinned to 1.99.1 in `rust-client/rust-toolchain.toml`; all run `--locked`, and `--offline` after a one-time `cargo fetch --locked` in `rust-client/`):
+
+```bash
+./scripts/rust/run.sh --demo            # offline synthetic conversations (no network)
+./scripts/rust/run.sh --live            # builds with --features live; QR login / saved-session resume
+./scripts/rust/build.sh --offline [--features live]
+cd rust-client
+cargo test --locked --offline <name>    # single test by substring, e.g. `cargo test --locked --offline actual_runtime_survives`
+cargo test --locked --offline --all-features                       # optional adapters + embedded Signal engine
+cargo clippy --locked --offline --all-targets --all-features -- -D warnings
+cargo test --release --locked --offline --features trust-wasm protocol::trust   # release AND debug must both pass (Wasmi dispatch differs)
+node tests/fixtures/signal/oracle.cjs   # Node oracles that cross-check Rust against the original JS behavior (also messaging/, stickers/)
+python3 ../scripts/rust/inventory-ui-assets.py --check && python3 ../scripts/rust/generate-ui-catalog.py --check   # UI asset drift (CI gate)
+```
+
 Ad-hoc RE helpers live in [reverse-engineering/tools/](reverse-engineering/tools/) (`check_decrypted_db.py`, `offline_decrypt_check.py`, `debug_parse_binnet.js`) — see [reverse-engineering/README.md](reverse-engineering/README.md).
 
 ## Runtime architecture
@@ -66,6 +81,24 @@ start.sh → electron <dir> → bootstrap.js → main-dist/main.js
 [bootstrap.js](bootstrap.js) loads perf tracing, runs `main-dist/migration.js`, then branches on `--launch-compact-app` and on `app.requestSingleInstanceLock()` (losers go to `second-instance.js`, which quits).
 
 Renderer entry points are HTML files in `pc-dist/`: `index.html` (main), `login.html`, `compact-app.html`, `znotification.html`, `child.html`, plus worker hosts `shared-worker.html` / `sqlite.html`. The renderer is a React 16 + Redux + Recoil SPA with many dedicated workers (search, zd, trust, pdf, dal, opfs, cpu-heavy, preview-thumb, mainless). Bundle filenames carry a content hash (`e08d0d44f38873747a6b`) — do not hardcode it in new code; the HTML files reference it.
+
+## Rust native client (`rust-client/`)
+
+A from-scratch egui/eframe client (no WebView, no code or assets from other Zalo clients), crate `zalo-linux-native-preview`, binary `zalo-rust`. Electron remains the supported app; the Rust client is not at parity. [rust-client/MIGRATION_STATUS.md](rust-client/MIGRATION_STATUS.md) is the authority on what has real-account evidence versus synthetic-only, and [FEATURE_PARITY.md](rust-client/FEATURE_PARITY.md) tracks gaps. Never describe a fixture or loopback test as proof of live behavior. Never point it at `~/.config/ZaloData`.
+
+**Layers** (`src/lib.rs`): `domain` (typed IDs, no GUI/transport deps) → `store` (SQLite; one worker owns the connection; keyset pagination on timestamp+ID; additive schema migrations, currently schema 8, no downgrade path, older binaries reject newer schemas) → `protocol` (`qr`, `auth`, `trust` WASM host, `bootstrap`, `http`, `messaging`, `signal`) → `app` (bounded-channel workers; `app/live/runtime` is the live session loop) → `ui` (egui, reads events per frame; never does I/O, DB or image decoding on the render thread). `profile` provides isolated XDG paths, process lock and atomic secret writes; `diagnostics` is a bounded redacted JSONL logger.
+
+**Cargo features gate whole subsystems**, and `scripts/rust/check.sh` asserts the dependency graph: default builds contain no `reqwest`/`tokio-tungstenite`/`wasmi`/`libsignal-core`; `signal-store` adds only storage DTOs; `live` (= `messaging` ⊃ `live-login` ⊃ `network` + `trust-wasm`) must **not** pull in the Signal engine; only explicit `signal-crypto` does (`crates/zalo-signal-engine`, with `libsignal-core` pinned by git rev). When adding a dependency, put it behind the narrowest feature and re-run `check.sh`.
+
+Invariants that span files: bounded queues/caches with visible retryable state on saturation (never block the UI or silently drop a send); everything scoped by account+thread+message ID with stale generation/epoch results rejected; unknown wire formats and E2EE queues **fail closed** (not acknowledged, no encryption downgrade); network errors preserve the session, only an explicit auth rejection may invalidate it; uncertain sends are never silently retried. [rust-client/ARCHITECTURE.md](rust-client/ARCHITECTURE.md) has the full review contract; `PROTOCOL_*.md`/`E2EE_*.md` hold the reverse-engineered wire evidence per area.
+
+UI work: read [UI_DESIGN.md](rust-client/UI_DESIGN.md), [UI_REDESIGN_GUIDE.md](rust-client/UI_REDESIGN_GUIDE.md) and [src/ui/AGENTS.md](rust-client/src/ui/AGENTS.md) first (the approved "Zalo Chat Redesign" overrides the original CSS). Keep the embedded Segoe UI/icon-font assets, no hand-drawn icon substitutes, and check synthetic screenshots at 1200×780 and 640×480.
+
+`ZALO_E2EE_*` env vars (`PROBE`, `REPLACE_PC_KEY`, `SEND`, `RECEIVE`, …) are live-account E2EE experiments; `run.sh` switches to `--features live,signal-crypto` when any is set (see `E2EE_LIVE_PLAN.md`). Don't set them casually — they act on a real account.
+
+## Working rules (from AGENTS.md)
+
+Change only what the task requires. **Do not commit or push unless explicitly asked** — leave changes in the workspace and report. A hook/classifier/permission denial is final: report it rather than routing around it with another tool or script. Commit subjects are imperative (`Fix crash on restart`), PRs target `latest`; releases update `version.txt` and `changelogs/`. Handwritten JS uses four spaces, CommonJS, single quotes, semicolons.
 
 ## Native module layer
 
@@ -82,7 +115,7 @@ Note: `zcall/binding-stub.js` and `zwalker/index-stub.js` exist but nothing requ
 
 ### db-cross-v4 (the port's main RE deliverable)
 
-Decrypts Zalo's `ZDB4.0` backup containers so chat history restore works. [generate-addon.py](generate-addon.py) is a single script that **embeds the full C++ source as a string literal**, writes it plus `binding.gyp`/`package.json` to `/tmp/db-cross-build`, builds with `node-gyp --target=22.3.27 --dist-url=https://www.electronjs.org/headers`, and copies the result into `native/nativelibs/db-cross-v4/prebuilt/linux/electron/x64/`. To change addon behavior, edit the C++ inside the Python string, not any `.cc` file on disk.
+Decrypts Zalo's `ZDB4.0` backup containers so chat history restore works. [generate-addon.py](generate-addon.py) is a single script that **embeds the full C++ source as a string literal**, writes it plus `binding.gyp`/`package.json` to `/tmp/db-cross-build`, builds with `node-gyp --target=43.3.0 --dist-url=https://www.electronjs.org/headers`, and copies the result into `native/nativelibs/db-cross-v4/prebuilt/linux/electron/x64/`. To change addon behavior, edit the C++ inside the Python string, not any `.cc` file on disk.
 
 Exports: `decompressAndDecryptDb_V2` (implemented), `parseBinNet` (implemented TLV parser), `decompressAndDecryptDb` (V1, returns -1).
 
@@ -120,7 +153,7 @@ The shell scripts parse each other with `grep`/`cut`, so their formatting is loa
 - `start.sh` launches **with the Chromium sandbox** and only falls back to `--no-sandbox` if bring-up actually fails, printing the root-level fix. Do not reintroduce an unconditional `--no-sandbox`: the sandbox works on Ubuntu 24.04+/26.04 despite `kernel.apparmor_restrict_unprivileged_userns=1`. `ZALO_NO_SANDBOX=1` is the deliberate escape hatch.
 - **Bump `version.txt` on every build you hand over, even a rebuild of the same change.** Two artifacts that differ but share a version are indistinguishable once installed, and hours get lost debugging a stale build. The helper logs the running version to `~/.config/ZaloData/zalo-cap.log` for the same reason: an app left open across an upgrade keeps running its old in-memory code, which looks exactly like a broken build.
 - `version.txt` (e.g. `v1.2.1`) is the update oracle. Both `start.sh` (AppImage path) and `update.sh` fetch `version.txt` from the `latest` branch on GitHub raw and compare with `version_lt`. Bumping it is what triggers user-facing update prompts — bump it in the same commit as a release.
-- Release flow: publish a GitHub release → [.github/workflows/build-appimage.yml](.github/workflows/build-appimage.yml) checks out `latest`, runs `build-appimage.sh`, and uploads `dist/*.AppImage` to the release.
+- Release flow: publish a GitHub release whose tag is `v<rust-client/Cargo.toml version>` → [.github/workflows/build-packages.yml](.github/workflows/build-packages.yml) runs `scripts/rust/package.sh` (pinned Docker images, glibc 2.31 baseline), installs the result with `apt`/`dnf` in clean containers (`scripts/rust/package/verify.sh`) and uploads `dist/rust/*.deb`, `*.rpm` and `SHA256SUMS` to the release. CI no longer builds the Electron AppImage; `build-appimage.sh`/`build-deb.sh` remain for manual builds only. Re-running the workflow for the same version needs a higher `package_release` input.
 
 ## Packaging targets
 
@@ -177,7 +210,7 @@ Every external artifact this repo fetches is pinned to an exact version **and** 
 | node-addon-api | `generate-addon.py`, `generate-jxl-addon.py` | 8.9.1 | Current line; fine now that Electron 43 embeds Node 24.18.1 |
 | libjxl / libjpeg-turbo | build host, copied into `zjxl/build/linux_x64/` | whatever the builder has | Vendored into the addon dir, so the shipped bytes are fixed at build time rather than resolved on the user's machine |
 | node-gyp | `generate-addon.py` | 12.4.0 | Build-host only, no ABI effect; 13.x requires Node ^22.22.2 |
-| GitHub Actions | `.github/workflows/build-appimage.yml` | commit SHAs | A mutable `@v4` tag can be repointed at new code by the action's owner |
+| GitHub Actions | `.github/workflows/build-packages.yml`, `rust-client.yml` | commit SHAs | A mutable `@v4` tag can be repointed at new code by the action's owner |
 
 `package.json` is different: it is VNG's upstream manifest for bundles that are already built and shipped in `main-dist/`/`pc-dist/`. Nothing installs from it, so changing versions there has no effect on what runs — do not "upgrade" it expecting a result.
 

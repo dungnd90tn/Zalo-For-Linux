@@ -14,6 +14,8 @@ RUSTUP_SHA256="b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55"
 PKG_VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$REPO_ROOT/rust-client/Cargo.toml" | head -1)"
 # Bump the release for every package you hand over, even a rebuild of the same code.
 PKG_RELEASE="${ZALO_PKG_RELEASE:-1}"
+# Cargo features of the shipped binary. Releases use `live`; set `live,signal-crypto` for a build that can try E2EE.
+PKG_FEATURES="${ZALO_PKG_FEATURES:-live}"
 OUT="$REPO_ROOT/dist/rust"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/zalo-linux-build/rust-pkg"
 mkdir -p "$OUT" "$CACHE"; chmod 700 "$CACHE"
@@ -22,7 +24,7 @@ rm -f "$OUT"/zalo-native*.deb "$OUT"/zalo-native*.rpm
 docker run --rm --network=host \
     -v "$REPO_ROOT:/src:ro" -v "$OUT:/out" -v "$CACHE:/cache" \
     -e RUSTUP_VERSION="$RUSTUP_VERSION" -e RUSTUP_SHA256="$RUSTUP_SHA256" \
-    -e PKG_VERSION="$PKG_VERSION" -e PKG_RELEASE="$PKG_RELEASE" \
+    -e PKG_VERSION="$PKG_VERSION" -e PKG_RELEASE="$PKG_RELEASE" -e PKG_FEATURES="$PKG_FEATURES" \
     -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     "$UBUNTU_IMAGE" /src/scripts/rust/package/container-build.sh
 

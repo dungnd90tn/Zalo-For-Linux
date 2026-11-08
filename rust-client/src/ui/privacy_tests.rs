@@ -404,8 +404,10 @@ fn cleanup(app: NativeApp, root: std::path::PathBuf) {
 }
 
 #[test]
-fn unknown_and_failed_policy_clear_cached_content_before_late_event_consumers() {
-    for status in [LivePrivacyStatus::Checking, LivePrivacyStatus::Failed] {
+fn unknown_policy_clears_cached_content_before_late_event_consumers() {
+    // Only "no policy announced yet" holds content back. A failed re-check keeps the last confirmed set in force
+    // (see `failed_recheck_keeps_the_interface_and_the_known_hidden_set`).
+    for status in [LivePrivacyStatus::Checking] {
         let ctx = egui::Context::default();
         let (mut app, root) = live::tests::fixture(&ctx);
         app.model.selected = Some("d:22".into());
@@ -857,7 +859,14 @@ fn worker_loss_or_expiration_revokes_pending_pin_and_the_current_hidden_lease() 
             assert!(state.worker.is_none() && state.privacy.prompt.is_none());
             assert_eq!(state.privacy.status, LivePrivacyStatus::Failed);
             assert!(!app.privacy_visible("d:22"));
-            assert!(app.model.selected.is_none() && app.model.messages.is_empty());
+            if opened {
+                // The unlocked hidden conversation closes with its lease.
+                assert!(app.model.selected.is_none() && app.model.messages.is_empty());
+            } else {
+                // An ordinary conversation stays open: losing the worker is not a reason to cover the interface.
+                assert_eq!(app.model.selected.as_deref(), Some("d:33"));
+                assert!(app.privacy_visible("d:33"));
+            }
             apply(
                 &mut app,
                 &ctx,
@@ -869,11 +878,11 @@ fn worker_loss_or_expiration_revokes_pending_pin_and_the_current_hidden_lease() 
                     outcome: HiddenUnlockOutcome::Unlocked,
                 },
             );
-            assert!(app.model.selected.is_none() && !app.privacy_visible("d:22"));
+            assert!(app.model.selected.as_deref() != Some("d:22") && !app.privacy_visible("d:22"));
             let output = settle(&mut app, &ctx, vec2(640.0, 480.0));
             assert!(texts(&output)
                 .iter()
-                .all(|text| !text.contains(PRIVATE_BODY) && !text.contains(DRAFT)));
+                .all(|text| !text.contains(PRIVATE_BODY) && (!opened || !text.contains(DRAFT))));
             app.drafts.select(draft_thread).unwrap();
             assert_eq!(app.drafts.active.text, DRAFT);
             cleanup(app, root);
@@ -937,4 +946,22 @@ fn outside_click_after_an_incorrect_pin_cannot_raise_the_curtain_above_cancel_or
             cleanup(app, root);
         }
     }
+}
+
+#[test]
+fn failed_recheck_keeps_the_interface_and_the_known_hidden_set() {
+    let ctx = egui::Context::default();
+    let (mut app, root) = live::tests::fixture(&ctx);
+    policy(&mut app, &ctx, 2, LivePrivacyStatus::Ready, None);
+    app.model.selected = Some("d:33".into());
+    app.model.conversations = vec![conversation("d:33", "Ordinary")];
+    policy(&mut app, &ctx, 3, LivePrivacyStatus::Failed, None);
+    assert!(app.privacy_ready());
+    assert_eq!(app.model.selected.as_deref(), Some("d:33"));
+    assert!(app.privacy_visible("d:33"));
+    let output = settle(&mut app, &ctx, vec2(1200.0, 780.0));
+    assert!(texts(&output).iter().all(|text| *text
+        != "Đang xác minh trạng thái riêng tư của hội thoại"
+        && *text != "Chưa xác minh được trạng thái riêng tư của hội thoại"));
+    cleanup(app, root);
 }

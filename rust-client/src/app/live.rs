@@ -192,6 +192,11 @@ pub enum LiveCommand {
         thread: String,
         before: Option<Cursor>,
     },
+    /// Counts and the newest pictures, files and links of the saved history.
+    Overview {
+        generation: u64,
+        thread: String,
+    },
     Send {
         generation: u64,
         thread: String,
@@ -295,6 +300,17 @@ pub enum LiveEvent {
         messages: Vec<Message>,
         has_older: bool,
     },
+    Overview {
+        account_id: String,
+        generation: u64,
+        thread: String,
+        overview: Box<crate::domain::ConversationOverview>,
+    },
+    OverviewFailed {
+        account_id: String,
+        generation: u64,
+        thread: String,
+    },
     Connection {
         account_id: String,
         state: LiveConnection,
@@ -351,6 +367,8 @@ impl LiveEvent {
             | Self::Ready { account_id, .. }
             | Self::Opened { account_id, .. }
             | Self::Page { account_id, .. }
+            | Self::Overview { account_id, .. }
+            | Self::OverviewFailed { account_id, .. }
             | Self::Connection { account_id, .. }
             | Self::Received { account_id, .. }
             | Self::Sent { account_id, .. }
@@ -487,6 +505,7 @@ impl LiveWorker {
                         .as_ref()
                         .is_none_or(|c| crate::domain::validate_id(&c.id).is_ok())
             }
+            LiveCommand::Overview { thread, .. } => Target::from_thread(thread).is_ok(),
             LiveCommand::Send { thread, text, .. } => {
                 Target::from_thread(thread).is_ok()
                     && !text.trim().is_empty()
@@ -634,6 +653,18 @@ impl super::Model {
             | LiveEvent::DirectoryChanged { conversations, .. } => {
                 self.conversations = conversations;
                 true
+            }
+            LiveEvent::Overview {
+                generation,
+                thread,
+                overview,
+                ..
+            } => self.apply_overview(generation, &thread, *overview),
+            LiveEvent::OverviewFailed {
+                generation, thread, ..
+            } => {
+                self.overview_failed(generation, &thread);
+                false
             }
             LiveEvent::Page {
                 generation,
@@ -798,7 +829,13 @@ impl super::Model {
                 self.has_older = true;
             }
         }
-        self.upsert_live_conversation(conversation);
+        // A conversation with only list-silent messages (birthday cards, Official Account broadcasts) is not
+        // added to the list; one already shown is still updated.
+        if conversation.last_message_at_ms > 0
+            || self.conversations.iter().any(|c| c.id == conversation.id)
+        {
+            self.upsert_live_conversation(conversation);
+        }
     }
 }
 

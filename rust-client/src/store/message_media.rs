@@ -32,6 +32,55 @@ pub(super) fn initialize(conn: &Connection, version: i64) -> Result<()> {
     Ok(())
 }
 
+/// Brings stored presentation snapshots up to the current reader. The full source content is immutable and is the
+/// only input; a row whose content no longer parses is left as it is. Runs once per reader revision.
+pub(super) fn reproject(conn: &Connection) -> Result<()> {
+    // Bump the marker when a descriptor derivation changes (v1: call logs read their params).
+    if conn.execute(
+        "INSERT OR IGNORE INTO store_markers(name) VALUES('media_projection_v1')",
+        [],
+    )? == 0
+    {
+        return Ok(());
+    }
+    let rows: Vec<(i64, String, String, String, String)> = {
+        let mut statement = conn.prepare(
+            "SELECT rowid,kind,metadata,projection,preview FROM message_media WHERE kind='chat.recommended'",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (rowid, kind, metadata, projection, stored_preview) in rows {
+        let Some(kind) = MediaKind::from_wire(&kind) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str(&metadata) else {
+            continue;
+        };
+        let Ok(content) = MediaMessageContent::new(kind, &value) else {
+            continue;
+        };
+        if content.as_json() != metadata || content.descriptor().validate().is_err() {
+            continue;
+        }
+        let Ok(next) = serde_json::to_string(content.descriptor()) else {
+            continue;
+        };
+        let next_preview = preview(content.descriptor());
+        if next.len() <= MAX_PROJECTION_BYTES
+            && (next != projection || next_preview != stored_preview)
+        {
+            conn.execute(
+                "UPDATE message_media SET projection=?2,preview=?3 WHERE rowid=?1",
+                params![rowid, next, next_preview],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn exists(conn: &Connection, message: &Message) -> Result<bool> {
     Ok(conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM message_media WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)")?.query_row(params![message.account_id,message.thread_id,message.id],|row|row.get(0))?)
 }
@@ -229,6 +278,47 @@ mod tests {
             message_id: message.id.clone(),
             content,
         }
+    }
+    #[test]
+    fn stored_call_logs_are_reprojected_from_their_immutable_content() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let content = MediaMessageContent::new(MediaKind::Recommended, &json!({
+            "action":"recommened.calltime","description":"Cuộc gọi","href":"",
+            "params":"{\"duration\":90,\"isCaller\":0,\"calltype\":0}","thumb":"","title":"sendBubbleMessage"
+        }))
+        .unwrap();
+        let m = Message {
+            account_id: "11".into(),
+            thread_id: "d:22".into(),
+            id: "call".into(),
+            sender: "22".into(),
+            text: "[Tin nhắn chat.recommended chưa được hỗ trợ]".into(),
+            sticker: None,
+            media: Some(content.descriptor().clone()),
+            sent_at_ms: 1000,
+        };
+        store
+            .receive_batch_with_media("11", &[(m, None, None, Some(content.clone()))], None)
+            .unwrap();
+        // What an older reader stored: the placeholder title.
+        store
+            .conn
+            .execute_batch(
+                "UPDATE message_media SET projection=replace(projection,'Cuộc gọi thoại đến','sendBubbleMessage'),
+                    preview='sendBubbleMessage';
+                DELETE FROM store_markers WHERE name='media_projection_v1';",
+            )
+            .unwrap();
+        assert!(store.message_media("11", "d:22", "call").is_err());
+        reproject(&store.conn).unwrap();
+        assert_eq!(
+            store.message_media("11", "d:22", "call").unwrap(),
+            Some(content)
+        );
+        assert_eq!(
+            store.conversations("11", 10).unwrap()[0].last_text,
+            "Cuộc gọi thoại đến"
+        );
     }
     #[test]
     fn legacy_media_enrichment_preserves_body_and_publishes_typed_history_and_preview() {

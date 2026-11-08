@@ -89,8 +89,10 @@ impl Privacy {
             ..Self::default()
         }
     }
+    /// A policy is in force: Zalo's answer, or the last confirmed hidden set while a check is retried. Only the
+    /// moment before the worker's first announcement keeps content back.
     pub fn ready(&self) -> bool {
-        self.status == LivePrivacyStatus::Ready
+        self.status != LivePrivacyStatus::Checking
     }
     pub fn hidden(&self, thread: &str) -> bool {
         self.hidden.contains(thread)
@@ -125,9 +127,12 @@ impl Privacy {
     pub fn reset_worker(&mut self) {
         let epoch = self.worker_epoch.wrapping_add(1);
         let serial = self.serial.wrapping_add(1);
+        // The known hidden threads stay hidden after the worker is gone; only unlocks, prompts and queries end.
+        let hidden = std::mem::take(&mut self.hidden);
         *self = Self {
             worker_epoch: epoch,
             serial,
+            hidden,
             ..Self::default()
         };
     }
@@ -366,6 +371,8 @@ impl Privacy {
                 }
             }
             LiveEvent::Page { thread, .. }
+            | LiveEvent::Overview { thread, .. }
+            | LiveEvent::OverviewFailed { thread, .. }
             | LiveEvent::SenderNames { thread, .. }
             | LiveEvent::MessagesRefreshed { thread, .. }
             | LiveEvent::MessagesRefreshFailed { thread, .. }

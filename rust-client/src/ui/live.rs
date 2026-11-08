@@ -1156,6 +1156,8 @@ pub(in crate::ui) mod tests {
                 focus_composer: false,
                 latest_page: true,
                 ime_composing: false,
+                info_tab: Default::default(),
+                attachments: Default::default(),
                 live: Some(state),
                 _profile: profile,
             },

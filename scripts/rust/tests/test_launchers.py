@@ -41,11 +41,17 @@ class LauncherTests(unittest.TestCase):
                 self.assertIn("--locked", build)
                 self.assertIn("--release", build)
                 if "--live" in options:
-                    self.assertEqual(build[build.index("--features") + 1], "live")
+                    # Live builds carry the Signal engine so end-to-end encrypted chats can be used.
+                    self.assertEqual(build[build.index("--features") + 1], "live,signal-crypto")
                 else:
                     self.assertNotIn("--features", build, "ordinary/demo builds must keep network features disabled")
                 self.assertEqual(metadata[0], "metadata")
                 self.assertIn("--offline", metadata)
+            # ZALO_RUST_NO_E2EE=1 opts out of the engine.
+            log.unlink(missing_ok=True)
+            subprocess.run([launcher, "--live"], cwd=root, env={**env, "ZALO_RUST_NO_E2EE": "1"}, check=True, capture_output=True, text=True)
+            build = json.loads(log.read_text().splitlines()[0])
+            self.assertEqual(build[build.index("--features") + 1], "live")
             env["MOCK_BUILD_FAILURE"] = "1"
             log.unlink()
             failed = subprocess.run([launcher, "--live"], cwd=root, env=env, capture_output=True, text=True)

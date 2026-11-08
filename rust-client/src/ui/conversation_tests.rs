@@ -198,3 +198,127 @@ fn short_bubbles_hug_content_and_long_messages_stay_inside_wide_and_compact_boun
         }
     }
 }
+
+/// A sticker is the picture alone: no bubble fill or border, and the message is only as wide
+/// as the picture (plus the status line when that is wider), never the full bubble width.
+#[cfg(feature = "messaging")]
+#[test]
+fn sticker_messages_have_no_bubble_and_fit_the_picture() {
+    use crate::domain::{StickerDescriptor, LEGACY_STICKER_PLACEHOLDER};
+    for own in [false, true] {
+        for animated in [false, true] {
+            let ctx = egui::Context::default();
+            visuals::install(&ctx);
+            let sticker = StickerDescriptor {
+                sticker_id: 7,
+                category_id: 4,
+                sticker_type: 3,
+            };
+            let mut cache = stickers::StickerCache::default();
+            if animated {
+                // A strip of three 130 px frames: one frame, not the whole strip, is displayed.
+                let mut rgba = vec![0u8; 390 * 130 * 4];
+                rgba.iter_mut().for_each(|byte| *byte = 200);
+                cache.seed_animation(
+                    &ctx,
+                    sticker,
+                    crate::app::stickers::StickerAnimation {
+                        frame_width: 130,
+                        frame_height: 130,
+                        columns: 3,
+                        atlas_width: 390,
+                        atlas_height: 130,
+                        delays_ms: vec![100; 3],
+                        rgba,
+                    },
+                );
+            } else {
+                cache.seed(&ctx, sticker, 130, 130, vec![200; 130 * 130 * 4]);
+            }
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        vec2(640.0, 480.0),
+                    )),
+                    focused: true,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        message_bubble(
+                            ui,
+                            &Message {
+                                account_id: "11".into(),
+                                thread_id: "d:22".into(),
+                                id: "sticker".into(),
+                                sender: if own { "11" } else { "22" }.into(),
+                                text: LEGACY_STICKER_PLACEHOLDER.into(),
+                                sent_at_ms: 1_700_000_000_000,
+                                sticker: Some(sticker),
+                                media: None,
+                            },
+                            false,
+                            Some("11"),
+                            "Nguyễn Minh",
+                            "Nguyễn Minh",
+                            None,
+                            Some(&mut cache),
+                            None,
+                            1,
+                        );
+                    });
+                },
+            );
+            let colors = crate::theme::palette(&ctx);
+            let label = format!("own={own} animated={animated}");
+            assert!(
+                !output.shapes.iter().any(|shape| matches!(
+                    &shape.shape,
+                    egui::Shape::Rect(rect)
+                        if (rect.fill == colors.bubble_incoming || rect.fill == colors.bubble_own)
+                            && rect.rounding.nw == 18.0
+                )),
+                "{label}: a sticker must not be drawn inside a bubble"
+            );
+            // egui draws an image as a white-tinted rectangle that samples the texture.
+            let picture = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == egui::Color32::WHITE
+                            && (rect.rect.width() - 130.0).abs() < 1.5
+                            && (rect.rect.height() - 130.0).abs() < 1.5 =>
+                    {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{label}: a 130 px sticker picture must be painted"));
+            if animated {
+                assert!(
+                    (picture.uv.width() - 1.0 / 3.0).abs() < 1e-4
+                        && (picture.uv.height() - 1.0).abs() < 1e-4,
+                    "{label}: one frame of the strip is shown, not the whole atlas: {:?}",
+                    picture.uv
+                );
+            }
+            let mut extent = egui::Rect::NOTHING;
+            for shape in &output.shapes {
+                let bounds = shape.shape.visual_bounding_rect();
+                if bounds.is_positive() && bounds.width() < 600.0 {
+                    extent = extent.union(bounds);
+                }
+            }
+            // Picture 130, plus the sender avatar and gap for an incoming message, plus the
+            // status line when it is wider than the picture.
+            let limit = 165.0 + if own { 0.0 } else { 40.0 };
+            assert!(
+                extent.width() <= limit,
+                "{label}: the message is {}px wide, expected at most {limit}",
+                extent.width()
+            );
+        }
+    }
+}

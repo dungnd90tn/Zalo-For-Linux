@@ -8,7 +8,7 @@ use crate::{
     },
 };
 pub(super) use cache::MediaCache;
-use cache::{Presentation, Viewer};
+use cache::{DownloadView, Presentation, Viewer};
 use eframe::egui::{self, vec2, RichText, Sense};
 
 const THUMBNAIL_FRAME: egui::Vec2 = vec2(330.0, 240.0);
@@ -38,10 +38,15 @@ pub(super) fn show(
             web_card(ui, message, generation, card, cache, max_width, true)
         }
         MediaDescriptor::Poll(poll) => poll_card(ui, poll),
-        MediaDescriptor::File(file) => file_card(ui, file),
+        MediaDescriptor::File(file) => file_card(ui, message, file, cache),
     }
 }
-fn file_card(ui: &mut egui::Ui, file: &FileDescriptor) {
+fn file_card(
+    ui: &mut egui::Ui,
+    message: &Message,
+    file: &FileDescriptor,
+    cache: Option<&mut MediaCache>,
+) {
     let colors = crate::theme::palette(ui.ctx());
     ui.horizontal_top(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(38.0, 42.0), Sense::hover());
@@ -85,6 +90,11 @@ fn file_card(ui: &mut egui::Ui, file: &FileDescriptor) {
             }
         });
     });
+    if let (Some(cache), Some(url), false, false) =
+        (cache, file.url.as_deref(), file.encrypted, file.is_folder)
+    {
+        download_controls(ui, message, file, url, cache);
+    }
     if let Some(url) = file
         .url
         .as_deref()
@@ -115,6 +125,105 @@ fn file_card(ui: &mut egui::Ui, file: &FileDescriptor) {
             )
             .wrap(),
         );
+    }
+}
+/// Explicit "save to disk" for a received file; nothing is fetched until the button is pressed.
+fn download_controls(
+    ui: &mut egui::Ui,
+    message: &Message,
+    file: &FileDescriptor,
+    url: &str,
+    cache: &mut MediaCache,
+) {
+    // Same origin policy the worker enforces; an off-CDN link only gets the browser link below.
+    if crate::app::media::thumbnail_url(url).is_err() {
+        return;
+    }
+    let colors = crate::theme::palette(ui.ctx());
+    let key = MediaKey {
+        account_id: message.account_id.clone(),
+        thread_id: message.thread_id.clone(),
+        message_id: message.id.clone(),
+        url: url.into(),
+    };
+    let note = |ui: &mut egui::Ui, text: String| {
+        ui.add(
+            egui::Label::new(
+                RichText::new(text)
+                    .size(super::visuals::TEXT_SMALL)
+                    .color(colors.text_secondary),
+            )
+            .wrap(),
+        );
+    };
+    match cache.download_view(&key) {
+        DownloadView::Idle => {
+            if super::visuals::chip(
+                ui,
+                "Tải về",
+                false,
+                true,
+                "Lưu tệp vào thư mục Tải xuống/Zalo Native. Ứng dụng không mở hay chạy tệp.",
+            )
+            .clicked()
+            {
+                cache.start_download(ui.ctx(), key, &file.title);
+            }
+        }
+        DownloadView::Running { received, total } => {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
+            let fraction = total.map(|total| (received as f32 / total as f32).clamp(0.0, 1.0));
+            let mut bar = egui::ProgressBar::new(fraction.unwrap_or(0.0));
+            if fraction.is_none() {
+                bar = bar.animate(true);
+            }
+            ui.add(bar.desired_width(ui.available_width().min(240.0)));
+            note(
+                ui,
+                match total {
+                    Some(total) => format!("{} / {}", file_size(received), file_size(total)),
+                    None => file_size(received),
+                },
+            );
+            if super::visuals::chip(ui, "Hủy", false, true, "Dừng tải và xóa phần đã tải").clicked()
+            {
+                cache.cancel_download(&key);
+            }
+        }
+        DownloadView::Saved(path) => {
+            note(ui, format!("Đã lưu: {}", display_path(&path)));
+            let folder = path
+                .parent()
+                .and_then(|dir| url::Url::from_directory_path(dir).ok());
+            if let Some(folder) = folder {
+                if ui
+                    .link("Mở thư mục chứa tệp")
+                    .on_hover_text(
+                        "Mở thư mục trong trình quản lý tệp. Tệp không được mở hay chạy.",
+                    )
+                    .clicked()
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(folder));
+                }
+            }
+        }
+        DownloadView::Failed(reason) => {
+            note(ui, reason.to_string());
+            if super::visuals::chip(ui, "Thử lại", false, true, "Tải lại tệp").clicked() {
+                cache.forget_download(&key);
+                cache.start_download(ui.ctx(), key, &file.title);
+            }
+        }
+    }
+}
+fn display_path(path: &std::path::Path) -> String {
+    match std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .and_then(|home| path.strip_prefix(home).ok().map(|rest| rest.to_owned()))
+    {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 fn file_size(bytes: u64) -> String {
@@ -801,6 +910,7 @@ mod tests {
             let ctx = egui::Context::default();
             super::super::visuals::install(&ctx);
             let file = make(url, encrypted);
+            let message = message(MediaDescriptor::File(file.clone()));
             let render = |events| {
                 ctx.run(
                     egui::RawInput {
@@ -812,7 +922,8 @@ mod tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| file_card(ui, &file));
+                        egui::CentralPanel::default()
+                            .show(ctx, |ui| file_card(ui, &message, &file, None));
                     },
                 )
             };
@@ -856,5 +967,82 @@ mod tests {
                 assert_eq!(output.platform_output.open_url.unwrap().url, url.unwrap());
             }
         }
+    }
+
+    #[test]
+    fn download_button_appears_only_for_cdn_file_links_and_state_follows_worker_events() {
+        use crate::app::download::{DownloadEvent, DownloadFailure};
+        let render_text = |file: &FileDescriptor, cache: &mut MediaCache| {
+            let ctx = egui::Context::default();
+            super::super::visuals::install(&ctx);
+            let message = message(MediaDescriptor::File(file.clone()));
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        vec2(320.0, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| file_card(ui, &message, file, Some(&mut *cache)));
+                },
+            );
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let file = |url: &str, encrypted, is_folder| FileDescriptor {
+            title: "bao-cao.pdf".into(),
+            size_bytes: Some(10),
+            extension: "pdf".into(),
+            url: Some(url.into()),
+            is_folder,
+            encrypted,
+        };
+        let mut cache = MediaCache::default();
+        let cdn = file("https://f1-zpc.zdn.vn/abc/bao-cao.pdf", false, false);
+        assert!(render_text(&cdn, &mut cache).contains("Tải về"));
+        for hidden in [
+            file("https://example.invalid/bao-cao.pdf", false, false),
+            file("https://f1-zpc.zdn.vn/abc/bao-cao.pdf", true, false),
+            file("https://f1-zpc.zdn.vn/abc/folder", false, true),
+        ] {
+            assert!(!render_text(&hidden, &mut cache).contains("Tải về"));
+        }
+        let key = MediaKey {
+            account_id: "11".into(),
+            thread_id: "g:22".into(),
+            message_id: "1".into(),
+            url: "https://f1-zpc.zdn.vn/abc/bao-cao.pdf".into(),
+        };
+        let saved = std::path::PathBuf::from("/tmp/Zalo Native/bao-cao.pdf");
+        cache.apply_download(DownloadEvent::Done {
+            key: key.clone(),
+            path: saved,
+            bytes: 10,
+        });
+        assert!(matches!(cache.download_view(&key), DownloadView::Saved(_)));
+        cache.apply_download(DownloadEvent::Failed {
+            key: key.clone(),
+            reason: DownloadFailure::Http(403),
+        });
+        assert!(matches!(
+            cache.download_view(&key),
+            DownloadView::Failed(DownloadFailure::Http(403))
+        ));
+        assert!(render_text(&cdn, &mut cache).contains("HTTP 403"));
+        cache.apply_download(DownloadEvent::Failed {
+            key: key.clone(),
+            reason: DownloadFailure::Cancelled,
+        });
+        assert!(matches!(cache.download_view(&key), DownloadView::Idle));
     }
 }

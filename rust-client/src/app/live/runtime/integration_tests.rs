@@ -217,6 +217,13 @@ impl Fixture {
             last_pong: tokio::time::Instant::now(),
             last_ping: None,
             authenticated_at: None,
+            list_encrypted: false,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_receive_report: None,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_receive: None,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_http: None,
         }
     }
 }
@@ -509,6 +516,12 @@ fn serve(
                             }
                             2 => page["hasMore"] = Value::Null,
                             3 => page["hasMore"] = json!(0),
+                            // The signal service omits zero-valued fields, so `err` may be absent.
+                            4 => {
+                                page.as_object_mut().unwrap().remove("err");
+                            }
+                            5 => page["err"] = Value::Null,
+                            15 => page["err"] = json!(1),
                             10..=13 => {
                                 page.as_object_mut().unwrap().remove(
                                     ["threads", "waitUids", "uids", "pendingUids"][mode - 10],
@@ -3149,16 +3162,22 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
                 .await
                 .unwrap();
             tokio::time::timeout(Duration::from_millis(500), async {
-                match events.recv().await.unwrap() {
-                    LiveEvent::Opened {
-                        generation,
-                        conversation,
-                        ..
-                    } => {
-                        assert_eq!(generation, 7);
-                        assert_eq!(conversation.id, "d:22");
+                loop {
+                    match events.recv().await.unwrap() {
+                        LiveEvent::Opened {
+                            generation,
+                            conversation,
+                            ..
+                        } => {
+                            assert_eq!(generation, 7);
+                            assert_eq!(conversation.id, "d:22");
+                            break;
+                        }
+                        // The interface no longer waits for the hidden-thread check, so its (failed) result may
+                        // arrive at any point; it keeps the remembered policy and must not block local work.
+                        LiveEvent::PrivacyChanged { .. } | LiveEvent::Ready { .. } => {}
+                        event => panic!("local Open failed: {event:?}"),
                     }
-                    event => panic!("local Open failed: {event:?}"),
                 }
             })
             .await
@@ -4564,13 +4583,17 @@ async fn hidden_policy_real_tls_search_pin_cancel_scope_and_remote_revoke() {
             ..
         })
     ));
+    // A failed re-check keeps the last confirmed set in force: the hidden thread stays hidden, any lease is
+    // gone, and ordinary history stays usable.
     assert!(
-        db.call(|s| s.page("11", "d:44", None, 50))
+        db.call(|s| s.page("11", "d:22", None, 50))
             .await
             .unwrap()
             .is_empty(),
-        "failed policy cannot expose even a cached previously-visible conversation"
+        "failed policy keeps the remembered hidden thread closed"
     );
+    assert!(output.privacy.read().unwrap().hidden.contains("d:22"));
+    assert!(output.privacy.read().unwrap().unlocked.is_none());
     assert!(f.state.privacy_requests.load(Ordering::SeqCst) >= 6);
 }
 
@@ -4640,7 +4663,7 @@ async fn eligibility_send_case(mode: usize, accepted: bool) {
                     if mode == 30 {
                         assert!(error.contains("sự kiện mã hóa"));
                     }
-                    if (10..=14).contains(&mode) {
+                    if (10..=15).contains(&mode) {
                         assert!(error.contains("định dạng"));
                     }
                     if (20..=23).contains(&mode) {
@@ -4701,14 +4724,14 @@ async fn eligibility_send_case(mode: usize, accepted: bool) {
 
 #[tokio::test]
 async fn source_terminal_pagination_flags_allow_real_plaintext_send() {
-    for mode in [1, 2, 3] {
+    for mode in [1, 2, 3, 4, 5] {
         eligibility_send_case(mode, true).await;
     }
 }
 
 #[tokio::test]
 async fn incomplete_or_encrypted_capability_never_sends_or_prepares_outbox() {
-    for mode in [10, 11, 12, 13, 14, 20, 21, 22, 23] {
+    for mode in [10, 11, 12, 13, 14, 15, 20, 21, 22, 23] {
         eligibility_send_case(mode, false).await;
     }
 }
@@ -4716,4 +4739,39 @@ async fn incomplete_or_encrypted_capability_never_sends_or_prepares_outbox() {
 #[tokio::test]
 async fn encrypted_state_change_during_verification_keeps_draft_without_send_or_ack() {
     eligibility_send_case(30, false).await;
+}
+
+#[tokio::test]
+async fn opening_a_conversation_refreshes_names_and_avatars_at_most_every_two_minutes() {
+    let f = Fixture::new(Reply::Normal);
+    let db = Database::open(f.profile.clone(), "11".into())
+        .await
+        .unwrap();
+    let transports = f.transports();
+    let session = f.directory_session(false);
+    let friend_lists = || {
+        f.state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.starts_with("/api/social/friend/getfriends?"))
+            .count()
+    };
+    let mut directory = DirectorySync::new();
+    directory.refresh_on_open(session.clone(), db.handle().unwrap(), &transports);
+    let result = (&mut directory.running.as_mut().unwrap().task).await;
+    directory.completed(result, session.clone(), db.handle().unwrap(), &transports);
+    assert_eq!(friend_lists(), 1);
+    // Opening again right away does not fetch the lists again.
+    directory.refresh_on_open(session.clone(), db.handle().unwrap(), &transports);
+    assert!(directory.running.is_none());
+    assert_eq!(friend_lists(), 1);
+    // After the window it does.
+    directory.last_started =
+        Some(tokio::time::Instant::now() - DIRECTORY_REFRESH_ON_OPEN - Duration::from_secs(1));
+    directory.refresh_on_open(session.clone(), db.handle().unwrap(), &transports);
+    let result = (&mut directory.running.as_mut().unwrap().task).await;
+    directory.completed(result, session, db.handle().unwrap(), &transports);
+    assert_eq!(friend_lists(), 2);
 }
