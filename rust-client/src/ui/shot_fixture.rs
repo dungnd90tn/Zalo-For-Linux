@@ -9,7 +9,9 @@
 //!   ZALO_UI_SHOT_SIZE=1200x780 cargo test --locked --offline --lib -- --ignored --exact ui::shot_fixture::demo_screenshot
 //! ```
 //!
-//! Optional: `ZALO_UI_SHOT_SCENE=settings|info|attach`, `ZALO_UI_SHOT_POINTER=x,y` (hover),
+//! Optional: `ZALO_UI_SHOT_SCENE=settings|info|attach|search` (`search` types `ZALO_UI_SHOT_QUERY`,
+//! default `demo`; `ZALO_UI_SHOT_JUMP=1` opens the oldest hit). `search-pages` seeds 75 matches;
+//! `ZALO_UI_SHOT_OLDER=1` loads its second page. `ZALO_UI_SHOT_POINTER=x,y` (hover),
 //! `ZALO_UI_SHOT_PRESS=1` (hold the press at that point) and `ZALO_UI_SHOT_TABS=n` (keyboard focus).
 use super::*;
 use std::io::Write as _;
@@ -80,7 +82,7 @@ impl eframe::App for Shot {
                         self.app.drafts.active.set_attachment(attachment);
                     }
                 }
-                "info" => {
+                "info" | "search" | "search-pages" => {
                     self.app.conversation_details = self
                         .app
                         .model
@@ -89,6 +91,44 @@ impl eframe::App for Shot {
                         .map(|thread| (crate::app::DEMO_ACCOUNT.into(), thread));
                 }
                 _ => {}
+            }
+        }
+        if self.frames == 25 && matches!(self.scene.as_str(), "search" | "search-pages") {
+            if let Some(thread) = self.app.model.selected.clone() {
+                self.app.message_search.text =
+                    std::env::var("ZALO_UI_SHOT_QUERY").unwrap_or_else(|_| "demo".into());
+                self.app.submit_message_search(&thread);
+            }
+        }
+        if self.frames == 40
+            && self.scene == "search-pages"
+            && std::env::var_os("ZALO_UI_SHOT_OLDER").is_some()
+        {
+            if let Some(thread) = self.app.model.selected.clone() {
+                if let Some(before) = self
+                    .app
+                    .model
+                    .search_results(&thread)
+                    .and_then(|r| r.next.clone())
+                {
+                    self.app.submit_message_search_before(&thread, Some(before));
+                }
+            }
+        }
+        if self.frames == 40
+            && self.scene == "search"
+            && std::env::var_os("ZALO_UI_SHOT_JUMP").is_some()
+        {
+            if let Some(thread) = self.app.model.selected.clone() {
+                if let Some(hit) = self
+                    .app
+                    .model
+                    .search_results(&thread)
+                    .and_then(|results| results.hits.last().cloned())
+                {
+                    let compact = ctx.screen_rect().width() < COMPACT_BREAKPOINT;
+                    self.app.jump_to_hit(&thread, &hit, compact);
+                }
             }
         }
         // Let the demo worker deliver its conversations and the first frames settle.
@@ -157,6 +197,24 @@ fn demo_screenshot() {
             let profile = Profile::at_root(&profile_root, "fixture")?;
             if std::env::var("ZALO_UI_SHOT_SCENE").as_deref() == Ok("info") {
                 seed_shared_items(&profile)?;
+            }
+            if std::env::var("ZALO_UI_SHOT_SCENE").as_deref() == Ok("search-pages") {
+                let mut store = crate::store::MessageStore::open(
+                    &profile.paths.data_dir.join("messages.sqlite3"),
+                )?;
+                let messages: Vec<_> = (0..75)
+                    .map(|i| Message {
+                        account_id: crate::app::DEMO_ACCOUNT.into(),
+                        thread_id: "welcome".into(),
+                        id: format!("search-page-{i:03}"),
+                        sender: "Demo".into(),
+                        text: format!("Demo · Hẹn gặp ở quán phở · tin tổng hợp {i:03}"),
+                        sticker: None,
+                        media: None,
+                        sent_at_ms: 1_900_000_000_000 + i,
+                    })
+                    .collect();
+                store.insert_batch(&messages)?;
             }
             let app = NativeApp::new(cc, profile, true)?;
             Ok(Box::new(Shot {

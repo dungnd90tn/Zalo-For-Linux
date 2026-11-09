@@ -227,6 +227,21 @@ impl MediaCache {
     }
     /// Explicit user action only. A refused start (queue full, worker gone) is shown as a failure.
     pub(super) fn start_download(&mut self, ctx: &egui::Context, key: MediaKey, name: &str) {
+        if self.account.as_deref() != Some(key.account_id.as_str())
+            || !self
+                .scope
+                .as_ref()
+                .is_some_and(|(thread, _)| thread == &key.thread_id)
+        {
+            return;
+        }
+        #[cfg(test)]
+        if self.fixture_only {
+            // Synthetic native-window fixtures must never download from a public CDN.
+            self.downloads
+                .put(key, Download::Failed(DownloadFailure::Network));
+            return;
+        }
         self.retire_closed_downloader();
         if self.downloader.is_none() {
             let repaint = ctx.clone();
@@ -257,6 +272,12 @@ impl MediaCache {
         self.downloads.pop(key);
     }
     pub(super) fn apply_download(&mut self, event: DownloadEvent) {
+        let key = match &event {
+            DownloadEvent::Done { key, .. } | DownloadEvent::Failed { key, .. } => key,
+        };
+        if self.account.as_deref() != Some(key.account_id.as_str()) {
+            return;
+        }
         match event {
             DownloadEvent::Done { key, path, .. } => {
                 self.downloads.put(key, Download::Saved(path));
@@ -373,6 +394,14 @@ impl MediaCache {
         );
     }
     #[cfg(test)]
+    pub fn seed_viewer(&mut self, key: MediaKey, caption: String, original_url: Option<String>) {
+        self.viewer = Some(Viewer {
+            key,
+            caption,
+            original_url,
+        });
+    }
+    #[cfg(test)]
     pub fn seed_failure(&mut self, key: MediaKey, generation: u64) {
         self.scope(&key.account_id, &key.thread_id, generation);
         self.fixture_only = true;
@@ -415,6 +444,55 @@ mod tests {
             rgba: Arc::new(vec![120; side as usize * side as usize * 4]),
         }
     }
+    #[test]
+    fn downloads_reject_foreign_scope_and_discard_late_events_after_account_change() {
+        let ctx = egui::Context::default();
+        let mut cache = MediaCache::default();
+        cache.scope("11", "d:22", 1);
+        let original = key("original");
+        for foreign in [
+            MediaKey {
+                account_id: "99".into(),
+                ..original.clone()
+            },
+            MediaKey {
+                thread_id: "g:22".into(),
+                ..original.clone()
+            },
+        ] {
+            cache.start_download(&ctx, foreign, "photo.jxl");
+            assert!(cache.downloader.is_none());
+            assert!(cache.downloads.is_empty());
+        }
+        cache.apply_download(DownloadEvent::Done {
+            key: original.clone(),
+            path: "/tmp/photo.jxl".into(),
+            bytes: 12,
+        });
+        assert!(matches!(
+            cache.download_view(&original),
+            DownloadView::Saved(_)
+        ));
+        // Same-account navigation retains the completed transfer, shared by the card and viewer.
+        cache.scope("11", "d:44", 2);
+        assert!(matches!(
+            cache.download_view(&original),
+            DownloadView::Saved(_)
+        ));
+        cache.scope("99", "d:22", 1);
+        cache.apply_download(DownloadEvent::Done {
+            key: original.clone(),
+            path: "/tmp/photo.jxl".into(),
+            bytes: 12,
+        });
+        assert!(matches!(cache.download_view(&original), DownloadView::Idle));
+        cache.apply_download(DownloadEvent::Failed {
+            key: original.clone(),
+            reason: DownloadFailure::Http(403),
+        });
+        assert!(matches!(cache.download_view(&original), DownloadView::Idle));
+    }
+
     #[test]
     fn stale_account_thread_and_page_results_cannot_replace_visible_assets() {
         let ctx = egui::Context::default();

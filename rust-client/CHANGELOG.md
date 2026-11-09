@@ -4,6 +4,27 @@ Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-clie
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
 Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../changelogs/RELEASE-v2.0.0.md).
 
+## [2.0.3] - 2026-11-09
+
+### Thêm mới
+- **Tìm tin nhắn trong hội thoại** (panel *Thông tin hội thoại* → *Tìm tin nhắn*): tìm không dấu, không phân biệt
+  hoa thường trong lịch sử đã lưu trên máy (không hỏi máy chủ Zalo). Ảnh, tệp, thẻ liên kết và bình chọn được tìm
+  theo chú thích/tên tệp/tiêu đề; nhãn dán và chuỗi giữ chỗ "[Tin nhắn … chưa được hỗ trợ]" không bao giờ khớp.
+  Tối đa 50 kết quả mới nhất, mỗi lần quét tối đa 20 000 tin; khi có thể còn kết quả cũ hơn thì ghi rõ.
+- Bấm một kết quả sẽ mở đúng trang chứa tin đó (kèm khoảng 10 tin mới hơn), cuộn tới và tô sáng tin trong vài giây;
+  ở cửa sổ hẹp panel thông tin tự đóng để thấy tin.
+- Hội thoại ẩn (mã PIN) hoặc khi trạng thái riêng tư chưa xác minh: tìm kiếm không trả về gì, giống phân trang
+  lịch sử; kết quả cho hội thoại bị khóa bị lọc trước khi tới giao diện.
+- Menu chuột phải trong bong bóng cho phép **sao chép tin nhắn**, chú thích ảnh, tên tệp,
+  nội dung thẻ và liên kết. Menu giữ nguyên bản nháp, đóng khi đổi hội thoại/tài khoản
+  hoặc khóa lại chat ẩn; chưa hỗ trợ sao chép pixel ảnh hay định dạng HTML.
+- **Tải ảnh gốc** từ thẻ ảnh hoặc cửa sổ xem ảnh: lưu nguyên byte vào Tải xuống/Zalo Native,
+  có tiến độ, hủy và thử lại; tối đa 100 MiB và không ghi đè tệp. Hủy vẫn dừng được khi máy chủ
+  đang treo; ảnh thiếu liên kết gốc khả dụng không dùng thumbnail để thay thế.
+- Tìm kiếm lịch sử đã lưu có nút **Tìm cũ hơn** và **Mới nhất**. Mỗi trang tối đa 50 kết quả;
+  có thể tìm tiếp sau mỗi lượt quét 20.000 tin, kể cả khi trang hiện tại chưa có kết quả.
+  Tin mới đến không làm dịch trang cũ; lỗi tải trang giữ kết quả và mốc tiếp tục để thử lại.
+
 ## [2.0.2] - 2026-11-08
 
 ### Sửa lỗi

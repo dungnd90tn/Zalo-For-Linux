@@ -196,7 +196,7 @@ fn tile(
     response.on_hover_text(hover).on_disabled_hover_text(hover)
 }
 
-fn section_title(ui: &mut egui::Ui, text: &str) {
+pub(super) fn section_title(ui: &mut egui::Ui, text: &str) {
     let colors = crate::theme::palette(ui.ctx());
     ui.add_space(14.0);
     ui.label(
@@ -321,6 +321,8 @@ impl NativeApp {
                 ui.ctx().copy_text(title.clone());
             }
         });
+
+        self.message_search_section(ui, thread);
 
         let overview = self.model.overview(&thread.id).cloned();
         section_title(ui, "Thông tin đã lưu trên máy");

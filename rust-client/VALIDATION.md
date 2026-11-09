@@ -770,3 +770,154 @@ Synthetic evidence for the [redesign guide](UI_REDESIGN_GUIDE.md); not real-acco
 and `ldd`, runs `rpm -V` for RPMs and removes the package. Passed on Ubuntu 20.04/22.04/24.04, Debian 12 (`.deb`) and
 Fedora 42, AlmaLinux 9 (`.rpm`). Debian 11 could not be tested: its apt mirrors return 404. Container installs say nothing
 about GUI behaviour on real desktops; use the demo window evidence above for that.
+
+## Saved-history search pagination (2026-11-09)
+
+The information panel now offers **Tìm cũ hơn** and **Mới nhất**. Search retains one
+page of at most 50 hits, evaluates at most 20,000 saved rows per request plus one
+lookahead row, and continues strictly before the last evaluated `(sent_at_ms, message_id)`.
+An empty scan page can continue. New arrivals do not shift older pages, changing
+the query cannot reuse an old boundary, and failed continuation preserves the
+previous page for retry. Each request rechecks account/thread privacy; no schema,
+remote search, receipt or encryption behavior changes.
+
+- Focused all-feature search checks: **26 passed**. Regressions cover timestamp
+  ties, concurrent newer arrivals, empty scan windows, exact exhaustion, hidden
+  relocking, malformed boundaries, backpressure, stale replies, worker pagination
+  and Light/Dark pointer interaction at sidebar/compact widths.
+- Default Rust checks: **244 library, 3 CLI and 3 schema-upgrade tests passed**;
+  **five IME adapter** and **19 Python tooling tests** passed. Strict
+  all-target/all-feature Clippy passed with Rust 1.99.1. The complete
+  `./scripts/rust/check.sh` exited successfully, including informational no-write
+  checks and the headless offline demo smoke.
+- The unfiltered all-feature command stopped in its library phase with **582 passed,
+  one failed and four ignored**. The failure is
+  `app::live::runtime::integration_tests::incomplete_or_encrypted_capability_never_sends_or_prepares_outbox`,
+  at its expected `đã bật mã hóa` error text. The same exact test fails on an
+  unmodified `0c25bc6` HEAD extracted to a disposable directory, with the same
+  assertion. HEAD already routes encrypted targets through `send_e2ee` when
+  `signal-crypto` is enabled. Neither that route nor its test was changed here.
+  A subsequent run with only that exact test excluded passed **601 tests** across
+  library, CLI, schema and Signal integration targets (four ignored, one explicitly
+  filtered). This checkpoint does **not** claim an entirely passing unfiltered
+  all-feature suite.
+- Six app-framebuffer screenshots were inspected under X11: Light/Dark at
+  **1200×780** and **640×480**, plus older-page/end-of-results captures at wide
+  Light and compact Dark. They show only seeded demo messages; no real profile,
+  login or desktop capture was used. Compact results remain inside the existing
+  scrollable information page. Files/logs use `/tmp/zalo-search-pagination-*`.
+
+To reproduce the pagination screenshots, use the ignored `ui::shot_fixture::demo_screenshot`
+with `ZALO_UI_SHOT_SCENE=search-pages`; add `ZALO_UI_SHOT_OLDER=1` for the second
+page. The fixture seeds 75 matches in its disposable demo profile. This is local
+storage/UI evidence, not real-account or Wayland acceptance.
+
+
+## Original-photo saving (2026-11-09)
+
+Received photo cards and the cached native viewer now offer **Tải ảnh gốc** for an
+available original URL accepted by the existing Zalo CDN policy. They share one
+transfer keyed by account/thread/message/original URL, with progress, cancel,
+retry and saved location. This preserves original bytes (including JXL), caps
+transfers at 100 MiB, uses sanitized collision-safe filenames and never falls
+back to the thumbnail. Cancel interrupts a stalled response and cleans the
+partial file; unsolicited HTTP 206 is rejected. No schema or sending changes.
+
+Six new regressions cover original-byte fidelity/partial responses, cancellation
+before connection and during a stalled body, filenames without signed queries,
+card/viewer shared state with no automatic transfer in Light/Dark at both sizes,
+and stale account/thread requests/results. Existing image geometry/DPI and file
+card checks also pass. Synthetic fixture mode refuses public-CDN downloads.
+
+Verification results:
+
+- Unfiltered all-feature library run: **588 passed, one failed, four ignored**.
+  The failure is the previously documented encrypted-capability test at
+  `integration_tests.rs:4670` (expected `đã bật mã hóa` text). All six new
+  regressions passed.
+- A repeat excluding only that known E2EE test, with two test threads, finished
+  **587 passed, one failed, four ignored, one filtered**. The additional failure
+  is `terminal_transport_failures_keep_one_local_actor_alive_until_explicit_shutdown`
+  at line 3252, which expects two or three hidden-policy requests. That test passed
+  in the initial full run and in its separate focused run. Its result is unstable;
+  this change does not claim an entirely green all-feature suite.
+- `./scripts/rust/check.sh` exited successfully: **244 default library, three
+  CLI, three schema-upgrade, five IME adapter and 19 Python tooling tests** passed,
+  along with formatting, strict default Clippy, dependency guards, informational
+  no-write CLI checks and the headless offline demo.
+- All-feature schema/Signal integration targets: **16 passed**. Strict
+  all-target/all-feature Clippy passed. Logs are in `/tmp/zalo-photo-*`.
+
+Eight native app-framebuffer screenshots were inspected under X11: photo card
+and viewer at **1200×780** and **640×480**, each in Light/Dark. Save actions remain
+visible, images retain their aspect ratio and are not enlarged above source
+pixels. Only synthetic profiles/pixels were used. The fixture does not log in or
+capture the desktop. Screenshots/logs use `/tmp/zalo-photo-*`.
+
+Reproduce with the ignored
+`ui::live::tests::signed_in_offline_native_window_fixture` in an all-feature test
+binary, `ZALO_UI_FIXTURE_READY=1`, `ZALO_UI_FIXTURE_MEDIA=photo`,
+`ZALO_UI_FIXTURE_WIDTH=1200|640`, `ZALO_UI_FIXTURE_THEME=light|dark`, and
+`ZALO_UI_SHOT=/tmp/zalo-photo-check.ppm`; add
+`ZALO_UI_FIXTURE_PHOTO_VIEWER=1` for the viewer. Original CDN signed URLs,
+cloud-specific headers and encrypted attachments still need real-service evidence.
+
+
+## Message clipboard menu (2026-11-09)
+
+The native message bubble now has an explicit secondary-click menu for copying
+plain text, photo title/caption, file name, card/poll presentation text and an
+available validated http(s) link from a photo/file/card projection. The original counterparts are `_handleCopy`,
+`handleCopyPhotoCaption`, `_handleCopyLink` and `_handleCopyOA` in
+`pc-dist/compact-app-pc.e08d0d44f38873747a6b.js:5406–5485`.
+No raw sidecar/HTML, encryption keys, sticker/unsupported-message placeholders,
+image pixels or remote actions are copied. Encrypted file URLs are withheld.
+
+The popup retains IDs/scope rather than a message payload, rechecks the current
+page/account/thread/generation/authentication/privacy before rendering, and
+closes when another modal opens. Its widget IDs carry the full scope. Escape or
+outside click closes it; background composition/sending is blocked and existing
+scope checks gate focus restoration. Secondary clicks respect the actual bubble,
+clip rectangle and foreground layers. Buttons are 44 logical pixels; the popup
+is constrained to the viewport. Tab/Shift+Tab stays within its actions, including
+wraparound; this explicitly avoids egui 0.29 disabled-background Tab starvation.
+
+Synthetic regression checks cover exact Vietnamese/emoji/newline fidelity, safe
+link handling and encrypted-link suppression, actual pointer-to-clipboard output
+at both sizes/themes, stale scopes/locked privacy/modals, draft preservation,
+Escape/background Enter, keyboard copy, foreground-window occlusion and disabled
+photo-viewer links/download actions behind the menu. These
+verify the egui clipboard output, not an external application's OS paste behavior.
+
+Eight native X11 app-framebuffer screenshots were inspected at **1200×780** and
+**640×480** in Light/Dark, showing both caption and link actions with no clipping,
+including the disabled photo viewer behind the menu.
+Only a synthetic profile/photo was used; no login, private account, desktop
+capture, network fetch or clipboard write was needed for the screenshots. Files
+and logs use `/tmp/zalo-message-menu-*`, `/tmp/zalo-message-viewer-menu-*` and
+`/tmp/zalo-message-actions-*`.
+Reproduce with the all-feature ignored
+`ui::live::tests::signed_in_offline_native_window_fixture`,
+`ZALO_UI_FIXTURE_READY=1`, `ZALO_UI_FIXTURE_MEDIA=photo`,
+`ZALO_UI_FIXTURE_MESSAGE_MENU=1`, `ZALO_UI_FIXTURE_WIDTH=1200|640`,
+`ZALO_UI_FIXTURE_THEME=light|dark`, and `ZALO_UI_SHOT=/tmp/menu.ppm`.
+
+Verification on Rust 1.99.1:
+
+- All-feature UI checks: **126 passed, three ignored**; all eight message-menu
+  regressions and the disabled-viewer regression passed.
+- Directory checks with two test threads: **eight passed**. Earlier runs under
+  higher parallel load hit loopback fixture timeouts; the final complete run
+  with four test threads passed all directory checks.
+- The unfiltered all-feature library run finished with **597 passed, one failed
+  and four ignored**. The sole failure is the previously reproduced baseline
+  `app::live::runtime::integration_tests::incomplete_or_encrypted_capability_never_sends_or_prepares_outbox`
+  assertion described above. Its E2EE route/test is unchanged. The all-feature
+  schema/Signal integration targets separately passed **16 tests**.
+- The complete `scripts/rust/check.sh` passed: **247 default library tests,
+  three CLI tests, three schema tests, five IME adapter tests and 19 Python
+  tooling tests**, formatting/dependency guards, strict default Clippy and
+  informational no-write/headless demo smoke checks. An earlier invocation
+  exited 143 before IME/lint/smoke; the final complete rerun exited zero.
+- Strict `cargo clippy --locked --offline --all-features --all-targets --
+  -D warnings` passed. No real-server messaging or external OS paste was tested.

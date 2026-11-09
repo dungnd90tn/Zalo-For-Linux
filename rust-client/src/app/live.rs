@@ -197,6 +197,13 @@ pub enum LiveCommand {
         generation: u64,
         thread: String,
     },
+    /// Saved messages of one conversation containing `query`; never asks the server.
+    Search {
+        request: u64,
+        thread: String,
+        query: String,
+        before: Option<Cursor>,
+    },
     Send {
         generation: u64,
         thread: String,
@@ -311,6 +318,17 @@ pub enum LiveEvent {
         generation: u64,
         thread: String,
     },
+    SearchResults {
+        account_id: String,
+        request: u64,
+        thread: String,
+        search: Box<crate::domain::MessageSearch>,
+    },
+    SearchFailed {
+        account_id: String,
+        request: u64,
+        thread: String,
+    },
     Connection {
         account_id: String,
         state: LiveConnection,
@@ -369,6 +387,8 @@ impl LiveEvent {
             | Self::Page { account_id, .. }
             | Self::Overview { account_id, .. }
             | Self::OverviewFailed { account_id, .. }
+            | Self::SearchResults { account_id, .. }
+            | Self::SearchFailed { account_id, .. }
             | Self::Connection { account_id, .. }
             | Self::Received { account_id, .. }
             | Self::Sent { account_id, .. }
@@ -506,6 +526,16 @@ impl LiveWorker {
                         .is_none_or(|c| crate::domain::validate_id(&c.id).is_ok())
             }
             LiveCommand::Overview { thread, .. } => Target::from_thread(thread).is_ok(),
+            LiveCommand::Search {
+                thread,
+                query,
+                before,
+                ..
+            } => {
+                Target::from_thread(thread).is_ok()
+                    && crate::domain::search::search_query(query) == Some(query.as_str())
+                    && crate::domain::search::valid_search_cursor(before.as_ref())
+            }
             LiveCommand::Send { thread, text, .. } => {
                 Target::from_thread(thread).is_ok()
                     && !text.trim().is_empty()
@@ -666,6 +696,15 @@ impl super::Model {
                 self.overview_failed(generation, &thread);
                 false
             }
+            LiveEvent::SearchResults {
+                request,
+                thread,
+                search,
+                ..
+            } => self.apply_search(request, &thread, *search),
+            LiveEvent::SearchFailed {
+                request, thread, ..
+            } => self.apply_search_failed(request, &thread),
             LiveEvent::Page {
                 generation,
                 thread,

@@ -23,6 +23,8 @@ mod live;
 mod login;
 #[cfg(feature = "messaging")]
 mod media;
+mod message_actions;
+mod message_search;
 #[cfg(all(test, feature = "messaging"))]
 mod modal_tests;
 #[cfg(feature = "messaging")]
@@ -82,6 +84,7 @@ pub struct NativeApp {
     modal_focus: Option<ModalFocus>,
     settings_open: bool,
     account_popup: Option<account::Popup>,
+    message_menu: Option<message_actions::Popup>,
     account_trigger_focus: Option<ModalFocus>,
     theme: crate::theme::ThemeController,
     settings: settings::Settings,
@@ -93,6 +96,7 @@ pub struct NativeApp {
     latest_page: bool,
     ime_composing: bool,
     info_tab: information::InfoTab,
+    message_search: message_search::SearchInput,
     attachments: attachments::AttachmentPicker,
     #[cfg(feature = "live-login")]
     live: Option<live::LiveState>,
@@ -140,6 +144,7 @@ impl NativeApp {
             modal_focus: None,
             settings_open: false,
             account_popup: None,
+            message_menu: None,
             account_trigger_focus: None,
             theme,
             settings: settings::Settings::default(),
@@ -151,6 +156,7 @@ impl NativeApp {
             latest_page: true,
             ime_composing: false,
             info_tab: Default::default(),
+            message_search: Default::default(),
             attachments: Default::default(),
             #[cfg(feature = "live-login")]
             live: None,
@@ -170,7 +176,11 @@ impl NativeApp {
     }
 
     fn modal_open(&self) -> bool {
-        if self.settings_open || self.details || self.account_popup.is_some() {
+        if self.settings_open
+            || self.details
+            || self.account_popup.is_some()
+            || self.message_menu.is_some()
+        {
             return true;
         }
         #[cfg(feature = "live-login")]
@@ -196,6 +206,11 @@ impl NativeApp {
                 .account_popup
                 .as_mut()
                 .and_then(|popup| popup.focus.take())
+                .or_else(|| {
+                    self.message_menu
+                        .as_mut()
+                        .and_then(|popup| popup.focus.take())
+                })
                 .or_else(|| self.modal_focus_snapshot(ctx));
             if let Some(focus) = &self.modal_focus {
                 ctx.memory_mut(|memory| memory.surrender_focus(focus.id));
@@ -364,6 +379,14 @@ impl NativeApp {
     }
 
     fn older_page(&mut self) {
+        if let Some(cursor) = self.model.messages.first().map(Message::cursor) {
+            self.load_page_before(cursor);
+        }
+    }
+
+    /// Load the page of messages older than `cursor` in the selected conversation, replacing
+    /// the visible page. Returns whether the worker accepted the request.
+    fn load_page_before(&mut self, cursor: crate::domain::Cursor) -> bool {
         #[cfg(feature = "messaging")]
         if self
             .model
@@ -371,19 +394,18 @@ impl NativeApp {
             .as_deref()
             .is_some_and(|thread| !self.privacy_visible(thread))
         {
-            return;
+            return false;
         }
         if self.model.pending {
-            return;
+            return false;
         }
         #[cfg(feature = "messaging")]
-        if let (Some(worker), Some(thread), Some(cursor)) = (
+        if let (Some(worker), Some(thread)) = (
             self.live.as_ref().and_then(|state| state.worker.as_ref()),
             self.model.selected.clone(),
-            self.model.messages.first().map(Message::cursor),
         ) {
             let generation = self.model.generation.wrapping_add(1);
-            match worker.submit(crate::app::live::LiveCommand::Load {
+            return match worker.submit(crate::app::live::LiveCommand::Load {
                 generation,
                 thread,
                 before: Some(cursor),
@@ -392,32 +414,34 @@ impl NativeApp {
                     self.model.generation = generation;
                     self.model.pending = true;
                     self.latest_page = false;
-                }
-                Err(error) => self.model.status = error.to_string(),
-            }
-            return;
-        }
-        if let (Some(worker), Some(thread), Some(cursor)) = (
-            self.worker.as_ref(),
-            self.model.selected.clone(),
-            self.model.messages.first().map(Message::cursor),
-        ) {
-            let generation = self.model.generation.wrapping_add(1);
-            match worker.submit(Command::Load {
-                generation,
-                thread,
-                before: Some(cursor),
-            }) {
-                Ok(()) => {
-                    self.model.generation = generation;
-                    self.model.pending = true;
-                    self.latest_page = false;
+                    true
                 }
                 Err(error) => {
                     self.model.status = error.to_string();
+                    false
                 }
-            }
+            };
         }
+        if let (Some(worker), Some(thread)) = (self.worker.as_ref(), self.model.selected.clone()) {
+            let generation = self.model.generation.wrapping_add(1);
+            return match worker.submit(Command::Load {
+                generation,
+                thread,
+                before: Some(cursor),
+            }) {
+                Ok(()) => {
+                    self.model.generation = generation;
+                    self.model.pending = true;
+                    self.latest_page = false;
+                    true
+                }
+                Err(error) => {
+                    self.model.status = error.to_string();
+                    false
+                }
+            };
+        }
+        false
     }
 
     fn send_local(&mut self) {
@@ -1375,7 +1399,8 @@ impl NativeApp {
                         self.model.generation,
                     ))
                     .auto_shrink([false, false])
-                    .stick_to_bottom(true)
+                    // Sticking to the newest message would override scrolling to a search hit.
+                    .stick_to_bottom(self.model.focus().is_none())
                     .max_height(timeline_height)
                     .show(ui, |ui| {
                         egui::Frame::none()
@@ -1428,7 +1453,15 @@ impl NativeApp {
                                 let own_name = self.account_label().to_owned();
                                 #[cfg(feature="messaging")]
                                 if let (Some(state),Some(account),Some(thread))=(&mut self.live,own_account.as_deref(),self.model.selected.as_deref()) {state.media.scope(account,thread,self.model.generation);}
+                                let menu_scope = self.message_menu_scope();
+                                let menu_focus = self.modal_focus_snapshot(ctx);
                                 let mut previous_day = None;
+                                let focus = self
+                                    .model
+                                    .focus()
+                                    .map(|focus| (focus.message_id.clone(), focus.shown_at));
+                                let now = std::time::Instant::now();
+                                let mut focus_drawn = false;
                                 for message in &self.model.messages {
                                     let day = local_parts(message.sent_at_ms)
                                         .map(|parts| (parts.tm_year, parts.tm_yday));
@@ -1459,14 +1492,43 @@ impl NativeApp {
                                         Some(state) if state.account.is_some() => (Some(&mut state.stickers),Some(&mut state.media)),
                                         _ => (None,None),
                                     };
-                                    message_bubble(ui, message, compact, own_account.as_deref(), &sender_name,&sender_avatar,avatar_texture.as_ref(),
+                                    let focused = focus.as_ref().filter(|(id, _)| *id == message.id);
+                                    let backdrop = ui.painter().add(egui::Shape::Noop);
+                                    let bubble = ui.scope(|ui| message_bubble(ui, message, compact, own_account.as_deref(), &sender_name,&sender_avatar,avatar_texture.as_ref(),
                                         #[cfg(feature = "messaging")]
                                         sticker_cache,
                                         #[cfg(feature = "messaging")]
                                         media_cache,
                                         self.model.generation,
-                                    );
+                                    ));
+                                    if let Some(position) = message_actions::requested(ui, bubble.inner, message) {
+                                        if let Some(scope) = &menu_scope {
+                                            self.message_menu = Some(message_actions::Popup::new(
+                                                scope.clone(), message.id.clone(), position, menu_focus.clone(),
+                                            ));
+                                        }
+                                    }
+                                    let bubble = bubble.response;
+                                    if let Some((_, shown_at)) = focused {
+                                        focus_drawn = true;
+                                        if shown_at.is_none() {
+                                            bubble.scroll_to_me(Some(Align::Center));
+                                        }
+                                        let alpha = message_search::focus_alpha(*shown_at, now);
+                                        ui.painter().set(
+                                            backdrop,
+                                            egui::Shape::rect_filled(
+                                                bubble.rect.expand2(vec2(8.0, 4.0)),
+                                                12.0,
+                                                colors.accent_soft.gamma_multiply(alpha),
+                                            ),
+                                        );
+                                    }
                                     ui.add_space(13.0);
+                                }
+                                if focus_drawn {
+                                    self.model.focus_shown(now);
+                                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
                                 }
                                 #[cfg(feature = "messaging")]
                                 if self.is_signed_in() && self.model.selected.is_none() {
@@ -1528,11 +1590,13 @@ impl NativeApp {
                 },
             );
         }
+        self.latch_modal_input(ctx);
         self.composer(ui, ctx, composer_height);
     }
 
     fn workspace(&mut self, ctx: &egui::Context) {
         self.sync_account_popup();
+        self.sync_message_menu();
         let colors = crate::theme::palette(ctx);
         let compact = ctx.screen_rect().width() < COMPACT_BREAKPOINT;
         self.navigation(ctx, compact);
@@ -1638,10 +1702,14 @@ impl NativeApp {
             self.live_dialogs(ctx);
         }
         #[cfg(feature = "messaging")]
-        if let Some(state) = &mut self.live {
-            media::viewer(ctx, &mut state.media);
+        {
+            let enabled = !self.modal_blocked && !self.modal_open();
+            if let Some(state) = &mut self.live {
+                media::viewer(ctx, &mut state.media, enabled);
+            }
         }
         self.show_account_popup(ctx);
+        self.show_message_menu(ctx);
         #[cfg(feature = "messaging")]
         if !self.settings_open && !application_information {
             self.hidden_pin_dialog(ctx);
@@ -1827,6 +1895,7 @@ impl eframe::App for NativeApp {
             }
         }
         self.sync_account_popup();
+        self.sync_message_menu();
         self.update_modal_input(ctx);
         #[cfg(feature = "live-login")]
         {
@@ -2065,7 +2134,7 @@ fn message_bubble(
     #[cfg(feature = "messaging")] sticker_cache: Option<&mut stickers::StickerCache>,
     #[cfg(feature = "messaging")] media_cache: Option<&mut media::MediaCache>,
     generation: u64,
-) {
+) -> egui::Rect {
     let colors = crate::theme::palette(ui.ctx());
     let own = is_own_sender(&message.sender, account);
     // Own plain text gets the solid accent bubble with on-color text. Media, stickers and cards
@@ -2173,7 +2242,7 @@ fn message_bubble(
                 let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
                 visuals::avatar_photo(ui, rect, sender_avatar, avatar_texture);
             }
-            egui::Frame::none()
+            let frame = egui::Frame::none()
                 .fill(if bare {
                     egui::Color32::TRANSPARENT
                 } else if accent {
@@ -2293,8 +2362,10 @@ fn message_bubble(
                         message_status(ui, message.sent_at_ms, own, account.is_some(), accent);
                     });
                 });
+            frame.response.rect
         },
-    );
+    )
+    .inner
 }
 
 fn message_status(ui: &mut egui::Ui, sent_at_ms: i64, own: bool, live: bool, accent: bool) {

@@ -1,5 +1,6 @@
 //! Native read-only media cards, with explicit external navigation and scoped background assets.
 mod cache;
+use super::message_actions::external_url;
 use crate::{
     app::media::MediaKey,
     domain::{
@@ -13,8 +14,8 @@ use eframe::egui::{self, vec2, RichText, Sense};
 
 const THUMBNAIL_FRAME: egui::Vec2 = vec2(330.0, 240.0);
 const VIEWER_FRAME: egui::Vec2 = vec2(740.0, 540.0);
-// Bounded caption (56), three gaps (24), and two footer text rows (48).
-const VIEWER_FOOTER_HEIGHT: f32 = 128.0;
+// Reserve room for the bounded caption, explicit save controls and external link.
+const VIEWER_FOOTER_HEIGHT: f32 = 200.0;
 
 pub(super) fn show(
     ui: &mut egui::Ui,
@@ -93,7 +94,13 @@ fn file_card(
     if let (Some(cache), Some(url), false, false) =
         (cache, file.url.as_deref(), file.encrypted, file.is_folder)
     {
-        download_controls(ui, message, file, url, cache);
+        let key = MediaKey {
+            account_id: message.account_id.clone(),
+            thread_id: message.thread_id.clone(),
+            message_id: message.id.clone(),
+            url: url.into(),
+        };
+        download_controls(ui, key, &file.title, "Tải về", cache);
     }
     if let Some(url) = file
         .url
@@ -127,25 +134,19 @@ fn file_card(
         );
     }
 }
-/// Explicit "save to disk" for a received file; nothing is fetched until the button is pressed.
+/// Shared explicit save action for files and original photos, keyed by the full message scope.
 fn download_controls(
     ui: &mut egui::Ui,
-    message: &Message,
-    file: &FileDescriptor,
-    url: &str,
+    key: MediaKey,
+    name: &str,
+    label: &str,
     cache: &mut MediaCache,
 ) {
     // Same origin policy the worker enforces; an off-CDN link only gets the browser link below.
-    if crate::app::media::thumbnail_url(url).is_err() {
+    if crate::app::media::thumbnail_url(&key.url).is_err() {
         return;
     }
     let colors = crate::theme::palette(ui.ctx());
-    let key = MediaKey {
-        account_id: message.account_id.clone(),
-        thread_id: message.thread_id.clone(),
-        message_id: message.id.clone(),
-        url: url.into(),
-    };
     let note = |ui: &mut egui::Ui, text: String| {
         ui.add(
             egui::Label::new(
@@ -160,14 +161,14 @@ fn download_controls(
         DownloadView::Idle => {
             if super::visuals::chip(
                 ui,
-                "Tải về",
+                label,
                 false,
                 true,
-                "Lưu tệp vào thư mục Tải xuống/Zalo Native. Ứng dụng không mở hay chạy tệp.",
+                "Lưu vào thư mục Tải xuống/Zalo Native, tối đa 100 MiB. Không ghi đè, mở hay chạy tệp.",
             )
             .clicked()
             {
-                cache.start_download(ui.ctx(), key, &file.title);
+                cache.start_download(ui.ctx(), key, name);
             }
         }
         DownloadView::Running { received, total } => {
@@ -212,11 +213,52 @@ fn download_controls(
             note(ui, reason.to_string());
             if super::visuals::chip(ui, "Thử lại", false, true, "Tải lại tệp").clicked() {
                 cache.forget_download(&key);
-                cache.start_download(ui.ctx(), key, &file.title);
+                cache.start_download(ui.ctx(), key, name);
             }
         }
     }
 }
+/// The extension describes the original bytes; a CDN URL without a known image extension
+/// stays extensionless. Never invent JPEG, use a signed query as a name, or use the caption.
+fn photo_download_name(key: &MediaKey) -> String {
+    let extension = url::Url::parse(&key.url).ok().and_then(|url| {
+        let leaf = url.path_segments()?.next_back()?;
+        let (_, extension) = leaf.rsplit_once('.')?;
+        let extension = extension.to_ascii_lowercase();
+        matches!(
+            extension.as_str(),
+            "jpg" | "jpeg" | "png" | "webp" | "gif" | "jxl" | "avif" | "bmp" | "tif" | "tiff"
+        )
+        .then_some(extension)
+    });
+    let name = format!(
+        "anh-{}{}",
+        key.message_id,
+        extension
+            .map(|extension| format!(".{extension}"))
+            .unwrap_or_default()
+    );
+    crate::app::download::safe_file_name(&name)
+}
+
+/// Card and viewer share the original URL's transfer; the thumbnail is never a fallback download.
+fn photo_download_controls(
+    ui: &mut egui::Ui,
+    key: &MediaKey,
+    original: Option<&str>,
+    cache: &mut MediaCache,
+) {
+    let Some(url) = original.filter(|url| crate::app::media::thumbnail_url(url).is_ok()) else {
+        return;
+    };
+    let original_key = MediaKey {
+        url: url.into(),
+        ..key.clone()
+    };
+    let name = photo_download_name(&original_key);
+    download_controls(ui, original_key, &name, "Tải ảnh gốc", cache);
+}
+
 fn display_path(path: &std::path::Path) -> String {
     match std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -243,7 +285,7 @@ fn photo_card(
     message: &Message,
     generation: u64,
     photo: &PhotoDescriptor,
-    cache: Option<&mut MediaCache>,
+    mut cache: Option<&mut MediaCache>,
     max_width: f32,
 ) {
     let colors = crate::theme::palette(ui.ctx());
@@ -258,7 +300,7 @@ fn photo_card(
             generation,
             url,
             photo.width.zip(photo.height),
-            cache,
+            cache.as_deref_mut(),
             max_width.min(330.0),
             Some((&photo.caption, photo.original_url.as_deref())),
         );
@@ -283,6 +325,15 @@ fn photo_card(
     }
     if !photo.caption.is_empty() {
         ui.add(egui::Label::new(&photo.caption).wrap());
+    }
+    if let Some(cache) = cache {
+        let key = MediaKey {
+            account_id: message.account_id.clone(),
+            thread_id: message.thread_id.clone(),
+            message_id: message.id.clone(),
+            url: String::new(),
+        };
+        photo_download_controls(ui, &key, photo.original_url.as_deref(), cache);
     }
     if let Some(url) = photo.original_url.as_deref().and_then(external_url) {
         if ui
@@ -532,17 +583,19 @@ fn placeholder(ui: &mut egui::Ui, width: f32, label: &str, height: Option<f32>) 
         })
         .response
 }
-pub(super) fn viewer(ctx: &egui::Context, cache: &mut MediaCache) {
+pub(super) fn viewer(ctx: &egui::Context, cache: &mut MediaCache, enabled: bool) {
     let Some(viewer) = cache.viewer.as_ref() else {
         return;
     };
     let key = viewer.key.clone();
     let caption = viewer.caption.clone();
-    let original = viewer.original_url.as_deref().and_then(external_url);
+    let original_url = viewer.original_url.clone();
+    let original = original_url.as_deref().and_then(external_url);
     let texture = cache.texture(&key);
     let mut open = true;
     egui::Window::new("Ảnh xem trước")
         .id(egui::Id::new("scoped_media_viewer"))
+        .enabled(enabled)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -573,45 +626,115 @@ pub(super) fn viewer(ctx: &egui::Context, cache: &mut MediaCache) {
                 } else {
                     ui.label("Ảnh không còn trong cache. Đóng và mở lại từ hội thoại để tải lại.");
                 }
-                if !caption.is_empty() {
-                    egui::ScrollArea::vertical()
-                        .id_salt("media_viewer_caption")
-                        .max_height(56.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            ui.add(egui::Label::new(caption).wrap());
-                        });
-                }
-                ui.label(
-                    RichText::new("Bản xem trước tĩnh có giới hạn kích thước.")
-                        .size(super::visuals::TEXT_SMALL),
-                );
-                if let Some(url) = original {
-                    if ui.link("Mở ảnh gốc trong trình duyệt").clicked() {
-                        ctx.open_url(egui::OpenUrl::new_tab(url));
-                    }
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt((
+                        "media_viewer_actions",
+                        &key.account_id,
+                        &key.thread_id,
+                        &key.message_id,
+                    ))
+                    .max_height(VIEWER_FOOTER_HEIGHT)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if !caption.is_empty() {
+                            egui::ScrollArea::vertical()
+                                .id_salt("media_viewer_caption")
+                                .max_height(56.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new(caption).wrap());
+                                });
+                        }
+                        ui.label(
+                            RichText::new("Bản xem trước tĩnh có giới hạn kích thước.")
+                                .size(super::visuals::TEXT_SMALL),
+                        );
+                        if let Some(url) = original {
+                            if ui.link("Mở ảnh gốc trong trình duyệt").clicked() {
+                                ctx.open_url(egui::OpenUrl::new_tab(url));
+                            }
+                        }
+                        photo_download_controls(ui, &key, original_url.as_deref(), cache);
+                    });
             });
         });
     if !open {
         cache.viewer = None;
     }
 }
-fn external_url(raw: &str) -> Option<String> {
-    if raw.len() > 8192 || raw.trim() != raw || raw.chars().any(char::is_control) {
-        return None;
-    }
-    let url = url::Url::parse(raw).ok()?;
-    (matches!(url.scheme(), "https" | "http")
-        && url.host_str().is_some()
-        && url.username().is_empty()
-        && url.password().is_none())
-    .then(|| url.to_string())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_viewer_cannot_open_links_or_start_downloads_behind_a_menu() {
+        let ctx = egui::Context::default();
+        super::super::visuals::install(&ctx);
+        let key = MediaKey {
+            account_id: "11".into(),
+            thread_id: "d:22".into(),
+            message_id: "1".into(),
+            url: "https://f1.zdn.vn/thumbnail.jpg".into(),
+        };
+        let original = "https://f1.zdn.vn/original.jpg";
+        let mut cache = MediaCache::default();
+        cache.seed(&ctx, key.clone(), 1, 16, 16, vec![120; 16 * 16 * 4]);
+        cache.viewer = Some(Viewer {
+            key: key.clone(),
+            caption: String::new(),
+            original_url: Some(original.into()),
+        });
+        let render = |cache: &mut MediaCache, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        vec2(640.0, 480.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| viewer(ctx, cache, false),
+            )
+        };
+        let _ = render(&mut cache, vec![]);
+        let out = render(&mut cache, vec![]);
+        for label in ["Mở ảnh gốc trong trình duyệt", "Tải ảnh gốc"] {
+            let position = out
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .expect("disabled action must remain visible");
+            for pressed in [true, false] {
+                let result = render(
+                    &mut cache,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+                assert!(result.platform_output.open_url.is_none());
+                assert!(matches!(
+                    cache.download_view(&MediaKey {
+                        url: original.into(),
+                        ..key.clone()
+                    }),
+                    DownloadView::Idle
+                ));
+            }
+        }
+    }
 
     #[test]
     fn cached_images_keep_logical_frames_on_maximize_and_do_not_upscale_pixels() {
@@ -682,7 +805,7 @@ mod tests {
                                 .native_pixels_per_point = Some(pixels_per_point);
                             let output = ctx.run(input, |ctx| {
                                 if open_viewer {
-                                    viewer(ctx, &mut cache);
+                                    viewer(ctx, &mut cache, true);
                                 } else {
                                     egui::CentralPanel::default().show(ctx, |ui| {
                                         let available_width = ui.available_width();
@@ -970,6 +1093,140 @@ mod tests {
     }
 
     #[test]
+    fn photo_download_names_preserve_formats_without_caption_or_signed_query() {
+        let mut key = MediaKey {
+            account_id: "11".into(),
+            thread_id: "g:22".into(),
+            message_id: "7".into(),
+            url: String::new(),
+        };
+        for (url, expected) in [
+            (
+                "https://photo-talk.zadn.vn/a/image.JXL?token=secret&name=bad.exe",
+                "anh-7.jxl",
+            ),
+            ("https://f1.zdn.vn/a/image.png", "anh-7.png"),
+            ("https://f1.zdn.vn/a/blob?format=jpeg", "anh-7"),
+            ("https://f1.zdn.vn/a/unsafe.svg", "anh-7"),
+        ] {
+            key.url = url.into();
+            assert_eq!(photo_download_name(&key), expected);
+        }
+        key.message_id = "../a\u{202e}\n".into();
+        let name = photo_download_name(&key);
+        assert!(!name.contains(['/', '\n', '\u{202e}']));
+    }
+
+    #[test]
+    fn original_photo_save_is_explicit_and_shared_between_card_and_viewer() {
+        use crate::app::download::{DownloadEvent, DownloadFailure};
+        for dark in [false, true] {
+            for size in [vec2(1200.0, 780.0), vec2(640.0, 480.0)] {
+                let ctx = egui::Context::default();
+                super::super::visuals::install(&ctx);
+                crate::theme::apply(
+                    &ctx,
+                    if dark {
+                        crate::theme::ThemeMode::Dark
+                    } else {
+                        crate::theme::ThemeMode::Light
+                    },
+                );
+                let original = "https://photo-talk.zadn.vn/source/original.jxl?token=synthetic";
+                let key = MediaKey {
+                    account_id: "11".into(),
+                    thread_id: "g:22".into(),
+                    message_id: "1".into(),
+                    url: "https://f1.zdn.vn/thumb.png".into(),
+                };
+                let original_key = MediaKey {
+                    url: original.into(),
+                    ..key.clone()
+                };
+                let photo = PhotoDescriptor {
+                    title: "Ảnh tổng hợp".into(),
+                    caption: "Chú thích tiếng Việt".into(),
+                    thumbnail_url: Some(key.url.clone()),
+                    original_url: Some(original.into()),
+                    width: Some(16),
+                    height: Some(16),
+                };
+                let message = message(MediaDescriptor::Photo(photo.clone()));
+                let mut cache = MediaCache::default();
+                cache.seed(&ctx, key.clone(), 1, 16, 16, vec![120; 16 * 16 * 4]);
+                let render = |cache: &mut MediaCache, photo: &PhotoDescriptor, viewing| {
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            if viewing {
+                                viewer(ctx, cache, true);
+                            } else {
+                                egui::CentralPanel::default().show(ctx, |ui| {
+                                    photo_card(ui, &message, 1, photo, Some(cache), 300.0)
+                                });
+                            }
+                        },
+                    )
+                };
+                let text = |out: egui::FullOutput| {
+                    out.shapes
+                        .into_iter()
+                        .filter_map(|shape| match shape.shape {
+                            egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let first = text(render(&mut cache, &photo, false));
+                assert!(first.contains("Tải ảnh gốc"));
+                assert!(
+                    matches!(cache.download_view(&original_key), DownloadView::Idle),
+                    "drawing must not start a transfer"
+                );
+                cache.apply_download(DownloadEvent::Done {
+                    key: original_key.clone(),
+                    path: "/tmp/Zalo Native/anh-1.jxl".into(),
+                    bytes: 42,
+                });
+                assert!(text(render(&mut cache, &photo, false)).contains("Đã lưu:"));
+                cache.viewer = Some(Viewer {
+                    key: key.clone(),
+                    caption: photo.caption.clone(),
+                    original_url: photo.original_url.clone(),
+                });
+                let _ = render(&mut cache, &photo, true);
+                assert!(text(render(&mut cache, &photo, true)).contains("Đã lưu:"));
+                cache.apply_download(DownloadEvent::Failed {
+                    key: original_key.clone(),
+                    reason: DownloadFailure::Http(403),
+                });
+                assert!(text(render(&mut cache, &photo, false)).contains("Thử lại"));
+                cache.apply_download(DownloadEvent::Failed {
+                    key: original_key.clone(),
+                    reason: DownloadFailure::Cancelled,
+                });
+                assert!(text(render(&mut cache, &photo, false)).contains("Tải ảnh gốc"));
+                for url in [
+                    None,
+                    Some("http://f1.zdn.vn:8080/a.jpg"),
+                    Some("https://example.invalid/a.jpg"),
+                ] {
+                    let unavailable = PhotoDescriptor {
+                        original_url: url.map(str::to_owned),
+                        ..photo.clone()
+                    };
+                    let rendered = text(render(&mut cache, &unavailable, false));
+                    assert!(!rendered.contains("Tải ảnh gốc"), "{url:?}: {rendered}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn download_button_appears_only_for_cdn_file_links_and_state_follows_worker_events() {
         use crate::app::download::{DownloadEvent, DownloadFailure};
         let render_text = |file: &FileDescriptor, cache: &mut MediaCache| {
@@ -1008,6 +1265,7 @@ mod tests {
             encrypted,
         };
         let mut cache = MediaCache::default();
+        cache.scope("11", "g:22", 1);
         let cdn = file("https://f1-zpc.zdn.vn/abc/bao-cao.pdf", false, false);
         assert!(render_text(&cdn, &mut cache).contains("Tải về"));
         for hidden in [

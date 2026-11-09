@@ -7,6 +7,7 @@ pub mod attachment;
 pub(crate) mod info;
 pub mod media;
 pub mod overview;
+pub mod search;
 #[cfg(feature = "messaging")]
 pub(crate) mod system;
 pub use attachment::{Attachment, AttachmentError, MAX_DIRECT_FILE_BYTES};
@@ -16,6 +17,7 @@ pub use media::{
     WebContentDescriptor, MAX_MEDIA_DESCRIPTOR_BYTES,
 };
 pub use overview::{ConversationOverview, SharedItem, SharedKind, OVERVIEW_ITEM_LIMIT};
+pub use search::{MessageHit, MessageSearch, SEARCH_RESULT_LIMIT};
 
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 200;

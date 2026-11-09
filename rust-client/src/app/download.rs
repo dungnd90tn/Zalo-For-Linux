@@ -1,6 +1,6 @@
-//! Explicit, bounded download of a file received in a conversation.
+//! Explicit, bounded download of an attachment or original photo received in a conversation.
 //!
-//! A download only starts after the user presses the button on a file card. The URL must pass the
+//! A download only starts after the user presses the save button on a file/photo card or its viewer. The URL must pass the
 //! same CDN policy as thumbnails (HTTPS, `*.zdn.vn`/`*.zadn.vn`, no credentials, no redirects).
 //! Bytes stream to a private `.part` file, are capped, and are renamed to a collision-free name only
 //! once complete, so a failed or cancelled transfer never leaves a partial file under the final name
@@ -17,7 +17,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch, Notify, Semaphore};
 
 /// The original treats files up to this size as "small" (direct upload); larger ones use Zalo Cloud.
 pub const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
@@ -58,6 +58,7 @@ pub struct Progress {
     received: AtomicU64,
     total: AtomicU64,
     cancel: AtomicBool,
+    wake: Notify,
 }
 impl Progress {
     pub fn received(&self) -> u64 {
@@ -69,6 +70,13 @@ impl Progress {
     }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+    async fn wait_cancelled(&self) {
+        // notify_one retains a permit if cancellation races the first poll.
+        if !self.cancelled() {
+            self.wake.notified().await;
+        }
     }
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
@@ -212,12 +220,13 @@ async fn worker(
             cancel.clone(),
         );
         tokio::spawn(async move {
-            let Ok(_permit) = slots.acquire().await else {
-                return;
-            };
             let result = tokio::select! {biased;
                 _ = stop.changed() => Err(DownloadFailure::Cancelled),
-                result = run(&client, &request) => result,
+                _ = request.progress.wait_cancelled() => Err(DownloadFailure::Cancelled),
+                result = async {
+                    let _permit = slots.acquire().await.map_err(|_| DownloadFailure::Cancelled)?;
+                    run(&client, &request).await
+                } => result,
             };
             let event = match result {
                 Ok((path, bytes)) => DownloadEvent::Done {
@@ -304,12 +313,26 @@ pub(crate) async fn stream_to_dir(
     name: &str,
     progress: &Progress,
 ) -> std::result::Result<(PathBuf, u64), DownloadFailure> {
+    tokio::select! {biased;
+        _ = progress.wait_cancelled() => Err(DownloadFailure::Cancelled),
+        result = stream_to_dir_inner(client, url, dir, name, progress) => result,
+    }
+}
+
+async fn stream_to_dir_inner(
+    client: &reqwest::Client,
+    url: url::Url,
+    dir: &Path,
+    name: &str,
+    progress: &Progress,
+) -> std::result::Result<(PathBuf, u64), DownloadFailure> {
     let mut response = client
         .get(url)
         .send()
         .await
         .map_err(|_| DownloadFailure::Network)?;
-    if !response.status().is_success() {
+    // No range was requested: accepting 206 could silently save a truncated original.
+    if response.status() != reqwest::StatusCode::OK {
         return Err(DownloadFailure::Http(response.status().as_u16()));
     }
     let total = response.content_length();
@@ -345,6 +368,9 @@ pub(crate) async fn stream_to_dir(
     }
     if total.is_some_and(|total| total != received) {
         return Err(DownloadFailure::Network);
+    }
+    if progress.cancelled() {
+        return Err(DownloadFailure::Cancelled);
     }
     file.sync_all().map_err(|_| DownloadFailure::Disk)?;
     drop(file);
@@ -632,6 +658,139 @@ mod tests {
             DownloadFailure::Cancelled
         );
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn original_photo_bytes_are_saved_unchanged_and_partial_responses_are_refused() {
+        let dir = scratch("photo");
+        let bytes = include_bytes!("../../tests/fixtures/media/photo.jxl").to_vec();
+        // Original JXL bytes are saved, not the decoded/resized preview.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = bytes.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut input = [0; 1024];
+            let _ = socket.read(&mut input).await;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&body).await.unwrap();
+        });
+        let (path, _) = stream_to_dir(
+            &client(),
+            url::Url::parse(&format!("http://{address}/photo.jxl")).unwrap(),
+            &dir,
+            "anh-1.jxl",
+            &Progress::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        let partial = serve(
+            "HTTP/1.1 206 Partial Content\r\ncontent-length: 3\r\nconnection: close\r\n\r\n",
+            b"abc".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            stream_to_dir(
+                &client(),
+                partial,
+                &dir,
+                "partial.jpg",
+                &Progress::default()
+            )
+            .await
+            .unwrap_err(),
+            DownloadFailure::Http(206)
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_body_and_removes_the_part_file() {
+        let dir = scratch("stalled");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (written, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\nx")
+                .await
+                .unwrap();
+            let _ = written.send(());
+            let _ = socket.read(&mut request).await;
+        });
+        let progress = Arc::new(Progress::default());
+        let running = progress.clone();
+        let destination = dir.clone();
+        let task = tokio::spawn(async move {
+            stream_to_dir(
+                &client(),
+                url::Url::parse(&format!("http://{address}/original.jpg")).unwrap(),
+                &destination,
+                "photo.jpg",
+                &running,
+            )
+            .await
+        });
+        ready.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while progress.received() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        progress.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err(),
+            DownloadFailure::Cancelled
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_start_does_not_connect_or_create_any_file() {
+        let dir = scratch("not-started");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!(
+            "http://{}/photo.jpg",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let progress = Progress::default();
+        progress.cancel();
+        assert_eq!(
+            stream_to_dir(&client(), url, &dir, "photo.jpg", &progress)
+                .await
+                .unwrap_err(),
+            DownloadFailure::Cancelled
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

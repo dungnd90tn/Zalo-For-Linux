@@ -1144,6 +1144,7 @@ pub(in crate::ui) mod tests {
                 modal_focus: None,
                 settings_open: false,
                 account_popup: None,
+                message_menu: None,
                 account_trigger_focus: None,
                 theme: crate::theme::ThemeController::new(
                     profile.paths.config_dir.clone(),
@@ -1157,6 +1158,7 @@ pub(in crate::ui) mod tests {
                 latest_page: true,
                 ime_composing: false,
                 info_tab: Default::default(),
+                message_search: Default::default(),
                 attachments: Default::default(),
                 live: Some(state),
                 _profile: profile,
@@ -2052,6 +2054,7 @@ pub(in crate::ui) mod tests {
             app: NativeApp,
             geometry: Option<[f32; 4]>,
             grab: crate::ui::shot_fixture::Grabber,
+            menu_opened: bool,
         }
         impl eframe::App for MeasuredFixture {
             fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -2072,6 +2075,20 @@ pub(in crate::ui) mod tests {
                     if let Some(live) = self.app.live.as_mut() {
                         live.privacy = super::super::privacy::Privacy::fixture_ready();
                         live.directory.fixture_rows();
+                    }
+                }
+                if !self.menu_opened && std::env::var_os("ZALO_UI_FIXTURE_MESSAGE_MENU").is_some() {
+                    if let (Some(scope), Some(message)) = (
+                        self.app.message_menu_scope(),
+                        self.app.model.messages.last(),
+                    ) {
+                        self.app.message_menu = Some(super::super::message_actions::Popup::new(
+                            scope,
+                            message.id.clone(),
+                            screen.center(),
+                            self.app.modal_focus_snapshot(ctx),
+                        ));
+                        self.menu_opened = true;
                     }
                 }
                 self.app.update(ctx, frame);
@@ -2129,6 +2146,7 @@ pub(in crate::ui) mod tests {
                             app,
                             geometry: None,
                             grab: Default::default(),
+                            menu_opened: false,
                         }) as Box<dyn eframe::App>
                     })
                     .map_err(Into::into);
@@ -2475,6 +2493,7 @@ pub(in crate::ui) mod tests {
                     app,
                     geometry: None,
                     grab: Default::default(),
+                    menu_opened: false,
                 }))
             }),
         )
@@ -2632,9 +2651,23 @@ pub(in crate::ui) mod tests {
                 if failed {
                     state.media.seed_failure(key, app.model.generation);
                 } else {
-                    state
-                        .media
-                        .seed(ctx, key, app.model.generation, width, height, rgba.clone());
+                    state.media.seed(
+                        ctx,
+                        key.clone(),
+                        app.model.generation,
+                        width,
+                        height,
+                        rgba.clone(),
+                    );
+                    if std::env::var_os("ZALO_UI_FIXTURE_PHOTO_VIEWER").is_some() {
+                        if let Some(MediaDescriptor::Photo(photo)) = message.media.as_ref() {
+                            state.media.seed_viewer(
+                                key,
+                                photo.caption.clone(),
+                                photo.original_url.clone(),
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -39,7 +39,7 @@ unknown; zero is a valid size. `files_oracle.cjs` retains eight synthetic origin
 reader cases. File URLs are exposed only as an explicit HTTPS browser action;
 HTTP links upgrade to HTTPS. No file is automatically downloaded, opened locally
 or executed. Nonempty `secureKey`/`e2eeKey` markers withhold the plaintext action.
-Native upload, download management/resume, folder extraction and E2EE attachment
+Native upload, transfer resume, folder extraction and E2EE attachment
 decryption remain unavailable.
 
 ## Durable content and replay
@@ -97,9 +97,23 @@ Worker and GPU caches each retain at most 32 entries/16 MiB of pixel payload;
 request/result queues hold 16/2 items. Cache entries/results retain account,
 thread, message and generation scope. Pixel caches are memory-only. Failure has
 a 30-second retry cooldown and explicit retry; closed workers can be recreated.
-Cached thumbnails open a native viewer without downloading an original. Opening
-an original image or an available external link requires an explicit click.
-Upload, full-resolution in-app viewing and universal OA actions remain pending.
+Cached thumbnails open a native viewer without downloading an original. **Tải ảnh gốc**
+on the photo card and viewer shares one transfer keyed by account/thread/message/original
+URL. The source `saveImageData` queue (`compact-app-pc.*.js:153214`) likewise takes a
+URL and destination separately from displayed pixels. Native saves the original bytes
+through `FileDownloader`, without decoding/re-encoding
+or falling back to the thumbnail. Only an available original URL passing the CDN policy
+offers this action; secure-photo markers continue to suppress it. Progress, cancellation,
+retry and the saved location use the same controls as file cards. Original URL image
+extensions are preserved in a sanitized `anh-<message-id>` filename; unknown extensions
+stay absent, and signed query strings/captions never become filenames. Downloads are
+capped at 100 MiB, never overwrite existing files, and cancel even during a stalled
+response, cleaning the private partial file. An unsolicited HTTP 206 is refused.
+The viewer footer scrolls within its bound so save actions remain reachable in compact
+windows and with long captions. Browser navigation still requires a separate explicit
+click. Upload, full-resolution in-app viewing and universal OA actions remain pending.
+See [file transfer limits](PROTOCOL_FILES.md#receiving-files-implemented-unverified-against-the-real-service).
+Local HTTP and synthetic UI checks establish these behaviors, not production CDN acceptance.
 
 ## Identity avatars
 
