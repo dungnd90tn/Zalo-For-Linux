@@ -37,6 +37,13 @@ pub struct MessageSearch {
     pub hits: Vec<MessageHit>,
     /// More matches may exist: the result limit or the scan bound was reached.
     pub truncated: bool,
+    /// Continue strictly before the last inspected row, even when this page has no hits.
+    pub next: Option<Cursor>,
+}
+
+/// Shared command validation for search pagination boundaries.
+pub fn valid_search_cursor(cursor: Option<&Cursor>) -> bool {
+    cursor.is_none_or(|cursor| cursor.sent_at_ms >= 0 && super::validate_id(&cursor.id).is_ok())
 }
 
 /// The trimmed query, or `None` when it is empty, too long or has nothing searchable.

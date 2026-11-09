@@ -2093,16 +2093,18 @@ async fn handle_command(
             request,
             thread,
             query,
+            before,
         } => {
             let account = events.account.clone();
             let requested = thread.clone();
             let result = db
                 .call_with(StorageOperation::LoadHistory, move |s| {
-                    s.search_messages(
+                    s.search_messages_before(
                         &account,
                         &requested,
                         &query,
                         crate::domain::SEARCH_RESULT_LIMIT,
+                        before.as_ref(),
                     )
                 })
                 .await;

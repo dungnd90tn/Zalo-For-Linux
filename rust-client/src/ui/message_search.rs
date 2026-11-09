@@ -15,27 +15,47 @@ pub(super) struct SearchInput {
 
 impl NativeApp {
     pub(super) fn submit_message_search(&mut self, thread: &str) {
+        self.submit_message_search_before(thread, None);
+    }
+
+    pub(super) fn submit_message_search_before(
+        &mut self,
+        thread: &str,
+        before: Option<crate::domain::Cursor>,
+    ) {
         let query = self.message_search.text.clone();
         #[cfg(feature = "messaging")]
         if let Some(worker) = self.live.as_ref().and_then(|state| state.worker.as_ref()) {
-            let result = self.model.request_search(thread, &query, |request, query| {
-                worker.submit(crate::app::live::LiveCommand::Search {
-                    request,
-                    thread: thread.to_owned(),
-                    query,
-                })
-            });
+            let result = self.model.request_search_before(
+                thread,
+                &query,
+                before,
+                |request, query, before| {
+                    worker.submit(crate::app::live::LiveCommand::Search {
+                        request,
+                        thread: thread.to_owned(),
+                        query,
+                        before,
+                    })
+                },
+            );
             self.search_submitted(result);
             return;
         }
         if let Some(worker) = &self.worker {
-            let result = self.model.request_search(thread, &query, |request, query| {
-                worker.submit(crate::app::Command::Search {
-                    request,
-                    thread: thread.to_owned(),
-                    query,
-                })
-            });
+            let result = self.model.request_search_before(
+                thread,
+                &query,
+                before,
+                |request, query, before| {
+                    worker.submit(crate::app::Command::Search {
+                        request,
+                        thread: thread.to_owned(),
+                        query,
+                        before,
+                    })
+                },
+            );
             self.search_submitted(result);
         }
     }
@@ -117,7 +137,6 @@ impl NativeApp {
                 small("Chưa tìm được trong lịch sử đã lưu. Hãy thử lại.".into())
                     .color(colors.text_secondary),
             );
-            return;
         }
         let Some(results) = self.model.search_results(&thread.id).cloned() else {
             ui.label(
@@ -126,12 +145,35 @@ impl NativeApp {
             );
             return;
         };
+        ui.horizontal(|ui| {
+            let same_query = self.message_search.text.trim() == results.query;
+            if ui
+                .add_enabled(
+                    same_query && results.next.is_some(),
+                    egui::Button::new("Tìm cũ hơn").min_size(vec2(0.0, 44.0)),
+                )
+                .on_disabled_hover_text(
+                    "Nhấn Tìm để bắt đầu lại khi đổi từ khóa; chỉ tìm tiếp khi còn lịch sử cũ hơn.",
+                )
+                .clicked()
+            {
+                self.submit_message_search_before(&thread.id, results.next.clone());
+            }
+            if ui
+                .add(egui::Button::new("Mới nhất").min_size(vec2(0.0, 44.0)))
+                .on_hover_text("Tìm lại từ tin nhắn mới nhất")
+                .clicked()
+            {
+                self.submit_message_search(&thread.id);
+            }
+        });
         if results.hits.is_empty() {
             ui.label(
-                small(format!(
-                    "Không có tin nhắn đã lưu nào chứa “{}”.",
-                    results.query
-                ))
+                small(if results.next.is_some() {
+                    format!("Chưa thấy “{}” trong phần lịch sử vừa tìm. Có thể tìm tiếp các tin cũ hơn.", results.query)
+                } else {
+                    format!("Không còn kết quả cho “{}” trong phần lịch sử đã tìm.", results.query)
+                })
                 .color(colors.text_secondary),
             );
             return;
@@ -139,11 +181,11 @@ impl NativeApp {
         ui.label(
             small(if results.truncated {
                 format!(
-                    "{} kết quả mới nhất · có thể còn kết quả cũ hơn",
+                    "{} kết quả trên trang · còn lịch sử cũ hơn",
                     results.hits.len().min(SEARCH_RESULT_LIMIT)
                 )
             } else {
-                format!("{} kết quả", results.hits.len())
+                format!("{} kết quả trên trang", results.hits.len())
             })
             .color(colors.text_secondary),
         );
@@ -152,7 +194,11 @@ impl NativeApp {
         let width = ui.available_width();
         let mut chosen = None;
         egui::ScrollArea::vertical()
-            .id_salt(("message-search", &thread.id))
+            .id_salt((
+                "message-search",
+                &thread.id,
+                results.hits.first().map(|hit| &hit.message_id),
+            ))
             .max_height(260.0)
             .auto_shrink([false, true])
             .show(ui, |ui| {
@@ -266,4 +312,139 @@ pub(super) fn focus_alpha(shown_at: Option<Instant>, now: Instant) -> f32 {
     let total = crate::app::search::FOCUS_HIGHLIGHT.as_secs_f32();
     let elapsed = now.saturating_duration_since(shown_at).as_secs_f32();
     (1.0 - elapsed / total).clamp(0.0, 1.0)
+}
+
+#[cfg(all(test, feature = "messaging"))]
+mod tests {
+    use super::*;
+    use crate::domain::{Cursor, MessageSearch};
+
+    fn frame(
+        app: &mut NativeApp,
+        ctx: &egui::Context,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(width, 480.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.message_search_section(
+                        ui,
+                        &Conversation {
+                            id: "welcome".into(),
+                            title: "Tổng hợp".into(),
+                            last_message_at_ms: 0,
+                            last_text: String::new(),
+                            last_sender: String::new(),
+                        },
+                    );
+                });
+            },
+        )
+    }
+
+    fn text_rect(output: &egui::FullOutput, label: &str) -> egui::Rect {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Missing label {label}"))
+    }
+
+    #[test]
+    fn empty_page_can_continue_and_changed_query_disables_continuation_in_both_themes() {
+        for dark in [false, true] {
+            // Sidebar widths at 1200×780 and 640×480, plus the full compact information page.
+            for width in [344.0, 300.0, 560.0] {
+                let ctx = egui::Context::default();
+                let (mut app, root) = super::super::live::tests::fixture(&ctx);
+                app.live = None;
+                app.worker = Some(
+                    crate::app::Worker::demo(
+                        root.join("pages.sqlite3"),
+                        std::sync::Arc::new(|| {}),
+                    )
+                    .unwrap(),
+                );
+                crate::theme::apply(
+                    &ctx,
+                    if dark {
+                        crate::theme::ThemeMode::Dark
+                    } else {
+                        crate::theme::ThemeMode::Light
+                    },
+                );
+                app.message_search = SearchInput {
+                    thread: "welcome".into(),
+                    text: "offline".into(),
+                };
+                let boundary = Cursor {
+                    sent_at_ms: 10,
+                    id: "boundary".into(),
+                };
+                let mut request = 0;
+                app.model
+                    .request_search("welcome", "offline", |r, _| {
+                        request = r;
+                        Ok(())
+                    })
+                    .unwrap();
+                app.model.apply_search(
+                    request,
+                    "welcome",
+                    MessageSearch {
+                        query: "offline".into(),
+                        hits: vec![],
+                        truncated: true,
+                        next: Some(boundary),
+                    },
+                );
+                let _ = frame(&mut app, &ctx, width, vec![]);
+                let output = frame(&mut app, &ctx, width, vec![]);
+                let older = text_rect(&output, "Tìm cũ hơn");
+                let newest = text_rect(&output, "Mới nhất");
+                assert!(older.right() < width && newest.right() < width);
+                assert!(older.bottom() <= 480.0 && newest.bottom() <= 480.0);
+                // Changing the query must not dispatch an old boundary under a new query.
+                app.message_search.text = "changed".into();
+                let click = |pressed| egui::Event::PointerButton {
+                    pos: older.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                let _ = frame(
+                    &mut app,
+                    &ctx,
+                    width,
+                    vec![egui::Event::PointerMoved(older.center()), click(true)],
+                );
+                let _ = frame(&mut app, &ctx, width, vec![click(false)]);
+                assert!(!app.model.search_pending("welcome"));
+                app.message_search.text = "offline".into();
+                let _ = frame(&mut app, &ctx, width, vec![]);
+                let _ = frame(&mut app, &ctx, width, vec![click(true)]);
+                let _ = frame(&mut app, &ctx, width, vec![click(false)]);
+                assert!(
+                    app.model.search_pending("welcome"),
+                    "empty scan pages must remain navigable"
+                );
+                drop(app);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
 }

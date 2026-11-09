@@ -48,10 +48,32 @@ impl Model {
         query: &str,
         enqueue: impl FnOnce(u64, String) -> std::result::Result<(), SubmitError>,
     ) -> std::result::Result<(), SubmitError> {
+        self.request_search_before(thread, query, None, |request, query, _| {
+            enqueue(request, query)
+        })
+    }
+
+    /// Continue only the completed query's advertised boundary. A failed enqueue leaves
+    /// the current page available for retry; a new query starts from the newest rows.
+    pub fn request_search_before(
+        &mut self,
+        thread: &str,
+        query: &str,
+        before: Option<Cursor>,
+        enqueue: impl FnOnce(u64, String, Option<Cursor>) -> std::result::Result<(), SubmitError>,
+    ) -> std::result::Result<(), SubmitError> {
         let query = search_query(query).ok_or(SubmitError::Invalid)?.to_owned();
+        if before.is_some()
+            && (self.search.pending
+                || !self
+                    .search_results(thread)
+                    .is_some_and(|results| results.query == query && results.next == before))
+        {
+            return Err(SubmitError::Invalid);
+        }
         let request = self.search.request.wrapping_add(1);
-        enqueue(request, query)?;
-        if self.search.thread.as_deref() != Some(thread) {
+        enqueue(request, query, before.clone())?;
+        if before.is_none() {
             self.search.results = None;
         }
         self.search.thread = Some(thread.to_owned());
@@ -145,6 +167,7 @@ mod tests {
             query: query.into(),
             hits: vec![hit("1", None)],
             truncated: false,
+            next: None,
         }
     }
 
@@ -198,6 +221,79 @@ mod tests {
         model.clear_search();
         assert!(!model.apply_search(request, "a", results("x")));
         assert!(!model.apply_search_failed(request, "a"));
+    }
+
+    #[test]
+    fn continuation_preserves_results_on_backpressure_or_failure_and_rejects_stale_pages() {
+        let mut model = Model::default();
+        let mut request = 0;
+        model
+            .request_search("a", "x", |r, _| {
+                request = r;
+                Ok(())
+            })
+            .unwrap();
+        let boundary = Cursor {
+            sent_at_ms: 1,
+            id: "1".into(),
+        };
+        let mut page = results("x");
+        page.next = Some(boundary.clone());
+        page.truncated = true;
+        assert!(model.apply_search(request, "a", page.clone()));
+        assert_eq!(
+            model.request_search_before("a", "x", Some(boundary.clone()), |_, _, _| Err(
+                SubmitError::Busy
+            )),
+            Err(SubmitError::Busy)
+        );
+        assert_eq!(model.search_results("a"), Some(&page));
+        for (thread, query) in [("b", "x"), ("a", "changed")] {
+            assert_eq!(
+                model.request_search_before(
+                    thread,
+                    query,
+                    Some(boundary.clone()),
+                    |_, _, _| unreachable!()
+                ),
+                Err(SubmitError::Invalid)
+            );
+        }
+        let mut next_request = 0;
+        model
+            .request_search_before("a", "x", Some(boundary.clone()), |r, query, cursor| {
+                next_request = r;
+                assert_eq!(query, "x");
+                assert_eq!(cursor, Some(boundary.clone()));
+                Ok(())
+            })
+            .unwrap();
+        assert!(!model.apply_search(request, "a", results("old")));
+        assert_eq!(
+            model.request_search_before("a", "x", Some(boundary.clone()), |_, _, _| unreachable!()),
+            Err(SubmitError::Invalid)
+        );
+        assert!(model.apply_search_failed(next_request, "a"));
+        assert_eq!(model.search_results("a"), Some(&page));
+        model
+            .request_search_before("a", "x", Some(boundary), |r, _, _| {
+                next_request = r;
+                Ok(())
+            })
+            .unwrap();
+        assert!(model.apply_search(next_request, "a", results("x")));
+        assert!(model.search_results("a").unwrap().next.is_none());
+        model
+            .request_search("a", "new query", |r, _| {
+                request = r;
+                Ok(())
+            })
+            .unwrap();
+        assert!(model.search_results("a").is_none());
+        assert!(!model.apply_search(next_request, "a", results("x")));
+        assert!(model.apply_search(request, "a", results("new query")));
+        model.clear_search();
+        assert!(!model.apply_search(request, "a", page));
     }
 
     #[test]

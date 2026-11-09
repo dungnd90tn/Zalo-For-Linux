@@ -43,8 +43,24 @@ impl MessageStore {
         query: &str,
         limit: usize,
     ) -> Result<MessageSearch> {
+        self.search_messages_before(account, thread, query, limit, None)
+    }
+
+    /// Continue with an exclusive keyset boundary. The cursor follows inspected rows,
+    /// so a page without matches can still advance past the scan budget.
+    pub fn search_messages_before(
+        &self,
+        account: &str,
+        thread: &str,
+        query: &str,
+        limit: usize,
+        before: Option<&Cursor>,
+    ) -> Result<MessageSearch> {
         validate_id(account)?;
         validate_id(thread)?;
+        if !crate::domain::search::valid_search_cursor(before) {
+            bail!("Invalid search cursor");
+        }
         let Some(matcher) = Matcher::new(query) else {
             bail!("Invalid search query");
         };
@@ -56,7 +72,13 @@ impl MessageStore {
         if !self.live_thread_visible(account, thread)? {
             return Ok(search);
         }
-        let mut statement = self.conn.prepare_cached(
+        // Separate SQL shapes allow SQLite to seek directly to the continuation boundary.
+        let boundary = if before.is_some() {
+            "AND (m.sent_at_ms,m.message_id)<(?5,?6)"
+        } else {
+            ""
+        };
+        let sql = format!(
             "SELECT m.message_id,m.sender,m.sent_at_ms,m.body,
                 EXISTS(SELECT 1 FROM message_content c WHERE c.account_id=m.account_id AND c.thread_id=m.thread_id
                     AND c.message_id=m.message_id AND c.kind='sticker'),
@@ -65,27 +87,48 @@ impl MessageStore {
              FROM messages m LEFT JOIN message_media mm
                ON mm.account_id=m.account_id AND mm.thread_id=m.thread_id AND mm.message_id=m.message_id
              WHERE m.account_id=?1 AND m.thread_id=?2
-             ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?4",
-        )?;
-        let mut rows = statement.query(params![
-            account,
-            thread,
-            MAX_MEDIA_DESCRIPTOR_BYTES as i64,
-            SEARCH_SCAN_ROWS as i64
-        ])?;
+             {boundary}
+             ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?4"
+        );
+        let mut statement = self.conn.prepare_cached(&sql)?;
+        let mut rows = if let Some(cursor) = before {
+            statement.query(params![
+                account,
+                thread,
+                MAX_MEDIA_DESCRIPTOR_BYTES as i64,
+                SEARCH_SCAN_ROWS as i64 + 1,
+                cursor.sent_at_ms,
+                cursor.id
+            ])?
+        } else {
+            statement.query(params![
+                account,
+                thread,
+                MAX_MEDIA_DESCRIPTOR_BYTES as i64,
+                SEARCH_SCAN_ROWS as i64 + 1
+            ])?
+        };
         let mut scanned = 0usize;
+        let mut last_scanned = None;
         while let Some(row) = rows.next()? {
+            // A single lookahead proves there are older rows. Do not consume it:
+            // the next request must include it regardless of whether it matches.
+            if scanned == SEARCH_SCAN_ROWS || search.hits.len() == limit {
+                search.next = last_scanned;
+                search.truncated = true;
+                break;
+            }
             scanned += 1;
+            last_scanned = Some(Cursor {
+                sent_at_ms: row.get(2)?,
+                id: row.get(0)?,
+            });
             let Some(text) = searchable(row.get(3)?, row.get(4)?, row.get(5)?) else {
                 continue;
             };
             let Some((snippet, highlight)) = matcher.snippet(&text) else {
                 continue;
             };
-            if search.hits.len() == limit {
-                search.truncated = true;
-                break;
-            }
             search.hits.push(MessageHit {
                 message_id: row.get(0)?,
                 sender: row.get(1)?,
@@ -96,9 +139,6 @@ impl MessageStore {
             });
         }
         drop(rows);
-        if scanned == SEARCH_SCAN_ROWS {
-            search.truncated = true;
-        }
         for hit in &mut search.hits {
             hit.jump = self.jump_cursor(account, thread, hit.sent_at_ms, &hit.message_id)?;
         }
@@ -252,6 +292,133 @@ mod tests {
         let page = store.page("11", "d:22", Some(&cursor), 50).unwrap();
         let position = page.iter().position(|m| m.id == "m000").unwrap();
         assert_eq!(page.len() - position, 11, "hit plus ten newer messages");
+    }
+
+    #[test]
+    fn pagination_has_no_gaps_with_timestamp_ties_and_new_arrivals() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let messages: Vec<_> = (0..125)
+            .map(|i| {
+                message(
+                    &format!("m{i:03}"),
+                    if i % 3 == 0 { "khác" } else { "hẹn" },
+                    10,
+                )
+            })
+            .collect();
+        for chunk in messages.chunks(crate::domain::MAX_PAGE_SIZE) {
+            store.insert_batch(chunk).unwrap();
+        }
+        let expected: Vec<_> = messages
+            .iter()
+            .rev()
+            .filter(|m| m.text == "hẹn")
+            .map(|m| m.id.clone())
+            .collect();
+        let mut page = store.search_messages("11", "d:22", "hen", 50).unwrap();
+        assert_eq!(page.hits.len(), 50);
+        let first = page.next.clone().unwrap();
+        let mut found: Vec<_> = ids(&page).into_iter().map(str::to_owned).collect();
+        put(&mut store, message("new", "hẹn mới", 11));
+        page = store
+            .search_messages_before("11", "d:22", "hen", 50, Some(&first))
+            .unwrap();
+        found.extend(ids(&page).into_iter().map(str::to_owned));
+        assert_eq!(found, expected);
+        assert!(!page.truncated);
+        assert!(page.next.is_none());
+        // Replaying the same boundary is stable, even after a newer message arrives.
+        assert_eq!(
+            page,
+            store
+                .search_messages_before("11", "d:22", "hen", 50, Some(&first))
+                .unwrap()
+        );
+        assert_eq!(
+            ids(&store.search_messages("11", "d:22", "hen", 1).unwrap()),
+            ["new"]
+        );
+    }
+
+    #[test]
+    fn scan_budget_can_continue_past_an_empty_page_and_exact_end_is_not_truncated() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let messages: Vec<_> = (0..=SEARCH_SCAN_ROWS)
+            .map(|i| {
+                message(
+                    &format!("m{i:05}"),
+                    if i == 0 { "đích" } else { "khác" },
+                    i as i64,
+                )
+            })
+            .collect();
+        for chunk in messages.chunks(crate::domain::MAX_PAGE_SIZE) {
+            store.insert_batch(chunk).unwrap();
+        }
+        let page = store.search_messages("11", "d:22", "dich", 50).unwrap();
+        assert!(page.hits.is_empty());
+        assert!(page.truncated);
+        assert_eq!(page.next.as_ref().unwrap().id, "m00001");
+        let last = store
+            .search_messages_before("11", "d:22", "dich", 50, page.next.as_ref())
+            .unwrap();
+        assert_eq!(ids(&last), ["m00000"]);
+        assert!(last.next.is_none());
+        let exact = store
+            .search_messages_before(
+                "11",
+                "d:22",
+                "absent",
+                50,
+                Some(&Cursor {
+                    sent_at_ms: SEARCH_SCAN_ROWS as i64,
+                    id: format!("m{SEARCH_SCAN_ROWS:05}"),
+                }),
+            )
+            .unwrap();
+        assert!(exact.hits.is_empty());
+        assert!(
+            !exact.truncated,
+            "exactly the scan budget with no older rows is exhausted"
+        );
+        assert!(exact.next.is_none());
+    }
+
+    #[test]
+    fn continuation_rechecks_privacy_and_validates_boundaries() {
+        let mut store = MessageStore::in_memory().unwrap();
+        for i in 0..3 {
+            put(&mut store, message(&i.to_string(), "bí mật", i));
+        }
+        let page = store.search_messages("11", "d:22", "bi mat", 1).unwrap();
+        let boundary = page.next.as_ref().unwrap();
+        store.begin_live_privacy("11").unwrap();
+        for unlocked in [false, true, false] {
+            store
+                .replace_live_privacy("11", &["d:22".into()], unlocked.then_some("d:22"))
+                .unwrap();
+            let page = store
+                .search_messages_before("11", "d:22", "bi mat", 1, Some(boundary))
+                .unwrap();
+            assert_eq!(page.hits.len(), usize::from(unlocked));
+            if !unlocked {
+                assert!(page.next.is_none());
+            }
+        }
+        for cursor in [
+            Cursor {
+                sent_at_ms: -1,
+                id: "ok".into(),
+            },
+            Cursor {
+                sent_at_ms: 1,
+                id: "".into(),
+            },
+        ] {
+            assert!(store
+                .search_messages_before("11", "d:22", "bi mat", 1, Some(&cursor))
+                .is_err());
+        }
     }
 
     #[test]

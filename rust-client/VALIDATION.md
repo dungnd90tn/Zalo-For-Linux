@@ -770,3 +770,44 @@ Synthetic evidence for the [redesign guide](UI_REDESIGN_GUIDE.md); not real-acco
 and `ldd`, runs `rpm -V` for RPMs and removes the package. Passed on Ubuntu 20.04/22.04/24.04, Debian 12 (`.deb`) and
 Fedora 42, AlmaLinux 9 (`.rpm`). Debian 11 could not be tested: its apt mirrors return 404. Container installs say nothing
 about GUI behaviour on real desktops; use the demo window evidence above for that.
+
+## Saved-history search pagination (2026-11-09)
+
+The information panel now offers **Tìm cũ hơn** and **Mới nhất**. Search retains one
+page of at most 50 hits, evaluates at most 20,000 saved rows per request plus one
+lookahead row, and continues strictly before the last evaluated `(sent_at_ms, message_id)`.
+An empty scan page can continue. New arrivals do not shift older pages, changing
+the query cannot reuse an old boundary, and failed continuation preserves the
+previous page for retry. Each request rechecks account/thread privacy; no schema,
+remote search, receipt or encryption behavior changes.
+
+- Focused all-feature search checks: **26 passed**. Regressions cover timestamp
+  ties, concurrent newer arrivals, empty scan windows, exact exhaustion, hidden
+  relocking, malformed boundaries, backpressure, stale replies, worker pagination
+  and Light/Dark pointer interaction at sidebar/compact widths.
+- Default Rust checks: **244 library, 3 CLI and 3 schema-upgrade tests passed**;
+  **five IME adapter** and **19 Python tooling tests** passed. Strict
+  all-target/all-feature Clippy passed with Rust 1.99.1. The complete
+  `./scripts/rust/check.sh` exited successfully, including informational no-write
+  checks and the headless offline demo smoke.
+- The unfiltered all-feature command stopped in its library phase with **582 passed,
+  one failed and four ignored**. The failure is
+  `app::live::runtime::integration_tests::incomplete_or_encrypted_capability_never_sends_or_prepares_outbox`,
+  at its expected `đã bật mã hóa` error text. The same exact test fails on an
+  unmodified `0c25bc6` HEAD extracted to a disposable directory, with the same
+  assertion. HEAD already routes encrypted targets through `send_e2ee` when
+  `signal-crypto` is enabled. Neither that route nor its test was changed here.
+  A subsequent run with only that exact test excluded passed **601 tests** across
+  library, CLI, schema and Signal integration targets (four ignored, one explicitly
+  filtered). This checkpoint does **not** claim an entirely passing unfiltered
+  all-feature suite.
+- Six app-framebuffer screenshots were inspected under X11: Light/Dark at
+  **1200×780** and **640×480**, plus older-page/end-of-results captures at wide
+  Light and compact Dark. They show only seeded demo messages; no real profile,
+  login or desktop capture was used. Compact results remain inside the existing
+  scrollable information page. Files/logs use `/tmp/zalo-search-pagination-*`.
+
+To reproduce the pagination screenshots, use the ignored `ui::shot_fixture::demo_screenshot`
+with `ZALO_UI_SHOT_SCENE=search-pages`; add `ZALO_UI_SHOT_OLDER=1` for the second
+page. The fixture seeds 75 matches in its disposable demo profile. This is local
+storage/UI evidence, not real-account or Wayland acceptance.

@@ -4,6 +4,13 @@ Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-clie
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
 Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../changelogs/RELEASE-v2.0.0.md).
 
+## [Unreleased]
+
+### Thêm mới
+- Tìm kiếm lịch sử đã lưu có nút **Tìm cũ hơn** và **Mới nhất**. Mỗi trang tối đa 50 kết quả;
+  có thể tìm tiếp sau mỗi lượt quét 20.000 tin, kể cả khi trang hiện tại chưa có kết quả.
+  Tin mới đến không làm dịch trang cũ; lỗi tải trang giữ kết quả và mốc tiếp tục để thử lại.
+
 ## [2.0.3] - 2026-11-08
 
 ### Thêm mới

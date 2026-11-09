@@ -202,6 +202,7 @@ pub enum LiveCommand {
         request: u64,
         thread: String,
         query: String,
+        before: Option<Cursor>,
     },
     Send {
         generation: u64,
@@ -525,9 +526,15 @@ impl LiveWorker {
                         .is_none_or(|c| crate::domain::validate_id(&c.id).is_ok())
             }
             LiveCommand::Overview { thread, .. } => Target::from_thread(thread).is_ok(),
-            LiveCommand::Search { thread, query, .. } => {
+            LiveCommand::Search {
+                thread,
+                query,
+                before,
+                ..
+            } => {
                 Target::from_thread(thread).is_ok()
                     && crate::domain::search::search_query(query) == Some(query.as_str())
+                    && crate::domain::search::valid_search_cursor(before.as_ref())
             }
             LiveCommand::Send { thread, text, .. } => {
                 Target::from_thread(thread).is_ok()

@@ -64,6 +64,7 @@ pub enum Command {
         request: u64,
         thread: String,
         query: String,
+        before: Option<Cursor>,
     },
     Shutdown,
 }
@@ -258,12 +259,14 @@ impl Worker {
                             request,
                             thread,
                             query,
+                            before,
                         } => {
-                            let event = match store.search_messages(
+                            let event = match store.search_messages_before(
                                 DEMO_ACCOUNT,
                                 &thread,
                                 &query,
                                 crate::domain::SEARCH_RESULT_LIMIT,
+                                before.as_ref(),
                             ) {
                                 Ok(search) => Event::SearchResults {
                                     request,
@@ -329,8 +332,15 @@ fn submit(
                 && *size_bytes <= crate::domain::MAX_DIRECT_FILE_BYTES
         }
         Command::Overview { thread, .. } => validate_id(thread).is_ok(),
-        Command::Search { thread, query, .. } => {
-            validate_id(thread).is_ok() && crate::domain::search::search_query(query) == Some(query)
+        Command::Search {
+            thread,
+            query,
+            before,
+            ..
+        } => {
+            validate_id(thread).is_ok()
+                && crate::domain::search::search_query(query) == Some(query)
+                && crate::domain::search::valid_search_cursor(before.as_ref())
         }
         Command::Shutdown => true,
     };
@@ -1042,6 +1052,7 @@ mod tests {
                 request: 1,
                 thread: "welcome".into(),
                 query: " untrimmed ".into(),
+                before: None,
             }),
             Err(SubmitError::Invalid)
         );
@@ -1051,6 +1062,7 @@ mod tests {
                     request,
                     thread: "welcome".into(),
                     query,
+                    before: None,
                 })
             })
             .unwrap();
@@ -1060,6 +1072,78 @@ mod tests {
         assert_eq!(results.hits.len(), 1);
         assert_eq!(results.hits[0].message_id, "demo-1");
         assert_eq!(results.hits[0].jump, None);
+        drop(worker);
+        drop(profile);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn demo_worker_search_continues_and_restarts_without_losing_rows() {
+        let root =
+            std::env::temp_dir().join(format!("zalo-search-pages-{}", local_message_id().unwrap()));
+        let profile = crate::profile::Profile::at_root(&root, "demo").unwrap();
+        profile.bind_account(DEMO_ACCOUNT).unwrap();
+        let path = profile.paths.data_dir.join("messages.sqlite3");
+        let mut store = MessageStore::open(&path).unwrap();
+        let messages: Vec<_> = (0..75)
+            .map(|i| Message {
+                account_id: DEMO_ACCOUNT.into(),
+                thread_id: "search-pages".into(),
+                id: format!("p{i:03}"),
+                sender: "fixture".into(),
+                text: "hẹn gặp".into(),
+                sticker: None,
+                media: None,
+                sent_at_ms: 10,
+            })
+            .collect();
+        store.insert_batch(&messages).unwrap();
+        drop(store);
+        let mut worker = Worker::demo(path, Arc::new(|| {})).unwrap();
+        let mut model = Model::default();
+        assert!(model.apply(worker.events.blocking_recv().unwrap()));
+        let mut submit = |model: &mut Model, before| {
+            model
+                .request_search_before("search-pages", "hen", before, |request, query, before| {
+                    worker.submit(Command::Search {
+                        request,
+                        thread: "search-pages".into(),
+                        query,
+                        before,
+                    })
+                })
+                .unwrap();
+            assert!(model.apply(worker.events.blocking_recv().unwrap()));
+        };
+        submit(&mut model, None);
+        let first = model.search_results("search-pages").unwrap().clone();
+        assert_eq!(first.hits.len(), 50);
+        submit(&mut model, first.next.clone());
+        let second = model.search_results("search-pages").unwrap();
+        assert_eq!(second.hits.len(), 25);
+        assert!(second.next.is_none());
+        let actual: Vec<_> = first
+            .hits
+            .iter()
+            .chain(&second.hits)
+            .map(|h| h.message_id.as_str())
+            .collect();
+        let expected: Vec<_> = messages.iter().rev().map(|m| m.id.as_str()).collect();
+        assert_eq!(actual, expected);
+        submit(&mut model, None);
+        assert_eq!(model.search_results("search-pages"), Some(&first));
+        assert_eq!(
+            worker.submit(Command::Search {
+                request: 100,
+                thread: "search-pages".into(),
+                query: "hen".into(),
+                before: Some(Cursor {
+                    sent_at_ms: -1,
+                    id: "x".into()
+                }),
+            }),
+            Err(SubmitError::Invalid)
+        );
         drop(worker);
         drop(profile);
         std::fs::remove_dir_all(root).unwrap();

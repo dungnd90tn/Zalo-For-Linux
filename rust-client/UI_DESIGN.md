@@ -74,6 +74,8 @@ Kiểm thử synthetic UI và TLS loopback xác minh các nhánh tương tác, s
 
 Hiện tại, tin đến nằm trái, tin của tài khoản nằm phải; thời gian/ngày phân tách dùng dữ liệu đã lưu. Nhận ACK từ máy chủ không đồng nghĩa người nhận đã đọc.
 
+Tìm tin nhắn trong panel thông tin chỉ đọc lịch sử đã lưu của hội thoại đang chọn. Mỗi trang giữ tối đa 50 kết quả; “Tìm cũ hơn” tiếp tục sau dòng cuối đã quét, kể cả khi lượt quét 20.000 tin chưa thấy kết quả. “Mới nhất” tìm lại từ đầu. Đổi từ khóa phải bấm “Tìm” trước khi tiếp tục trang cũ; đổi hội thoại/tài khoản hoặc khóa lại chat ẩn loại kết quả cũ theo scope hiện hữu. Lỗi tải trang giữ trang trước và mốc tiếp tục để thử lại. Đây không phải tìm kiếm trên máy chủ.
+
 Thông báo `webchat` / `msginfo.actionlist` hiển thị văn bản tiếng Việt từ template, tên gợi ý và tiêu đề gốc. Toàn bộ cấu trúc được giữ riêng trong SQLite, kể cả action và trường chưa biết; UI hiện chỉ đọc nội dung, chưa thực thi action hoặc tải URL/ảnh trong thông báo. Không biến object thành JSON thô hay placeholder làm mất dữ liệu, và không dùng sự kiện thông báo để xác nhận tin gửi.
 
 Ảnh nhận có thumbnail, tiêu đề/chú thích và viewer native dùng pixel đã cache; ảnh gốc chỉ mở trình duyệt khi bấm. Thẻ OA dùng preview tiếng Việt đã đối chiếu nguồn và metadata; mẫu remote chưa biết phải giải thích giới hạn, giữ toàn bộ dữ liệu, không chạy JavaScript/action. History snapshot chỉ chứa projection tối đa 16 KiB; raw content thuộc worker/SQLite. Tham chiếu [PROTOCOL_MEDIA.md](PROTOCOL_MEDIA.md) cho codec/CDN và điều kiện làm giàu placeholder cũ.
