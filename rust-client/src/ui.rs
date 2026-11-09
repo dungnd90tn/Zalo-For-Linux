@@ -23,6 +23,7 @@ mod live;
 mod login;
 #[cfg(feature = "messaging")]
 mod media;
+mod message_actions;
 mod message_search;
 #[cfg(all(test, feature = "messaging"))]
 mod modal_tests;
@@ -83,6 +84,7 @@ pub struct NativeApp {
     modal_focus: Option<ModalFocus>,
     settings_open: bool,
     account_popup: Option<account::Popup>,
+    message_menu: Option<message_actions::Popup>,
     account_trigger_focus: Option<ModalFocus>,
     theme: crate::theme::ThemeController,
     settings: settings::Settings,
@@ -142,6 +144,7 @@ impl NativeApp {
             modal_focus: None,
             settings_open: false,
             account_popup: None,
+            message_menu: None,
             account_trigger_focus: None,
             theme,
             settings: settings::Settings::default(),
@@ -173,7 +176,11 @@ impl NativeApp {
     }
 
     fn modal_open(&self) -> bool {
-        if self.settings_open || self.details || self.account_popup.is_some() {
+        if self.settings_open
+            || self.details
+            || self.account_popup.is_some()
+            || self.message_menu.is_some()
+        {
             return true;
         }
         #[cfg(feature = "live-login")]
@@ -199,6 +206,7 @@ impl NativeApp {
                 .account_popup
                 .as_mut()
                 .and_then(|popup| popup.focus.take())
+                .or_else(|| self.message_menu.as_mut().and_then(|popup| popup.focus.take()))
                 .or_else(|| self.modal_focus_snapshot(ctx));
             if let Some(focus) = &self.modal_focus {
                 ctx.memory_mut(|memory| memory.surrender_focus(focus.id));
@@ -1441,6 +1449,8 @@ impl NativeApp {
                                 let own_name = self.account_label().to_owned();
                                 #[cfg(feature="messaging")]
                                 if let (Some(state),Some(account),Some(thread))=(&mut self.live,own_account.as_deref(),self.model.selected.as_deref()) {state.media.scope(account,thread,self.model.generation);}
+                                let menu_scope = self.message_menu_scope();
+                                let menu_focus = self.modal_focus_snapshot(ctx);
                                 let mut previous_day = None;
                                 let focus = self
                                     .model
@@ -1486,7 +1496,15 @@ impl NativeApp {
                                         #[cfg(feature = "messaging")]
                                         media_cache,
                                         self.model.generation,
-                                    )).response;
+                                    ));
+                                    if let Some(position) = message_actions::requested(ui, bubble.inner, message) {
+                                        if let Some(scope) = &menu_scope {
+                                            self.message_menu = Some(message_actions::Popup::new(
+                                                scope.clone(), message.id.clone(), position, menu_focus.clone(),
+                                            ));
+                                        }
+                                    }
+                                    let bubble = bubble.response;
                                     if let Some((_, shown_at)) = focused {
                                         focus_drawn = true;
                                         if shown_at.is_none() {
@@ -1568,11 +1586,13 @@ impl NativeApp {
                 },
             );
         }
+        self.latch_modal_input(ctx);
         self.composer(ui, ctx, composer_height);
     }
 
     fn workspace(&mut self, ctx: &egui::Context) {
         self.sync_account_popup();
+        self.sync_message_menu();
         let colors = crate::theme::palette(ctx);
         let compact = ctx.screen_rect().width() < COMPACT_BREAKPOINT;
         self.navigation(ctx, compact);
@@ -1682,6 +1702,7 @@ impl NativeApp {
             media::viewer(ctx, &mut state.media);
         }
         self.show_account_popup(ctx);
+        self.show_message_menu(ctx);
         #[cfg(feature = "messaging")]
         if !self.settings_open && !application_information {
             self.hidden_pin_dialog(ctx);
@@ -1867,6 +1888,7 @@ impl eframe::App for NativeApp {
             }
         }
         self.sync_account_popup();
+        self.sync_message_menu();
         self.update_modal_input(ctx);
         #[cfg(feature = "live-login")]
         {
@@ -2105,7 +2127,7 @@ fn message_bubble(
     #[cfg(feature = "messaging")] sticker_cache: Option<&mut stickers::StickerCache>,
     #[cfg(feature = "messaging")] media_cache: Option<&mut media::MediaCache>,
     generation: u64,
-) {
+) -> egui::Rect {
     let colors = crate::theme::palette(ui.ctx());
     let own = is_own_sender(&message.sender, account);
     // Own plain text gets the solid accent bubble with on-color text. Media, stickers and cards
@@ -2213,7 +2235,7 @@ fn message_bubble(
                 let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
                 visuals::avatar_photo(ui, rect, sender_avatar, avatar_texture);
             }
-            egui::Frame::none()
+            let frame = egui::Frame::none()
                 .fill(if bare {
                     egui::Color32::TRANSPARENT
                 } else if accent {
@@ -2333,8 +2355,9 @@ fn message_bubble(
                         message_status(ui, message.sent_at_ms, own, account.is_some(), accent);
                     });
                 });
+            frame.response.rect
         },
-    );
+    ).inner
 }
 
 fn message_status(ui: &mut egui::Ui, sent_at_ms: i64, own: bool, live: bool, accent: bool) {

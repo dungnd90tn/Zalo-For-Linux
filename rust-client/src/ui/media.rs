@@ -1,5 +1,6 @@
 //! Native read-only media cards, with explicit external navigation and scoped background assets.
 mod cache;
+use super::message_actions::external_url;
 use crate::{
     app::media::MediaKey,
     domain::{
@@ -659,17 +660,6 @@ pub(super) fn viewer(ctx: &egui::Context, cache: &mut MediaCache) {
     if !open {
         cache.viewer = None;
     }
-}
-fn external_url(raw: &str) -> Option<String> {
-    if raw.len() > 8192 || raw.trim() != raw || raw.chars().any(char::is_control) {
-        return None;
-    }
-    let url = url::Url::parse(raw).ok()?;
-    (matches!(url.scheme(), "https" | "http")
-        && url.host_str().is_some()
-        && url.username().is_empty()
-        && url.password().is_none())
-    .then(|| url.to_string())
 }
 
 #[cfg(test)]

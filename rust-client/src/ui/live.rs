@@ -1144,6 +1144,7 @@ pub(in crate::ui) mod tests {
                 modal_focus: None,
                 settings_open: false,
                 account_popup: None,
+                message_menu: None,
                 account_trigger_focus: None,
                 theme: crate::theme::ThemeController::new(
                     profile.paths.config_dir.clone(),
