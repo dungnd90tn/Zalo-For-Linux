@@ -66,7 +66,7 @@ impl Connection {
         let Some(http) = self.e2ee_http.clone() else {
             return events
                 .emit(fail(
-                    "Chưa sẵn sàng gửi mã hóa. Bản nháp được giữ lại.",
+                    "Hội thoại này đã bật mã hóa đầu cuối. Client chưa sẵn sàng gửi ở chế độ này; bản nháp được giữ lại.",
                     false,
                 ))
                 .await;
