@@ -811,3 +811,53 @@ To reproduce the pagination screenshots, use the ignored `ui::shot_fixture::demo
 with `ZALO_UI_SHOT_SCENE=search-pages`; add `ZALO_UI_SHOT_OLDER=1` for the second
 page. The fixture seeds 75 matches in its disposable demo profile. This is local
 storage/UI evidence, not real-account or Wayland acceptance.
+
+
+## Original-photo saving (2026-11-09)
+
+Received photo cards and the cached native viewer now offer **Tải ảnh gốc** for an
+available original URL accepted by the existing Zalo CDN policy. They share one
+transfer keyed by account/thread/message/original URL, with progress, cancel,
+retry and saved location. This preserves original bytes (including JXL), caps
+transfers at 100 MiB, uses sanitized collision-safe filenames and never falls
+back to the thumbnail. Cancel interrupts a stalled response and cleans the
+partial file; unsolicited HTTP 206 is rejected. No schema or sending changes.
+
+Six new regressions cover original-byte fidelity/partial responses, cancellation
+before connection and during a stalled body, filenames without signed queries,
+card/viewer shared state with no automatic transfer in Light/Dark at both sizes,
+and stale account/thread requests/results. Existing image geometry/DPI and file
+card checks also pass. Synthetic fixture mode refuses public-CDN downloads.
+
+Verification results:
+
+- Unfiltered all-feature library run: **588 passed, one failed, four ignored**.
+  The failure is the previously documented encrypted-capability test at
+  `integration_tests.rs:4670` (expected `đã bật mã hóa` text). All six new
+  regressions passed.
+- A repeat excluding only that known E2EE test, with two test threads, finished
+  **587 passed, one failed, four ignored, one filtered**. The additional failure
+  is `terminal_transport_failures_keep_one_local_actor_alive_until_explicit_shutdown`
+  at line 3252, which expects two or three hidden-policy requests. That test passed
+  in the initial full run and in its separate focused run. Its result is unstable;
+  this change does not claim an entirely green all-feature suite.
+- `./scripts/rust/check.sh` exited successfully: **244 default library, three
+  CLI, three schema-upgrade, five IME adapter and 19 Python tooling tests** passed,
+  along with formatting, strict default Clippy, dependency guards, informational
+  no-write CLI checks and the headless offline demo.
+- All-feature schema/Signal integration targets: **16 passed**. Strict
+  all-target/all-feature Clippy passed. Logs are in `/tmp/zalo-photo-*`.
+
+Eight native app-framebuffer screenshots were inspected under X11: photo card
+and viewer at **1200×780** and **640×480**, each in Light/Dark. Save actions remain
+visible, images retain their aspect ratio and are not enlarged above source
+pixels. Only synthetic profiles/pixels were used. The fixture does not log in or
+capture the desktop. Screenshots/logs use `/tmp/zalo-photo-*`.
+
+Reproduce with the ignored
+`ui::live::tests::signed_in_offline_native_window_fixture` in an all-feature test
+binary, `ZALO_UI_FIXTURE_READY=1`, `ZALO_UI_FIXTURE_MEDIA=photo`,
+`ZALO_UI_FIXTURE_WIDTH=1200|640`, `ZALO_UI_FIXTURE_THEME=light|dark`, and
+`ZALO_UI_SHOT=/tmp/zalo-photo-check.ppm`; add
+`ZALO_UI_FIXTURE_PHOTO_VIEWER=1` for the viewer. Original CDN signed URLs,
+cloud-specific headers and encrypted attachments still need real-service evidence.

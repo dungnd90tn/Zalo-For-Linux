@@ -70,3 +70,12 @@ under `$XDG_DOWNLOAD_DIR/Zalo Native`. The original also sends account headers f
 (`getDownloadHeaders`) and uses end-to-end keys for encrypted ones; neither is reproduced, so a `401/403`
 or `3xx` from the CDN is the signal that more headers are needed. The diagnostics log records only the
 status code and byte count (`stage=media_assets`).
+
+
+The same worker also handles **Tải ảnh gốc** from received photo cards and the native
+preview viewer; it saves the original URL's bytes, never the thumbnail or a re-encoded
+preview. Only HTTP 200 is accepted because these requests do not ask for a byte range.
+Cancel interrupts waiting for a download slot, response headers or a stalled body;
+the partial file is removed. Completed downloads survive navigation within one account;
+account/privacy resets discard the presentation state and stop its worker. No resumable
+transfer, cloud-specific credentials or encrypted attachment decoding is implemented.

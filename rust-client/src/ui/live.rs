@@ -2633,9 +2633,23 @@ pub(in crate::ui) mod tests {
                 if failed {
                     state.media.seed_failure(key, app.model.generation);
                 } else {
-                    state
-                        .media
-                        .seed(ctx, key, app.model.generation, width, height, rgba.clone());
+                    state.media.seed(
+                        ctx,
+                        key.clone(),
+                        app.model.generation,
+                        width,
+                        height,
+                        rgba.clone(),
+                    );
+                    if std::env::var_os("ZALO_UI_FIXTURE_PHOTO_VIEWER").is_some() {
+                        if let Some(MediaDescriptor::Photo(photo)) = message.media.as_ref() {
+                            state.media.seed_viewer(
+                                key,
+                                photo.caption.clone(),
+                                photo.original_url.clone(),
+                            );
+                        }
+                    }
                 }
             }
         }

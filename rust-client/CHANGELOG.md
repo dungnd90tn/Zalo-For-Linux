@@ -7,6 +7,9 @@ Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../chang
 ## [Unreleased]
 
 ### Thêm mới
+- **Tải ảnh gốc** từ thẻ ảnh hoặc cửa sổ xem ảnh: lưu nguyên byte vào Tải xuống/Zalo Native,
+  có tiến độ, hủy và thử lại; tối đa 100 MiB và không ghi đè tệp. Hủy vẫn dừng được khi máy chủ
+  đang treo; ảnh thiếu liên kết gốc khả dụng không dùng thumbnail để thay thế.
 - Tìm kiếm lịch sử đã lưu có nút **Tìm cũ hơn** và **Mới nhất**. Mỗi trang tối đa 50 kết quả;
   có thể tìm tiếp sau mỗi lượt quét 20.000 tin, kể cả khi trang hiện tại chưa có kết quả.
   Tin mới đến không làm dịch trang cũ; lỗi tải trang giữ kết quả và mốc tiếp tục để thử lại.
