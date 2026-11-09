@@ -583,7 +583,7 @@ fn placeholder(ui: &mut egui::Ui, width: f32, label: &str, height: Option<f32>) 
         })
         .response
 }
-pub(super) fn viewer(ctx: &egui::Context, cache: &mut MediaCache) {
+pub(super) fn viewer(ctx: &egui::Context, cache: &mut MediaCache, enabled: bool) {
     let Some(viewer) = cache.viewer.as_ref() else {
         return;
     };
@@ -595,6 +595,7 @@ pub(super) fn viewer(ctx: &egui::Context, cache: &mut MediaCache) {
     let mut open = true;
     egui::Window::new("Ảnh xem trước")
         .id(egui::Id::new("scoped_media_viewer"))
+        .enabled(enabled)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -667,6 +668,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disabled_viewer_cannot_open_links_or_start_downloads_behind_a_menu() {
+        let ctx = egui::Context::default();
+        super::super::visuals::install(&ctx);
+        let key = MediaKey {
+            account_id: "11".into(),
+            thread_id: "d:22".into(),
+            message_id: "1".into(),
+            url: "https://f1.zdn.vn/thumbnail.jpg".into(),
+        };
+        let original = "https://f1.zdn.vn/original.jpg";
+        let mut cache = MediaCache::default();
+        cache.seed(&ctx, key.clone(), 1, 16, 16, vec![120; 16 * 16 * 4]);
+        cache.viewer = Some(Viewer {
+            key: key.clone(),
+            caption: String::new(),
+            original_url: Some(original.into()),
+        });
+        let render = |cache: &mut MediaCache, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        vec2(640.0, 480.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| viewer(ctx, cache, false),
+            )
+        };
+        let _ = render(&mut cache, vec![]);
+        let out = render(&mut cache, vec![]);
+        for label in ["Mở ảnh gốc trong trình duyệt", "Tải ảnh gốc"] {
+            let position = out
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .expect("disabled action must remain visible");
+            for pressed in [true, false] {
+                let result = render(
+                    &mut cache,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+                assert!(result.platform_output.open_url.is_none());
+                assert!(matches!(
+                    cache.download_view(&MediaKey {
+                        url: original.into(),
+                        ..key.clone()
+                    }),
+                    DownloadView::Idle
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn cached_images_keep_logical_frames_on_maximize_and_do_not_upscale_pixels() {
         for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
             for (pixel_width, pixel_height) in [(1024, 768), (80, 40)] {
@@ -735,7 +805,7 @@ mod tests {
                                 .native_pixels_per_point = Some(pixels_per_point);
                             let output = ctx.run(input, |ctx| {
                                 if open_viewer {
-                                    viewer(ctx, &mut cache);
+                                    viewer(ctx, &mut cache, true);
                                 } else {
                                     egui::CentralPanel::default().show(ctx, |ui| {
                                         let available_width = ui.available_width();
@@ -1092,7 +1162,7 @@ mod tests {
                         },
                         |ctx| {
                             if viewing {
-                                viewer(ctx, cache);
+                                viewer(ctx, cache, true);
                             } else {
                                 egui::CentralPanel::default().show(ctx, |ui| {
                                     photo_card(ui, &message, 1, photo, Some(cache), 300.0)

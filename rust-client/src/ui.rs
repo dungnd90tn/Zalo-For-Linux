@@ -206,7 +206,11 @@ impl NativeApp {
                 .account_popup
                 .as_mut()
                 .and_then(|popup| popup.focus.take())
-                .or_else(|| self.message_menu.as_mut().and_then(|popup| popup.focus.take()))
+                .or_else(|| {
+                    self.message_menu
+                        .as_mut()
+                        .and_then(|popup| popup.focus.take())
+                })
                 .or_else(|| self.modal_focus_snapshot(ctx));
             if let Some(focus) = &self.modal_focus {
                 ctx.memory_mut(|memory| memory.surrender_focus(focus.id));
@@ -1698,8 +1702,11 @@ impl NativeApp {
             self.live_dialogs(ctx);
         }
         #[cfg(feature = "messaging")]
-        if let Some(state) = &mut self.live {
-            media::viewer(ctx, &mut state.media);
+        {
+            let enabled = !self.modal_blocked && !self.modal_open();
+            if let Some(state) = &mut self.live {
+                media::viewer(ctx, &mut state.media, enabled);
+            }
         }
         self.show_account_popup(ctx);
         self.show_message_menu(ctx);
@@ -2357,7 +2364,8 @@ fn message_bubble(
                 });
             frame.response.rect
         },
-    ).inner
+    )
+    .inner
 }
 
 fn message_status(ui: &mut egui::Ui, sent_at_ms: i64, own: bool, live: bool, accent: bool) {

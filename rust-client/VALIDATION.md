@@ -861,3 +861,63 @@ binary, `ZALO_UI_FIXTURE_READY=1`, `ZALO_UI_FIXTURE_MEDIA=photo`,
 `ZALO_UI_SHOT=/tmp/zalo-photo-check.ppm`; add
 `ZALO_UI_FIXTURE_PHOTO_VIEWER=1` for the viewer. Original CDN signed URLs,
 cloud-specific headers and encrypted attachments still need real-service evidence.
+
+
+## Message clipboard menu (2026-11-09)
+
+The native message bubble now has an explicit secondary-click menu for copying
+plain text, photo title/caption, file name, card/poll presentation text and an
+available validated http(s) link from a photo/file/card projection. The original counterparts are `_handleCopy`,
+`handleCopyPhotoCaption`, `_handleCopyLink` and `_handleCopyOA` in
+`pc-dist/compact-app-pc.e08d0d44f38873747a6b.js:5406–5485`.
+No raw sidecar/HTML, encryption keys, sticker/unsupported-message placeholders,
+image pixels or remote actions are copied. Encrypted file URLs are withheld.
+
+The popup retains IDs/scope rather than a message payload, rechecks the current
+page/account/thread/generation/authentication/privacy before rendering, and
+closes when another modal opens. Its widget IDs carry the full scope. Escape or
+outside click closes it; background composition/sending is blocked and existing
+scope checks gate focus restoration. Secondary clicks respect the actual bubble,
+clip rectangle and foreground layers. Buttons are 44 logical pixels; the popup
+is constrained to the viewport. Tab/Shift+Tab stays within its actions, including
+wraparound; this explicitly avoids egui 0.29 disabled-background Tab starvation.
+
+Synthetic regression checks cover exact Vietnamese/emoji/newline fidelity, safe
+link handling and encrypted-link suppression, actual pointer-to-clipboard output
+at both sizes/themes, stale scopes/locked privacy/modals, draft preservation,
+Escape/background Enter, keyboard copy, foreground-window occlusion and disabled
+photo-viewer links/download actions behind the menu. These
+verify the egui clipboard output, not an external application's OS paste behavior.
+
+Eight native X11 app-framebuffer screenshots were inspected at **1200×780** and
+**640×480** in Light/Dark, showing both caption and link actions with no clipping,
+including the disabled photo viewer behind the menu.
+Only a synthetic profile/photo was used; no login, private account, desktop
+capture, network fetch or clipboard write was needed for the screenshots. Files
+and logs use `/tmp/zalo-message-menu-*`, `/tmp/zalo-message-viewer-menu-*` and
+`/tmp/zalo-message-actions-*`.
+Reproduce with the all-feature ignored
+`ui::live::tests::signed_in_offline_native_window_fixture`,
+`ZALO_UI_FIXTURE_READY=1`, `ZALO_UI_FIXTURE_MEDIA=photo`,
+`ZALO_UI_FIXTURE_MESSAGE_MENU=1`, `ZALO_UI_FIXTURE_WIDTH=1200|640`,
+`ZALO_UI_FIXTURE_THEME=light|dark`, and `ZALO_UI_SHOT=/tmp/menu.ppm`.
+
+Verification on Rust 1.99.1:
+
+- All-feature UI checks: **126 passed, three ignored**; all eight message-menu
+  regressions and the disabled-viewer regression passed.
+- Directory checks with two test threads: **eight passed**. Earlier runs under
+  higher parallel load hit loopback fixture timeouts; the final complete run
+  with four test threads passed all directory checks.
+- The unfiltered all-feature library run finished with **597 passed, one failed
+  and four ignored**. The sole failure is the previously reproduced baseline
+  `app::live::runtime::integration_tests::incomplete_or_encrypted_capability_never_sends_or_prepares_outbox`
+  assertion described above. Its E2EE route/test is unchanged. The all-feature
+  schema/Signal integration targets separately passed **16 tests**.
+- The complete `scripts/rust/check.sh` passed: **247 default library tests,
+  three CLI tests, three schema tests, five IME adapter tests and 19 Python
+  tooling tests**, formatting/dependency guards, strict default Clippy and
+  informational no-write/headless demo smoke checks. An earlier invocation
+  exited 143 before IME/lint/smoke; the final complete rerun exited zero.
+- Strict `cargo clippy --locked --offline --all-features --all-targets --
+  -D warnings` passed. No real-server messaging or external OS paste was tested.

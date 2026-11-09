@@ -2054,6 +2054,7 @@ pub(in crate::ui) mod tests {
             app: NativeApp,
             geometry: Option<[f32; 4]>,
             grab: crate::ui::shot_fixture::Grabber,
+            menu_opened: bool,
         }
         impl eframe::App for MeasuredFixture {
             fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -2074,6 +2075,20 @@ pub(in crate::ui) mod tests {
                     if let Some(live) = self.app.live.as_mut() {
                         live.privacy = super::super::privacy::Privacy::fixture_ready();
                         live.directory.fixture_rows();
+                    }
+                }
+                if !self.menu_opened && std::env::var_os("ZALO_UI_FIXTURE_MESSAGE_MENU").is_some() {
+                    if let (Some(scope), Some(message)) = (
+                        self.app.message_menu_scope(),
+                        self.app.model.messages.last(),
+                    ) {
+                        self.app.message_menu = Some(super::super::message_actions::Popup::new(
+                            scope,
+                            message.id.clone(),
+                            screen.center(),
+                            self.app.modal_focus_snapshot(ctx),
+                        ));
+                        self.menu_opened = true;
                     }
                 }
                 self.app.update(ctx, frame);
@@ -2131,6 +2146,7 @@ pub(in crate::ui) mod tests {
                             app,
                             geometry: None,
                             grab: Default::default(),
+                            menu_opened: false,
                         }) as Box<dyn eframe::App>
                     })
                     .map_err(Into::into);
@@ -2477,6 +2493,7 @@ pub(in crate::ui) mod tests {
                     app,
                     geometry: None,
                     grab: Default::default(),
+                    menu_opened: false,
                 }))
             }),
         )

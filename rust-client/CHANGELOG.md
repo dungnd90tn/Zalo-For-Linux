@@ -7,6 +7,9 @@ Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../chang
 ## [Unreleased]
 
 ### Thêm mới
+- Menu chuột phải trong bong bóng cho phép **sao chép tin nhắn**, chú thích ảnh, tên tệp,
+  nội dung thẻ và liên kết. Menu giữ nguyên bản nháp, đóng khi đổi hội thoại/tài khoản
+  hoặc khóa lại chat ẩn; chưa hỗ trợ sao chép pixel ảnh hay định dạng HTML.
 - **Tải ảnh gốc** từ thẻ ảnh hoặc cửa sổ xem ảnh: lưu nguyên byte vào Tải xuống/Zalo Native,
   có tiến độ, hủy và thử lại; tối đa 100 MiB và không ghi đè tệp. Hủy vẫn dừng được khi máy chủ
   đang treo; ảnh thiếu liên kết gốc khả dụng không dùng thumbnail để thay thế.
