@@ -921,3 +921,183 @@ Verification on Rust 1.99.1:
   exited 143 before IME/lint/smoke; the final complete rerun exited zero.
 - Strict `cargo clippy --locked --offline --all-features --all-targets --
   -D warnings` passed. No real-server messaging or external OS paste was tested.
+
+## E2EE send acknowledgement and accepted-send recovery (2026-11-11)
+
+The exact original `parseE2eeResp` normalizer passes ten synthetic metadata
+cases in `tests/fixtures/messaging/send_ack_oracle.cjs`. It already supports
+`minGlobalMsgId`; this milestone adds request binding when `clientId` is present
+and refuses conflicting server IDs. The original helper instead lets an explicit
+`msgId` override its normalized ID; native rejection is deliberately stricter.
+Replies without `clientId` retain the existing synchronous HTTP-request binding.
+
+A validated server acknowledgement followed by a local persistence failure is
+now reported as server-accepted, not unknown delivery. A SQLite insertion-failure
+test verifies that the persisted ACK and exact ciphertext survive, dispatch is
+not reopened, and later echo reconciliation creates one message. Automatic
+startup reconciliation of acknowledged rows remains future work. Actual UI-event
+tests verify that accepted failures enter delivery review, retain newer draft
+edits, reject stale account/request failures and do not reopen a dismissed review
+on duplicate events. No plaintext downgrade or automatic resend was added.
+
+Verification used pinned Rust **1.99.1**, locked offline dependencies and disposable
+synthetic storage/local loopback fixtures:
+
+```sh
+node tests/fixtures/messaging/send_ack_oracle.cjs
+cargo test --locked --offline --features messaging --test e2ee_send_ack
+cargo test --locked --offline --all-features e2ee -- --test-threads=2
+cargo test --locked --offline --all-features -- --test-threads=2
+cargo clippy --locked --offline --all-features --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+The new external response suite passes **two tests**; the focused E2EE run passes
+**50** library tests. The complete matrix passes **624 tests**: 603 library,
+three CLI, two acknowledgement integration, three schema, eight crypto, four
+provisioning and one receive; four native fixtures remain ignored. The previously
+documented capability-test failure also passes in this run with two test threads;
+its production behavior was not changed by this milestone. Strict Clippy and
+formatting pass. Logs are in ignored `target/e2ee-qa-{targeted,full,clippy}.log`.
+
+The sandbox run invoked installed toolchain binaries directly, with explicit
+`RUSTC`/`RUSTDOC` and isolated `CARGO_HOME=target/e2ee-qa-cargo` reusing the existing
+registry/Git cache. No dependency download or home-directory toolchain update
+was needed. No personal account, key replacement, real-server message/ACK,
+GUI capture, packaging, installation, commit or push was performed. These checks
+do not establish production E2EE interoperability or completion of the full plan.
+
+## Local acknowledged-send startup repair (2026-11-11)
+
+Startup now repairs current-account acknowledged chat outbox rows before loading
+the existing provisional privacy state or publishing history. The local database
+actor processes at most 64 rows per job with a client-ID keyset cursor. It reuses
+the atomic, idempotent echo commit and never dispatches HTTP, encrypts again or
+emits `Sent`/`SendSettled`. Initialization acknowledgements (`init-*`), unconfirmed
+states and other accounts are excluded. The existing remembered-hidden-policy
+behavior is unchanged; this milestone does not impose a fresh-server privacy
+check. Because ACK rows do not retain the server timestamp, repair keeps any
+existing message timestamp or uses the original local draft creation time.
+
+Three independent disposable-database integration tests cover restart and
+account/init/state isolation, unchanged ciphertext/metadata/ratchet/cursor bytes,
+a 64+3-row backlog across reopening, and an insertion failure that retains its
+ACK while keeping prior committed progress. Three inline store tests additionally
+cover invalid batch bounds and rejecting an oversized stored body before loading
+it. Two real local TLS runtime tests verify all 130 accepted rows are restored
+before the first privacy-filtered `Ready`, and that a failed insertion stops
+startup before any network request, upgrade or history publication. No recovered
+message settles a current UI draft. Cancellation can interrupt between actor
+jobs; an already running bounded job may finish its durable commits.
+
+Verification used Rust 1.99.1 and the isolated cache/direct toolchain setup from
+the preceding checkpoint:
+
+```sh
+cargo test --locked --offline --test e2ee_echo_recovery -- --test-threads=2
+cargo test --locked --offline --all-features acknowledgement_repair -- --test-threads=2
+cargo test --locked --offline --all-features startup_ -- --test-threads=2
+cargo test --locked --offline --all-features -- --test-threads=2
+cargo clippy --locked --offline --all-features --all-targets -- -D warnings
+cargo check --locked --offline --features live --all-targets
+cargo fmt --all -- --check
+```
+
+The default-feature external suite passes **three tests**; store repair passes
+**three** and the startup filter passes **ten**, with one public-network fixture
+ignored. The final all-feature matrix passes **632 tests**: 608 library, three
+CLI, three recovery integration, two ACK integration, three schema, eight crypto,
+four provisioning and one receive. Four opt-in fixtures remain ignored. Strict
+Clippy, the `live` build without Signal features, formatting and diff checks pass.
+Logs are in ignored `target/ack-recovery-qa-{full,clippy,live-check}.log`.
+
+An initial socket-test invocation lacked sandbox permission and stopped at
+loopback bind with `PermissionDenied`. Work stopped until the user explicitly
+authorized loopback testing; the runtime tests and full matrix then ran with the
+appropriate scoped permission and passed. Only local fixtures and synthetic data
+were used. No Zalo service, personal profile, real-server send/ACK, key rotation,
+GUI capture, installation, commit or push was involved. ACKs never saved locally
+still cannot be reconstructed, and per-device E2EE session readiness remains a
+separate unfinished plan item.
+
+## Checked composer device readiness (2026-11-11)
+
+The normal encrypted composer now verifies a complete, bounded fresh 563 device
+inventory, correlated 560 compatibility and fresh 541 bundles before planning a
+send. A missing peer session initializes only that device; cached unknown/stale
+IIDs, changed identities/registrations, missing own sessions, incomplete inventory
+and non-inactivity refusals fail closed. Only peer refusal `-7` permits omission;
+`-8` does not. Engine output must contain exactly the verified peer and own-device
+copies with matching registration IDs. The coordinator's canonical namespace
+order is preserved. An actual loopback HTTPS test verifies all three destinations,
+IIDs, exact durable ciphertext bytes and a correlated scoped `Sent`; a stale
+follow-up sends no HTTP and reserves no additional outbox row.
+
+Real-engine regressions retain exact account, binding, ratchet, ciphertext, outbox,
+message and cursor snapshots when an opaque session disagrees with its fresh
+registration or a typed initialization remains unknown across restart. The engine
+rejects that genuine session mismatch with `IdentityChanged` before returning
+ciphertext; independent malformed-IID, duplicate and missing-record checks exercise
+the additional prepared-record guard. Supported intervening messages are processed
+during readiness and initialization. A failed incoming SQL write emits one scoped
+`SendFailed`, propagates `StorageContext` to the existing transport-pause handler,
+and sends no queue ACK, initialization or chat HTTP request.
+
+Schema nine adds typed initialization intent and a scoped index. Its marker is
+written before session commit; ACK confirmation and retirement are atomic.
+Independent disk fixtures verify v8→v9 byte preservation and reopen, rollback after
+table creation, account-scoped foreign-key cascade and unchanged refusal of future
+schema ten. Ordinary unknown chat rows are never classified by their body. Legacy
+unmarked unknown initialization cannot be reconstructed by this migration.
+
+Verification used pinned Rust 1.99.1, direct `RUSTC`/`RUSTDOC`, the existing isolated
+`CARGO_HOME=target/e2ee-qa-cargo`, locked offline dependencies and synthetic profiles:
+
+```sh
+node tests/fixtures/messaging/device_readiness_oracle.cjs
+cargo test --locked --offline --all-features readiness -- --test-threads=2
+cargo test --locked --offline --all-features typed_init -- --test-threads=2
+cargo test --locked --offline --features messaging --test e2ee_device_readiness
+cargo test --locked --offline --test e2ee_readiness_schema_upgrade
+cargo test --locked --offline --all-features -- --test-threads=2
+cargo clippy --locked --offline --all-features --all-targets -- -D warnings
+cargo check --locked --offline --features live --all-targets
+```
+
+The original-source oracle passes **10 refusal and seven metadata cases**. Targeted
+readiness passes **seven**, typed-init **four** (including the restart case), parser
+**four** and default-feature migration **four**. The complete matrix passes **652
+tests**: 620 library, three CLI, four parser, three recovery, four readiness-schema,
+two ACK, three other schema, eight crypto, four provisioning and one receive.
+Four opt-in fixtures remain ignored. Strict Clippy and the `live` all-target check
+pass; its dependency graph excludes Signal, QuickJS and libsignal-core. A final
+test-only lexical mutex scope correction was rechecked with Clippy and the actual
+composer target. Logs use ignored `target/device-readiness-qa-*-final.log` plus
+`device-readiness-qa-live-{check,tree}.log`.
+
+The full-run fixture corrections wait for fresh startup privacy completion before
+advancing virtual time and for the second completed HTTP response before checking
+the original request bounds. Expected peer disconnects during initial fixture
+AUTH are accepted only for broken pipe, connection reset or unexpected EOF; other
+errors still fail. Production timers and route/count assertions are unchanged.
+
+An automatic permission review timed out before launching a final test command.
+Work stopped under Rule #0.6 until the user explicitly authorized retry; all socket
+gates above subsequently ran with scoped loopback permission. No real Zalo service,
+personal profile, installation, commit or push was used. This is partial D2, not
+real-server acceptance: automatic stale-session renewal, identity-change prompts,
+full offline-queue integration and atomic staging of a new first-use peer binding
+remain unimplemented. Historical explicit probe selection paths retain their prior
+coverage helpers; ordinary `live` builds still exclude the optional Signal engine.
+
+A fresh `cargo build --locked --offline --release --features live` and
+`python3 scripts/rust/smoke-release.py --expect-live` (from the repository root)
+pass with schema **nine**, 19 synthetic messages and six conversations across
+restart. The smoke verifies private permissions, external process-lock refusal,
+informational-command inertness and preservation of legacy/local history; it
+reports `network_used=false`. The new 21,591,264-byte artifact is
+`target/release/zalo-rust`, SHA-256
+`a7699adf8c6096cb7f51fdb21f4da51f309eb6ccf0e24330862a8335b3d17e17`.
+It was not installed or opened with a real profile. Final whole-crate formatting
+and diff checks also pass; release/smoke logs are
+`target/device-readiness-qa-{release,smoke}.log`.

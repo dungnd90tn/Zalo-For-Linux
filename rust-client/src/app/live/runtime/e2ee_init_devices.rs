@@ -130,6 +130,10 @@ impl Connection {
                         Err(note) => anyhow::bail!(note),
                     };
                     let client_id = store.e2ee_reserve_send(&o, &l, &thread, INIT_TEXT, now_ms)?;
+                    if let Err(error) = store.e2ee_mark_peer_init(&o, &l, &o, client_id) {
+                        let _ = store.e2ee_discard_reserved(&o, client_id);
+                        return Err(error);
+                    }
                     match co.plan_personal(store, client_id, INIT_TEXT, vec![recipient], &g, &c) {
                         Ok(plan) => Ok(Some((client_id, plan))),
                         Err(error) => {
@@ -182,11 +186,9 @@ impl Connection {
             match outcome {
                 Ok(()) => {
                     let server_id = format!("init-{}-{now_ms}", device.wire());
-                    db.call(move |s| {
-                        s.e2ee_record_ack(&o, id, &server_id)?;
-                        s.e2ee_retire_init(&o, id)
-                    })
-                    .await?;
+                    let l = local.clone();
+                    db.call(move |s| s.e2ee_confirm_peer_init(&o, &l, &o, id, &server_id))
+                        .await?;
                     report.line(&format!("device {}: init message accepted", device.wire()));
                     initialized += 1;
                 }

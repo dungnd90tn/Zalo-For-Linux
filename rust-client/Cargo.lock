@@ -4735,7 +4735,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-linux-native-preview"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "aes",
  "aes-gcm",

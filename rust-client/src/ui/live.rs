@@ -619,11 +619,14 @@ impl NativeApp {
             LiveEvent::SendFailed {
                 thread,
                 request_id,
-                unknown_delivery: true,
+                unknown_delivery,
                 server_accepted,
                 ..
-            } => {
-                state.delivery.failed(thread, *request_id, *server_accepted);
+            } if *unknown_delivery || *server_accepted => {
+                let changed = state.delivery.failed(thread, *request_id, *server_accepted);
+                if !changed {
+                    return;
+                }
                 if state.privacy.visible(thread) && self.model.selected.as_deref() == Some(thread) {
                     state.delivery.edited(thread, &self.drafts.active.text);
                     state.review_dialog = true;
@@ -634,7 +637,9 @@ impl NativeApp {
                 request_id,
                 accepted: false,
                 ..
-            } => state.delivery.failed(thread, *request_id, false),
+            } => {
+                state.delivery.failed(thread, *request_id, false);
+            }
             _ => {}
         }
         state.observe_status(&event);
@@ -1476,6 +1481,75 @@ pub(in crate::ui) mod tests {
             assert_eq!(action, Some(expected));
         }
     }
+    #[test]
+    fn accepted_send_failure_enters_review_without_losing_newer_draft_or_replaying_stale_events() {
+        for edited in [false, true] {
+            let ctx = egui::Context::default();
+            let (mut app, root) = fixture(&ctx);
+            let mut state = app.live.take().unwrap();
+            app.model.selected = Some("d:22".into());
+            app.drafts.select("d:22").unwrap();
+            app.drafts.active.text = "Tin đã gửi".into();
+            let mut request = 0;
+            app.drafts
+                .active
+                .send_live(0, "d:22".into(), |command| {
+                    if let LiveCommand::Send { request_id, .. } = command {
+                        request = request_id;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            state.delivery.submitted("d:22", request, "Tin đã gửi");
+            if edited {
+                app.drafts.active.text = "Bản nháp mới".into();
+                app.drafts.active.edited();
+            }
+            let event = |account: &str, id| LiveEvent::SendFailed {
+                account_id: account.into(),
+                generation: 0,
+                thread: "d:22".into(),
+                request_id: id,
+                error: "Zalo đã nhận nhưng chưa lưu được trên thiết bị".into(),
+                unknown_delivery: false,
+                server_accepted: true,
+            };
+            app.apply_live_event(&mut state, event("other", request), &ctx);
+            app.apply_live_event(&mut state, event("11", request + 1), &ctx);
+            assert!(app.drafts.active.in_flight());
+            assert!(!state.review_dialog);
+            assert!(state.delivery.review("d:22").is_none());
+            app.apply_live_event(&mut state, event("11", request), &ctx);
+            assert!(!app.drafts.active.in_flight());
+            assert!(state.review_dialog);
+            assert!(state.delivery.review("d:22").unwrap().accepted);
+            assert_eq!(
+                app.drafts.active.text,
+                if edited {
+                    "Bản nháp mới"
+                } else {
+                    "Tin đã gửi"
+                }
+            );
+            assert_eq!(state.delivery.can_send("d:22"), edited);
+            state.review_dialog = false;
+            app.apply_live_event(&mut state, event("11", request), &ctx);
+            assert!(
+                !state.review_dialog,
+                "Duplicate failure must not reopen a dismissed review"
+            );
+            assert_eq!(state.delivery.can_send("d:22"), edited);
+            state.delivery.edited("d:22", "Tin đã gửi");
+            assert!(
+                !state.delivery.can_send("d:22"),
+                "Undo must retain the original accepted-body guard"
+            );
+            drop(state);
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
     #[test]
     fn terminal_worker_close_preserves_typed_reason_fault_and_expiration() {
         use crate::app::live::{LiveCategory, LiveDiagnostic, LiveStage};

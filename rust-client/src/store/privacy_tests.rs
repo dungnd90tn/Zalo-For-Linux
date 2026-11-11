@@ -225,7 +225,7 @@ fn locked_receives_and_ack_keep_raw_history_cursors_and_outbox_without_projectio
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     assert_eq!(
         store

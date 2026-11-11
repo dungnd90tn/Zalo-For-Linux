@@ -27,6 +27,16 @@ pub const MAX_DISPATCH_PAYLOAD: usize = 1024 * 1024;
 pub const MAX_DISPATCH_PEERS: usize = 64;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PENDING_SENDS: i64 = 100;
+const PEER_INIT_PENDING_SQL: &str = "SELECT EXISTS(SELECT 1 FROM e2ee_outbox o JOIN e2ee_peer_init_outbox i ON i.account=o.account AND i.client_id=o.client_id WHERE o.account=?1 AND o.local_epoch=?2 AND o.platform=?3 AND o.thread=?4 AND o.state<>'committed')";
+
+pub const MAX_ACK_REPAIR_BATCH: usize = 64;
+
+/// Progress only: recovered message content stays inside the database owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EchoRepairBatch {
+    pub repaired: usize,
+    pub last_client_id: Option<u64>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Platform {
@@ -579,13 +589,15 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
     CREATE TABLE IF NOT EXISTS e2ee_operation_reservations(account TEXT NOT NULL,stable_key TEXT NOT NULL,operation_id INTEGER NOT NULL,input_digest BLOB NOT NULL,PRIMARY KEY(account,stable_key),UNIQUE(account,operation_id));
     CREATE TABLE IF NOT EXISTS e2ee_operations(account TEXT NOT NULL,operation_id INTEGER NOT NULL,digest BLOB NOT NULL,input_digest BLOB NOT NULL,revision INTEGER NOT NULL,queue TEXT,cursor INTEGER,PRIMARY KEY(account,operation_id));
     CREATE TABLE IF NOT EXISTS e2ee_outbox(account TEXT NOT NULL,client_id INTEGER NOT NULL,thread TEXT NOT NULL,local_epoch INTEGER NOT NULL,platform INTEGER NOT NULL,body TEXT NOT NULL,created_ms INTEGER NOT NULL,state TEXT NOT NULL,ciphertext BLOB,metadata BLOB,server_id TEXT,operation_id INTEGER,crypto_revision INTEGER,peer_bindings TEXT,payload_hash BLOB,PRIMARY KEY(account,client_id));
+    CREATE TABLE IF NOT EXISTS e2ee_peer_init_outbox(account TEXT NOT NULL,client_id INTEGER NOT NULL,PRIMARY KEY(account,client_id),FOREIGN KEY(account,client_id) REFERENCES e2ee_outbox(account,client_id) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS e2ee_verified_outbox(account TEXT NOT NULL,client_id INTEGER NOT NULL,codec INTEGER NOT NULL,operation_id INTEGER NOT NULL,crypto_revision INTEGER NOT NULL,payload_hash BLOB NOT NULL,PRIMARY KEY(account,client_id));
     CREATE TABLE IF NOT EXISTS e2ee_local_candidates(account TEXT NOT NULL,epoch INTEGER NOT NULL,platform INTEGER NOT NULL,intent TEXT NOT NULL,operation_id INTEGER NOT NULL,expected_current INTEGER,prekey_count INTEGER NOT NULL,state TEXT NOT NULL,base_revision INTEGER NOT NULL,plan_digest BLOB NOT NULL,stage_digest BLOB,registration_id INTEGER,PRIMARY KEY(account,epoch),UNIQUE(account,intent),UNIQUE(account,operation_id));
     CREATE TABLE IF NOT EXISTS e2ee_pending_records(account TEXT NOT NULL,epoch INTEGER NOT NULL,key TEXT NOT NULL,value BLOB NOT NULL,PRIMARY KEY(account,epoch,key));
     CREATE TABLE IF NOT EXISTS e2ee_public_outbox(account TEXT NOT NULL,operation_id INTEGER NOT NULL,epoch INTEGER NOT NULL,codec INTEGER NOT NULL,command INTEGER NOT NULL,payload BLOB NOT NULL,payload_hash BLOB NOT NULL,bundle_hash BLOB NOT NULL,state TEXT NOT NULL,attempt_counter INTEGER NOT NULL DEFAULT 0,attempt_generation INTEGER,socket_epoch INTEGER,request_id TEXT,attempt_hash BLOB,PRIMARY KEY(account,operation_id));
     CREATE UNIQUE INDEX IF NOT EXISTS e2ee_public_request_id ON e2ee_public_outbox(account,request_id) WHERE request_id IS NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS e2ee_server_message ON e2ee_outbox(account,thread,server_id) WHERE server_id IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS e2ee_outbox_state ON e2ee_outbox(account,state,client_id);")?;
+    CREATE INDEX IF NOT EXISTS e2ee_outbox_state ON e2ee_outbox(account,state,client_id);
+    CREATE INDEX IF NOT EXISTS e2ee_pending_peer_init_scope ON e2ee_outbox(account,local_epoch,platform,thread,client_id) WHERE state<>'committed';")?;
     Ok(())
 }
 
@@ -1587,6 +1599,96 @@ impl MessageStore {
         tx.commit()?;
         Ok(next as u64)
     }
+    /// Persist the intent before any initialization ratchet is committed. This is
+    /// not a server acknowledgement and never interprets the draft's text.
+    pub fn e2ee_mark_peer_init(
+        &mut self,
+        owner: &str,
+        local: &LocalNamespace,
+        peer: &str,
+        client_id: u64,
+    ) -> Result<()> {
+        account(owner)?;
+        account(peer)?;
+        integer(client_id)?;
+        let tx = self.conn.transaction()?;
+        validate_address(
+            &tx,
+            owner,
+            &RecordKey::LocalIdentity {
+                local: local.clone(),
+            },
+            true,
+        )?;
+        let matches:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM e2ee_outbox WHERE account=?1 AND client_id=?2 AND local_epoch=?3 AND platform=?4 AND thread=?5 AND state='reserved')",params![owner,client_id as i64,epoch(&local.epoch)?,local.platform.wire(),format!("d:{peer}")],|row|row.get(0))?;
+        ensure!(
+            matches,
+            "Initialization intent does not match the reserved send"
+        );
+        tx.execute("INSERT INTO e2ee_peer_init_outbox(account,client_id) VALUES(?1,?2) ON CONFLICT DO NOTHING",params![owner,client_id as i64])?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Unknown initialization outcomes must not become proof of a usable session
+    /// after restart. Ordinary unknown chat sends are deliberately not matched.
+    pub fn e2ee_peer_init_pending(
+        &self,
+        owner: &str,
+        local: &LocalNamespace,
+        peer: &str,
+    ) -> Result<bool> {
+        account(owner)?;
+        account(peer)?;
+        validate_address(
+            &self.conn,
+            owner,
+            &RecordKey::LocalIdentity {
+                local: local.clone(),
+            },
+            true,
+        )?;
+        Ok(self.conn.query_row(
+            PEER_INIT_PENDING_SQL,
+            params![
+                owner,
+                epoch(&local.epoch)?,
+                local.platform.wire(),
+                format!("d:{peer}")
+            ],
+            |row| row.get(0),
+        )?)
+    }
+    /// Call only after a correlated initialization ACK. Confirmation and retirement
+    /// are one transaction, so a crash cannot leave a confirmed init blocking chat.
+    pub fn e2ee_confirm_peer_init(
+        &mut self,
+        owner: &str,
+        local: &LocalNamespace,
+        peer: &str,
+        client_id: u64,
+        server_id: &str,
+    ) -> Result<()> {
+        account(owner)?;
+        account(peer)?;
+        integer(client_id)?;
+        validate_id(server_id)?;
+        ensure!(
+            server_id.starts_with("init-"),
+            "Invalid initialization acknowledgement"
+        );
+        let tx = self.conn.transaction()?;
+        validate_address(
+            &tx,
+            owner,
+            &RecordKey::LocalIdentity {
+                local: local.clone(),
+            },
+            true,
+        )?;
+        ensure!(tx.execute("UPDATE e2ee_outbox SET server_id=?6,state='committed' WHERE account=?1 AND client_id=?2 AND local_epoch=?3 AND platform=?4 AND thread=?5 AND state IN ('sending','unknown','acknowledged','committed') AND (server_id IS NULL OR server_id=?6) AND EXISTS(SELECT 1 FROM e2ee_peer_init_outbox i WHERE i.account=e2ee_outbox.account AND i.client_id=e2ee_outbox.client_id)",params![owner,client_id as i64,epoch(&local.epoch)?,local.platform.wire(),format!("d:{peer}"),server_id])?==1,"Initialization confirmation conflict");
+        tx.commit()?;
+        Ok(())
+    }
     pub fn e2ee_commit_send(
         &mut self,
         send: PreparedSend<'_>,
@@ -1855,6 +1957,56 @@ impl MessageStore {
         ensure!(self.conn.execute("UPDATE e2ee_outbox SET server_id=?3,state=CASE WHEN state='committed' THEN state ELSE 'acknowledged' END WHERE account=?1 AND client_id=?2 AND state IN ('sending','unknown','acknowledged','committed') AND (server_id IS NULL OR server_id=?3)",params![owner,client_id as i64,server_id])?==1,"Conflicting encrypted acknowledgement");
         Ok(())
     }
+    /// Restore local chat echoes from durable acknowledgements, without dispatching
+    /// or changing any ratchet. The ACK does not persist a server timestamp, so
+    /// commit_echo retains an existing timestamp or uses the original draft time.
+    /// Each row commits independently. On failure its ACK remains recoverable;
+    /// the startup caller must stop this pass rather than retry a poison row.
+    pub fn e2ee_repair_acknowledged(
+        &mut self,
+        owner: &str,
+        after_client_id: Option<u64>,
+        limit: usize,
+    ) -> Result<EchoRepairBatch> {
+        account(owner)?;
+        ensure!(
+            (1..=MAX_ACK_REPAIR_BATCH).contains(&limit),
+            "Invalid echo repair batch limit"
+        );
+        let after = after_client_id.map(integer).transpose()?.unwrap_or(0);
+        let rows = {
+            let mut query = self.conn.prepare_cached(
+                "SELECT client_id,CASE WHEN length(CAST(server_id AS BLOB))<=256 THEN server_id END,
+                 length(CAST(body AS BLOB))
+                 FROM e2ee_outbox WHERE account=?1 AND state='acknowledged'
+                 AND client_id>?2 AND server_id IS NOT NULL AND server_id NOT LIKE 'init-%'
+                 ORDER BY client_id LIMIT ?3",
+            )?;
+            let result = query
+                .query_map(params![owner, after, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            result
+        };
+        let mut progress = EchoRepairBatch::default();
+        for (client, server, body_bytes) in rows {
+            ensure!(
+                (0..=MAX_TEXT_BYTES as i64).contains(&body_bytes),
+                "Stored echo exceeds text budget"
+            );
+            let client = u64::try_from(client)?;
+            integer(client)?;
+            self.e2ee_commit_echo(owner, client, &server, None)?;
+            progress.repaired += 1;
+            progress.last_client_id = Some(client);
+        }
+        Ok(progress)
+    }
     /// Closes a session-initialization send (command 543). It carries no chat message, so no echo will
     /// ever arrive to commit it; without this the draft guard would block the next init for the same
     /// thread. Only an acknowledged row whose server id marks it as an init can be retired this way.
@@ -1956,6 +2108,146 @@ mod tests {
             .e2ee_register_peer("123", &local, "456", None, &binding(Platform::Mobile, 2))
             .unwrap();
         (store, local, peer)
+    }
+    #[test]
+    fn typed_init_intent_scopes_pending_state_and_cascades_reserved_discard() {
+        let (mut store, local, _) = setup();
+        // Legitimate chat text may look exactly like init text: intent is never inferred.
+        let chat = store
+            .e2ee_reserve_send("123", &local, "d:456", r#"{"subDevice":[]}"#, 1000)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE e2ee_outbox SET state='unknown' WHERE account='123' AND client_id=?1",
+                [chat as i64],
+            )
+            .unwrap();
+        assert!(!store.e2ee_peer_init_pending("123", &local, "456").unwrap());
+        let init = store
+            .e2ee_reserve_send("123", &local, "d:456", "synthetic init", 1001)
+            .unwrap();
+        assert!(store
+            .e2ee_mark_peer_init("123", &local, "789", init)
+            .is_err());
+        assert!(store
+            .e2ee_mark_peer_init("999", &local, "456", init)
+            .is_err());
+        store
+            .e2ee_mark_peer_init("123", &local, "456", init)
+            .unwrap();
+        store
+            .e2ee_mark_peer_init("123", &local, "456", init)
+            .unwrap();
+        assert!(store.e2ee_peer_init_pending("123", &local, "456").unwrap());
+        assert!(!store.e2ee_peer_init_pending("123", &local, "789").unwrap());
+        assert!(
+            store
+                .e2ee_confirm_peer_init("123", &local, "456", init, "init-test")
+                .is_err(),
+            "A reserved row cannot be acknowledged"
+        );
+        assert!(store.e2ee_discard_reserved("123", init).unwrap());
+        assert!(!store.e2ee_peer_init_pending("123", &local, "456").unwrap());
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM e2ee_peer_init_outbox", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let own = store
+            .e2ee_reserve_send("123", &local, "d:123", "own init", 1002)
+            .unwrap();
+        store
+            .e2ee_mark_peer_init("123", &local, "123", own)
+            .unwrap();
+        assert!(store.e2ee_peer_init_pending("123", &local, "123").unwrap());
+    }
+    #[test]
+    fn typed_init_confirmation_is_atomic_idempotent_and_preserves_unknown_on_abort() {
+        let (mut store, local, _) = setup();
+        let init = store
+            .e2ee_reserve_send("123", &local, "d:456", "synthetic init", 1000)
+            .unwrap();
+        store
+            .e2ee_mark_peer_init("123", &local, "456", init)
+            .unwrap();
+        store.conn.execute("UPDATE e2ee_outbox SET state='unknown',ciphertext=x'010203',metadata=x'7b7d' WHERE account='123' AND client_id=?1",[init as i64]).unwrap();
+        store.conn.execute_batch("CREATE TEMP TRIGGER abort_init_confirmation BEFORE UPDATE OF state ON e2ee_outbox WHEN NEW.state='committed' BEGIN SELECT RAISE(ABORT,'synthetic confirmation failure'); END;").unwrap();
+        assert!(store
+            .e2ee_confirm_peer_init("123", &local, "456", init, "init-test")
+            .is_err());
+        let row = store.e2ee_outgoing("123", init).unwrap();
+        assert!(row.state == SendState::Unknown && row.server_id.is_none());
+        assert_eq!(row.ciphertext, Some(vec![1, 2, 3]));
+        assert_eq!(row.metadata, Some(b"{}".to_vec()));
+        assert!(store.e2ee_peer_init_pending("123", &local, "456").unwrap());
+        store
+            .conn
+            .execute_batch("DROP TRIGGER abort_init_confirmation;")
+            .unwrap();
+        assert!(store
+            .e2ee_confirm_peer_init("123", &local, "789", init, "init-test")
+            .is_err());
+        assert!(store
+            .e2ee_confirm_peer_init("123", &local, "456", init, "9001")
+            .is_err());
+        store
+            .e2ee_confirm_peer_init("123", &local, "456", init, "init-test")
+            .unwrap();
+        store
+            .e2ee_confirm_peer_init("123", &local, "456", init, "init-test")
+            .unwrap();
+        assert!(!store.e2ee_peer_init_pending("123", &local, "456").unwrap());
+        assert!(store
+            .e2ee_confirm_peer_init("123", &local, "456", init, "init-conflict")
+            .is_err());
+        assert!(store.e2ee_outgoing("123", init).unwrap().state == SendState::Committed);
+        assert_eq!(
+            store.page("123", "d:456", None, 10).unwrap().len(),
+            0,
+            "Initialization is never chat history"
+        );
+    }
+    #[test]
+    fn typed_init_pending_uses_scoped_outbox_and_marker_indexes() {
+        let (store, local, _) = setup();
+        let mut query = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {PEER_INIT_PENDING_SQL}"))
+            .unwrap();
+        let details = query
+            .query_map(
+                params![
+                    "123",
+                    epoch(&local.epoch).unwrap(),
+                    local.platform.wire(),
+                    "d:456"
+                ],
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            details.contains("e2ee_pending_peer_init_scope"),
+            "{details}"
+        );
+        assert!(details.contains("SEARCH i USING"), "{details}");
+        assert!(
+            !details.lines().any(|line| {
+                line.strip_prefix("SCAN ").is_some_and(|table| {
+                    matches!(
+                        table.split_whitespace().next(),
+                        Some("o" | "i" | "e2ee_outbox" | "e2ee_peer_init_outbox")
+                    )
+                })
+            }) && !details.contains("TEMP B-TREE"),
+            "{details}"
+        );
     }
     fn key(local: &LocalNamespace, id: u32) -> RecordKey {
         RecordKey::PreKey {
@@ -3053,7 +3345,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                8
+                9
             );
             for table in [
                 "e2ee_local_candidates",
@@ -3102,7 +3394,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                8
+                9
             );
             assert_eq!(
                 store.page("123", "d:456", None, 10).unwrap()[0].id,
@@ -3208,6 +3500,128 @@ mod tests {
         client
     }
     #[test]
+    fn acknowledgement_repair_is_bounded_account_scoped_and_skips_non_chat_and_unconfirmed_rows() {
+        let (mut store, local, _) = setup();
+        let first = prepared(&mut store, &local, 1, "first accepted");
+        store.e2ee_take_ready("123", first).unwrap();
+        store.e2ee_record_ack("123", first, "9001").unwrap();
+        let second = prepared(&mut store, &local, 2, "second accepted");
+        store.e2ee_take_ready("123", second).unwrap();
+        store.e2ee_record_ack("123", second, "9002").unwrap();
+        let init = prepared(&mut store, &local, 3, "session initialization");
+        store.e2ee_take_ready("123", init).unwrap();
+        store.e2ee_record_ack("123", init, "init-9003").unwrap();
+        let unknown = prepared(&mut store, &local, 4, "unknown delivery");
+        store.e2ee_take_ready("123", unknown).unwrap();
+        store.e2ee_send_failed("123", unknown, false).unwrap();
+        let ready = prepared(&mut store, &local, 5, "not dispatched");
+        assert_eq!(
+            store
+                .e2ee_repair_acknowledged("999", None, 1)
+                .unwrap()
+                .repaired,
+            0
+        );
+        assert!(store.e2ee_repair_acknowledged("123", None, 0).is_err());
+        assert!(store
+            .e2ee_repair_acknowledged("123", None, MAX_ACK_REPAIR_BATCH + 1)
+            .is_err());
+        assert!(store.e2ee_repair_acknowledged("123", Some(0), 1).is_err());
+        let batch = store.e2ee_repair_acknowledged("123", None, 1).unwrap();
+        assert_eq!(
+            batch,
+            EchoRepairBatch {
+                repaired: 1,
+                last_client_id: Some(first)
+            }
+        );
+        assert!(store.e2ee_outgoing("123", second).unwrap().state == SendState::Acknowledged);
+        let batch = store
+            .e2ee_repair_acknowledged("123", batch.last_client_id, 1)
+            .unwrap();
+        assert_eq!(
+            batch,
+            EchoRepairBatch {
+                repaired: 1,
+                last_client_id: Some(second)
+            }
+        );
+        assert_eq!(
+            store
+                .e2ee_repair_acknowledged("123", batch.last_client_id, 1)
+                .unwrap()
+                .repaired,
+            0
+        );
+        assert_eq!(
+            store
+                .e2ee_repair_acknowledged("123", None, 64)
+                .unwrap()
+                .repaired,
+            0
+        );
+        assert!(store.e2ee_outgoing("123", init).unwrap().state == SendState::Acknowledged);
+        assert!(store.e2ee_outgoing("123", unknown).unwrap().state == SendState::Unknown);
+        assert!(store.e2ee_outgoing("123", ready).unwrap().state == SendState::Ready);
+        let messages = store.page("123", "d:456", None, 10).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| message.sent_at_ms == 1000));
+        let repaired = store.e2ee_outgoing("123", first).unwrap();
+        assert_eq!(
+            repaired.ciphertext.as_deref(),
+            Some(b"exact ciphertext".as_slice())
+        );
+        assert_eq!(
+            repaired.metadata.as_deref(),
+            Some(b"inner metadata".as_slice())
+        );
+        assert!(store.e2ee_take_ready("123", first).is_err());
+    }
+    #[test]
+    fn acknowledgement_repair_keeps_durable_progress_and_failed_ack_for_next_startup() {
+        let (mut store, local, _) = setup();
+        let first = prepared(&mut store, &local, 1, "accepted one");
+        store.e2ee_take_ready("123", first).unwrap();
+        store.e2ee_record_ack("123", first, "9001").unwrap();
+        let second = prepared(&mut store, &local, 2, "accepted two");
+        store.e2ee_take_ready("123", second).unwrap();
+        store.e2ee_record_ack("123", second, "9002").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_repair BEFORE INSERT ON messages WHEN NEW.message_id='9002' BEGIN SELECT RAISE(ABORT, 'synthetic repair failure'); END;").unwrap();
+        assert!(store.e2ee_repair_acknowledged("123", None, 64).is_err());
+        assert!(store.e2ee_outgoing("123", first).unwrap().state == SendState::Committed);
+        assert!(store.e2ee_outgoing("123", second).unwrap().state == SendState::Acknowledged);
+        assert_eq!(store.page("123", "d:456", None, 10).unwrap().len(), 1);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_repair;")
+            .unwrap();
+        assert_eq!(
+            store
+                .e2ee_repair_acknowledged("123", None, 64)
+                .unwrap()
+                .repaired,
+            1
+        );
+        assert_eq!(store.page("123", "d:456", None, 10).unwrap().len(), 2);
+    }
+    #[test]
+    fn acknowledgement_repair_rejects_oversized_stored_body_without_retiring_ack() {
+        let (mut store, local, _) = setup();
+        let client = prepared(&mut store, &local, 1, "accepted bounded draft");
+        store.e2ee_take_ready("123", client).unwrap();
+        store.e2ee_record_ack("123", client, "9001").unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE e2ee_outbox SET body=?3 WHERE account=?1 AND client_id=?2",
+                params!["123", client as i64, "x".repeat(MAX_TEXT_BYTES + 1)],
+            )
+            .unwrap();
+        assert!(store.e2ee_repair_acknowledged("123", None, 64).is_err());
+        assert!(store.e2ee_outgoing("123", client).unwrap().state == SendState::Acknowledged);
+        assert!(store.page("123", "d:456", None, 10).unwrap().is_empty());
+    }
+    #[test]
     fn send_is_atomic_and_exact_ciphertext_survives_unknown_and_reconciliation() {
         let (mut store, local, _) = setup();
         let text = "x".repeat(MAX_TEXT_BYTES);
@@ -3245,6 +3659,36 @@ mod tests {
                 3000
             )
             .is_err());
+    }
+    #[test]
+    fn accepted_send_survives_echo_storage_failure_without_becoming_dispatchable() {
+        let (mut store, local, _) = setup();
+        let client = prepared(&mut store, &local, 1, "accepted draft");
+        let dispatched = store.e2ee_take_ready("123", client).unwrap();
+        store.e2ee_record_ack("123", client, "9001").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_e2ee_echo BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END;").unwrap();
+        assert!(store
+            .e2ee_commit_echo("123", client, "9001", Some(2000))
+            .is_err());
+        let accepted = store.e2ee_outgoing("123", client).unwrap();
+        assert!(accepted.state == SendState::Acknowledged);
+        assert_eq!(accepted.server_id.as_deref(), Some("9001"));
+        assert_eq!(accepted.ciphertext, dispatched.ciphertext);
+        assert_eq!(store.e2ee_recover_sends("123").unwrap(), 0);
+        assert!(store.e2ee_take_ready("123", client).is_err());
+        assert!(store.e2ee_send_failed("123", client, true).is_err());
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_e2ee_echo;")
+            .unwrap();
+        store
+            .e2ee_commit_echo("123", client, "9001", Some(2000))
+            .unwrap();
+        store
+            .e2ee_commit_echo("123", client, "9001", Some(2001))
+            .unwrap();
+        assert_eq!(store.page("123", "d:456", None, 10).unwrap().len(), 1);
+        assert!(store.e2ee_outgoing("123", client).unwrap().state == SendState::Committed);
     }
     #[test]
     fn dispatch_authority_requires_committed_exact_bytes_current_peers_and_generation() {

@@ -101,7 +101,7 @@ fn populated_v7_keeps_exact_bytes_pending_state_and_cascades_then_accepts_files(
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
         for (table, expected) in tables.iter().zip(&before) {
             assert_eq!(&rows(&conn, table), expected, "changed {table}");
@@ -178,7 +178,7 @@ fn newer_schema_is_refused_without_downgrade_or_row_changes() {
     let db = Database::new();
     seed_v7(&db.0);
     let conn = Connection::open(&db.0).unwrap();
-    conn.execute_batch("PRAGMA user_version=9").unwrap();
+    conn.execute_batch("PRAGMA user_version=10").unwrap();
     let before = rows(&conn, "message_media");
     drop(conn);
     assert!(MessageStore::open(&db.0).is_err());
@@ -187,6 +187,6 @@ fn newer_schema_is_refused_without_downgrade_or_row_changes() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
 }

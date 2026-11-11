@@ -924,6 +924,24 @@ pub fn e2ee_send_ack(payload: &Value) -> Result<SendAck, WireError> {
     send_ack(&serde_json::json!({"error_code": 0, "data": shaped}))
 }
 
+/// Bind a synchronous encrypted-send reply to its durable attempt when the service
+/// echoes a client ID. Older replies without that field remain HTTP-request bound.
+pub fn e2ee_send_ack_for(payload: &Value, expected_client_id: u64) -> Result<SendAck, WireError> {
+    let ack = e2ee_send_ack(payload)?;
+    let data = payload.get("data").ok_or(WireError::Invalid)?;
+    if let (Some(global), Some(message)) = (data.get("minGlobalMsgId"), data.get("msgId")) {
+        if id_string(global)? != id_string(message)? {
+            return Err(WireError::Invalid);
+        }
+    }
+    if let Some(client) = payload.get("data").and_then(|data| data.get("clientId")) {
+        if id_string(client)? != expected_client_id.to_string() {
+            return Err(WireError::Invalid);
+        }
+    }
+    Ok(ack)
+}
+
 /// Closed diagnostic labels, never peer IDs or arbitrary payload field names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EligibilityReason {
@@ -1171,6 +1189,47 @@ mod tests {
         // No id at all, or a service error, is refused.
         assert!(e2ee_send_ack(&json!({"error_code":0,"data":{"ts":1}})).is_err());
         assert!(e2ee_send_ack(&json!({"error_code":5,"data":{"minGlobalMsgId":"1"}})).is_err());
+    }
+    #[test]
+    fn encrypted_ack_binds_present_client_id_and_rejects_conflicting_server_ids() {
+        for client in [json!(123), json!("123")] {
+            assert!(e2ee_send_ack_for(
+                &json!({"error_code":0,"data":{"clientId":client,"minGlobalMsgId":"9001","ts":5}}),
+                123
+            )
+            .is_ok());
+        }
+        for client in [
+            json!(124),
+            json!("124"),
+            json!(null),
+            json!(false),
+            json!({}),
+            json!("0123"),
+        ] {
+            assert!(e2ee_send_ack_for(
+                &json!({"error_code":0,"data":{"clientId":client,"minGlobalMsgId":"9001"}}),
+                123
+            )
+            .is_err());
+        }
+        // A synchronous older HTTP response may omit the echo; no global event is accepted here.
+        assert!(e2ee_send_ack_for(&json!({"error_code":0,"data":{"msgId":9001}}), 123).is_ok());
+        assert!(e2ee_send_ack_for(
+            &json!({"error_code":0,"data":{"msgId":9001,"minGlobalMsgId":"9001"}}),
+            123
+        )
+        .is_ok());
+        assert!(e2ee_send_ack_for(
+            &json!({"error_code":0,"data":{"msgId":9002,"minGlobalMsgId":"9001"}}),
+            123
+        )
+        .is_err());
+        assert!(e2ee_send_ack_for(
+            &json!({"error_code":0,"data":{"clientId":"123","minGlobalMsgId":"9001","ts":-1}}),
+            123
+        )
+        .is_err());
     }
     fn frame(cmd: u16, value: Value) -> Vec<u8> {
         encode_frame(cmd, 0, &value).unwrap()

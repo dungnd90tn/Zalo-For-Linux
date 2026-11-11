@@ -1,26 +1,23 @@
 //! The composer's send to an end-to-end encrypted conversation: the original's `sendE2eeMsg`
 //! (`pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js`, line 159908).
 //!
-//! Ported behavior (see `E2EE_PARITY.md`, D2/D3/D7):
-//! 1. `checkSessionThenInit`: a device without a session gets the handshake first (560, 541 with `isReInit`,
-//!    543). An init failure is tried again up to `max_retry_reinit` (3) times, immediately; a refusal with
-//!    `-3` (client unsupported) or `-5` (own subdevice unsupported) is not retried: the original opens its
-//!    downgrade dialog and fails the message (`default_11_allow_downgrade` is true), and so does this.
-//! 2. The message is encrypted for the contact's devices and this account's other devices, committed, then
-//!    posted to `/api/e2ee/pc/message/sms` on the `chat_e2e` service.
-//! 3. Per-device results in the reply are not read (only the ids and the timestamp), as in the original.
-use super::e2ee_send::{has_session, post_prepared, prepare_authorized};
+//! Normal composer safety (see `E2EE_PARITY.md`, D2/D3/D7):
+//! 1. Read fresh enabled-device metadata, compatibility, and bundles. Initialize only verified missing
+//!    peer sessions; stale bindings, missing own-device sessions, and unconfirmed initialization fail
+//!    closed without automatic retry or plaintext fallback.
+//! 2. Recheck the account, epoch, trust, and exact recipient coverage before reserving the draft.
+//!    Verify each prepared record's routed address and actual session registration before committing.
+//! 3. Post the committed exact ciphertext to `/api/e2ee/pc/message/sms` on `chat_e2e` and preserve
+//!    ambiguous delivery without re-encrypting it. Per-device response results remain a parity gap.
+use super::e2ee_send::{post_prepared, prepare_checked};
 use super::signal_transport::Report;
 use super::*;
 use crate::protocol::signal::SignalError;
 
-/// `max_retry_reinit` (PC 226700 area): immediate re-attempts of a failed initialization.
-const MAX_RETRY_REINIT: usize = 3;
-
 fn next_sequence() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(9_400_000);
-    NEXT.fetch_add(16, Ordering::SeqCst)
+    NEXT.fetch_add(128, Ordering::SeqCst)
 }
 
 /// What the user is told when the message cannot go; the draft is always kept.
@@ -43,6 +40,25 @@ fn detail(step: &str, error: &anyhow::Error) -> String {
     format!("[{step}: {chain}]")
 }
 
+/// Keep server acceptance separate from local persistence and ambiguous delivery.
+fn post_failure(error: &anyhow::Error) -> (String, bool, bool) {
+    if error
+        .downcast_ref::<super::e2ee_send::AcceptedSendError>()
+        .is_some()
+    {
+        ("Zalo đã nhận tin nhắn nhưng chưa lưu được xác nhận trên thiết bị. Không gửi lại; bản nháp được giữ lại.".into(), false, true)
+    } else {
+        (
+            format!(
+                "Chưa có xác nhận từ Zalo. Không tự gửi lại. {}",
+                detail("gửi", error)
+            ),
+            true,
+            false,
+        )
+    }
+}
+
 impl Connection {
     /// Handshake if needed, then send. Emits `Sent` or `SendFailed`; never leaves the composer waiting.
     pub(super) async fn send_e2ee(
@@ -54,56 +70,67 @@ impl Connection {
         request_id: u64,
         text: &str,
     ) -> Result<()> {
-        let fail = |message: &str, unknown: bool| LiveEvent::SendFailed {
+        let fail = |message: &str, unknown: bool, accepted: bool| LiveEvent::SendFailed {
             account_id: events.account.clone(),
             generation,
             thread: thread.clone(),
             request_id,
             error: message.into(),
             unknown_delivery: unknown,
-            server_accepted: false,
+            server_accepted: accepted,
         };
         let Some(http) = self.e2ee_http.clone() else {
             return events
                 .emit(fail(
                     "Hội thoại này đã bật mã hóa đầu cuối. Client chưa sẵn sàng gửi ở chế độ này; bản nháp được giữ lại.",
                     false,
+                    false,
                 ))
                 .await;
         };
         let Some(peer) = thread.strip_prefix("d:").map(str::to_owned) else {
             return events
-                .emit(fail("Chỉ hỗ trợ mã hóa đầu cuối cho hội thoại 1-1.", false))
+                .emit(fail(
+                    "Chỉ hỗ trợ mã hóa đầu cuối cho hội thoại 1-1.",
+                    false,
+                    false,
+                ))
                 .await;
         };
         let owner = self.account.clone();
 
-        // checkSessionThenInit: a missing session means the handshake first.
-        let mut attempt = 0;
-        while !has_session(db, &owner, &peer).await? {
-            match self.handshake_with(db, &peer, next_sequence()).await {
-                Ok(_) => break,
-                Err(error) => {
-                    let definitive = matches!(
-                        error.downcast_ref::<SignalError>(),
-                        Some(SignalError::Service(-3 | -5))
-                    );
-                    let _ = diagnostic(&error, LiveStage::Send);
-                    attempt += 1;
-                    if definitive || attempt > MAX_RETRY_REINIT {
-                        let message = format!(
-                            "{} {}",
-                            init_failure_message(&error),
-                            detail("bắt tay", &error)
-                        );
-                        return events.emit(fail(&message, false)).await;
-                    }
+        // Every send verifies the full fresh device set. Deterministic metadata,
+        // identity and readiness errors must not retry account-changing handshakes.
+        let readiness = match self
+            .send_readiness(db, events, &peer, next_sequence())
+            .await
+        {
+            Ok(readiness) => std::sync::Arc::new(readiness),
+            Err(error) => {
+                let error =
+                    if error.downcast_ref::<SignalError>() == Some(&SignalError::Authentication) {
+                        error.context(WireError::Authentication)
+                    } else {
+                        error
+                    };
+                let critical = error.downcast_ref::<StorageContext>().is_some()
+                    || wire_error(&error) == Some(&WireError::Authentication);
+                let _ = diagnostic(&error, LiveStage::Send);
+                let message = format!(
+                    "{} {}",
+                    init_failure_message(&error),
+                    detail("thiết bị", &error)
+                );
+                events.emit(fail(&message, false, false)).await?;
+                if critical {
+                    return Err(error);
                 }
+                return Ok(());
             }
-        }
+        };
 
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-        let prepared = match prepare_authorized(db, &owner, &peer, text, now_ms).await {
+        let prepared = match prepare_checked(db, &owner, &peer, text, now_ms, readiness).await {
             Ok(prepared) => prepared,
             Err(error) => {
                 let _ = diagnostic(&error, LiveStage::Send);
@@ -111,7 +138,7 @@ impl Connection {
                     "Không mã hóa được tin nhắn cho người nhận. Bản nháp được giữ lại. {}",
                     detail("mã hóa", &error)
                 );
-                return events.emit(fail(&message, false)).await;
+                return events.emit(fail(&message, false, false)).await;
             }
         };
         let mut report = Report::discard();
@@ -130,12 +157,32 @@ impl Connection {
             }
             Err(error) => {
                 let _ = diagnostic(&error, LiveStage::Send);
-                let message = format!(
-                    "Chưa có xác nhận từ Zalo. Không tự gửi lại. {}",
-                    detail("gửi", &error)
-                );
-                events.emit(fail(&message, true)).await
+                let (message, unknown, accepted) = post_failure(&error);
+                events.emit(fail(&message, unknown, accepted)).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn readiness_request_blocks_do_not_overlap() {
+        // Twenty metadata pages plus compatibility, three peer lookups, own
+        // inventory and three missing-device renewals consume at most 28 IDs.
+        let first = next_sequence();
+        let next = next_sequence();
+        assert!(next >= first + 128 && first + 28 < next);
+    }
+
+    #[test]
+    fn accepted_local_failure_is_not_reported_as_unknown_delivery() {
+        let error: anyhow::Error = super::super::e2ee_send::AcceptedSendError.into();
+        let (message, unknown, accepted) = post_failure(&error);
+        assert!(accepted && !unknown);
+        assert!(message.contains("Zalo đã nhận") && message.contains("bản nháp"));
+        let (_, unknown, accepted) = post_failure(&anyhow::anyhow!("no readable reply"));
+        assert!(unknown && !accepted);
     }
 }

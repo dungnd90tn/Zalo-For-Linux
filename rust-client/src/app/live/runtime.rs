@@ -24,12 +24,15 @@ mod e2ee_init_devices;
 mod e2ee_init_peer;
 mod e2ee_probe;
 #[cfg(feature = "signal-crypto")]
+mod e2ee_readiness;
+#[cfg(feature = "signal-crypto")]
 mod e2ee_receive;
 #[cfg(feature = "signal-crypto")]
 mod e2ee_send;
 #[cfg(feature = "signal-crypto")]
 mod e2ee_send_probe;
 mod e2ee_threads;
+mod echo_recovery;
 #[cfg(test)]
 mod integration_tests;
 mod privacy;
@@ -2151,8 +2154,19 @@ async fn handle_command(
                     && target.kind == ThreadKind::Direct
                 {
                     if let Some(c) = connection.as_mut() {
-                        c.send_e2ee(db, events, generation, thread, request_id, &text)
-                            .await?;
+                        if let Err(error) = c
+                            .send_e2ee(db, events, generation, thread, request_id, &text)
+                            .await
+                        {
+                            if wire_error(&error) == Some(&WireError::Authentication) {
+                                events
+                                    .diagnostic(diagnostic(&error, LiveStage::Authentication))
+                                    .await?;
+                                events.connection(LiveConnection::Expired).await?;
+                                return Ok(CommandOutcome::PauseTransport);
+                            }
+                            return Err(error);
+                        }
                         return Ok(CommandOutcome::Continue);
                     }
                 }
@@ -2308,6 +2322,8 @@ async fn run_inner(
     transports: &Transports,
 ) -> Result<()> {
     let db = Database::open(profile, events.account.clone()).await?;
+    // Repair only durable, already accepted local sends before any history projection.
+    echo_recovery::repair(&db, &events.account).await?;
     let account = events.account.clone();
     // The last confirmed hidden set applies at once; the interface does not wait for the network check.
     let remembered = db

@@ -39,6 +39,23 @@ It preserves history, keys, foreign keys, outbox and receive cursors. Failure
 rolls back the table and version. Older binaries reject schema eight; there is no
 database downgrade path.
 
+Schema nine adds a typed initialization-intent table with a cascading outbox
+foreign key and a partial account/epoch/platform/thread index. This is an
+additive transaction: existing history, crypto records and committed payload
+bytes remain unchanged. The normal composer blocks unresolved marked init
+attempts across restart; a correlated ACK confirms and retires an init atomically.
+No body heuristic or pre-ACK server-ID marker is used. Legacy unmarked unknown
+attempts remain ambiguous and are not automatically reclassified. Earlier
+executables reject schema nine; no database downgrade is implemented.
+
+Normal-composer readiness now checks fresh target metadata, compatibility and
+per-device identities against the current account/epoch, then checks exact
+prepared recipient/IID coverage before committing encryption. This is not the
+full source metadata/stale/offline-queue state machine. Explicit historical probe
+drivers retain their inventory/recipient-selection helpers, while shared init
+bookkeeping gains typed intent and atomic confirmation. Real-server acceptance
+remains separate.
+
 Avatars use a maximum of 64 scoped directory point lookups per request and
 separate user/group identity keys. Own-profile metadata comes from the original
 `me-v2` endpoint as an optional final directory-sync step; it may wait for other
