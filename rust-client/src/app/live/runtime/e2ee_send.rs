@@ -23,6 +23,17 @@ use crate::{
 use std::sync::Arc;
 use zalo_signal_engine as engine;
 
+/// The server accepted the exact dispatch, but its local acknowledgement/echo
+/// could not be stored. Carries no transport error, identifiers or message data.
+#[derive(Debug)]
+pub(super) struct AcceptedSendError;
+impl std::fmt::Display for AcceptedSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Encrypted send accepted; local confirmation could not be stored")
+    }
+}
+impl std::error::Error for AcceptedSendError {}
+
 /// What the connection needs to make authenticated HTTP requests (set when the connection opens).
 #[derive(Clone)]
 pub(super) struct E2eeHttp {
@@ -244,7 +255,7 @@ pub(super) async fn post_prepared(
     for line in super::e2ee_probe::shape(&response) {
         report.line(&line);
     }
-    let ack = match wire::e2ee_send_ack(&response) {
+    let ack = match wire::e2ee_send_ack_for(&response, client_id) {
         Ok(ack) => ack,
         Err(_) => {
             let _ = db.call(move |s| s.e2ee_send_failed(&o, id, false)).await;
@@ -281,6 +292,7 @@ pub(super) async fn post_prepared(
         s.e2ee_commit_echo(&o, id, &server, ts)
     })
     .await
+    .map_err(|_| AcceptedSendError.into())
 }
 
 impl Connection {

@@ -3247,6 +3247,36 @@ mod tests {
             .is_err());
     }
     #[test]
+    fn accepted_send_survives_echo_storage_failure_without_becoming_dispatchable() {
+        let (mut store, local, _) = setup();
+        let client = prepared(&mut store, &local, 1, "accepted draft");
+        let dispatched = store.e2ee_take_ready("123", client).unwrap();
+        store.e2ee_record_ack("123", client, "9001").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_e2ee_echo BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END;").unwrap();
+        assert!(store
+            .e2ee_commit_echo("123", client, "9001", Some(2000))
+            .is_err());
+        let accepted = store.e2ee_outgoing("123", client).unwrap();
+        assert!(accepted.state == SendState::Acknowledged);
+        assert_eq!(accepted.server_id.as_deref(), Some("9001"));
+        assert_eq!(accepted.ciphertext, dispatched.ciphertext);
+        assert_eq!(store.e2ee_recover_sends("123").unwrap(), 0);
+        assert!(store.e2ee_take_ready("123", client).is_err());
+        assert!(store.e2ee_send_failed("123", client, true).is_err());
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_e2ee_echo;")
+            .unwrap();
+        store
+            .e2ee_commit_echo("123", client, "9001", Some(2000))
+            .unwrap();
+        store
+            .e2ee_commit_echo("123", client, "9001", Some(2001))
+            .unwrap();
+        assert_eq!(store.page("123", "d:456", None, 10).unwrap().len(), 1);
+        assert!(store.e2ee_outgoing("123", client).unwrap().state == SendState::Committed);
+    }
+    #[test]
     fn dispatch_authority_requires_committed_exact_bytes_current_peers_and_generation() {
         let (mut store, local, peer) = setup();
         let gate = GenerationGate::new(1).unwrap();

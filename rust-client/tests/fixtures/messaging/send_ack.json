@@ -1,0 +1,145 @@
+{
+  "provenance": "Exact original parseE2eeResp with synthetic response metadata. This normalizer does not establish HTTP success, safe IDs, request correlation or durable commit; native checks test those separately.",
+  "cases": [
+    {
+      "name": "encrypted_string_ids",
+      "input": {
+        "clientId": "101",
+        "minGlobalMsgId": "201",
+        "ts": 123,
+        "data": [
+          {
+            "error_code": 9
+          }
+        ]
+      },
+      "output": {
+        "clientId": "101",
+        "msgId": "201",
+        "ts": 123,
+        "minGlobalMsgId": "201"
+      }
+    },
+    {
+      "name": "encrypted_numeric_ids",
+      "input": {
+        "clientId": 101,
+        "minGlobalMsgId": 201,
+        "ts": "123"
+      },
+      "output": {
+        "clientId": 101,
+        "msgId": 201,
+        "ts": "123",
+        "minGlobalMsgId": 201
+      }
+    },
+    {
+      "name": "explicit_msg_id_overrides_normalization",
+      "input": {
+        "clientId": "101",
+        "minGlobalMsgId": "201",
+        "msgId": "999",
+        "ts": 123
+      },
+      "output": {
+        "clientId": "101",
+        "msgId": "999",
+        "ts": 123,
+        "minGlobalMsgId": "201"
+      }
+    },
+    {
+      "name": "plain_passthrough",
+      "input": {
+        "clientId": "101",
+        "msgId": "201",
+        "ts": 123
+      },
+      "output": {
+        "clientId": "101",
+        "msgId": "201",
+        "ts": 123
+      }
+    },
+    {
+      "name": "missing_client_passthrough",
+      "input": {
+        "minGlobalMsgId": "201",
+        "data": []
+      },
+      "output": {
+        "minGlobalMsgId": "201",
+        "data": []
+      }
+    },
+    {
+      "name": "missing_server_passthrough",
+      "input": {
+        "clientId": "101",
+        "data": []
+      },
+      "output": {
+        "clientId": "101",
+        "data": []
+      }
+    },
+    {
+      "name": "zero_client_passthrough",
+      "input": {
+        "clientId": 0,
+        "minGlobalMsgId": "201",
+        "data": []
+      },
+      "output": {
+        "clientId": 0,
+        "minGlobalMsgId": "201",
+        "data": []
+      }
+    },
+    {
+      "name": "null_minimum_passthrough",
+      "input": {
+        "clientId": "101",
+        "minGlobalMsgId": null,
+        "msgId": "201"
+      },
+      "output": {
+        "clientId": "101",
+        "minGlobalMsgId": null,
+        "msgId": "201"
+      }
+    },
+    {
+      "name": "no_timestamp",
+      "input": {
+        "clientId": "101",
+        "minGlobalMsgId": "201"
+      },
+      "output": {
+        "clientId": "101",
+        "msgId": "201",
+        "minGlobalMsgId": "201"
+      }
+    },
+    {
+      "name": "unknown_fields_retained",
+      "input": {
+        "clientId": "101",
+        "minGlobalMsgId": "201",
+        "extra": {
+          "retained": true
+        },
+        "data": []
+      },
+      "output": {
+        "clientId": "101",
+        "msgId": "201",
+        "minGlobalMsgId": "201",
+        "extra": {
+          "retained": true
+        }
+      }
+    }
+  ]
+}

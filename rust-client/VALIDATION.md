@@ -921,3 +921,48 @@ Verification on Rust 1.99.1:
   exited 143 before IME/lint/smoke; the final complete rerun exited zero.
 - Strict `cargo clippy --locked --offline --all-features --all-targets --
   -D warnings` passed. No real-server messaging or external OS paste was tested.
+
+## E2EE send acknowledgement and accepted-send recovery (2026-11-11)
+
+The exact original `parseE2eeResp` normalizer passes ten synthetic metadata
+cases in `tests/fixtures/messaging/send_ack_oracle.cjs`. It already supports
+`minGlobalMsgId`; this milestone adds request binding when `clientId` is present
+and refuses conflicting server IDs. The original helper instead lets an explicit
+`msgId` override its normalized ID; native rejection is deliberately stricter.
+Replies without `clientId` retain the existing synchronous HTTP-request binding.
+
+A validated server acknowledgement followed by a local persistence failure is
+now reported as server-accepted, not unknown delivery. A SQLite insertion-failure
+test verifies that the persisted ACK and exact ciphertext survive, dispatch is
+not reopened, and later echo reconciliation creates one message. Automatic
+startup reconciliation of acknowledged rows remains future work. Actual UI-event
+tests verify that accepted failures enter delivery review, retain newer draft
+edits, reject stale account/request failures and do not reopen a dismissed review
+on duplicate events. No plaintext downgrade or automatic resend was added.
+
+Verification used pinned Rust **1.99.1**, locked offline dependencies and disposable
+synthetic storage/local loopback fixtures:
+
+```sh
+node tests/fixtures/messaging/send_ack_oracle.cjs
+cargo test --locked --offline --features messaging --test e2ee_send_ack
+cargo test --locked --offline --all-features e2ee -- --test-threads=2
+cargo test --locked --offline --all-features -- --test-threads=2
+cargo clippy --locked --offline --all-features --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+The new external response suite passes **two tests**; the focused E2EE run passes
+**50** library tests. The complete matrix passes **624 tests**: 603 library,
+three CLI, two acknowledgement integration, three schema, eight crypto, four
+provisioning and one receive; four native fixtures remain ignored. The previously
+documented capability-test failure also passes in this run with two test threads;
+its production behavior was not changed by this milestone. Strict Clippy and
+formatting pass. Logs are in ignored `target/e2ee-qa-{targeted,full,clippy}.log`.
+
+The sandbox run invoked installed toolchain binaries directly, with explicit
+`RUSTC`/`RUSTDOC` and isolated `CARGO_HOME=target/e2ee-qa-cargo` reusing the existing
+registry/Git cache. No dependency download or home-directory toolchain update
+was needed. No personal account, key replacement, real-server message/ACK,
+GUI capture, packaging, installation, commit or push was performed. These checks
+do not establish production E2EE interoperability or completion of the full plan.

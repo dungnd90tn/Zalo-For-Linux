@@ -43,6 +43,25 @@ fn detail(step: &str, error: &anyhow::Error) -> String {
     format!("[{step}: {chain}]")
 }
 
+/// Keep server acceptance separate from local persistence and ambiguous delivery.
+fn post_failure(error: &anyhow::Error) -> (String, bool, bool) {
+    if error
+        .downcast_ref::<super::e2ee_send::AcceptedSendError>()
+        .is_some()
+    {
+        ("Zalo đã nhận tin nhắn nhưng chưa lưu được xác nhận trên thiết bị. Không gửi lại; bản nháp được giữ lại.".into(), false, true)
+    } else {
+        (
+            format!(
+                "Chưa có xác nhận từ Zalo. Không tự gửi lại. {}",
+                detail("gửi", error)
+            ),
+            true,
+            false,
+        )
+    }
+}
+
 impl Connection {
     /// Handshake if needed, then send. Emits `Sent` or `SendFailed`; never leaves the composer waiting.
     pub(super) async fn send_e2ee(
@@ -54,26 +73,31 @@ impl Connection {
         request_id: u64,
         text: &str,
     ) -> Result<()> {
-        let fail = |message: &str, unknown: bool| LiveEvent::SendFailed {
+        let fail = |message: &str, unknown: bool, accepted: bool| LiveEvent::SendFailed {
             account_id: events.account.clone(),
             generation,
             thread: thread.clone(),
             request_id,
             error: message.into(),
             unknown_delivery: unknown,
-            server_accepted: false,
+            server_accepted: accepted,
         };
         let Some(http) = self.e2ee_http.clone() else {
             return events
                 .emit(fail(
                     "Hội thoại này đã bật mã hóa đầu cuối. Client chưa sẵn sàng gửi ở chế độ này; bản nháp được giữ lại.",
                     false,
+                    false,
                 ))
                 .await;
         };
         let Some(peer) = thread.strip_prefix("d:").map(str::to_owned) else {
             return events
-                .emit(fail("Chỉ hỗ trợ mã hóa đầu cuối cho hội thoại 1-1.", false))
+                .emit(fail(
+                    "Chỉ hỗ trợ mã hóa đầu cuối cho hội thoại 1-1.",
+                    false,
+                    false,
+                ))
                 .await;
         };
         let owner = self.account.clone();
@@ -96,7 +120,7 @@ impl Connection {
                             init_failure_message(&error),
                             detail("bắt tay", &error)
                         );
-                        return events.emit(fail(&message, false)).await;
+                        return events.emit(fail(&message, false, false)).await;
                     }
                 }
             }
@@ -111,7 +135,7 @@ impl Connection {
                     "Không mã hóa được tin nhắn cho người nhận. Bản nháp được giữ lại. {}",
                     detail("mã hóa", &error)
                 );
-                return events.emit(fail(&message, false)).await;
+                return events.emit(fail(&message, false, false)).await;
             }
         };
         let mut report = Report::discard();
@@ -130,12 +154,23 @@ impl Connection {
             }
             Err(error) => {
                 let _ = diagnostic(&error, LiveStage::Send);
-                let message = format!(
-                    "Chưa có xác nhận từ Zalo. Không tự gửi lại. {}",
-                    detail("gửi", &error)
-                );
-                events.emit(fail(&message, true)).await
+                let (message, unknown, accepted) = post_failure(&error);
+                events.emit(fail(&message, unknown, accepted)).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn accepted_local_failure_is_not_reported_as_unknown_delivery() {
+        let error: anyhow::Error = super::super::e2ee_send::AcceptedSendError.into();
+        let (message, unknown, accepted) = post_failure(&error);
+        assert!(accepted && !unknown);
+        assert!(message.contains("Zalo đã nhận") && message.contains("bản nháp"));
+        let (_, unknown, accepted) = post_failure(&anyhow::anyhow!("no readable reply"));
+        assert!(unknown && !accepted);
     }
 }

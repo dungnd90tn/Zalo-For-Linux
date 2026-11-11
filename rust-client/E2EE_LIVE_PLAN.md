@@ -444,3 +444,11 @@ An earlier note in this file said pushed chat messages are acknowledged with `54
 (543/544/547-548/549/580/581). A received chat message is acknowledged with **`532 VERIFY_MSG`** `{nretry, queueName, ids:[{actionId}],
 reqId}` (batched 20 ids / 30 s), and a *delivered receipt* goes out over HTTP (`/api/e2ee/pc/t/message/delivered`). Use `E2EE_PARITY.md` as
 the checklist; this file stays as the chronological log.
+
+### Send confirmation and local storage failure (2026-11-11)
+
+Continued D10/D11 from `E2EE_PARITY.md`. The `minGlobalMsgId` parser and composer routing already existed before this milestone; earlier statements above that they were missing are historical. The synchronous send now checks a present response `clientId` against the durable attempt, accepts normalized numeric/string IDs, and refuses contradictory server IDs. An absent client echo keeps the existing HTTP-request binding. Invalid replies remain unknown and are never resent or re-encrypted automatically.
+
+After a valid ACK, a failed local ACK/echo write now reports **Zalo accepted the message, local confirmation could not be saved**. The matching request enters delivery review with the draft retained, instead of presenting the outcome as unconfirmed. A persisted ACK survives echo failure; reconciliation still produces exactly one local message. Targeted offline evidence: 50 E2EE tests, two independent acknowledgement integration tests and ten exact original-reader cases pass. No real account was opened or sent to for this checkpoint.
+
+Still pending: automatic startup recovery of acknowledged chat rows without network/re-encryption, and D2 per-device session coverage/stale/registration transitions. This checkpoint does not enable provisioning, rotate identities, acknowledge receive queues, establish production interoperability or complete the rollout.

@@ -32,7 +32,25 @@ impl DeliveryBook {
             self.overflow = true;
         }
     }
-    pub fn failed(&mut self, thread: &str, request: u64, accepted: bool) {
+    pub fn failed(&mut self, thread: &str, request: u64, accepted: bool) -> bool {
+        if let Some(pending) = self.pending.get(thread) {
+            if pending.request != request {
+                return false;
+            }
+        } else {
+            // Replayed failures cannot replace the digest or reopen a dismissed review.
+            if let Some(review) = self
+                .reviews
+                .get_mut(thread)
+                .filter(|review| review.request == request)
+            {
+                if accepted && !review.accepted {
+                    review.accepted = true;
+                    return true;
+                }
+            }
+            return false;
+        }
         let original = self
             .pending
             .get(thread)
@@ -54,6 +72,7 @@ impl DeliveryBook {
         } else {
             self.overflow = true;
         }
+        true
     }
     /// Worker loss cannot prove whether outstanding HTTP sends reached Zalo.
     pub fn interrupted(&mut self) {
@@ -107,6 +126,25 @@ fn digest(text: &str) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stale_failures_cannot_replace_newer_pending_or_review_state() {
+        let mut book = DeliveryBook::default();
+        book.submitted("d:22", 1, "old");
+        assert!(book.failed("d:22", 1, false));
+        book.edited("d:22", "new");
+        book.submitted("d:22", 2, "new");
+        assert!(!book.failed("d:22", 1, true));
+        assert!(!book.review("d:22").unwrap().accepted);
+        assert!(book.failed("d:22", 2, true));
+        assert!(!book.failed("d:22", 1, false));
+        assert!(book.review("d:22").unwrap().accepted);
+        assert!(
+            !book.failed("d:22", 2, false),
+            "Acceptance is never downgraded by replay"
+        );
+        assert!(book.review("d:22").unwrap().accepted);
+    }
+
     #[test]
     fn stopped_worker_preserves_unacknowledged_send_guard_across_reconnect() {
         let mut book = DeliveryBook::default();
