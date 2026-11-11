@@ -4599,6 +4599,136 @@ async fn hidden_policy_real_tls_search_pin_cancel_scope_and_remote_revoke() {
 
 // Exercise source flag compatibility through the real socket, command dispatcher,
 // durable actor and HTTP send path, rather than testing the parser alone.
+fn seed_acknowledged_startup(f: &Fixture, fail_echo: bool) {
+    let path = f.profile.paths.data_dir.join("messages.sqlite");
+    drop(MessageStore::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(path).unwrap();
+    for id in 1..=130_i64 {
+        conn.execute("INSERT INTO e2ee_outbox(account,client_id,thread,local_epoch,platform,body,created_ms,state,ciphertext,metadata,server_id) VALUES('11',?1,?2,1,2,'synthetic accepted body',?3,'acknowledged',X'010203',X'0405',?4)", rusqlite::params![id,if id==1 {"d:22"}else{"d:44"},1000+id,(9000+id).to_string()]).unwrap();
+    }
+    if fail_echo {
+        conn.execute_batch("CREATE TRIGGER fail_repaired_echo BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT,'synthetic echo failure'); END;").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn startup_repairs_acknowledged_chats_before_first_privacy_filtered_ready() {
+    let f = Fixture::new(Reply::Privacy);
+    seed_acknowledged_startup(&f, false);
+    let (commands, rx) = mpsc::channel(16);
+    let (tx, mut events) = mpsc::channel(32);
+    let (stop, cancel) = watch::channel(false);
+    let task = tokio::spawn(run_with_transports(
+        f.profile.clone(),
+        f.session(),
+        rx,
+        tx,
+        Arc::new(|| {}),
+        cancel,
+        f.transports(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap() {
+                LiveEvent::Ready { conversations, .. } => {
+                    assert_eq!(conversations.len(), 1);
+                    assert_eq!(conversations[0].id, "d:44");
+                    assert_eq!(conversations[0].last_text, "synthetic accepted body");
+                    let conn = rusqlite::Connection::open(
+                        f.profile.paths.data_dir.join("messages.sqlite"),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        conn.query_row(
+                            "SELECT count(*) FROM e2ee_outbox WHERE state='committed'",
+                            [],
+                            |r| r.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                        130
+                    );
+                    assert_eq!(
+                        conn.query_row(
+                            "SELECT count(*) FROM messages WHERE account_id='11'",
+                            [],
+                            |r| r.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                        130
+                    );
+                    break;
+                }
+                LiveEvent::Sent { .. } | LiveEvent::SendSettled { .. } => {
+                    panic!("Recovery must not settle a UI draft")
+                }
+                LiveEvent::Fault { error, .. } => panic!("Recovery failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(commands);
+    assert_eq!(f.state.http_sends.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn startup_echo_failure_stops_before_network_or_history_publication() {
+    let f = Fixture::new(Reply::Privacy);
+    seed_acknowledged_startup(&f, true);
+    let (_commands, rx) = mpsc::channel(16);
+    let (tx, mut events) = mpsc::channel(32);
+    let (_stop, cancel) = watch::channel(false);
+    let task = tokio::spawn(run_with_transports(
+        f.profile.clone(),
+        f.session(),
+        rx,
+        tx,
+        Arc::new(|| {}),
+        cancel,
+        f.transports(),
+    ));
+    let mut saw_storage = false;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .unwrap()
+    {
+        match event {
+            LiveEvent::Diagnostic { diagnostic, .. } => {
+                assert_eq!(diagnostic.stage, LiveStage::Storage);
+                saw_storage = true;
+            }
+            LiveEvent::Fault { .. } => {}
+            _ => panic!("Failed startup must not publish content or start transport"),
+        }
+    }
+    task.await.unwrap();
+    assert!(saw_storage);
+    assert!(f.state.requests.lock().unwrap().is_empty());
+    assert_eq!(f.state.upgrades.load(Ordering::SeqCst), 0);
+    let conn =
+        rusqlite::Connection::open(f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM e2ee_outbox WHERE state='acknowledged'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        130
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
 async fn eligibility_send_case(mode: usize, accepted: bool) {
     let f = Fixture::new(Reply::Runtime);
     f.state.eligibility_mode.store(mode, Ordering::SeqCst);

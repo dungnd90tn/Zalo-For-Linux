@@ -30,6 +30,7 @@ mod e2ee_send;
 #[cfg(feature = "signal-crypto")]
 mod e2ee_send_probe;
 mod e2ee_threads;
+mod echo_recovery;
 #[cfg(test)]
 mod integration_tests;
 mod privacy;
@@ -2308,6 +2309,8 @@ async fn run_inner(
     transports: &Transports,
 ) -> Result<()> {
     let db = Database::open(profile, events.account.clone()).await?;
+    // Repair only durable, already accepted local sends before any history projection.
+    echo_recovery::repair(&db, &events.account).await?;
     let account = events.account.clone();
     // The last confirmed hidden set applies at once; the interface does not wait for the network check.
     let remembered = db

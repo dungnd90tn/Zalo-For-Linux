@@ -28,6 +28,15 @@ pub const MAX_DISPATCH_PEERS: usize = 64;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PENDING_SENDS: i64 = 100;
 
+pub const MAX_ACK_REPAIR_BATCH: usize = 64;
+
+/// Progress only: recovered message content stays inside the database owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EchoRepairBatch {
+    pub repaired: usize,
+    pub last_client_id: Option<u64>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Platform {
     Mobile,
@@ -1855,6 +1864,56 @@ impl MessageStore {
         ensure!(self.conn.execute("UPDATE e2ee_outbox SET server_id=?3,state=CASE WHEN state='committed' THEN state ELSE 'acknowledged' END WHERE account=?1 AND client_id=?2 AND state IN ('sending','unknown','acknowledged','committed') AND (server_id IS NULL OR server_id=?3)",params![owner,client_id as i64,server_id])?==1,"Conflicting encrypted acknowledgement");
         Ok(())
     }
+    /// Restore local chat echoes from durable acknowledgements, without dispatching
+    /// or changing any ratchet. The ACK does not persist a server timestamp, so
+    /// commit_echo retains an existing timestamp or uses the original draft time.
+    /// Each row commits independently. On failure its ACK remains recoverable;
+    /// the startup caller must stop this pass rather than retry a poison row.
+    pub fn e2ee_repair_acknowledged(
+        &mut self,
+        owner: &str,
+        after_client_id: Option<u64>,
+        limit: usize,
+    ) -> Result<EchoRepairBatch> {
+        account(owner)?;
+        ensure!(
+            (1..=MAX_ACK_REPAIR_BATCH).contains(&limit),
+            "Invalid echo repair batch limit"
+        );
+        let after = after_client_id.map(integer).transpose()?.unwrap_or(0);
+        let rows = {
+            let mut query = self.conn.prepare_cached(
+                "SELECT client_id,CASE WHEN length(CAST(server_id AS BLOB))<=256 THEN server_id END,
+                 length(CAST(body AS BLOB))
+                 FROM e2ee_outbox WHERE account=?1 AND state='acknowledged'
+                 AND client_id>?2 AND server_id IS NOT NULL AND server_id NOT LIKE 'init-%'
+                 ORDER BY client_id LIMIT ?3",
+            )?;
+            let result = query
+                .query_map(params![owner, after, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            result
+        };
+        let mut progress = EchoRepairBatch::default();
+        for (client, server, body_bytes) in rows {
+            ensure!(
+                (0..=MAX_TEXT_BYTES as i64).contains(&body_bytes),
+                "Stored echo exceeds text budget"
+            );
+            let client = u64::try_from(client)?;
+            integer(client)?;
+            self.e2ee_commit_echo(owner, client, &server, None)?;
+            progress.repaired += 1;
+            progress.last_client_id = Some(client);
+        }
+        Ok(progress)
+    }
     /// Closes a session-initialization send (command 543). It carries no chat message, so no echo will
     /// ever arrive to commit it; without this the draft guard would block the next init for the same
     /// thread. Only an acknowledged row whose server id marks it as an init can be retired this way.
@@ -3206,6 +3265,128 @@ mod tests {
             .unwrap();
         assert!(!receipt.is_replay());
         client
+    }
+    #[test]
+    fn acknowledgement_repair_is_bounded_account_scoped_and_skips_non_chat_and_unconfirmed_rows() {
+        let (mut store, local, _) = setup();
+        let first = prepared(&mut store, &local, 1, "first accepted");
+        store.e2ee_take_ready("123", first).unwrap();
+        store.e2ee_record_ack("123", first, "9001").unwrap();
+        let second = prepared(&mut store, &local, 2, "second accepted");
+        store.e2ee_take_ready("123", second).unwrap();
+        store.e2ee_record_ack("123", second, "9002").unwrap();
+        let init = prepared(&mut store, &local, 3, "session initialization");
+        store.e2ee_take_ready("123", init).unwrap();
+        store.e2ee_record_ack("123", init, "init-9003").unwrap();
+        let unknown = prepared(&mut store, &local, 4, "unknown delivery");
+        store.e2ee_take_ready("123", unknown).unwrap();
+        store.e2ee_send_failed("123", unknown, false).unwrap();
+        let ready = prepared(&mut store, &local, 5, "not dispatched");
+        assert_eq!(
+            store
+                .e2ee_repair_acknowledged("999", None, 1)
+                .unwrap()
+                .repaired,
+            0
+        );
+        assert!(store.e2ee_repair_acknowledged("123", None, 0).is_err());
+        assert!(store
+            .e2ee_repair_acknowledged("123", None, MAX_ACK_REPAIR_BATCH + 1)
+            .is_err());
+        assert!(store.e2ee_repair_acknowledged("123", Some(0), 1).is_err());
+        let batch = store.e2ee_repair_acknowledged("123", None, 1).unwrap();
+        assert_eq!(
+            batch,
+            EchoRepairBatch {
+                repaired: 1,
+                last_client_id: Some(first)
+            }
+        );
+        assert!(store.e2ee_outgoing("123", second).unwrap().state == SendState::Acknowledged);
+        let batch = store
+            .e2ee_repair_acknowledged("123", batch.last_client_id, 1)
+            .unwrap();
+        assert_eq!(
+            batch,
+            EchoRepairBatch {
+                repaired: 1,
+                last_client_id: Some(second)
+            }
+        );
+        assert_eq!(
+            store
+                .e2ee_repair_acknowledged("123", batch.last_client_id, 1)
+                .unwrap()
+                .repaired,
+            0
+        );
+        assert_eq!(
+            store
+                .e2ee_repair_acknowledged("123", None, 64)
+                .unwrap()
+                .repaired,
+            0
+        );
+        assert!(store.e2ee_outgoing("123", init).unwrap().state == SendState::Acknowledged);
+        assert!(store.e2ee_outgoing("123", unknown).unwrap().state == SendState::Unknown);
+        assert!(store.e2ee_outgoing("123", ready).unwrap().state == SendState::Ready);
+        let messages = store.page("123", "d:456", None, 10).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| message.sent_at_ms == 1000));
+        let repaired = store.e2ee_outgoing("123", first).unwrap();
+        assert_eq!(
+            repaired.ciphertext.as_deref(),
+            Some(b"exact ciphertext".as_slice())
+        );
+        assert_eq!(
+            repaired.metadata.as_deref(),
+            Some(b"inner metadata".as_slice())
+        );
+        assert!(store.e2ee_take_ready("123", first).is_err());
+    }
+    #[test]
+    fn acknowledgement_repair_keeps_durable_progress_and_failed_ack_for_next_startup() {
+        let (mut store, local, _) = setup();
+        let first = prepared(&mut store, &local, 1, "accepted one");
+        store.e2ee_take_ready("123", first).unwrap();
+        store.e2ee_record_ack("123", first, "9001").unwrap();
+        let second = prepared(&mut store, &local, 2, "accepted two");
+        store.e2ee_take_ready("123", second).unwrap();
+        store.e2ee_record_ack("123", second, "9002").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_repair BEFORE INSERT ON messages WHEN NEW.message_id='9002' BEGIN SELECT RAISE(ABORT, 'synthetic repair failure'); END;").unwrap();
+        assert!(store.e2ee_repair_acknowledged("123", None, 64).is_err());
+        assert!(store.e2ee_outgoing("123", first).unwrap().state == SendState::Committed);
+        assert!(store.e2ee_outgoing("123", second).unwrap().state == SendState::Acknowledged);
+        assert_eq!(store.page("123", "d:456", None, 10).unwrap().len(), 1);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_repair;")
+            .unwrap();
+        assert_eq!(
+            store
+                .e2ee_repair_acknowledged("123", None, 64)
+                .unwrap()
+                .repaired,
+            1
+        );
+        assert_eq!(store.page("123", "d:456", None, 10).unwrap().len(), 2);
+    }
+    #[test]
+    fn acknowledgement_repair_rejects_oversized_stored_body_without_retiring_ack() {
+        let (mut store, local, _) = setup();
+        let client = prepared(&mut store, &local, 1, "accepted bounded draft");
+        store.e2ee_take_ready("123", client).unwrap();
+        store.e2ee_record_ack("123", client, "9001").unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE e2ee_outbox SET body=?3 WHERE account=?1 AND client_id=?2",
+                params!["123", client as i64, "x".repeat(MAX_TEXT_BYTES + 1)],
+            )
+            .unwrap();
+        assert!(store.e2ee_repair_acknowledged("123", None, 64).is_err());
+        assert!(store.e2ee_outgoing("123", client).unwrap().state == SendState::Acknowledged);
+        assert!(store.page("123", "d:456", None, 10).unwrap().is_empty());
     }
     #[test]
     fn send_is_atomic_and_exact_ciphertext_survives_unknown_and_reconciliation() {
