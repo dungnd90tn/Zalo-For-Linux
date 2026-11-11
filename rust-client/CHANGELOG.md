@@ -2,7 +2,30 @@
 
 Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-client/`). Định dạng theo
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
-Ghi chú phát hành dành cho người dùng nằm trong [changelogs/](../changelogs/RELEASE-v2.0.0.md).
+Ghi chú phát hành mới nhất nằm trong [changelogs/](../changelogs/RELEASE-v2.0.4.md).
+
+## [2.0.4] - 2026-11-11
+
+### Sửa lỗi
+- Phân biệt tin đã được máy chủ xác nhận nhưng lưu cục bộ thất bại với tin chưa rõ kết quả gửi.
+  Giữ bản nháp khi có lỗi; không tự gửi lại hoặc mã hóa lại. Kiểm tra `clientId` khi ACK có trường này
+  và từ chối các mã tin máy chủ mâu thuẫn.
+- Khôi phục cục bộ tin E2EE đã có ACK khi khởi động, theo từng tài khoản và từng lô tối đa 64 dòng;
+  không gọi mạng, không chạy lại mã hóa, không khôi phục nhầm tin khởi tạo phiên thành tin chat.
+- Với bản dựng có `signal-crypto`, kiểm tra mới danh sách thiết bị, khả năng tương thích và bộ khóa
+  trước khi gửi E2EE. Xác minh đủ bản sao cho người nhận và thiết bị của mình; từ chối gửi nếu phiên
+  cũ không khớp, danh tính thay đổi hoặc thiếu dữ liệu. Xử lý tin đến trong lúc chờ xác minh;
+  lỗi lưu tin đến được chuyển tới cơ chế tạm dừng kết nối.
+
+### Thay đổi
+- Cơ sở dữ liệu nâng lên **schema 9**: lưu ý định khởi tạo phiên bằng bản ghi riêng trước khi cập nhật
+  phiên; xác nhận và kết thúc khởi tạo trong cùng giao dịch. Khởi tạo mới chưa rõ kết quả tiếp tục chặn
+  gửi sau khi khởi động lại. Nâng cấp từ schema 8 giữ nguyên dữ liệu hiện có.
+- Bản `live` tiêu chuẩn không kèm engine Signal; tính năng E2EE cần bản dựng riêng có `signal-crypto`.
+  Đây là bước triển khai từng phần: chưa tự làm mới phiên cũ, chưa có luồng xác nhận đổi danh tính
+  hay hàng đợi E2EE ngoại tuyến đầy đủ. Không suy đoán được các lần khởi tạo cũ thiếu bản ghi ý định.
+
+Chi tiết và phạm vi kiểm chứng: [ghi chú 2.0.4](../changelogs/RELEASE-v2.0.4.md).
 
 ## [2.0.3] - 2026-11-09
 
