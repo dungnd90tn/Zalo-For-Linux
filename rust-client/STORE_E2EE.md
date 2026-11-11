@@ -105,3 +105,27 @@ prove acceptance of an entire uploaded batch. The SQL compatibility fixture
 `tests/fixtures/e2ee/released_v4_90b25d5.sql` contains exact released schema SQL
 and no profile data; a default-feature test preserves every synthetic row column
 across all thirteen pre-existing tables while adding the new tables.
+
+## Schema nine: typed initialization attempts
+
+The v8→v9 upgrade is additive and transactional: `e2ee_peer_init_outbox` stores
+only `(account, client_id)`, with a foreign key/cascade to `e2ee_outbox`. A partial
+outbox index bounds pending checks by account, local epoch, platform and thread;
+the query plan uses indexed searches rather than scanning historical sends.
+Existing rows, ciphertext, metadata and message history are not rewritten.
+Older binaries reject schema nine; there is no automatic downgrade.
+
+An initialization marks its reserved row before the engine can commit a session.
+The pending query joins the typed marker and refuses unresolved attempts only in
+the current scoped namespace; ordinary unknown chat is not initialization.
+After a correlated ACK, `e2ee_confirm_peer_init` confirms and retires the marked
+attempt in one transaction. Repeated confirmation with the same ID is idempotent;
+conflicting IDs or a failed write retain the prior state and exact bytes. A
+discarded reservation removes its marker through the foreign key. This is intent
+metadata, not permission to upload, replace an identity or acknowledge a queue.
+
+Legacy unmarked unknown attempts are ambiguous. Neither draft text nor server-ID
+guessing is used to classify them, so the typed guard cannot guarantee that it
+blocks a historical unmarked init. Existing first-use peer registration may
+leave a new binding staged if later engine signature verification fails; this
+checkpoint does not add full rollback of those new bindings.

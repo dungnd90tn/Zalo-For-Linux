@@ -117,6 +117,7 @@ impl Connection {
     /// The handshake with a contact, for the app's normal send: ask the service for the contact's devices and
     /// bundles, then create the sessions and send the init. The original does this inside `sendE2eeMsg`
     /// (`checkSessionThenInit`) whenever a device has no session yet.
+    #[cfg(test)]
     pub(super) async fn handshake_with(
         &mut self,
         db: &Database,
@@ -146,7 +147,7 @@ impl Connection {
             .await
     }
 
-    async fn handshake_devices(
+    pub(super) async fn handshake_devices(
         &mut self,
         db: &Database,
         owner: &str,
@@ -154,6 +155,44 @@ impl Connection {
         peer: &str,
         found: signal::FetchedBundles,
         report: &mut Report,
+    ) -> Result<&'static str> {
+        self.handshake_devices_inner(db, owner, local, peer, found, report, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn handshake_checked_devices(
+        &mut self,
+        db: &Database,
+        events: &Events,
+        local: &e2ee::LocalNamespace,
+        peer: &str,
+        found: signal::FetchedBundles,
+        deadline: tokio::time::Instant,
+    ) -> Result<&'static str> {
+        let owner = events.account.clone();
+        self.handshake_devices_inner(
+            db,
+            &owner,
+            local,
+            peer,
+            found,
+            &mut Report::discard(),
+            Some((events, deadline)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handshake_devices_inner(
+        &mut self,
+        db: &Database,
+        owner: &str,
+        local: &e2ee::LocalNamespace,
+        peer: &str,
+        found: signal::FetchedBundles,
+        report: &mut Report,
+        events: Option<(&Events, tokio::time::Instant)>,
     ) -> Result<&'static str> {
         let (owner, local, peer) = (owner.to_owned(), local.clone(), peer.to_owned());
         report.line(&format!(
@@ -212,6 +251,10 @@ impl Connection {
                     return Ok((skipped, None));
                 }
                 let client_id = store.e2ee_reserve_send(&o, &l, &t, INIT_TEXT, now_ms)?;
+                if let Err(error) = store.e2ee_mark_peer_init(&o, &l, &p, client_id) {
+                    let _ = store.e2ee_discard_reserved(&o, client_id);
+                    return Err(error);
+                }
                 match co.plan_personal(store, client_id, INIT_TEXT, recipients, &g, &c) {
                     Ok(plan) => Ok((skipped, Some((client_id, plan)))),
                     Err(error) => {
@@ -266,16 +309,19 @@ impl Connection {
         ));
         let request_id = self.request();
         let body = json!({"reqId": request_id, "data": {"type": 0, "uidTo": peer, "data": data}});
-        let outcome = self.send_init(&request_id, body, report).await;
+        let outcome = if let Some((events, deadline)) = events {
+            self.send_checked_init(&request_id, body, db, events, deadline)
+                .await
+        } else {
+            self.send_init(&request_id, body, report).await
+        };
         let (o, id) = (owner.clone(), client_id);
         match outcome {
             Ok(()) => {
                 let server_id = format!("init-peer-{now_ms}");
-                db.call(move |s| {
-                    s.e2ee_record_ack(&o, id, &server_id)?;
-                    s.e2ee_retire_init(&o, id)
-                })
-                .await?;
+                let (l, p) = (local.clone(), peer.clone());
+                db.call(move |s| s.e2ee_confirm_peer_init(&o, &l, &p, id, &server_id))
+                    .await?;
                 report.line("handshake accepted by the service");
                 Ok("the handshake with the contact was sent; the contact's devices answer with a session acknowledgement")
             }
@@ -289,7 +335,7 @@ impl Connection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use futures_util::{SinkExt, StreamExt};
@@ -302,7 +348,7 @@ mod tests {
             .collect()
     }
     /// A genuine engine-created public bundle for the contact's device, in the service's JSON shape.
-    async fn wire_bundle(platform: engine::SignalPlatform, device: u8) -> Value {
+    pub(crate) async fn wire_bundle(platform: engine::SignalPlatform, device: u8) -> Value {
         let id = engine::AccountId::new("22").unwrap();
         let worker = engine::Engine::new(id.clone(), 1, engine::EngineOptions::default()).unwrap();
         let result = worker
@@ -337,7 +383,7 @@ mod tests {
             "opKeys": b.prekeys.iter().map(|(id, key)| json!({"id": id, "key": STANDARD.encode(key)})).collect::<Vec<_>>(),
         })
     }
-    fn seed_identity(db_path: &std::path::Path) {
+    pub(crate) fn seed_identity(db_path: &std::path::Path) {
         use crate::store::e2ee::VerifiedBinding;
         let fixture: Value =
             serde_json::from_str(include_str!("../../../../tests/fixtures/e2ee/session.json"))

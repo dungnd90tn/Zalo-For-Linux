@@ -1,0 +1,245 @@
+{
+  "provenance": "Exact original initSessionWith refusal ternary and mergeMetaListFromServer. Peer inactivity is -7 only; own-device exclusions use the source-configured stop-retry table. Metadata projection does not establish transport completeness or identity replacement permission.",
+  "inactive": -7,
+  "stop_retry": [
+    -2,
+    -3,
+    -5,
+    -7,
+    -9.1,
+    -9.2,
+    -9.3,
+    -9.4,
+    -9.5,
+    -9.6
+  ],
+  "cases": [
+    {
+      "name": "peer_inactive",
+      "own": false,
+      "error": -7,
+      "outcome": "ignored",
+      "marked_inactive": true
+    },
+    {
+      "name": "peer_unsupported_device",
+      "own": false,
+      "error": -8,
+      "outcome": "error",
+      "marked_inactive": false
+    },
+    {
+      "name": "peer_client_unsupported",
+      "own": false,
+      "error": -3,
+      "outcome": "error",
+      "marked_inactive": false
+    },
+    {
+      "name": "peer_blacklist",
+      "own": false,
+      "error": -11,
+      "outcome": "error",
+      "marked_inactive": false
+    },
+    {
+      "name": "peer_own_bundle_missing",
+      "own": false,
+      "error": -9,
+      "outcome": "error",
+      "marked_inactive": false
+    },
+    {
+      "name": "peer_timeout",
+      "own": false,
+      "error": {
+        "code": "ERR_CONNECTION_TIMED_OUT"
+      },
+      "outcome": "timeout",
+      "marked_inactive": false
+    },
+    {
+      "name": "own_client_unsupported",
+      "own": true,
+      "error": -3,
+      "outcome": "ignored",
+      "marked_inactive": false
+    },
+    {
+      "name": "own_inactive",
+      "own": true,
+      "error": -7,
+      "outcome": "ignored",
+      "marked_inactive": true
+    },
+    {
+      "name": "own_unsupported_device",
+      "own": true,
+      "error": -8,
+      "outcome": "error",
+      "marked_inactive": false
+    },
+    {
+      "name": "own_blacklist",
+      "own": true,
+      "error": -11,
+      "outcome": "error",
+      "marked_inactive": false
+    }
+  ],
+  "metadata_cases": [
+    {
+      "name": "missing_iid",
+      "devices": [
+        {
+          "di": 0
+        }
+      ],
+      "previous": [],
+      "result": {
+        "0": {
+          "deviceId": 0,
+          "sessionTs": 0,
+          "stale": 100
+        }
+      }
+    },
+    {
+      "name": "zero_iid",
+      "devices": [
+        {
+          "di": 0,
+          "iid": 0
+        }
+      ],
+      "previous": [],
+      "result": {
+        "0": {
+          "deviceId": 0,
+          "sessionKey": 0,
+          "sessionTs": 0,
+          "stale": 100
+        }
+      }
+    },
+    {
+      "name": "null_iid",
+      "devices": [
+        {
+          "di": 0,
+          "iid": null
+        }
+      ],
+      "previous": [],
+      "result": {
+        "0": {
+          "deviceId": 0,
+          "sessionKey": null,
+          "sessionTs": 0,
+          "stale": 100
+        }
+      }
+    },
+    {
+      "name": "positive_iid",
+      "devices": [
+        {
+          "di": 0,
+          "iid": 123
+        }
+      ],
+      "previous": [],
+      "result": {
+        "0": {
+          "deviceId": 0,
+          "sessionKey": 123,
+          "sessionTs": 0,
+          "stale": 100
+        }
+      }
+    },
+    {
+      "name": "same_iid_keeps_session",
+      "devices": [
+        {
+          "di": 0,
+          "iid": 123
+        }
+      ],
+      "previous": [
+        {
+          "deviceId": 0,
+          "sessionKey": 123,
+          "sessionTs": 9,
+          "stale": 0,
+          "inactive": 1
+        }
+      ],
+      "result": {
+        "0": {
+          "deviceId": 0,
+          "sessionKey": 123,
+          "sessionTs": 9,
+          "stale": 0,
+          "inactive": 0
+        }
+      }
+    },
+    {
+      "name": "changed_iid_marks_stale",
+      "devices": [
+        {
+          "di": 0,
+          "iid": 124
+        }
+      ],
+      "previous": [
+        {
+          "deviceId": 0,
+          "sessionKey": 123,
+          "sessionTs": 9,
+          "stale": 0
+        }
+      ],
+      "result": {
+        "0": {
+          "deviceId": 0,
+          "sessionKey": 124,
+          "sessionTs": 0,
+          "stale": 100
+        }
+      }
+    },
+    {
+      "name": "missing_old_device_retained_stale",
+      "devices": [
+        {
+          "di": 0,
+          "iid": 123
+        }
+      ],
+      "previous": [
+        {
+          "deviceId": 1,
+          "sessionKey": 456,
+          "sessionTs": 9,
+          "stale": 0
+        }
+      ],
+      "result": {
+        "0": {
+          "deviceId": 0,
+          "sessionKey": 123,
+          "sessionTs": 0,
+          "stale": 100
+        },
+        "1": {
+          "deviceId": 1,
+          "sessionKey": 456,
+          "sessionTs": 9,
+          "stale": 100
+        }
+      }
+    }
+  ]
+}

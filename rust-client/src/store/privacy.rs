@@ -208,7 +208,7 @@ mod tests {
             s.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
                 .unwrap(),
-            8
+            9
         );
     }
 }

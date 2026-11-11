@@ -60,7 +60,7 @@ pub(super) fn claim() -> bool {
 }
 
 /// A recipient for a device that already has a session here (no bundle needed), or `None`.
-fn existing_recipient(
+pub(super) fn existing_recipient(
     store: &mut crate::store::MessageStore,
     owner: &str,
     local: &e2ee::LocalNamespace,
@@ -90,7 +90,8 @@ fn existing_recipient(
     }))
 }
 
-/// Whether this device already has a session with any device of `peer` (the original's `_getSession`).
+/// Test/probe compatibility helper; normal sends require the full verified device set.
+#[cfg(test)]
 pub(super) async fn has_session(db: &Database, owner: &str, peer: &str) -> Result<bool> {
     let (o, u) = (owner.to_owned(), peer.to_owned());
     db.call(move |s| {
@@ -129,6 +130,28 @@ pub(super) async fn prepare_authorized(
     text: &str,
     now_ms: i64,
 ) -> Result<Prepared> {
+    prepare_with_readiness(db, owner, peer, text, now_ms, None).await
+}
+
+pub(super) async fn prepare_checked(
+    db: &Database,
+    owner: &str,
+    peer: &str,
+    text: &str,
+    now_ms: i64,
+    readiness: Arc<super::e2ee_readiness::Readiness>,
+) -> Result<Prepared> {
+    prepare_with_readiness(db, owner, peer, text, now_ms, Some(readiness)).await
+}
+
+async fn prepare_with_readiness(
+    db: &Database,
+    owner: &str,
+    peer: &str,
+    text: &str,
+    now_ms: i64,
+    readiness: Option<Arc<super::e2ee_readiness::Readiness>>,
+) -> Result<Prepared> {
     let epoch = {
         let owner = owner.to_owned();
         db.call(move |s| s.e2ee_current_local(&owner)).await?
@@ -154,8 +177,13 @@ pub(super) async fn prepare_authorized(
         cancel.clone(),
         coordinator.clone(),
     );
+    let checked = readiness.clone();
     let (client_id, plan, devices) = db
         .call(move |store| {
+            let recipients = if let Some(checked) = checked {
+                anyhow::ensure!(checked.local == l, "Encrypted readiness epoch changed");
+                checked.recipients(store, &o, &p)?
+            } else {
             let mut recipients = Vec::new();
             for device in [DevicePlatform::Mobile, DevicePlatform::Web, DevicePlatform::Pc] {
                 if let Some(recipient) = existing_recipient(store, &o, &l, &p, device)? {
@@ -172,6 +200,8 @@ pub(super) async fn prepare_authorized(
                     recipients.push(recipient);
                 }
             }
+            recipients
+            };
             let devices = recipients.len();
             let client_id = store.e2ee_reserve_send(&o, &l, &format!("d:{p}"), &t, now_ms)?;
             match co.plan_personal(store, client_id, &t, recipients, &g, &c) {
@@ -193,6 +223,15 @@ pub(super) async fn prepare_authorized(
             return Err(error);
         }
     };
+    if let Some(checked) = readiness {
+        if let Err(error) = checked.check_prepared(prepared.exact_sms()) {
+            let (o, id) = (owner.to_owned(), client_id);
+            let _ = db
+                .call(move |store| store.e2ee_discard_reserved(&o, id))
+                .await;
+            return Err(error);
+        }
+    }
     let (o, g2) = (owner.to_owned(), gate.clone());
     let dispatch = db
         .call(move |s| {

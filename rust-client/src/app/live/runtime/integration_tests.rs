@@ -24,6 +24,8 @@ use std::{
 #[derive(Clone, Copy)]
 enum Reply {
     Normal,
+    #[cfg(feature = "signal-crypto")]
+    EncryptedSend,
     Redirect,
     Oversize,
     Stall,
@@ -65,6 +67,8 @@ struct State {
     http_sends: AtomicUsize,
     echoed: AtomicBool,
     privacy_requests: AtomicUsize,
+    privacy_responses: AtomicUsize,
+    privacy_response: tokio::sync::Notify,
     privacy_hold: AtomicBool,
     privacy_policy: AtomicUsize,
     eligibility_mode: AtomicUsize,
@@ -236,6 +240,298 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.scratch);
     }
 }
+
+#[cfg(feature = "signal-crypto")]
+#[tokio::test]
+async fn device_readiness_composer_sends_exact_verified_coverage_and_settles_correlated_ack() {
+    use super::e2ee_init_peer::tests::{seed_identity, wire_bundle};
+    use super::e2ee_readiness::tests::{parsed_bundle, server, Mode};
+    use crate::protocol::signal::{DevicePlatform, FetchedBundles};
+    let fixture = Fixture::new(Reply::EncryptedSend);
+    let path = fixture.profile.paths.data_dir.join("messages.sqlite");
+    seed_identity(&path);
+    let db = Database::open(fixture.profile.clone(), "11".into())
+        .await
+        .unwrap();
+    let bundles = vec![
+        wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await,
+        wire_bundle(zalo_signal_engine::SignalPlatform::Web, 1).await,
+    ];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = tokio::spawn(server(listener, bundles.clone(), Mode::OwnPresent));
+    let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+        .await
+        .unwrap();
+    let mut connection = Connection::connected(socket, "11");
+    connection.next().await.unwrap();
+    let (tx, mut rx) = mpsc::channel(32);
+    let events = Events {
+        account: "11".into(),
+        tx,
+        repaint: Arc::new(|| {}),
+        privacy: Default::default(),
+    };
+    let local = crate::store::e2ee::LocalNamespace {
+        epoch: "1".into(),
+        platform: crate::store::e2ee::Platform::Pc,
+    };
+    for (uid, device, bundle) in [
+        ("22", DevicePlatform::Mobile, bundles[0].clone()),
+        ("11", DevicePlatform::Web, bundles[1].clone()),
+    ] {
+        connection
+            .handshake_checked_devices(
+                &db,
+                &events,
+                &local,
+                uid,
+                FetchedBundles {
+                    peer: uid.into(),
+                    bundles: vec![parsed_bundle(uid, device, bundle)],
+                },
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+    }
+    let config = ServerConfig::parse(
+        &json!({"zpw_service_map_v3":{"chat_e2e":["https://wpa.zaloapp.com"]},"zpw_ws":[]}),
+    )
+    .unwrap();
+    let session = Arc::new(synthetic_session(fixture.profile.clone(), config));
+    connection.e2ee_http = Some(super::e2ee_send::E2eeHttp {
+        client: fixture.client(),
+        session: session.clone(),
+    });
+    connection
+        .send_e2ee(&db, &events, 77, "d:22".into(), 88, "Tin E2EE tổng hợp")
+        .await
+        .unwrap();
+    let mut sent = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let LiveEvent::SendFailed { error, .. } = &event {
+            panic!("Synthetic verified send was rejected: {error}");
+        }
+        if let LiveEvent::Sent {
+            account_id,
+            generation,
+            thread,
+            request_id,
+            message,
+            ..
+        } = event
+        {
+            assert_eq!(
+                (account_id.as_str(), generation, thread.as_str(), request_id),
+                ("11", 77, "d:22", 88)
+            );
+            assert_eq!(
+                (
+                    message.id.as_str(),
+                    message.text.as_str(),
+                    message.sent_at_ms
+                ),
+                ("99100", "Tin E2EE tổng hợp", 1760000000001)
+            );
+            sent += 1;
+        }
+    }
+    assert_eq!(sent, 1);
+    drop(connection);
+    let outgoing = service.await.unwrap();
+    let init: Vec<_> = outgoing
+        .iter()
+        .filter(|(command, _)| *command == 543)
+        .collect();
+    assert_eq!(
+        init.len(),
+        3,
+        "Only two setup handshakes and the missing peer-web handshake are sent"
+    );
+    assert_eq!(init[2].1["uidTo"], "22");
+    assert_eq!(init[2].1["data"].as_array().unwrap().len(), 1);
+    assert_eq!(init[2].1["data"][0]["deviceId"], 1);
+    assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 1);
+    let encoded = {
+        let requests = fixture.state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].0.starts_with("/api/e2ee/pc/message/sms?"));
+        url::form_urlencoded::parse(requests[0].1.as_bytes())
+            .find(|(name, _)| name == "params")
+            .unwrap()
+            .1
+            .into_owned()
+    };
+    let exact = session.decrypt_payload(&encoded).unwrap();
+    let envelope: Value = serde_json::from_slice(&exact).unwrap();
+    let records: Vec<Value> =
+        serde_json::from_str(envelope["listParams"].as_str().unwrap()).unwrap();
+    let expected = [
+        bundles[1]["preKey"]["iKey"]["id"].as_u64().unwrap(),
+        bundles[0]["preKey"]["iKey"]["id"].as_u64().unwrap(),
+        bundles[1]["preKey"]["iKey"]["id"].as_u64().unwrap(),
+    ];
+    for (record, iid) in records.iter().zip(expected) {
+        let extension: Value = serde_json::from_str(record["e2eeExt"].as_str().unwrap()).unwrap();
+        assert_eq!(extension["iid"].as_u64(), Some(iid));
+    }
+    let stored: (String, Vec<u8>) = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT state,ciphertext FROM e2ee_outbox WHERE account='11' AND server_id='99100'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored.0, "committed");
+    assert!(
+        stored.1 == exact,
+        "HTTP dispatch must contain the exact durable ciphertext bytes"
+    );
+    // A subsequent stale snapshot is rejected by the normal composer without
+    // another HTTP POST, an init retry, or a new chat outbox row.
+    let before = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT count(*) FROM e2ee_outbox", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = tokio::spawn(server(listener, bundles, Mode::UnknownIid));
+    let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+        .await
+        .unwrap();
+    let mut connection = Connection::connected(socket, "11");
+    connection.next().await.unwrap();
+    connection.e2ee_http = Some(super::e2ee_send::E2eeHttp {
+        client: fixture.client(),
+        session,
+    });
+    connection
+        .send_e2ee(&db, &events, 78, "d:22".into(), 89, "Tin bị chặn tổng hợp")
+        .await
+        .unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(LiveEvent::SendFailed {
+            generation: 78,
+            request_id: 89,
+            unknown_delivery: false,
+            server_accepted: false,
+            ..
+        })
+    ));
+    drop(connection);
+    assert!(service
+        .await
+        .unwrap()
+        .iter()
+        .all(|(command, _)| *command != 543));
+    assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM e2ee_outbox", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        before
+    );
+    drop(db);
+}
+#[cfg(feature = "signal-crypto")]
+#[tokio::test]
+async fn device_readiness_incoming_storage_failure_escapes_command_and_never_dispatches() {
+    use super::e2ee_init_peer::tests::{seed_identity, wire_bundle};
+    use super::e2ee_readiness::tests::{server, Mode};
+    let fixture = Fixture::new(Reply::EncryptedSend);
+    let path = fixture.profile.paths.data_dir.join("messages.sqlite");
+    seed_identity(&path);
+    let db = Database::open(fixture.profile.clone(), "11".into())
+        .await
+        .unwrap();
+    rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TRIGGER synthetic_incoming_failure BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT,'synthetic storage failure'); END;").unwrap();
+    let bundles = vec![wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = tokio::spawn(server(listener, bundles, Mode::QueryIncomingFailure));
+    let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+        .await
+        .unwrap();
+    let mut connection = Connection::connected(socket, "11");
+    connection.next().await.unwrap();
+    let config = ServerConfig::parse(
+        &json!({"zpw_service_map_v3":{"chat_e2e":["https://wpa.zaloapp.com"]},"zpw_ws":[]}),
+    )
+    .unwrap();
+    let session = Arc::new(synthetic_session(fixture.profile.clone(), config));
+    connection.e2ee_http = Some(super::e2ee_send::E2eeHttp {
+        client: fixture.client(),
+        session: session.clone(),
+    });
+    let (tx, mut rx) = mpsc::channel(32);
+    let events = Events {
+        account: "11".into(),
+        tx,
+        repaint: Arc::new(|| {}),
+        privacy: Default::default(),
+    };
+    let mut connection = Some(connection);
+    let error = handle_command(
+        LiveCommand::Send {
+            generation: 79,
+            thread: "d:22".into(),
+            request_id: 90,
+            text: "Bản nháp tổng hợp".into(),
+        },
+        &mut connection,
+        &db,
+        &events,
+        &session,
+        &fixture.client(),
+    )
+    .await
+    .err()
+    .expect("Storage failure must reach run_inner's PauseTransport handler");
+    assert!(error.downcast_ref::<StorageContext>().is_some());
+    let mut failures = 0;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            LiveEvent::SendFailed {
+                generation: 79,
+                request_id: 90,
+                unknown_delivery: false,
+                server_accepted: false,
+                ..
+            } => failures += 1,
+            LiveEvent::Sent { .. } => {
+                panic!("A failed incoming write must not settle an outgoing message")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(failures, 1);
+    drop(connection);
+    let seen = service.await.unwrap();
+    assert_eq!(
+        seen.iter().map(|(command, _)| *command).collect::<Vec<_>>(),
+        vec![563, 563],
+        "No queue ACK or initialization can follow the failed write"
+    );
+    assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 0);
+    assert!(fixture.state.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM e2ee_outbox", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(db);
+}
+
 fn serve(
     mut socket: TcpStream,
     config: Arc<rustls::ServerConfig>,
@@ -377,7 +673,17 @@ fn serve(
         } else {
             wire::encode_frame(1,0,&json!({"error_code":0,"key":STANDARD.encode([7;32]),"encrypt":1,"data":STANDARD.encode(z.finish().unwrap())})).unwrap()
         };
-        ws.send(tungstenite::Message::Binary(auth_frame)).unwrap();
+        if let Err(error) = ws.send(tungstenite::Message::Binary(auth_frame)) {
+            // A storage-startup test can finish at Ready and cancel its pending
+            // network attempt before this fixture finishes authentication.
+            if matches!(&error, tungstenite::Error::Io(io) if matches!(io.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof))
+            {
+                state.closed.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+            panic!("Synthetic WebSocket authentication failed: {error}");
+        }
         loop {
             let message = match ws.read() {
                 Ok(m) => m,
@@ -811,8 +1117,13 @@ fn serve(
             );
             return;
         }
-        let _ = stream.write_all(&response);
-        let _ = stream.flush();
+        if stream.write_all(&response).is_ok()
+            && stream.flush().is_ok()
+            && route == "/api/hiddenconvers/get-all"
+        {
+            state.privacy_responses.fetch_add(1, Ordering::SeqCst);
+            state.privacy_response.notify_one();
+        }
         return;
     }
     if matches!(reply, Reply::Stall | Reply::RuntimeStall) {
@@ -839,6 +1150,43 @@ fn serve(
     let route = path.split('?').next().unwrap();
     let cipher =
         SessionCipher::from_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
+    #[cfg(feature = "signal-crypto")]
+    if matches!(reply, Reply::EncryptedSend) {
+        assert_eq!(route, "/api/e2ee/pc/message/sms");
+        let params = url::form_urlencoded::parse(&body)
+            .find(|(name, _)| name == "params")
+            .unwrap()
+            .1
+            .into_owned();
+        let parameters: Value = serde_json::from_slice(&cipher.decrypt(&params).unwrap()).unwrap();
+        assert_eq!(parameters["destType"], 3);
+        assert_eq!(parameters["threadId"], "22");
+        let records: Vec<Value> =
+            serde_json::from_str(parameters["listParams"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record["toId"].clone(), record["platform"].clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (json!("11"), json!(1)),
+                (json!("22"), json!(0)),
+                (json!("22"), json!(1))
+            ]
+        );
+        state.http_sends.fetch_add(1, Ordering::SeqCst);
+        let inner = json!({"error_code":0,"data":{"clientId":parameters["clientId"],"minGlobalMsgId":"99100","ts":1760000000001_i64}});
+        let response=serde_json::to_vec(&json!({"error_code":0,"data":cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()})).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.len()
+        )
+        .unwrap();
+        stream.write_all(&response).unwrap();
+        stream.flush().unwrap();
+        return;
+    }
     let inner = if route == "/api/group/getgi/v2" {
         json!({"error_code":0,"data":{"groupId":"22","e2ee":false}})
     } else {
@@ -3113,6 +3461,7 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
             let observed = tokio::time::timeout(Duration::from_secs(2), async {
                 let mut reason = None;
                 let mut directory_done = attempt > 0;
+                let mut privacy_done = attempt > 0;
                 let mut terminal = false;
                 loop {
                     match events.recv().await.expect("local worker must stay alive") {
@@ -3121,6 +3470,9 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
                             terminal = true
                         }
                         LiveEvent::DirectoryStatus { syncing: false, .. } => directory_done = true,
+                        LiveEvent::PrivacyChanged { revision, .. } if revision > 1 => {
+                            privacy_done = true
+                        }
                         LiveEvent::Connection {
                             state: LiveConnection::Online,
                             ..
@@ -3130,7 +3482,7 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
                         }
                         _ => {}
                     }
-                    if terminal && directory_done {
+                    if terminal && directory_done && privacy_done {
                         break reason.expect("terminal state must have a diagnostic");
                     }
                 }
@@ -3140,8 +3492,9 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
             assert_eq!(observed.category, expected_category);
             assert!(!task.is_finished());
             if attempt == 0 {
-                // Test every terminal class beyond all reconnect backoffs. Startup
-                // privacy is already verified before this first transport attempt.
+                // Test every terminal class beyond all reconnect backoffs.
+                // Wait above for the fresh startup privacy result (revision > 1),
+                // separately from the provisional remembered policy at revision 1.
                 // The explicit second reconnect may have a real TLS privacy fetch
                 // in flight, whose deadline must not be expired by artificial time.
                 tokio::time::pause();
@@ -3237,6 +3590,16 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
             f.state.upgrades.load(Ordering::SeqCst),
             if reply.is_some() { 2 } else { 0 }
         );
+        // Reconnect and privacy refresh are independent jobs. Wait for the
+        // second response to finish. An unchanged policy emits no second
+        // PrivacyChanged event, so use the fixture's completed-write witness.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while f.state.privacy_responses.load(Ordering::SeqCst) < 2 {
+                f.state.privacy_response.notified().await;
+            }
+        })
+        .await
+        .unwrap();
         {
             let requests = f.state.requests.lock().unwrap();
             let count = |route: &str| {
@@ -3249,7 +3612,11 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
             assert_eq!(count("/api/preloadconvers/get-last-msgs"), 1);
             // One startup check, one explicit reconnect and at most one periodic
             // check from the deliberate 60-second advance; in-flight requests coalesce.
-            assert!((2..=3).contains(&count("/api/hiddenconvers/get-all")));
+            assert!(
+                (2..=3).contains(&count("/api/hiddenconvers/get-all")),
+                "Synthetic terminal state {expected_state:?}: {} privacy requests",
+                count("/api/hiddenconvers/get-all")
+            );
             assert!(requests.len() <= 5);
             assert!(requests.iter().all(|(path, body)| body.is_empty()
                 && matches!(

@@ -517,6 +517,32 @@ pub fn compatible(scope: &Scope, sequence: u64, peer: &str) -> Result<SignalRequ
     uid(peer)?;
     SignalRequest::new(scope, sequence, Command::Compatible, json!({"uids":[peer]}))
 }
+/// A compatibility inventory, not proof that a peer has enabled encryption.
+/// Unknown replies never imply that all device types are available.
+pub fn compatible_reply(
+    request: &SignalRequest,
+    active: &Scope,
+    reply: &Value,
+    peer: &str,
+) -> Result<Vec<DevicePlatform>> {
+    uid(peer)?;
+    if request.command != Command::Compatible || request.data.get("uids") != Some(&json!([peer])) {
+        return Err(SignalError::Correlation);
+    }
+    let data = request.reply(active, 560, reply)?;
+    let entries = bounded_array(&data["compatible"], 3)?;
+    let mut devices = BTreeSet::new();
+    for entry in entries {
+        if entry.get("uid").and_then(Value::as_str) != Some(peer) {
+            return Err(SignalError::Scope);
+        }
+        let device = DevicePlatform::parse(&entry["deviceId"])?;
+        if !devices.insert(device) {
+            return Err(SignalError::Duplicate);
+        }
+    }
+    Ok(devices.into_iter().collect())
+}
 pub fn compatible_group(
     scope: &Scope,
     sequence: u64,
@@ -689,6 +715,95 @@ pub fn metadata(scope: &Scope, sequence: u64, after: Option<&Cursor>) -> Result<
 pub struct DeviceMetadata {
     pub device: DevicePlatform,
     pub iid: u16,
+}
+/// Ephemeral per-target projection. An unknown IID never creates a registration ID.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReadinessDevice {
+    pub device: DevicePlatform,
+    pub iid: Option<u16>,
+}
+/// One correlated page, never an authorization by itself. Callers must finish the
+/// bounded walk and reject uncertain or conflicting target metadata.
+pub struct TargetDevicePage {
+    pub devices: Option<Vec<ReadinessDevice>>,
+    pub uncertain: bool,
+    pub next: Option<Cursor>,
+}
+pub fn target_device_page(
+    request: &SignalRequest,
+    active: &Scope,
+    reply: &Value,
+    peer: &str,
+) -> Result<TargetDevicePage> {
+    uid(peer)?;
+    if request.command != Command::Metadata {
+        return Err(SignalError::Correlation);
+    }
+    let data = request.reply(active, 563, reply)?;
+    let threads = bounded_array(&data["threads"], MAX_PAGE_ITEMS)?;
+    let uids = bounded_array(&data["uids"], MAX_PAGE_ITEMS)?;
+    let waiting = bounded_array(&data["waitUids"], MAX_PAGE_ITEMS)?;
+    let pending = bounded_array(&data["pendingUids"], MAX_PAGE_ITEMS)?;
+    let more = match data.get("hasMore") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(Value::Number(n)) if n.as_u64() == Some(0) => false,
+        Some(Value::Number(n)) if n.as_u64() == Some(1) => true,
+        _ => return Err(SignalError::Incomplete),
+    };
+    let next = if more {
+        Some(Cursor::parse(
+            data.get("lastId").ok_or(SignalError::Incomplete)?,
+        )?)
+    } else {
+        None
+    };
+    let mut devices = None;
+    for thread in threads {
+        let target = thread["uid"].as_str().ok_or(SignalError::Invalid)?;
+        uid(target)?;
+        if target != peer {
+            continue;
+        }
+        if devices.is_some() {
+            return Err(SignalError::Duplicate);
+        }
+        let mut seen = BTreeSet::new();
+        let mut found = Vec::new();
+        for item in bounded_array(&thread["devices"], 3)? {
+            let device = DevicePlatform::parse(&item["di"])?;
+            if !seen.insert(device) {
+                return Err(SignalError::Duplicate);
+            }
+            let iid = match item.get("iid") {
+                None => None,
+                Some(value) => match registration(value)? {
+                    0 => None,
+                    known => Some(known),
+                },
+            };
+            found.push(ReadinessDevice { device, iid });
+        }
+        devices = Some(found);
+    }
+    let mut uncertain = false;
+    for value in uids.iter().chain(waiting.iter()) {
+        let target = value.as_str().ok_or(SignalError::Invalid)?;
+        uid(target)?;
+    }
+    for value in waiting {
+        uncertain |= value.as_str() == Some(peer);
+    }
+    for value in pending {
+        let target = value["uid"].as_str().ok_or(SignalError::Invalid)?;
+        uid(target)?;
+        uncertain |= target == peer;
+    }
+    Ok(TargetDevicePage {
+        devices,
+        uncertain,
+        next,
+    })
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct ThreadMetadata {
@@ -1423,6 +1538,126 @@ mod tests {
     }
     fn response(request: &SignalRequest, data: Value) -> Value {
         json!({"error_code":0,"data":{"reqId":request.request_id(),"data":data}})
+    }
+    #[test]
+    fn compatibility_inventory_is_correlated_and_never_guesses_devices() {
+        let active = scope();
+        let request = compatible(&active, 81, "22").unwrap();
+        let valid = response(
+            &request,
+            json!({"err":0,"compatible":[{"uid":"22","deviceId":2},{"uid":"22","deviceId":0}]}),
+        );
+        assert_eq!(
+            compatible_reply(&request, &active, &valid, "22").unwrap(),
+            vec![DevicePlatform::Mobile, DevicePlatform::Pc]
+        );
+        let empty = response(&request, json!({"compatible":[]}));
+        assert!(compatible_reply(&request, &active, &empty, "22")
+            .unwrap()
+            .is_empty());
+        for data in [
+            json!({}),
+            json!({"compatible":null}),
+            json!({"compatible":{}}),
+            json!({"compatible":[{"uid":"33","deviceId":0}]}),
+            json!({"compatible":[{"uid":"22","deviceId":3}]}),
+            json!({"compatible":[{"uid":"22","deviceId":"0"}]}),
+            json!({"compatible":[{"uid":"22","deviceId":0},{"uid":"22","deviceId":0}]}),
+            json!({"err":-7,"compatible":[]}),
+        ] {
+            assert!(compatible_reply(&request, &active, &response(&request, data), "22").is_err());
+        }
+        assert!(compatible_reply(&request, &active, &valid, "33").is_err());
+        assert!(compatible_reply(&request, &Scope::new("11", 8).unwrap(), &valid, "22").is_err());
+        let mut wrong = valid.clone();
+        wrong["data"]["reqId"] = json!("other");
+        assert!(compatible_reply(&request, &active, &wrong, "22").is_err());
+        let mut failed = valid;
+        failed["error_code"] = json!(102);
+        assert!(matches!(
+            compatible_reply(&request, &active, &failed, "22"),
+            Err(SignalError::Authentication)
+        ));
+    }
+    #[test]
+    fn target_device_pages_preserve_unknown_iids_and_do_not_invent_stale_flags() {
+        let active = scope();
+        let request = metadata(&active, 82, None).unwrap();
+        let base = json!({"err":0,"threads":[{"uid":"22","devices":[{"di":0,"iid":123},{"di":1,"iid":0},{"di":2}]}],"uids":[],"waitUids":[],"pendingUids":[]});
+        let page =
+            target_device_page(&request, &active, &response(&request, base.clone()), "22").unwrap();
+        let found = page.devices.unwrap();
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].iid, Some(123));
+        assert!(found[1].iid.is_none() && found[2].iid.is_none());
+        assert!(!page.uncertain && page.next.is_none());
+        for flag in [Value::Null, json!(false), json!(0)] {
+            let mut data = base.clone();
+            data["hasMore"] = flag;
+            assert!(
+                target_device_page(&request, &active, &response(&request, data), "22")
+                    .unwrap()
+                    .next
+                    .is_none()
+            );
+        }
+        for flag in [json!(true), json!(1)] {
+            let mut data = base.clone();
+            data["hasMore"] = flag;
+            data["lastId"] = json!(40);
+            let cursor = target_device_page(&request, &active, &response(&request, data), "22")
+                .unwrap()
+                .next
+                .unwrap();
+            let next = metadata(&active, 83, Some(&cursor)).unwrap();
+            assert_eq!(next.wire_data(&active).unwrap()["data"]["lastId"], 40);
+        }
+        for field in ["threads", "uids", "waitUids", "pendingUids"] {
+            let mut data = base.clone();
+            data.as_object_mut().unwrap().remove(field);
+            assert!(
+                target_device_page(&request, &active, &response(&request, data), "22").is_err()
+            );
+        }
+        for iid in [Value::Null, json!(false), json!("invalid"), json!(65536)] {
+            let mut data = base.clone();
+            data["threads"][0]["devices"][0]["iid"] = iid;
+            assert!(
+                target_device_page(&request, &active, &response(&request, data), "22").is_err()
+            );
+        }
+        let mut numeric_strings = base.clone();
+        numeric_strings["threads"][0]["devices"][0]["iid"] = json!("123");
+        numeric_strings["threads"][0]["devices"][1]["iid"] = json!("0");
+        let found = target_device_page(
+            &request,
+            &active,
+            &response(&request, numeric_strings),
+            "22",
+        )
+        .unwrap()
+        .devices
+        .unwrap();
+        assert_eq!(found[0].iid, Some(123));
+        assert!(found[1].iid.is_none());
+        let mut waiting = base.clone();
+        waiting["waitUids"] = json!(["22"]);
+        assert!(
+            target_device_page(&request, &active, &response(&request, waiting), "22")
+                .unwrap()
+                .uncertain
+        );
+        let mut pending = base.clone();
+        pending["pendingUids"] = json!([{"uid":"22","deviceId":0}]);
+        assert!(
+            target_device_page(&request, &active, &response(&request, pending), "22")
+                .unwrap()
+                .uncertain
+        );
+        let mut other = base;
+        other["threads"] = json!([{"uid":"33","devices":[]}]);
+        let page = target_device_page(&request, &active, &response(&request, other), "22").unwrap();
+        assert!(page.devices.is_none() && !page.uncertain);
     }
     fn normalize_sms(mut value: Value) -> Value {
         if let Some(records) = value.get_mut("listParams") {
