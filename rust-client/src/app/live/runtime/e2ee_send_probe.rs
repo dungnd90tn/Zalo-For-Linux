@@ -58,8 +58,8 @@ pub(super) struct BundleQuery {
     /// Write the reply's shape to the report even when the service refused.
     pub verbose: bool,
 }
-/// A recipient for one fetched device bundle. The identity is recorded on first use; a device already
-/// trusted with a *different* identity is refused (the note says so) rather than replaced.
+/// A recipient for the explicit diagnostic probe. First-use activation here is
+/// legacy behavior; production initialization uses `init_recipient_for` instead.
 pub(super) fn recipient_for(
     store: &mut crate::store::MessageStore,
     owner: &str,
@@ -67,6 +67,32 @@ pub(super) fn recipient_for(
     uid: &str,
     b: &signal::PublicBundle,
     now_ms: i64,
+) -> Result<std::result::Result<Recipient, String>> {
+    recipient_for_inner(store, owner, local, uid, b, now_ms, false)
+}
+
+/// Reserve first-use trust without activating it before signature verification.
+/// Only the typed initialization coordinator may commit this candidate.
+pub(super) fn init_recipient_for(
+    store: &mut crate::store::MessageStore,
+    owner: &str,
+    local: &e2ee::LocalNamespace,
+    uid: &str,
+    b: &signal::PublicBundle,
+    now_ms: i64,
+) -> Result<std::result::Result<Recipient, String>> {
+    recipient_for_inner(store, owner, local, uid, b, now_ms, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recipient_for_inner(
+    store: &mut crate::store::MessageStore,
+    owner: &str,
+    local: &e2ee::LocalNamespace,
+    uid: &str,
+    b: &signal::PublicBundle,
+    now_ms: i64,
+    initialization: bool,
 ) -> Result<std::result::Result<Recipient, String>> {
     let identity = *b.identity.bytes();
     let fingerprint = Sha256::digest(identity).to_vec();
@@ -84,19 +110,18 @@ pub(super) fn recipient_for(
             )))
         }
         None => {
-            let namespace = store.e2ee_register_peer(
-                owner,
-                local,
-                uid,
-                None,
-                &VerifiedBinding {
-                    platform: platform(b.device),
-                    registration_id: b.registration_id,
-                    identity_key: identity,
-                    session_timestamp: now_ms as u64,
-                },
-            )?;
-            (namespace, now_ms as u64)
+            let binding = VerifiedBinding {
+                platform: platform(b.device),
+                registration_id: b.registration_id,
+                identity_key: identity,
+                session_timestamp: now_ms as u64,
+            };
+            if initialization {
+                store.e2ee_reserve_first_use_peer(owner, local, uid, &binding)?
+            } else {
+                let namespace = store.e2ee_register_peer(owner, local, uid, None, &binding)?;
+                (namespace, now_ms as u64)
+            }
         }
     };
     Ok(Ok(Recipient {

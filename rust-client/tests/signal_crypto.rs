@@ -13,6 +13,9 @@ use zalo_rust::{
 };
 use zalo_signal_engine as engine;
 
+#[path = "signal_crypto/first_use_tests.rs"]
+mod first_use_tests;
+
 fn local(platform: engine::SignalPlatform) -> engine::LocalNamespace {
     engine::LocalNamespace {
         epoch: engine::RegistrationEpoch::new(1).unwrap(),

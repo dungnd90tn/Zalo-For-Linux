@@ -37,6 +37,7 @@ pub(super) mod tests {
         OmittedWeb,
         RefuseWeb(i64),
         OwnMissing,
+        OwnBadSignature,
         OwnStateDuringInit,
         OwnPresent,
         StateDuringInit,
@@ -105,9 +106,20 @@ pub(super) mod tests {
                     let keys: Vec<Value> = if uid == "11" {
                         if matches!(
                             mode,
-                            Mode::OwnMissing | Mode::OwnPresent | Mode::OwnStateDuringInit
+                            Mode::OwnMissing
+                                | Mode::OwnPresent
+                                | Mode::OwnStateDuringInit
+                                | Mode::OwnBadSignature
                         ) {
-                            vec![bundles[1].clone()]
+                            let mut bundle = bundles[1].clone();
+                            if matches!(mode, Mode::OwnBadSignature) {
+                                let mut signature = STANDARD
+                                    .decode(bundle["preKey"]["signature"].as_str().unwrap())
+                                    .unwrap();
+                                signature[0] ^= 1;
+                                bundle["preKey"]["signature"] = json!(STANDARD.encode(signature));
+                            }
+                            vec![bundle]
                         } else {
                             vec![]
                         }
@@ -154,7 +166,7 @@ pub(super) mod tests {
         seen
     }
 
-    pub(super) async fn check(
+    pub(crate) async fn check(
         db: &Database,
         bundles: &[Value],
         mode: Mode,

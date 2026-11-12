@@ -257,6 +257,100 @@ fn durable_crypto(path: &Path) -> Vec<Vec<Vec<SqlValue>>> {
     .collect()
 }
 
+fn assert_no_first_use_commit(path: &Path, initial_records: &[Vec<SqlValue>]) {
+    let state = durable_crypto(path);
+    assert_eq!(
+        state[0], initial_records,
+        "Failed preparation cannot commit crypto records"
+    );
+    assert!(state[1].is_empty(), "Unsent reservation must be removed");
+    assert!(
+        state[2].is_empty(),
+        "Discarded reservations cannot leave init intent"
+    );
+    let conn = Sqlite::open(path).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM e2ee_peer_epochs WHERE active=1",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "Unverified candidates cannot become trusted"
+    );
+}
+
+#[tokio::test]
+async fn first_use_fanout_one_invalid_signature_discards_every_overlay_and_retry_verifies_again() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let bundles = vec![
+        wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await,
+        wire_bundle(zalo_signal_engine::SignalPlatform::Web, 1).await,
+    ];
+    let root =
+        std::env::temp_dir().join(format!("zalo-first-use-fanout-{:x}", rand::random::<u64>()));
+    let profile = Arc::new(crate::profile::Profile::at_root(&root, "fixture").unwrap());
+    let path = profile.paths.data_dir.join("messages.sqlite");
+    seed_identity(&path);
+    let db = Database::open(profile, "11".into()).await.unwrap();
+    let records = durable_crypto(&path).remove(0);
+    let mut invalid = bundles.clone();
+    invalid[1]["preKey"]["signature"] = json!(STANDARD.encode([0u8; 64]));
+    for sequence in [36_000_000, 36_000_128] {
+        let (failed, seen, _) = check(&db, &invalid, Mode::Normal, sequence).await;
+        assert!(failed.is_err());
+        assert!(seen.iter().all(|(cmd, _)| *cmd != 543));
+        assert_no_first_use_commit(&path, &records);
+    }
+    let conn = Sqlite::open(&path).unwrap();
+    assert!(
+        conn.query_row(
+            "SELECT count(*) FROM e2ee_peer_epochs WHERE active=-1",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap()
+            <= 2,
+        "Repeated failure must not grow candidates per device"
+    );
+    drop(conn);
+    let (ready, seen, _) = check(&db, &bundles, Mode::Normal, 36_000_256).await;
+    assert!(
+        ready.is_ok(),
+        "A fresh verified retry can initialize both devices"
+    );
+    assert_eq!(seen.iter().filter(|(cmd, _)| *cmd == 543).count(), 1);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn first_use_own_device_invalid_signature_cannot_activate_own_or_peer_bindings() {
+    let bundles = vec![
+        wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await,
+        wire_bundle(zalo_signal_engine::SignalPlatform::Web, 1).await,
+    ];
+    let root = std::env::temp_dir().join(format!("zalo-first-use-own-{:x}", rand::random::<u64>()));
+    let profile = Arc::new(crate::profile::Profile::at_root(&root, "fixture").unwrap());
+    let path = profile.paths.data_dir.join("messages.sqlite");
+    seed_identity(&path);
+    let db = Database::open(profile, "11".into()).await.unwrap();
+    let records = durable_crypto(&path).remove(0);
+    let (failed, seen, _) = check(&db, &bundles, Mode::OwnBadSignature, 37_000_000).await;
+    assert!(failed.is_err());
+    assert!(seen.iter().all(|(cmd, _)| *cmd != 543));
+    assert_no_first_use_commit(&path, &records);
+    let (ready, seen, _) = check(&db, &bundles, Mode::OwnMissing, 37_000_128).await;
+    assert!(ready.is_ok());
+    let inits: Vec<_> = seen.iter().filter(|(cmd, _)| *cmd == 543).collect();
+    assert_eq!(inits.len(), 2);
+    assert_eq!(inits[0].1["uidTo"], "11");
+    assert_eq!(inits[1].1["uidTo"], "22");
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn readiness_rejects_actual_opaque_session_iid_mismatch_without_committing_a_ratchet() {
     let mut bundles = vec![wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await];

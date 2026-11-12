@@ -8,7 +8,7 @@
 //! device that already has a session here is skipped, so a repeated run sends nothing. The init text goes
 //! through the same reviewed pipeline as a message (reserve, plan, prepare, one SQL commit, dispatch
 //! bookkeeping) but is delivered by command 543 and never shown as a conversation message.
-use super::e2ee_send_probe::{recipient_for, BundleQuery, GENERATION};
+use super::e2ee_send_probe::{init_recipient_for, BundleQuery, GENERATION};
 use super::signal_transport::Report;
 use super::*;
 use crate::{
@@ -125,7 +125,7 @@ impl Connection {
                             return Ok(None);
                         }
                     }
-                    let recipient = match recipient_for(store, &o, &l, &o, &bundle, now_ms)? {
+                    let recipient = match init_recipient_for(store, &o, &l, &o, &bundle, now_ms)? {
                         Ok(recipient) => recipient,
                         Err(note) => anyhow::bail!(note),
                     };
@@ -134,7 +134,14 @@ impl Connection {
                         let _ = store.e2ee_discard_reserved(&o, client_id);
                         return Err(error);
                     }
-                    match co.plan_personal(store, client_id, INIT_TEXT, vec![recipient], &g, &c) {
+                    match co.plan_personal_init(
+                        store,
+                        client_id,
+                        INIT_TEXT,
+                        vec![recipient],
+                        &g,
+                        &c,
+                    ) {
                         Ok(plan) => Ok(Some((client_id, plan))),
                         Err(error) => {
                             let _ = store.e2ee_discard_reserved(&o, client_id);

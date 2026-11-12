@@ -1155,3 +1155,38 @@ registration, including a newly discovered own device, can still leave a new
 binding without a session after signature failure; old trusted bindings are not
 silently replaced. Legacy unmarked unknown init attempts remain outside the typed
 pending-intent guarantee. These synthetic results do not certify production E2EE.
+
+## Atomic first-use initialization (2026-11-12)
+
+Peer/own-device initialization now reserves untrusted inactive candidates and uses
+the typed-init-only planner. It binds candidate account/local epoch, address, IID,
+fingerprint and timestamp to the actual recipients, requires signed bundles and
+commits activation with verified engine records and exact init outbox bytes in one
+revision-CAS transaction. The regular personal-message planner stays active-only.
+Repeated failed proposals reuse a candidate per scoped device; persisted engine or
+outbox references and unresolved typed-init intent prevent rebinding.
+
+Eight focused tests pass: five library and three direct coordinator cases. They
+cover invalid first-use peer/own/multi-device signatures, bounded candidate reuse,
+all personal/group-sender record references and outbox references, typed-purpose
+and bundle requirements, cancellation, revision/local-epoch changes, SQL abort,
+successful atomic activation, restart and unknown-init protection. The full
+all-feature suite passes **664 tests with four ignored** (628 library, 36 other).
+Commands, using the existing pinned offline toolchain/cache and synthetic profiles:
+
+```sh
+cargo test --locked --offline --all-features first_use -- --test-threads=2
+cargo test --locked --offline --all-features -- --test-threads=2
+```
+
+Strict all-feature/all-target Clippy (`-D warnings`), standard-`live` all-target
+compile, formatting and diff checks also pass. Logs are ignored
+`target/atomic-first-use-{focused,all-tests,clippy,live-check}.log`.
+
+No schema/version change or new release/install was made. Inactive proposals may
+remain after failure/restart; no new active init trust is established before the
+verified commit. Existing active bindings are not replaced. Inbound receive and
+the explicit diagnostic dry probe retain their older eager first-use registration;
+this checkpoint does not claim atomicity for those paths. Standard `live` still
+excludes the optional engine. No real account/server was used, and these tests do
+not establish production interoperability.

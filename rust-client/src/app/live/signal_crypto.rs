@@ -144,6 +144,7 @@ impl VerifiedPreparedSend {
 pub struct PreparedPersonalInput {
     client_id: u64,
     recipients: Vec<Recipient>,
+    activate_peers: Vec<e2ee::PeerActivation>,
     scope: signal::Scope,
     thread: String,
     local: e2ee::LocalNamespace,
@@ -364,9 +365,37 @@ impl Coordinator {
         store: &mut MessageStore,
         client_id: u64,
         text: &str,
+        recipients: Vec<Recipient>,
+        gate: &e2ee::GenerationGate,
+        cancel: &Cancellation,
+    ) -> Result<PreparedPersonalInput> {
+        self.plan_personal_inner(store, client_id, text, recipients, gate, cancel, false)
+    }
+
+    /// First-use trust is available only to a durable typed initialization.
+    /// A candidate must pass ProcessBundle before its activation can commit.
+    pub fn plan_personal_init(
+        &self,
+        store: &mut MessageStore,
+        client_id: u64,
+        text: &str,
+        recipients: Vec<Recipient>,
+        gate: &e2ee::GenerationGate,
+        cancel: &Cancellation,
+    ) -> Result<PreparedPersonalInput> {
+        self.plan_personal_inner(store, client_id, text, recipients, gate, cancel, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_personal_inner(
+        &self,
+        store: &mut MessageStore,
+        client_id: u64,
+        text: &str,
         mut recipients: Vec<Recipient>,
         gate: &e2ee::GenerationGate,
         cancel: &Cancellation,
+        initializing: bool,
     ) -> Result<PreparedPersonalInput> {
         let deadline = Instant::now() + BATCH_TIMEOUT;
         self.current(gate, cancel)?;
@@ -376,6 +405,9 @@ impl Coordinator {
         );
         let reservation = store.e2ee_outgoing(self.account.as_str(), client_id)?;
         let local = store_local(&self.local)?;
+        if initializing {
+            store.e2ee_validate_init_reservation(self.account.as_str(), &local, client_id)?;
+        }
         ensure!(
             reservation.state == e2ee::SendState::Reserved && reservation.local == local,
             "Encrypted send reservation is not current"
@@ -393,6 +425,7 @@ impl Coordinator {
         recipients.sort_by(|a, b| a.trust.peer.cmp(&b.trust.peer));
         let mut unique = BTreeSet::new();
         let mut planned = BTreeSet::new();
+        let mut activate_peers = Vec::new();
         let mut hash = Sha256::new();
         digest_part(&mut hash, b"zalo-personal-preparation-v1");
         digest_part(&mut hash, self.account.as_str().as_bytes());
@@ -404,14 +437,42 @@ impl Coordinator {
             let trust = &recipient.trust;
             let peer: e2ee::PeerNamespace =
                 serde_json::from_value(serde_json::to_value(&trust.peer)?)?;
-            store.e2ee_validate_peer_identity(
-                self.account.as_str(),
-                &local,
-                &peer,
-                trust.registration_id,
-                &trust.identity_key,
-                trust.session_timestamp,
-            )?;
+            let active =
+                store.e2ee_active_peer(self.account.as_str(), &local, &peer.uid, peer.platform)?;
+            if initializing && active.is_none() {
+                ensure!(
+                    recipient.bundle.is_some(),
+                    "First-use initialization requires a signed bundle"
+                );
+                store.e2ee_validate_first_use_identity(
+                    self.account.as_str(),
+                    &local,
+                    &peer,
+                    &e2ee::VerifiedBinding {
+                        platform: peer.platform,
+                        registration_id: trust.registration_id,
+                        identity_key: trust.identity_key,
+                        session_timestamp: trust.session_timestamp,
+                    },
+                )?;
+                let activation = e2ee::PeerActivation {
+                    local: local.clone(),
+                    peer: peer.clone(),
+                    expected_previous: None,
+                };
+                digest_part(&mut hash, b"verified-first-use-init-v1");
+                digest_part(&mut hash, &serde_json::to_vec(&activation)?);
+                activate_peers.push(activation);
+            } else {
+                store.e2ee_validate_peer_identity(
+                    self.account.as_str(),
+                    &local,
+                    &peer,
+                    trust.registration_id,
+                    &trust.identity_key,
+                    trust.session_timestamp,
+                )?;
+            }
             ensure!(
                 (trust.peer.uid.as_str() == thread || trust.peer.uid == self.account)
                     && !(trust.peer.uid == self.account
@@ -485,6 +546,7 @@ impl Coordinator {
         Ok(PreparedPersonalInput {
             client_id,
             recipients,
+            activate_peers,
             scope,
             thread: thread.into(),
             local,
@@ -508,6 +570,7 @@ impl Coordinator {
         let PreparedPersonalInput {
             client_id,
             recipients,
+            activate_peers,
             scope,
             thread,
             local,
@@ -621,7 +684,7 @@ impl Coordinator {
                 operation_id: durable_id,
                 input_digest,
                 allowed_keys,
-                activate_peers: vec![],
+                activate_peers,
                 mutations: aggregate.into_values().collect(),
             },
             client_id,
