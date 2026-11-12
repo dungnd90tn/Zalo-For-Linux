@@ -1101,3 +1101,57 @@ reports `network_used=false`. The new 21,591,264-byte artifact is
 It was not installed or opened with a real profile. Final whole-crate formatting
 and diff checks also pass; release/smoke logs are
 `target/device-readiness-qa-{release,smoke}.log`.
+
+## Essential send continuation: checked renewal and own devices (2026-11-12)
+
+The optional `signal-crypto` normal composer now renews an existing session when
+fresh 563 metadata has no IID, provided fresh re-init 541 data matches its trusted
+IID and identity. Only selected devices renew; the original engine archives their
+previous sessions without changing trusted namespaces or known-good sessions.
+A stored engine timestamp newer than its binding rejects renewal before any
+reservation, because the engine would retain the old open session in that case.
+Missing own-device sessions initialize first, followed by peer initialization,
+with a separate correlated 543 service confirmation for each UID group.
+
+The original-library oracle independently exercises equal/older timestamp
+behavior, closed-session retention, and trust/signature rejection. Real-engine
+runtime cases check targeted renewal, unmodified unaffected devices, prepared
+recipient coverage, changed IID/identity and invalid-signature refusal, the newer
+timestamp guard, and interrupted peer/own initialization. The disk integration
+case checks that a failed renewal leaves existing trust/ratchet bytes untouched;
+successful renewed init ciphertext decrypts correctly; an unknown dispatch keeps
+its exact bytes and typed intent across restart, refuses redispatch and wrong-scope
+confirmation, and never becomes chat history. No real account or server was used.
+
+Verification used the same pinned Rust 1.99.1, direct compiler paths, isolated
+`target/e2ee-qa-cargo`, locked offline dependencies and synthetic loopback fixtures:
+
+```sh
+node tests/fixtures/messaging/session_renewal_oracle.cjs
+node tests/fixtures/messaging/device_readiness_oracle.cjs
+cargo test --locked --offline --all-features --lib readiness -- --test-threads=2
+cargo test --locked --offline --all-features --test signal_crypto forced_renewal_preserves_trust_and_durable_unconfirmed_intent
+cargo test --locked --offline --all-features -- --test-threads=2
+cargo clippy --locked --offline --all-features --all-targets -- -D warnings
+cargo check --locked --offline --features live --all-targets
+```
+
+Focused readiness/renewal tests pass **seven**; the independent disk integration
+case passes, including a final rerun after test-only lint corrections. The original
+session-renewal oracle and the existing **ten refusal/seven metadata cases** pass.
+The full matrix passes **656 tests**, with **four ignored**: 623 library and 33
+other tests. Strict all-feature/all-target Clippy, formatting and diff checks pass.
+The `live` all-target compile check passes, and its dependency tree excludes Signal,
+QuickJS and libsignal-core. Logs are ignored
+`target/essential-renewal-{focused,all-tests,store-final,clippy,live-check,live-tree}.log`.
+
+No schema or package version changed; the database remains schema nine. This
+checkpoint did not build a new release, install an app, open a personal profile,
+rotate real keys, send a real message, commit or push. Existing 2.0.4 packages do
+not contain this workspace change. Standard `live` continues to exclude the engine.
+548 processing, persistent stale state, general stale renewal, identity-change
+confirmation and full E2EE offline-queue ordering remain pending. First-use
+registration, including a newly discovered own device, can still leave a new
+binding without a session after signature failure; old trusted bindings are not
+silently replaced. Legacy unmarked unknown init attempts remain outside the typed
+pending-intent guarantee. These synthetic results do not certify production E2EE.

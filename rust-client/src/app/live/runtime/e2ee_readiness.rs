@@ -33,9 +33,11 @@ pub(super) mod tests {
     pub(crate) enum Mode {
         Normal,
         UnknownIid,
+        UnknownIidStateDuringInit,
         OmittedWeb,
         RefuseWeb(i64),
         OwnMissing,
+        OwnStateDuringInit,
         OwnPresent,
         StateDuringInit,
         QueryIncomingFailure,
@@ -80,7 +82,7 @@ pub(super) mod tests {
                         frame(&mut socket,501,json!({"error_code":0,"data":{"msgs":[{"uidFrom":"22","idTo":"11","msgId":"99003","cliMsgId":"99004","ts":"1700000000000","msgType":"webchat","content":"Tin kiểm thử lỗi lưu trữ"}]}})).await;
                     }
                     let devices:Vec<_> = bundles.iter().filter(|b| !matches!(mode,Mode::OmittedWeb) || b["deviceId"] != 1).map(|bundle| {
-                        json!({"di":bundle["deviceId"],"iid":if matches!(mode,Mode::UnknownIid) && bundle["deviceId"]==0 {json!(0)}else{bundle["preKey"]["iKey"]["id"].clone()}})
+                        json!({"di":bundle["deviceId"],"iid":if matches!(mode,Mode::UnknownIid | Mode::UnknownIidStateDuringInit) && bundle["deviceId"]==0 {json!(0)}else{bundle["preKey"]["iKey"]["id"].clone()}})
                     }).collect();
                     json!({"threads":[{"uid":"22","devices":devices}],"uids":[],"waitUids":[],"pendingUids":[]})
                 }
@@ -101,7 +103,10 @@ pub(super) mod tests {
                         }
                     }
                     let keys: Vec<Value> = if uid == "11" {
-                        if matches!(mode, Mode::OwnMissing | Mode::OwnPresent) {
+                        if matches!(
+                            mode,
+                            Mode::OwnMissing | Mode::OwnPresent | Mode::OwnStateDuringInit
+                        ) {
                             vec![bundles[1].clone()]
                         } else {
                             vec![]
@@ -120,7 +125,12 @@ pub(super) mod tests {
                 543 => {
                     // An ordinary incoming message must survive even inside the init wait.
                     frame(&mut socket,501,json!({"error_code":0,"data":{"msgs":[{"uidFrom":"22","idTo":"11","msgId":"99001","cliMsgId":"99002","ts":"1700000000000","msgType":"webchat","content":"Tin xen giữa tổng hợp"}]}})).await;
-                    if matches!(mode, Mode::StateDuringInit) {
+                    if matches!(
+                        mode,
+                        Mode::StateDuringInit
+                            | Mode::UnknownIidStateDuringInit
+                            | Mode::OwnStateDuringInit
+                    ) {
                         frame(&mut socket, 548, json!({"error_code":0,"data":{}})).await;
                         continue;
                     }
@@ -303,14 +313,9 @@ pub(super) mod tests {
         .await
         .unwrap();
         assert_eq!(prepared.devices, 2);
-        for (index, mode) in [
-            Mode::UnknownIid,
-            Mode::OmittedWeb,
-            Mode::RefuseWeb(-8),
-            Mode::OwnMissing,
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, mode) in [Mode::OmittedWeb, Mode::RefuseWeb(-8)]
+            .into_iter()
+            .enumerate()
         {
             let before = state(&path);
             let (result, seen, _) =
@@ -377,43 +382,18 @@ pub(super) mod tests {
         .await
         .is_err());
         assert!(state(&path) == before);
-        // Initialize an own web session through the same reviewed 543 pipeline,
-        // then require the actual checked send to include its copy after peers.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(server(listener, bundles.clone(), Mode::Normal));
-        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
-            .await
-            .unwrap();
-        let mut connection = Connection::connected(socket, "11");
-        connection.next().await.unwrap();
-        let (tx, _rx) = mpsc::channel(32);
-        let events = Events {
-            account: "11".into(),
-            tx,
-            repaint: Arc::new(|| {}),
-            privacy: Default::default(),
-        };
-        let local = e2ee::LocalNamespace {
-            epoch: "1".into(),
-            platform: e2ee::Platform::Pc,
-        };
-        connection
-            .handshake_checked_devices(
-                &db,
-                &events,
-                &local,
-                "11",
-                signal::FetchedBundles {
-                    peer: "11".into(),
-                    bundles: vec![parsed_bundle("11", DevicePlatform::Web, bundles[1].clone())],
-                },
-                tokio::time::Instant::now() + READ_BUDGET,
-            )
-            .await
-            .unwrap();
-        drop(connection);
-        server.await.unwrap();
+        // The composer initializes a missing own web session automatically,
+        // then a later send reuses it and includes its copy alongside the peers.
+        let (own_ready, seen, _) = check(&db, &bundles, Mode::OwnMissing, 20_002_128).await;
+        assert!(own_ready.is_ok());
+        let handshakes = seen
+            .iter()
+            .filter(|(cmd, _)| *cmd == 543)
+            .collect::<Vec<_>>();
+        assert_eq!(handshakes.len(), 1);
+        assert_eq!(handshakes[0].1["uidTo"], "11");
+        assert_eq!(handshakes[0].1["data"].as_array().unwrap().len(), 1);
+        assert_eq!(handshakes[0].1["data"][0]["deviceId"], 1);
         let (ready, seen, _) = check(&db, &bundles, Mode::OwnPresent, 20_003_000).await;
         assert!(seen.iter().all(|(cmd, _)| *cmd != 543));
         let proof = Arc::new(ready.unwrap());
@@ -569,7 +549,7 @@ impl Readiness {
             .collect()
     }
 
-    fn missing(&self, store: &mut MessageStore) -> Result<Vec<DevicePlatform>> {
+    fn missing(&self, store: &mut MessageStore) -> Result<Vec<(String, DevicePlatform)>> {
         ensure!(
             !store.e2ee_peer_init_pending(&self.owner, &self.local, &self.peer)?
                 && !store.e2ee_peer_init_pending(&self.owner, &self.local, &self.owner)?,
@@ -608,16 +588,11 @@ impl Readiness {
             } else {
                 false
             };
-            ensure!(
-                !has_session || device.metadata_known || device.initialized,
-                "An encrypted device has stale metadata and needs session renewal"
-            );
-            if !has_session {
-                ensure!(
-                    device.uid != self.owner,
-                    "An own device needs encrypted session initialization"
-                );
-                missing.push(device.bundle.device);
+            // A fresh bundle with the same trusted IID and identity permits a
+            // checked renewal when 563 cannot establish the cached session IID.
+            // Own-device copies need the same checked initialization as peers.
+            if !has_session || (!device.metadata_known && !device.initialized) {
+                missing.push((device.uid.clone(), device.bundle.device));
             }
         }
         // An omitted cached device is not proof of removal. Keep its session and
@@ -1014,12 +989,12 @@ impl Connection {
         let mut ready = std::sync::Arc::try_unwrap(ready)
             .map_err(|_| anyhow::anyhow!("Encrypted readiness is still shared"))?;
         if !missing.is_empty() {
-            let mut bundles = Vec::new();
-            for device in &missing {
+            let mut fetched = Vec::new();
+            for (uid, device) in &missing {
                 let found = self
                     .readiness_bundle(
                         &scope,
-                        peer,
+                        uid,
                         DeviceSelection::One(*device),
                         sequence,
                         true,
@@ -1031,7 +1006,7 @@ impl Connection {
                 sequence += 1;
                 ensure!(
                     found.bundles.len() == 1,
-                    "A missing encrypted device returned no bundle"
+                    "An encrypted device needing initialization returned no bundle"
                 );
                 let bundle = found
                     .bundles
@@ -1041,30 +1016,44 @@ impl Connection {
                 let original = ready
                     .devices
                     .iter()
-                    .find(|entry| entry.uid == peer && entry.bundle.device == *device)
-                    .expect("missing device belongs to verified set");
+                    .find(|entry| entry.uid == *uid && entry.bundle.device == *device)
+                    .expect("initialization device belongs to verified set");
                 ensure!(
                     bundle.registration_id == original.bundle.registration_id
                         && bundle.identity.bytes() == original.bundle.identity.bytes(),
                     "An encrypted identity changed before initialization"
                 );
-                bundles.push(bundle);
+                fetched.push((uid.clone(), bundle));
             }
-            self.handshake_checked_devices(
-                db,
-                events,
-                &ready.local,
-                peer,
-                signal::FetchedBundles {
-                    peer: peer.into(),
-                    bundles,
-                },
-                deadline,
-            )
-            .await?;
-            for device in &mut ready.devices {
-                if device.uid == peer && missing.contains(&device.bundle.device) {
-                    device.initialized = true;
+            // Complete the account's own copies before initializing the peer,
+            // like checkSessionThenInit. Every group needs its own durable ACK.
+            for uid in [owner.as_str(), peer] {
+                let bundles = fetched
+                    .iter()
+                    .filter(|(target, _)| target == uid)
+                    .map(|(_, bundle)| bundle.clone())
+                    .collect::<Vec<_>>();
+                if bundles.is_empty() {
+                    continue;
+                }
+                self.handshake_checked_devices(
+                    db,
+                    events,
+                    &ready.local,
+                    uid,
+                    signal::FetchedBundles {
+                        peer: uid.to_owned(),
+                        bundles,
+                    },
+                    deadline,
+                )
+                .await?;
+                for device in &mut ready.devices {
+                    if device.uid == uid
+                        && missing.contains(&(device.uid.clone(), device.bundle.device))
+                    {
+                        device.initialized = true;
+                    }
                 }
             }
         }

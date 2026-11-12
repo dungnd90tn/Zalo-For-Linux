@@ -156,10 +156,12 @@ impl Connection {
         found: signal::FetchedBundles,
         report: &mut Report,
     ) -> Result<&'static str> {
-        self.handshake_devices_inner(db, owner, local, peer, found, report, None)
+        self.handshake_devices_inner(db, owner, local, peer, found, report, None, false)
             .await
     }
 
+    /// Only the freshly verified devices selected by readiness are supplied:
+    /// force their bundles through the engine even when a cached session exists.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handshake_checked_devices(
         &mut self,
@@ -179,6 +181,7 @@ impl Connection {
             found,
             &mut Report::discard(),
             Some((events, deadline)),
+            true,
         )
         .await
     }
@@ -193,6 +196,7 @@ impl Connection {
         found: signal::FetchedBundles,
         report: &mut Report,
         events: Option<(&Events, tokio::time::Instant)>,
+        force_selected: bool,
     ) -> Result<&'static str> {
         let (owner, local, peer) = (owner.to_owned(), local.clone(), peer.to_owned());
         report.line(&format!(
@@ -224,6 +228,10 @@ impl Connection {
         );
         let planned = db
             .call(move |store| {
+                anyhow::ensure!(
+                    !store.e2ee_peer_init_pending(&o, &l, &p)?,
+                    "An encrypted initialization is not durably confirmed"
+                );
                 let mut recipients = Vec::new();
                 let mut skipped = 0usize;
                 for bundle in &found.bundles {
@@ -233,13 +241,34 @@ impl Connection {
                         &p,
                         super::e2ee_send_probe::platform(bundle.device),
                     )? {
-                        let key = e2ee::RecordKey::Session {
-                            local: l.clone(),
-                            peer: active.namespace,
-                        };
-                        if !store.e2ee_snapshot(&o, &[key])?.records.is_empty() {
-                            skipped += 1;
-                            continue;
+                        if force_selected {
+                            // ProcessBundle archives the open session only when
+                            // its stored engine timestamp is not newer than the
+                            // trusted binding timestamp supplied to the engine.
+                            // Never report a renewal that would keep the old one.
+                            let timestamp = store.e2ee_snapshot(
+                                &o,
+                                &[e2ee::RecordKey::SessionTimestamp {
+                                    local: l.clone(),
+                                    peer: active.namespace.clone(),
+                                }],
+                            )?;
+                            for record in timestamp.records {
+                                let value: u64 = serde_json::from_slice(&record.value)?;
+                                anyhow::ensure!(
+                                    value <= active.session_timestamp,
+                                    "The encrypted session is newer than its trusted binding; renewal requires verification"
+                                );
+                            }
+                        } else {
+                            let key = e2ee::RecordKey::Session {
+                                local: l.clone(),
+                                peer: active.namespace,
+                            };
+                            if !store.e2ee_snapshot(&o, &[key])?.records.is_empty() {
+                                skipped += 1;
+                                continue;
+                            }
                         }
                     }
                     match recipient_for(store, &o, &l, &p, bundle, now_ms)? {
