@@ -45,14 +45,14 @@ Các ảnh dưới đây là **ảnh giả lập**: chụp từ chế độ `--d
 
 ## Cài đặt nhanh bằng gói `.deb` / `.rpm`
 
-Tải gói của [bản phát hành](changelogs/RELEASE-v2.0.0.md) rồi cài bằng trình quản lý gói của bản phân phối. Gói dành cho **x86_64**, cần glibc 2.31 trở lên. Đã cài, chạy `--doctor` và gỡ thử bằng `apt`/`dnf` trong container sạch trên Ubuntu 20.04/22.04/24.04, Debian 12, Fedora 42 và AlmaLinux 9; các bản khác cùng họ nhiều khả năng chạy được nhưng chưa được kiểm:
+Xem [ghi chú đóng gói 2.0.4-3](changelogs/RELEASE-v2.0.4-3.md) và cài gói bằng trình quản lý gói của bản phân phối. Gói dành cho **x86_64**, cần glibc 2.31 trở lên. Bản 2.0.4-3 đã được thử nâng cấp trên Ubuntu 20.04 và cài/gỡ trên AlmaLinux 9. Ma trận kiểm thử gói 2.0.4-2 gồm Ubuntu 20.04/22.04/24.04, Debian 12, Fedora 42 và AlmaLinux 9.
 
 ```bash
 # Ubuntu / Debian
-sudo apt install ./zalo-native_2.0.0-3_amd64.deb
+sudo apt install ./zalo-native_2.0.4-3_amd64.deb
 
 # Fedora / RHEL / AlmaLinux / Rocky (yum dùng cùng lệnh)
-sudo dnf install ./zalo-native-2.0.0-3.x86_64.rpm
+sudo dnf install ./zalo-native-2.0.4-3.x86_64.rpm
 ```
 
 Mở **Zalo Native** từ menu ứng dụng hoặc chạy `zalo-native --live`; `zalo-native --demo` mở bản dùng thử. Gỡ cài đặt bằng `sudo apt remove zalo-native` hoặc `sudo dnf remove zalo-native`. Gói độc lập với gói Electron `zalo` và có thể cài cùng lúc. Hiện chưa có kho `apt`/`dnf` để tự cập nhật: muốn nâng cấp, cài gói mới hơn theo cùng lệnh.
@@ -265,7 +265,7 @@ Xử lý mạng, truy cập dữ liệu và giải mã ảnh phải chạy ngoà
 - [Quy ước nội dung đa phương tiện](rust-client/PROTOCOL_MEDIA.md): định dạng hỗ trợ, giải mã và giới hạn tài nguyên.
 - [Kiểm chứng](rust-client/VALIDATION.md): lệnh kiểm thử và bằng chứng kiểm tra trên desktop.
 - [Tiến độ phát triển](rust-client/MIGRATION_STATUS.md): các mốc triển khai và lịch sử kiểm chứng.
-- [Nhật ký thay đổi](rust-client/CHANGELOG.md) và [ghi chú phát hành 2.0.0](changelogs/RELEASE-v2.0.0.md).
+- [Nhật ký thay đổi](rust-client/CHANGELOG.md) và [ghi chú đóng gói 2.0.4-3](changelogs/RELEASE-v2.0.4-3.md).
 - [Hướng dẫn áp dụng thiết kế mới](rust-client/UI_REDESIGN_GUIDE.md): màu, kích thước và các điểm lệch có chủ ý so với bản thiết kế.
 
 Thương hiệu Zalo và tài nguyên đi kèm thuộc về chủ sở hữu tương ứng. Việc tích hợp không thể hiện sự liên kết hay bảo chứng; mã bên thứ ba giữ nguyên các thông báo bản quyền/giấy phép của mình.

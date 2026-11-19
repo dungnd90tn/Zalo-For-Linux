@@ -1,5 +1,7 @@
 # v2.0.4 — Củng cố trạng thái gửi và kiểm tra phiên mã hóa
 
+Ghi chú này mô tả gói 2.0.4 đầu tiên. Xem [bản đóng gói 2.0.4-3](RELEASE-v2.0.4-3.md) để cập nhật lỗi đồng bộ và các tính năng nhắn tin bổ sung.
+
 Bản cập nhật **Zalo Native** tập trung vào tính nhất quán khi gửi, lưu và khôi phục tin nhắn.
 Ứng dụng vẫn là bản thử nghiệm cộng đồng dành cho Linux.
 

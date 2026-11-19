@@ -2,7 +2,34 @@
 
 Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-client/`). Định dạng theo
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
-Ghi chú phát hành mới nhất nằm trong [changelogs/](../changelogs/RELEASE-v2.0.4.md).
+Ghi chú đóng gói mới nhất nằm trong [bản 2.0.4-3](../changelogs/RELEASE-v2.0.4-3.md).
+
+## Chưa phát hành (dự kiến 2.0.5)
+
+### Ưu tiên kiểm chứng
+
+- Xác nhận phiên đã lưu giữ Online sau đồng bộ. Thử gửi bằng **Enter** và nút **Gửi** khi bật/tắt x-unikey, trên X11 và Wayland.
+- Kiểm chứng trên tài khoản thử các luồng trả lời, gửi tệp và ảnh, thông báo, chuyển tiếp, thu hồi và thao tác nhóm. Ghi kết quả theo từng luồng trong [VALIDATION.md](VALIDATION.md).
+- Khi chốt mã, cập nhật phiên bản Native trong `Cargo.toml` và `Cargo.lock`, chốt ghi chú 2.0.5, build gói `.deb`/`.rpm` và kiểm tra nâng cấp từ `2.0.4-3`. Thẻ phát hành phải khớp phiên bản Native.
+
+## Gói 2.0.4-3 - 2026-11-19
+
+### Sửa lỗi
+
+- Tin `webchat` dạng đối tượng không còn làm rớt kết nối và vô hiệu hóa nút **Gửi** trong lúc đồng bộ. Hiển thị phần chữ khi nhận dạng được, hoặc dòng thay thế cho dạng chưa hỗ trợ.
+- Tooltip của nút **Gửi** ghi rõ khi ngoại tuyến, đang kết nối hoặc phiên đã hết hạn.
+
+## Gói 2.0.4-2 - 2026-11-19
+
+### Thêm mới
+
+- Trả lời tin văn bản kèm trích dẫn. Gửi một tệp tối đa 100 MiB hoặc một ảnh HD tĩnh với xem trước và chú thích.
+- Số tin chưa đọc trên máy này, trạng thái chuyển/đã xem có xác nhận và thông báo Linux với xem trước nội dung mặc định tắt.
+- Chuyển tiếp văn bản cá nhân đến một bạn bè, thu hồi tin văn bản của mình trong hội thoại cá nhân, xem thành viên, mời và rời nhóm thường theo quyền.
+
+### Thay đổi
+
+- Hồ sơ nâng lên **schema 16**, giữ lịch sử đã lưu. Các bản dựng dùng schema cũ hơn không mở được hồ sơ đã nâng cấp.
 
 ## [2.0.4] - 2026-11-11
 
