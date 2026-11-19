@@ -182,6 +182,7 @@ pub(super) mod tests {
         assert_eq!(connection.next().await.unwrap().unwrap().cmd, 1);
         let (tx, mut rx) = mpsc::channel(32);
         let events = Events {
+            unread: None,
             account: "11".into(),
             tx,
             repaint: Arc::new(|| {}),

@@ -39,8 +39,81 @@ unknown; zero is a valid size. `files_oracle.cjs` retains eight synthetic origin
 reader cases. File URLs are exposed only as an explicit HTTPS browser action;
 HTTP links upgrade to HTTPS. No file is automatically downloaded, opened locally
 or executed. Nonempty `secureKey`/`e2eeKey` markers withhold the plaintext action.
-Native upload, transfer resume, folder extraction and E2EE attachment
-decryption remain unavailable.
+Ordinary single-file and single-photo HD sending are implemented as described
+below. Original-photo sending, albums, animation, transfer resume, folder
+extraction and E2EE attachment decryption remain unavailable.
+
+## Ordinary single-file sending
+
+The optional live messaging path uses the configured FILE service, not the chat
+service or the legacy whole-file endpoint. Direct/group chunks POST to
+`/api/message/asyncfile/upload` or `/api/group/asyncfile/upload`, with multipart
+`chunkContent` and encrypted parameters `totalChunk`, original `fileName`,
+`clientId`, `totalSize`, `imei`, one-based `chunkId`, and `toid`/`grid`.
+Server-configured chunk sizes are bounded to 64000–1048576 bytes (default 256000).
+Files must be nonempty and at most 100 MiB; a private immediately unlinked snapshot
+and streaming MD5 bind the selected bytes without retaining them in the profile.
+
+The final `/api/message/asyncfile/msg` or `/api/group/asyncfile/msg` request binds
+`fileId`, lowercase MD5 `checksum`, `checksumSha:""`, `extension`, `totalSize`,
+NFC-normalized `fileName`, `clientId`, `fType:1`, `fileCount:0`, `fdata:"{}"`,
+`fileUrl`, `ttl:0` and `toid`/`grid`. Only direct final requests include `imei`.
+The source extension keeps its original case, including Unicode; native cards
+compare its Unicode-lowercase projection without changing wire spelling.
+Extensions of seven or more UTF-16 units become empty, matching the source.
+A final chunk response or matching online command-601 `file_done` supplies the
+resource URL. This observation adds no control ACK and leaves command 603
+untouched. Resource completion is not message acceptance. URLs are bounded HTTPS
+opaque values, never automatically fetched; no CDN hostname is invented for them.
+
+Schema eleven adds a separate account/thread/client-scoped `attachment_outbox`.
+Resource metadata and exact final JSON plus SHA-256 commit before the final POST;
+the actor rechecks current privacy, session and encryption capability before
+claiming dispatch. Restart maps uploading/resource-ready to known-unsent
+interruption and final sending to unknown delivery. Unknown or acknowledged-but-
+unrepaired duplicates are blocked by filename/size/MD5 fingerprint, with no
+automatic reupload or resend. ACK persistence precedes transactional synthetic
+`share.file` insertion; restart repairs a known ACK without network access.
+Matching own file echoes reconcile by typed metadata, never by placeholder text.
+The additive migration preserves schema-ten quotes and existing history/E2EE
+records; older binaries refuse schema eleven and no downgrade is provided.
+
+## Ordinary single-photo HD sending
+
+The worker reads authenticated feature settings from the source-supported
+`settings/features` and legacy `setttings/features` paths, with nullable/alias
+fallback. Route and limits come from those settings rather than an assumed
+photo endpoint. Upload uses `/api/{message|group}/photo_original/upload` on FILE
+or `/api/{message|group}/upload/photo` on PHOTO as configured. Final submission
+uses `/api/{message|group}/photo_original/send` on FILE. A matching online-601
+`photo_success`/`act:photo` resource or finished chunk result supplies URLs;
+resource completion never settles the photo message or a FILE send.
+
+Source input is limited to the smaller server/native bound: at most 20 MiB and
+16 megapixels. Preparation applies EXIF orientation, strips metadata and composites
+alpha on black, then downsizes without upscaling to at most 2560×2560 and encodes
+JPEG with bounded quality attempts to at most 5 MiB. This is HD recompression,
+not original-byte sending. The local preview decodes those exact processed bytes.
+Combined prepared JPEG bytes and thumbnail allocations use a 32 MiB lease
+budget; private unlinked files close when their scope/lease is dropped.
+
+Final parameters bind `photoId`, `clientId`, `desc`, `width`, `height`, `rawUrl`,
+`thumbUrl`, `hdUrl`, `language:"VN"`, `imei` and `ttl:0`. Direct sends add `toid`
+and `normalUrl`; group sends add `grid` and `oriUrl`, and also retain `imei`.
+Optional `thumbSize`, `fileSize` and `hdSize` stay bounded. URLs remain opaque
+HTTPS resources. The complete caption is bound before POST even when the native
+history projection displays only its bounded preview.
+
+Schema twelve adds the separate typed `photo_outbox`, preserving schema-eleven
+FILE records, quotes, history and E2EE intent. FILE and PHOTO share a transactional
+one-active-transfer/account guard and monotonic client counter, but cannot settle
+each other's resources or ACKs. Exact immutable final JSON plus SHA-256 and raw
+`chat.photo` metadata commit before dispatch; no personal path or source pixels
+are stored. Unknown/acknowledged duplicates use account/thread/JPEG-MD5/dimensions,
+so changing a caption cannot authorize an uncertain resend. Known-unsent restart,
+unknown final dispatch, durable ACK/local-echo repair and no automatic resend
+follow the FILE contract. Older binaries refuse schema twelve; no downgrade is
+provided. Real-service photo acceptance remains pending.
 
 ## Durable content and replay
 
@@ -111,7 +184,7 @@ capped at 100 MiB, never overwrite existing files, and cancel even during a stal
 response, cleaning the private partial file. An unsolicited HTTP 206 is refused.
 The viewer footer scrolls within its bound so save actions remain reachable in compact
 windows and with long captions. Browser navigation still requires a separate explicit
-click. Upload, full-resolution in-app viewing and universal OA actions remain pending.
+click. Original-photo sending, full-resolution in-app viewing and universal OA actions remain pending.
 See [file transfer limits](PROTOCOL_FILES.md#receiving-files-implemented-unverified-against-the-real-service).
 Local HTTP and synthetic UI checks establish these behaviors, not production CDN acceptance.
 

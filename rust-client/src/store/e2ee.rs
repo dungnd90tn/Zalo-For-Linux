@@ -2225,6 +2225,10 @@ impl MessageStore {
         );
         let existing:Option<i64>=tx.query_row("SELECT sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",params![owner,thread,server_id],|r|r.get(0)).optional()?;
         let message = Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: owner.into(),
             thread_id: thread.clone(),
             id: server_id.into(),
@@ -2638,6 +2642,10 @@ mod tests {
     }
     fn message(id: &str) -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "123".into(),
             thread_id: "d:456".into(),
             id: id.into(),
@@ -3677,7 +3685,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                9
+                16
             );
             for table in [
                 "e2ee_local_candidates",
@@ -3726,7 +3734,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                9
+                16
             );
             assert_eq!(
                 store.page("123", "d:456", None, 10).unwrap()[0].id,

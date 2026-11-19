@@ -7,6 +7,10 @@ use serde_json::json;
 
 fn message(account: &str, thread: &str, id: &str, time: i64) -> Message {
     Message {
+        reply_blocked: false,
+        recalled: false,
+        source_client_id: None,
+        quote: None,
         account_id: account.into(),
         thread_id: thread.into(),
         id: id.into(),
@@ -101,6 +105,7 @@ fn visibility_is_filtered_before_limits_and_locked_search_has_no_preview() {
                 messages: vec![],
                 message_info: vec![],
                 message_media: vec![],
+                message_quotes: vec![],
                 observed_at_ms: 4000,
             })
             .unwrap();
@@ -225,7 +230,7 @@ fn locked_receives_and_ack_keep_raw_history_cursors_and_outbox_without_projectio
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        9
+        16
     );
     assert_eq!(
         store

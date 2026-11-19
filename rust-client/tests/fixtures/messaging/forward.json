@@ -1,0 +1,183 @@
+{
+  "provenance": "Original forwardMultiMessage, reference/decor and TTL builders with synthetic IDs, text and identity AES. Fixtures exercise inner request shape only.",
+  "cases": [
+    {
+      "name": "incoming_dm",
+      "original": {
+        "msgId": "9001",
+        "cliMsgId": "8001",
+        "sendDttm": 1700000000123,
+        "message": "Chuyển tiếp tiếng Việt\n\"nội dung\" 😀",
+        "fromUid": "22",
+        "toUid": "22"
+      },
+      "toUid": "33",
+      "native_supported": true,
+      "wire": {
+        "endpoint": {
+          "domainType": "file",
+          "path": "/api/message/mforward",
+          "query": "zpw_ver=681&zpw_type=24"
+        },
+        "payload": {
+          "toIds": [
+            {
+              "clientId": "7001",
+              "toUid": "33",
+              "ttl": 0
+            }
+          ],
+          "imei": "synthetic-device",
+          "ttl": 0,
+          "msgType": "1",
+          "totalIds": 1,
+          "msgInfo": "{\"message\":\"Chuyển tiếp tiếng Việt\\n\\\"nội dung\\\" 😀\",\"reference\":\"{\\\"type\\\":3,\\\"data\\\":\\\"{\\\\\\\"id\\\\\\\":\\\\\\\"35b58bea60ee6e55f48ee091a86cf635\\\\\\\",\\\\\\\"ts\\\\\\\":1700000000123,\\\\\\\"logSrcType\\\\\\\":1,\\\\\\\"fwLvl\\\\\\\":1,\\\\\\\"rootMsgRef\\\\\\\":{\\\\\\\"id\\\\\\\":\\\\\\\"35b58bea60ee6e55f48ee091a86cf635\\\\\\\",\\\\\\\"ts\\\\\\\":1700000000123,\\\\\\\"logSrcType\\\\\\\":1}}\\\"}\"}",
+          "decorLog": "{\"fw\":{\"pmsg\":{\"st\":1,\"ts\":1700000000123,\"id\":\"35b58bea60ee6e55f48ee091a86cf635\"},\"rmsg\":{\"st\":1,\"ts\":1700000000123,\"id\":\"35b58bea60ee6e55f48ee091a86cf635\"},\"fwLvl\":1}}"
+        },
+        "metric": 12440
+      }
+    },
+    {
+      "name": "own_dm",
+      "original": {
+        "msgId": "9001",
+        "cliMsgId": "8001",
+        "sendDttm": 1700000000123,
+        "message": "Chuyển tiếp tiếng Việt\n\"nội dung\" 😀",
+        "fromUid": "0",
+        "toUid": "22"
+      },
+      "toUid": "33",
+      "native_supported": true,
+      "wire": {
+        "endpoint": {
+          "domainType": "file",
+          "path": "/api/message/mforward",
+          "query": "zpw_ver=681&zpw_type=24"
+        },
+        "payload": {
+          "toIds": [
+            {
+              "clientId": "7001",
+              "toUid": "33",
+              "ttl": 0
+            }
+          ],
+          "imei": "synthetic-device",
+          "ttl": 0,
+          "msgType": "1",
+          "totalIds": 1,
+          "msgInfo": "{\"message\":\"Chuyển tiếp tiếng Việt\\n\\\"nội dung\\\" 😀\",\"reference\":\"{\\\"type\\\":3,\\\"data\\\":\\\"{\\\\\\\"id\\\\\\\":\\\\\\\"0234433aac6068d0814cda90167b031c\\\\\\\",\\\\\\\"ts\\\\\\\":1700000000123,\\\\\\\"logSrcType\\\\\\\":1,\\\\\\\"fwLvl\\\\\\\":1,\\\\\\\"rootMsgRef\\\\\\\":{\\\\\\\"id\\\\\\\":\\\\\\\"0234433aac6068d0814cda90167b031c\\\\\\\",\\\\\\\"ts\\\\\\\":1700000000123,\\\\\\\"logSrcType\\\\\\\":1}}\\\"}\"}",
+          "decorLog": "{\"fw\":{\"pmsg\":{\"st\":1,\"ts\":1700000000123,\"id\":\"0234433aac6068d0814cda90167b031c\"},\"rmsg\":{\"st\":1,\"ts\":1700000000123,\"id\":\"0234433aac6068d0814cda90167b031c\"},\"fwLvl\":1}}"
+        },
+        "metric": 12440
+      }
+    },
+    {
+      "name": "incoming_group_to_dm",
+      "original": {
+        "msgId": "9001",
+        "cliMsgId": "8001",
+        "sendDttm": 1700000000123,
+        "message": "Chuyển tiếp tiếng Việt\n\"nội dung\" 😀",
+        "fromUid": "55",
+        "toUid": "g77"
+      },
+      "toUid": "33",
+      "native_supported": true,
+      "wire": {
+        "endpoint": {
+          "domainType": "file",
+          "path": "/api/message/mforward",
+          "query": "zpw_ver=681&zpw_type=24"
+        },
+        "payload": {
+          "toIds": [
+            {
+              "clientId": "7001",
+              "toUid": "33",
+              "ttl": 0
+            }
+          ],
+          "imei": "synthetic-device",
+          "ttl": 0,
+          "msgType": "1",
+          "totalIds": 1,
+          "msgInfo": "{\"message\":\"Chuyển tiếp tiếng Việt\\n\\\"nội dung\\\" 😀\",\"reference\":\"{\\\"type\\\":3,\\\"data\\\":\\\"{\\\\\\\"id\\\\\\\":\\\\\\\"68b3073679bfeb9789a5df7217989fa7\\\\\\\",\\\\\\\"ts\\\\\\\":1700000000123,\\\\\\\"logSrcType\\\\\\\":2,\\\\\\\"fwLvl\\\\\\\":1,\\\\\\\"rootMsgRef\\\\\\\":{\\\\\\\"id\\\\\\\":\\\\\\\"68b3073679bfeb9789a5df7217989fa7\\\\\\\",\\\\\\\"ts\\\\\\\":1700000000123,\\\\\\\"logSrcType\\\\\\\":2}}\\\"}\"}",
+          "decorLog": "{\"fw\":{\"pmsg\":{\"st\":2,\"ts\":1700000000123,\"id\":\"68b3073679bfeb9789a5df7217989fa7\"},\"rmsg\":{\"st\":2,\"ts\":1700000000123,\"id\":\"68b3073679bfeb9789a5df7217989fa7\"},\"fwLvl\":1}}"
+        },
+        "metric": 12440
+      }
+    },
+    {
+      "name": "missing_source_client_id",
+      "original": {
+        "msgId": "9001",
+        "sendDttm": 1700000000123,
+        "message": "Chuyển tiếp tiếng Việt\n\"nội dung\" 😀",
+        "fromUid": "22",
+        "toUid": "22"
+      },
+      "toUid": "33",
+      "native_supported": false,
+      "wire": {
+        "endpoint": {
+          "domainType": "file",
+          "path": "/api/message/mforward",
+          "query": "zpw_ver=681&zpw_type=24"
+        },
+        "payload": {
+          "toIds": [
+            {
+              "clientId": "7001",
+              "toUid": "33",
+              "ttl": 0
+            }
+          ],
+          "imei": "synthetic-device",
+          "ttl": 0,
+          "msgType": "1",
+          "totalIds": 1,
+          "msgInfo": "{\"message\":\"Chuyển tiếp tiếng Việt\\n\\\"nội dung\\\" 😀\"}"
+        },
+        "metric": 12440
+      }
+    },
+    {
+      "name": "ephemeral_destination",
+      "original": {
+        "msgId": "9001",
+        "cliMsgId": "8001",
+        "sendDttm": 1700000000123,
+        "message": "Chuyển tiếp tiếng Việt\n\"nội dung\" 😀",
+        "fromUid": "22",
+        "toUid": "22"
+      },
+      "toUid": "44",
+      "native_supported": false,
+      "wire": {
+        "endpoint": {
+          "domainType": "file",
+          "path": "/api/message/mforward",
+          "query": "zpw_ver=681&zpw_type=24"
+        },
+        "payload": {
+          "toIds": [
+            {
+              "clientId": "7001",
+              "toUid": "44",
+              "ttl": 3600
+            }
+          ],
+          "imei": "synthetic-device",
+          "ttl": 0,
+          "msgType": "1",
+          "totalIds": 1,
+          "msgInfo": "{\"message\":\"Chuyển tiếp tiếng Việt\\n\\\"nội dung\\\" 😀\",\"reference\":\"{\\\"type\\\":3,\\\"data\\\":\\\"{\\\\\\\"id\\\\\\\":\\\\\\\"35b58bea60ee6e55f48ee091a86cf635\\\\\\\",\\\\\\\"ts\\\\\\\":1700000000123,\\\\\\\"logSrcType\\\\\\\":1,\\\\\\\"fwLvl\\\\\\\":1,\\\\\\\"rootMsgRef\\\\\\\":{\\\\\\\"id\\\\\\\":\\\\\\\"35b58bea60ee6e55f48ee091a86cf635\\\\\\\",\\\\\\\"ts\\\\\\\":1700000000123,\\\\\\\"logSrcType\\\\\\\":1}}\\\"}\"}",
+          "decorLog": "{\"fw\":{\"pmsg\":{\"st\":1,\"ts\":1700000000123,\"id\":\"35b58bea60ee6e55f48ee091a86cf635\"},\"rmsg\":{\"st\":1,\"ts\":1700000000123,\"id\":\"35b58bea60ee6e55f48ee091a86cf635\"},\"fwLvl\":1}}"
+        },
+        "metric": 12440
+      }
+    }
+  ]
+}

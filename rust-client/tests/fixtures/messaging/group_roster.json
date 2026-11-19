@@ -1,0 +1,59 @@
+{
+  "provenance": "Original getInfoMultiGroup, getMemberInGroup and member normalization helpers with synthetic IDs and identity AES.",
+  "group": "900719925474099123",
+  "roster": {
+    "path": "/api/group/getmg-v2",
+    "host": "group.example.test",
+    "query": {
+      "zpw_ver": "681",
+      "zpw_type": "24"
+    },
+    "payload": {
+      "gridVerMap": "{\"900719925474099123\":0}"
+    },
+    "metric": 12028
+  },
+  "profiles": {
+    "path": "/api/social/group/members",
+    "host": "profile.example.test",
+    "query": {
+      "zpw_ver": "681",
+      "zpw_type": "24"
+    },
+    "payload": {
+      "friend_pversion_map": [
+        "88_0",
+        "33_0",
+        "22_0"
+      ]
+    },
+    "metric": 12030
+  },
+  "sourceMembers": [
+    "24_0",
+    "88_4",
+    "22_1",
+    "24_0",
+    "33_2"
+  ],
+  "normalized": {
+    "memberVerMap": {
+      "22": 1,
+      "24": 0,
+      "33": 2,
+      "88": 4
+    },
+    "memberIds": [
+      "24",
+      "88",
+      "22",
+      "33"
+    ]
+  },
+  "roleOrder": [
+    "88",
+    "33",
+    "24",
+    "22"
+  ]
+}

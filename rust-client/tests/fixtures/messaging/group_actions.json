@@ -1,0 +1,41 @@
+{
+  "provenance": "Original inviteMemberV2 and leaveGroup builders with synthetic identities and identity AES.",
+  "group": "900719925474099123",
+  "friend": "22",
+  "device": "synthetic-device",
+  "invite": {
+    "path": "/api/group/invite/v2",
+    "query": {
+      "zpw_ver": "681",
+      "zpw_type": "24"
+    },
+    "payload": {
+      "grid": "900719925474099123",
+      "members": [
+        "22"
+      ],
+      "memberTypes": [
+        -1
+      ],
+      "imei": "synthetic-device",
+      "clientLang": "VN"
+    },
+    "metric": 12444
+  },
+  "leave": {
+    "path": "/api/group/leave",
+    "query": {
+      "zpw_ver": "681",
+      "zpw_type": "24"
+    },
+    "payload": {
+      "grids": [
+        "900719925474099123"
+      ],
+      "imei": "synthetic-device",
+      "silent": 0,
+      "language": "VN"
+    },
+    "metric": 11189
+  }
+}

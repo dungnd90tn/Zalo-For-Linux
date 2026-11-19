@@ -15,10 +15,15 @@ fn conversation(id: &str, title: &str) -> Conversation {
         last_message_at_ms: 1_700_000_000_000,
         last_text: PRIVATE_BODY.into(),
         last_sender: "22".into(),
+        group_left: false,
     }
 }
 fn message() -> Message {
     Message {
+        reply_blocked: false,
+        recalled: false,
+        source_client_id: None,
+        quote: None,
         account_id: "11".into(),
         thread_id: "d:22".into(),
         id: "private-message".into(),

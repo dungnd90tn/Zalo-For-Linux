@@ -902,6 +902,10 @@ mod tests {
 
     fn message(media: MediaDescriptor) -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "11".into(),
             thread_id: "g:22".into(),
             id: "1".into(),
@@ -987,6 +991,10 @@ mod tests {
             ],
         };
         let message = Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "11".into(),
             thread_id: "d:22".into(),
             id: "1".into(),

@@ -1412,6 +1412,10 @@ async fn legacy_missing_client_type_requires_approval_without_network_or_any_dis
         let mut store = crate::store::MessageStore::open(&db_path).unwrap();
         store
             .insert_batch(&[crate::domain::Message {
+                reply_blocked: false,
+                recalled: false,
+                source_client_id: None,
+                quote: None,
                 account_id: "11".into(),
                 thread_id: "d:12".into(),
                 id: "kept".into(),

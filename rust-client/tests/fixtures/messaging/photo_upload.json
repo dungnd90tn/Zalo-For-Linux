@@ -1,0 +1,749 @@
+{
+  "provenance": "Exact original getInfoUploadPhotoFromData HD routing, ordinary buildSendChunksInfo/getUrl, getFileAsyncItem Photo, __waitAsyncFileInfo resource assignment, buildParams/sendMsgPhotoAsync. Synthetic bytes/IDs; identity AES and no-network transport stubs. Resource completion is not final message acceptance.",
+  "cases": [
+    {
+      "group": false,
+      "route": "file",
+      "caption": "",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "width": 640,
+      "height": 480,
+      "urls": {
+        "org": "https://photos.example.test/original",
+        "thumb": "https://photos.example.test/thumb",
+        "hd": "https://photos.example.test/hd",
+        "thumbSize": 1,
+        "fileSize": 6,
+        "hdSize": 4
+      },
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/message/photo_original/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/message/photo_original/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/message/photo_original/send?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "photoId": "synthetic-photo",
+          "clientId": 7001,
+          "desc": "",
+          "width": 640,
+          "height": 480,
+          "toid": "22",
+          "rawUrl": "https://photos.example.test/original",
+          "thumbUrl": "https://photos.example.test/thumb",
+          "normalUrl": "https://photos.example.test/original",
+          "hdUrl": "https://photos.example.test/hd",
+          "thumbSize": 1,
+          "fileSize": 6,
+          "hdSize": 4,
+          "language": "VN",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": false,
+      "route": "file",
+      "caption": "Ảnh thử nghiệm tổng hợp",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "width": 640,
+      "height": 480,
+      "urls": {
+        "org": "https://photos.example.test/original",
+        "thumb": "https://photos.example.test/thumb",
+        "hd": "https://photos.example.test/hd",
+        "thumbSize": 1,
+        "fileSize": 6,
+        "hdSize": 4
+      },
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/message/photo_original/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/message/photo_original/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/message/photo_original/send?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "photoId": "synthetic-photo",
+          "clientId": 7001,
+          "desc": "Ảnh thử nghiệm tổng hợp",
+          "width": 640,
+          "height": 480,
+          "toid": "22",
+          "rawUrl": "https://photos.example.test/original",
+          "thumbUrl": "https://photos.example.test/thumb",
+          "normalUrl": "https://photos.example.test/original",
+          "hdUrl": "https://photos.example.test/hd",
+          "thumbSize": 1,
+          "fileSize": 6,
+          "hdSize": 4,
+          "language": "VN",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": false,
+      "route": "photo",
+      "caption": "",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "width": 640,
+      "height": 480,
+      "urls": {
+        "org": "https://photos.example.test/original",
+        "thumb": "https://photos.example.test/thumb",
+        "hd": "https://photos.example.test/hd",
+        "thumbSize": 1,
+        "fileSize": 6,
+        "hdSize": 4
+      },
+      "chunks": [
+        {
+          "url": "https://photos.example.test/api/message/upload/photo?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://photos.example.test/api/message/upload/photo?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/message/photo_original/send?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "photoId": "synthetic-photo",
+          "clientId": 7001,
+          "desc": "",
+          "width": 640,
+          "height": 480,
+          "toid": "22",
+          "rawUrl": "https://photos.example.test/original",
+          "thumbUrl": "https://photos.example.test/thumb",
+          "normalUrl": "https://photos.example.test/original",
+          "hdUrl": "https://photos.example.test/hd",
+          "thumbSize": 1,
+          "fileSize": 6,
+          "hdSize": 4,
+          "language": "VN",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": false,
+      "route": "photo",
+      "caption": "Ảnh thử nghiệm tổng hợp",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "width": 640,
+      "height": 480,
+      "urls": {
+        "org": "https://photos.example.test/original",
+        "thumb": "https://photos.example.test/thumb",
+        "hd": "https://photos.example.test/hd",
+        "thumbSize": 1,
+        "fileSize": 6,
+        "hdSize": 4
+      },
+      "chunks": [
+        {
+          "url": "https://photos.example.test/api/message/upload/photo?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://photos.example.test/api/message/upload/photo?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/message/photo_original/send?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "photoId": "synthetic-photo",
+          "clientId": 7001,
+          "desc": "Ảnh thử nghiệm tổng hợp",
+          "width": 640,
+          "height": 480,
+          "toid": "22",
+          "rawUrl": "https://photos.example.test/original",
+          "thumbUrl": "https://photos.example.test/thumb",
+          "normalUrl": "https://photos.example.test/original",
+          "hdUrl": "https://photos.example.test/hd",
+          "thumbSize": 1,
+          "fileSize": 6,
+          "hdSize": 4,
+          "language": "VN",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": true,
+      "route": "file",
+      "caption": "",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "width": 640,
+      "height": 480,
+      "urls": {
+        "org": "https://photos.example.test/original",
+        "thumb": "https://photos.example.test/thumb",
+        "hd": "https://photos.example.test/hd",
+        "thumbSize": 1,
+        "fileSize": 6,
+        "hdSize": 4
+      },
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/group/photo_original/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/group/photo_original/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/group/photo_original/send?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "photoId": "synthetic-photo",
+          "clientId": 7001,
+          "desc": "",
+          "width": 640,
+          "height": 480,
+          "grid": "33",
+          "rawUrl": "https://photos.example.test/original",
+          "thumbUrl": "https://photos.example.test/thumb",
+          "oriUrl": "https://photos.example.test/original",
+          "hdUrl": "https://photos.example.test/hd",
+          "thumbSize": 1,
+          "fileSize": 6,
+          "hdSize": 4,
+          "language": "VN",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": true,
+      "route": "file",
+      "caption": "Ảnh thử nghiệm tổng hợp",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "width": 640,
+      "height": 480,
+      "urls": {
+        "org": "https://photos.example.test/original",
+        "thumb": "https://photos.example.test/thumb",
+        "hd": "https://photos.example.test/hd",
+        "thumbSize": 1,
+        "fileSize": 6,
+        "hdSize": 4
+      },
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/group/photo_original/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/group/photo_original/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/group/photo_original/send?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "photoId": "synthetic-photo",
+          "clientId": 7001,
+          "desc": "Ảnh thử nghiệm tổng hợp",
+          "width": 640,
+          "height": 480,
+          "grid": "33",
+          "rawUrl": "https://photos.example.test/original",
+          "thumbUrl": "https://photos.example.test/thumb",
+          "oriUrl": "https://photos.example.test/original",
+          "hdUrl": "https://photos.example.test/hd",
+          "thumbSize": 1,
+          "fileSize": 6,
+          "hdSize": 4,
+          "language": "VN",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": true,
+      "route": "photo",
+      "caption": "",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "width": 640,
+      "height": 480,
+      "urls": {
+        "org": "https://photos.example.test/original",
+        "thumb": "https://photos.example.test/thumb",
+        "hd": "https://photos.example.test/hd",
+        "thumbSize": 1,
+        "fileSize": 6,
+        "hdSize": 4
+      },
+      "chunks": [
+        {
+          "url": "https://photos.example.test/api/group/upload/photo?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://photos.example.test/api/group/upload/photo?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/group/photo_original/send?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "photoId": "synthetic-photo",
+          "clientId": 7001,
+          "desc": "",
+          "width": 640,
+          "height": 480,
+          "grid": "33",
+          "rawUrl": "https://photos.example.test/original",
+          "thumbUrl": "https://photos.example.test/thumb",
+          "oriUrl": "https://photos.example.test/original",
+          "hdUrl": "https://photos.example.test/hd",
+          "thumbSize": 1,
+          "fileSize": 6,
+          "hdSize": 4,
+          "language": "VN",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": true,
+      "route": "photo",
+      "caption": "Ảnh thử nghiệm tổng hợp",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "width": 640,
+      "height": 480,
+      "urls": {
+        "org": "https://photos.example.test/original",
+        "thumb": "https://photos.example.test/thumb",
+        "hd": "https://photos.example.test/hd",
+        "thumbSize": 1,
+        "fileSize": 6,
+        "hdSize": 4
+      },
+      "chunks": [
+        {
+          "url": "https://photos.example.test/api/group/upload/photo?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://photos.example.test/api/group/upload/photo?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22photo.jpg%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "photo.jpg",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "photo.jpg"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/group/photo_original/send?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "photoId": "synthetic-photo",
+          "clientId": 7001,
+          "desc": "Ảnh thử nghiệm tổng hợp",
+          "width": 640,
+          "height": 480,
+          "grid": "33",
+          "rawUrl": "https://photos.example.test/original",
+          "thumbUrl": "https://photos.example.test/thumb",
+          "oriUrl": "https://photos.example.test/original",
+          "hdUrl": "https://photos.example.test/hd",
+          "thumbSize": 1,
+          "fileSize": 6,
+          "hdSize": 4,
+          "language": "VN",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    }
+  ]
+}

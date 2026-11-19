@@ -255,6 +255,10 @@ async fn a_first_contact_prekey_message_is_decrypted_and_committed_once_with_its
     assert_eq!(verified.plaintext(), text.as_bytes());
 
     let message = Message {
+        reply_blocked: false,
+        recalled: false,
+        source_client_id: None,
+        quote: None,
         account_id: "202".into(),
         thread_id: "d:101".into(),
         id: "srv-1".into(),

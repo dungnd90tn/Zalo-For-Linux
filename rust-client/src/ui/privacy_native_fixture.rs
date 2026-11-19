@@ -27,10 +27,15 @@ fn conversation(thread: &str) -> Conversation {
         }
         .into(),
         last_sender: "44".into(),
+        group_left: false,
     }
 }
 fn message(thread: &str) -> Message {
     Message {
+        reply_blocked: false,
+        recalled: false,
+        source_client_id: None,
+        quote: None,
         account_id: "11".into(),
         thread_id: thread.into(),
         id: format!("synthetic-{thread}"),

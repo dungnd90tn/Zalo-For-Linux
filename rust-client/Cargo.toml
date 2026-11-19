@@ -28,6 +28,7 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 base64 = "0.22"
 md-5 = "0.10"
+unicode-normalization = "=0.1.24"
 url = "2"
 bytes = { version = "1", optional = true }
 aes-gcm = { version = "0.10", optional = true }
@@ -61,13 +62,14 @@ signal-crypto = ["signal-store", "messaging", "zalo-signal-engine/embedded", "de
 trust-wasm = ["dep:wasmi"]
 network = ["dep:reqwest", "dep:bytes"]
 live-login = ["network", "trust-wasm", "dep:qrcode", "dep:png"]
-messaging = ["live-login", "dep:aes-gcm", "dep:flate2", "dep:futures-util", "dep:tokio-tungstenite", "dep:percent-encoding", "dep:image", "dep:jxl-oxide", "dep:jxl-bitstream", "dep:jxl-oxide-common"]
+messaging = ["live-login", "dep:aes-gcm", "dep:flate2", "dep:futures-util", "dep:tokio-tungstenite", "dep:percent-encoding", "dep:image", "dep:jxl-oxide", "dep:jxl-bitstream", "dep:jxl-oxide-common", "dep:zbus"]
 live = ["messaging"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # eframe disables winit defaults; restore Adwaita CSD for Wayland compositors
 # without server decorations while retaining the compositor's decoration policy.
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
+zbus = { version = "=5.19.0", default-features = false, features = ["tokio"], optional = true }
 
 [dev-dependencies]
 winit = { version = "0.30", default-features = false, features = ["x11"] }

@@ -58,6 +58,7 @@ fn main() -> Result<()> {
         let batch = DirectoryBatch {
             message_info: Vec::new(),
             message_media: Vec::new(),
+            message_quotes: Vec::new(),
             account_id: "0".into(),
             entries: (start..(start + DIRECTORY_LIMIT).min(count))
                 .map(|i| record(i, count))
@@ -120,6 +121,7 @@ fn main() -> Result<()> {
         let batch = DirectoryBatch {
             message_info: Vec::new(),
             message_media: Vec::new(),
+            message_quotes: Vec::new(),
             account_id: "0".into(),
             entries: vec![extra.clone()],
             messages: vec![],

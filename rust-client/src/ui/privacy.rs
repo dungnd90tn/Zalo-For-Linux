@@ -376,6 +376,7 @@ impl Privacy {
             | LiveEvent::SearchResults { thread, .. }
             | LiveEvent::SearchFailed { thread, .. }
             | LiveEvent::SenderNames { thread, .. }
+            | LiveEvent::Recalled { thread, .. }
             | LiveEvent::MessagesRefreshed { thread, .. }
             | LiveEvent::MessagesRefreshFailed { thread, .. }
             | LiveEvent::RequestFailed { thread, .. }
@@ -479,9 +480,13 @@ impl NativeApp {
             state.sender_names = Default::default();
             state.hydration = Default::default();
             state.media = Default::default();
+            state.photo_preview.clear();
             state.avatars = Default::default();
             state.stickers = Default::default();
             state.directory.privacy_reset(ctx, state.privacy.ready());
+            state.forwarding.clear_picker();
+            state.recall.clear_confirmation();
+            state.groups.clear_projection();
         }
     }
     pub(super) fn relock_hidden(&mut self) {
@@ -498,6 +503,9 @@ impl NativeApp {
         }
         if !state.privacy.cancel(state.worker.as_ref()) {
             state.worker = None;
+            state.forwarding.worker_closed();
+            state.recall.worker_closed();
+            state.groups.worker_closed();
             state.privacy.reset_worker();
             state.connection = crate::app::live::LiveConnection::Offline;
             state.reason = Some("Chưa xác nhận được trạng thái riêng tư. Hãy kết nối lại.".into());

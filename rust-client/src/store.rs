@@ -1,18 +1,31 @@
 //! SQLite storage owned by one background thread. All pages have a fixed upper bound.
+use crate::domain::read_state::{ReceiptBinding, ReceiveContext};
 use crate::domain::{
     canonical_plain_text, validate_id, Conversation, Cursor, InfoMessageContent, MediaKind,
-    MediaMessageContent, Message, MAX_INFO_BATCH_BYTES, MAX_PAGE_SIZE, MAX_PREVIEW_CHARS,
+    MediaMessageContent, Message, MessageQuote, QuoteContent, MAX_INFO_BATCH_BYTES, MAX_PAGE_SIZE,
+    MAX_PREVIEW_CHARS,
 };
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
+pub mod attachments;
 pub mod directory;
 pub mod e2ee;
+pub mod forward;
+#[cfg(feature = "messaging")]
+pub(crate) use group_actions::GroupActionFailure;
+#[cfg(feature = "messaging")]
+pub use group_actions::{GroupActionOutcome, GroupInviteTarget};
+mod group_actions;
 pub mod message_content;
 mod message_info;
 mod message_media;
+mod message_reply;
 mod overview;
+pub mod photos;
 mod privacy;
+mod read_state;
+pub(crate) mod recall;
 mod search;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
@@ -24,6 +37,49 @@ pub type ReceivedMedia = (
     Option<String>,
     Option<InfoMessageContent>,
     Option<MediaMessageContent>,
+);
+pub type ReceivedReply = (
+    Message,
+    Option<String>,
+    Option<InfoMessageContent>,
+    Option<MediaMessageContent>,
+    Option<QuoteContent>,
+);
+
+/// Received rows and the (thread ID, message ID) keys newly counted unread.
+pub type ReceivedWithUnread = (Vec<(Message, Conversation)>, Vec<(String, String)>);
+
+#[cfg(feature = "messaging")]
+use crate::protocol::forward::ForwardMarker;
+#[cfg(not(feature = "messaging"))]
+enum ForwardMarker {}
+
+/// Worker-provided source marker scoped to a message within its HTTP preview batch.
+pub struct ForwardBinding {
+    #[cfg(feature = "messaging")]
+    pub(crate) thread_id: String,
+    #[cfg(feature = "messaging")]
+    pub(crate) message_id: String,
+    #[cfg(feature = "messaging")]
+    pub(crate) marker: ForwardMarker,
+}
+
+#[cfg(feature = "messaging")]
+use crate::protocol::recall::RecallNotice;
+#[cfg(not(feature = "messaging"))]
+enum RecallNotice {}
+
+#[derive(Default)]
+struct ReceiveExtras<'a> {
+    attention: Option<(&'a [ReceiptBinding], ReceiveContext)>,
+    #[cfg(feature = "messaging")]
+    notices: &'a [RecallNotice],
+}
+
+type ReceivedWithRecalls = (
+    Vec<(Message, Conversation)>,
+    Vec<(String, String)>,
+    Vec<recall::RecallChange>,
 );
 
 /// Closed, payload-free storage diagnostics. Never log an arbitrary error chain:
@@ -99,7 +155,7 @@ const CURSOR_PAGE_SQL: &str =
     WHERE m.account_id=?1 AND m.thread_id=?2 AND (m.sent_at_ms,m.message_id)<(?3,?4)
     ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?5";
 const CONVERSATIONS_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
-    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,'') FROM conversations c
+    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,''),EXISTS(SELECT 1 FROM group_left l WHERE l.account_id=c.account_id AND l.thread_id=c.thread_id) FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
         AND NOT EXISTS(SELECT 1 FROM list_silent_messages q WHERE q.account_id=recent.account_id AND q.thread_id=recent.thread_id AND q.message_id=recent.message_id)
@@ -112,7 +168,7 @@ const CONVERSATIONS_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms
     AND (m.rowid IS NOT NULL OR NOT EXISTS(SELECT 1 FROM messages x WHERE x.account_id=c.account_id AND x.thread_id=c.thread_id))
     ORDER BY c.last_message_at_ms DESC,c.thread_id LIMIT ?2";
 const CONVERSATION_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
-    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,'') FROM conversations c
+    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,''),EXISTS(SELECT 1 FROM group_left l WHERE l.account_id=c.account_id AND l.thread_id=c.thread_id) FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
         AND NOT EXISTS(SELECT 1 FROM list_silent_messages q WHERE q.account_id=recent.account_id AND q.thread_id=recent.thread_id AND q.message_id=recent.message_id)
@@ -127,6 +183,7 @@ fn conversation_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
         last_message_at_ms: r.get(2)?,
         last_text: r.get(3)?,
         last_sender: r.get(4)?,
+        group_left: r.get(5)?,
     })
 }
 fn insert_validated(conn: &Connection, messages: &[Message]) -> Result<usize> {
@@ -195,6 +252,7 @@ fn insert_validated_with_media<'a>(
                         "UPDATE messages SET body=?4 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
                         params![m.account_id, m.thread_id, m.id, m.text],
                     )?;
+                    message_reply::persist(conn, m, None)?;
                     continue;
                 }
                 if previous != (m.sender.clone(), m.text.clone(), m.sent_at_ms) {
@@ -203,6 +261,7 @@ fn insert_validated_with_media<'a>(
                 message_content::persist(conn, m, true)?;
                 message_info::persist(conn, m, info, true)?;
                 message_media::persist(conn, m, media, true)?;
+                message_reply::persist(conn, m, None)?;
                 continue;
             }
             thread.execute(params![m.account_id, m.thread_id, m.sent_at_ms])?;
@@ -217,9 +276,34 @@ fn insert_validated_with_media<'a>(
             message_content::persist(conn, m, false)?;
             message_info::persist(conn, m, info, false)?;
             message_media::persist(conn, m, media, false)?;
+            message_reply::persist(conn, m, None)?;
         }
     }
     Ok(inserted)
+}
+
+#[cfg(feature = "messaging")]
+fn structured_webchat_conflicts_with_send_echo(
+    conn: &Connection,
+    message: &Message,
+    marker: Option<&ForwardMarker>,
+) -> Result<bool> {
+    if !matches!(marker, Some(ForwardMarker::StructuredWebchat))
+        || message.sender != message.account_id
+    {
+        return Ok(false);
+    }
+    // An object row cannot turn an acknowledged intent into an accepted echo,
+    // or overwrite the canonical projection of a previously accepted send.
+    // Keep the rest of the verified batch and its cursor moving.
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM outgoing
+           WHERE account_id=?1 AND thread_id=?2 AND server_id=?3
+           UNION ALL SELECT 1 FROM forward_outbox
+           WHERE account_id=?1 AND thread_id=?2 AND server_id=?3)",
+        params![message.account_id, message.thread_id, message.id],
+        |row| row.get(0),
+    )?)
 }
 
 /// History stored before list-silent messages were recognised: e-cards kept only as their placeholder (their
@@ -281,7 +365,7 @@ impl MessageStore {
     fn initialize(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 9 {
+        if version > 16 {
             bail!("Database was created by a newer client");
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
@@ -319,9 +403,16 @@ impl MessageStore {
         message_content::initialize(&conn)?;
         message_info::initialize(&conn)?;
         message_media::initialize(&conn, version)?;
+        message_reply::initialize(&conn)?;
+        attachments::initialize(&conn)?;
+        photos::initialize(&conn)?;
+        read_state::initialize(&conn)?;
+        forward::initialize(&conn)?;
+        recall::initialize(&conn)?;
+        group_actions::initialize(&conn)?;
         message_media::reproject(&conn)?;
         silence_legacy(&conn)?;
-        conn.execute_batch("PRAGMA user_version=9; COMMIT;")?;
+        conn.execute_batch("PRAGMA user_version=16; COMMIT;")?;
         privacy::initialize(&conn)?;
         Ok(Self { conn })
     }
@@ -366,9 +457,34 @@ impl MessageStore {
         text: &str,
         now_ms: i64,
     ) -> Result<u64> {
+        self.prepare_outgoing_inner(account, thread, text, None, now_ms)
+    }
+    pub fn prepare_outgoing_reply(
+        &mut self,
+        account: &str,
+        thread: &str,
+        text: &str,
+        reply_to: &str,
+        now_ms: i64,
+    ) -> Result<u64> {
+        self.prepare_outgoing_inner(account, thread, text, Some(reply_to), now_ms)
+    }
+    fn prepare_outgoing_inner(
+        &mut self,
+        account: &str,
+        thread: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        now_ms: i64,
+    ) -> Result<u64> {
         validate_id(account)?;
         validate_id(thread)?;
-        if !self.live_thread_visible(account, thread)? {
+        if !self.live_thread_visible(account, thread)?
+            || self.group_write_blocked(account, thread)?
+        {
+            if reply_to.is_some() {
+                bail!(crate::domain::reply::ReplyUnavailable);
+            }
             bail!(FailureReason::Validation);
         }
         if text.len() > crate::domain::MAX_TEXT_BYTES || now_ms < 1 {
@@ -379,6 +495,30 @@ impl MessageStore {
             bail!("Invalid outgoing message");
         }
         let tx = self.conn.transaction()?;
+        let quote = if let Some(target) = reply_to {
+            validate_id(target).map_err(|_| crate::domain::reply::ReplyUnavailable)?;
+            let encrypted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM e2ee_threads WHERE account_id=?1 AND thread_id=?2)",
+                params![account, thread],
+                |row| row.get(0),
+            )?;
+            if encrypted {
+                bail!(crate::domain::reply::ReplyUnavailable);
+            }
+            let mut source = tx.query_row("SELECT sender,body,sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND NOT EXISTS(SELECT 1 FROM message_content WHERE account_id=?1 AND thread_id=?2 AND message_id=?3) AND NOT EXISTS(SELECT 1 FROM message_info WHERE account_id=?1 AND thread_id=?2 AND message_id=?3) AND NOT EXISTS(SELECT 1 FROM message_media WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)", params![account,thread,target], |row| Ok(Message {reply_blocked: false, recalled: false,
+                account_id:account.into(),thread_id:thread.into(),id:target.into(),sender:row.get(0)?,text:row.get(1)?,sent_at_ms:row.get(2)?,source_client_id:None,quote:None,sticker:None,media:None,
+            })).optional()?.ok_or(crate::domain::reply::ReplyUnavailable)?;
+            message_reply::hydrate(&tx, &mut source)?;
+            source
+                .validate()
+                .map_err(|_| crate::domain::reply::ReplyUnavailable)?;
+            Some(
+                MessageQuote::from_message(&source)
+                    .map_err(|_| crate::domain::reply::ReplyUnavailable)?,
+            )
+        } else {
+            None
+        };
         let unresolved: i64 = tx.query_row(
             "SELECT COUNT(*) FROM outgoing WHERE account_id=?1 AND state IN ('sending','unknown','acknowledged')",
             [account],
@@ -427,6 +567,9 @@ impl MessageStore {
         }
         tx.execute("INSERT INTO outgoing_counters(account_id,last_id) VALUES(?1,?2) ON CONFLICT(account_id) DO UPDATE SET last_id=excluded.last_id",params![account,next])?;
         tx.execute("INSERT INTO outgoing(account_id,thread_id,client_id,body,created_at_ms,state) VALUES(?1,?2,?3,?4,?5,'sending')",params![account,thread,next.to_string(),text,now_ms])?;
+        if let Some(quote) = quote {
+            tx.execute("INSERT INTO outgoing_reply(account_id,client_id,quote_metadata,quote_projection) VALUES(?1,?2,?3,?4)",params![account,next.to_string(),message_reply::synthetic(&quote)?.as_json(),serde_json::to_string(&quote)?])?;
+        }
         tx.commit()?;
         Ok(next as u64)
     }
@@ -460,7 +603,9 @@ impl MessageStore {
         validate_id(account)?;
         validate_id(server_id)?;
         let changed=self.conn.execute("UPDATE outgoing SET state='acknowledged',server_id=?3 WHERE account_id=?1 AND client_id=?2 AND (server_id IS NULL OR server_id=?3)
-            AND NOT EXISTS(SELECT 1 FROM outgoing other WHERE other.account_id=outgoing.account_id AND other.thread_id=outgoing.thread_id AND other.server_id=?3 AND other.client_id<>outgoing.client_id)",params![account,client_id.to_string(),server_id])?;
+            AND NOT EXISTS(SELECT 1 FROM outgoing other WHERE other.account_id=outgoing.account_id AND other.thread_id=outgoing.thread_id AND other.server_id=?3 AND other.client_id<>outgoing.client_id)
+            AND NOT EXISTS(SELECT 1 FROM forward_outbox WHERE account_id=?1 AND thread_id=outgoing.thread_id AND server_id=?3)
+            AND NOT EXISTS(SELECT 1 FROM message_forward WHERE account_id=?1 AND thread_id=outgoing.thread_id AND message_id=?3 AND kind='forwarded')",params![account,client_id.to_string(),server_id])?;
         if changed != 1 {
             bail!(FailureReason::ConflictingEcho);
         }
@@ -493,7 +638,9 @@ impl MessageStore {
             bail!(FailureReason::ConflictingEcho);
         }
         let ambiguous: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM outgoing WHERE account_id=?1 AND thread_id=?2 AND server_id=?3 AND client_id<>?4)",
+            "SELECT EXISTS(SELECT 1 FROM outgoing WHERE account_id=?1 AND thread_id=?2 AND server_id=?3 AND client_id<>?4)
+              OR EXISTS(SELECT 1 FROM forward_outbox WHERE account_id=?1 AND thread_id=?2 AND server_id=?3)
+              OR EXISTS(SELECT 1 FROM message_forward WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND kind='forwarded')",
             params![account,thread,server_id,client_id.to_string()],
             |row| row.get(0),
         )?;
@@ -501,7 +648,11 @@ impl MessageStore {
             bail!(FailureReason::ConflictingEcho);
         }
         let existing_ts:Option<i64>=tx.query_row("SELECT sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",params![account,thread,server_id],|r|r.get(0)).optional()?;
-        let message = Message {
+        let mut message = Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: Some(client_id.to_string()),
+            quote: message_reply::outgoing(&tx, account, client_id)?,
             account_id: account.into(),
             thread_id: thread.clone(),
             id: server_id.into(),
@@ -511,8 +662,16 @@ impl MessageStore {
             media: None,
             sent_at_ms: existing_ts.or(timestamp).unwrap_or(created),
         };
+        if recall::materialized(&tx, &message)? {
+            recall::redact(&mut message);
+            tx.execute(
+                "UPDATE outgoing SET body=?3 WHERE account_id=?1 AND client_id=?2",
+                params![account, client_id.to_string(), crate::domain::RECALLED_TEXT],
+            )?;
+        }
         message.validate()?;
         insert_validated(&tx, std::slice::from_ref(&message))?;
+        message_reply::hydrate(&tx, &mut message)?;
         tx.execute("UPDATE outgoing SET state='accepted',server_id=?3 WHERE account_id=?1 AND client_id=?2",params![account,client_id.to_string(),server_id])?;
         let conversation = tx.query_row(
             CONVERSATION_SQL,
@@ -533,10 +692,12 @@ impl MessageStore {
             account,
             messages
                 .iter()
-                .map(|(message, client)| (message, client, None, None)),
+                .map(|(message, client)| (message, client, None, None, None, None)),
             messages.len(),
             cursor,
+            ReceiveExtras::default(),
         )
+        .map(|(messages, _, _)| messages)
     }
 
     /// Full info content is immutable and commits in the very same transaction
@@ -551,10 +712,12 @@ impl MessageStore {
             account,
             messages
                 .iter()
-                .map(|(message, client, info)| (message, client, info.as_ref(), None)),
+                .map(|(message, client, info)| (message, client, info.as_ref(), None, None, None)),
             messages.len(),
             cursor,
+            ReceiveExtras::default(),
         )
+        .map(|(messages, _, _)| messages)
     }
 
     pub fn receive_batch_with_media(
@@ -567,9 +730,99 @@ impl MessageStore {
             account,
             messages
                 .iter()
-                .map(|(m, c, i, media)| (m, c, i.as_ref(), media.as_ref())),
+                .map(|(m, c, i, media)| (m, c, i.as_ref(), media.as_ref(), None, None)),
             messages.len(),
             cursor,
+            ReceiveExtras::default(),
+        )
+        .map(|(messages, _, _)| messages)
+    }
+
+    pub fn receive_batch_with_replies(
+        &mut self,
+        account: &str,
+        messages: &[ReceivedReply],
+        cursor: Option<(&str, &str)>,
+    ) -> Result<Vec<(Message, Conversation)>> {
+        self.receive_batch_inner(
+            account,
+            messages.iter().map(|(m, c, i, media, quote)| {
+                (m, c, i.as_ref(), media.as_ref(), quote.as_ref(), None)
+            }),
+            messages.len(),
+            cursor,
+            ReceiveExtras::default(),
+        )
+        .map(|(messages, _, _)| messages)
+    }
+
+    /// Return committed messages and exact new unread keys from one transaction.
+    pub fn receive_batch_with_receipts(
+        &mut self,
+        account: &str,
+        messages: &[ReceivedReply],
+        cursor: Option<(&str, &str)>,
+        receipts: &[ReceiptBinding],
+        context: ReceiveContext,
+    ) -> Result<ReceivedWithUnread> {
+        self.receive_batch_inner(
+            account,
+            messages.iter().map(|(m, c, i, media, quote)| {
+                (m, c, i.as_ref(), media.as_ref(), quote.as_ref(), None)
+            }),
+            messages.len(),
+            cursor,
+            ReceiveExtras {
+                attention: Some((receipts, context)),
+                ..ReceiveExtras::default()
+            },
+        )
+        .map(|(messages, unread, _)| (messages, unread))
+    }
+
+    #[cfg(all(test, feature = "messaging"))]
+    pub(crate) fn receive_batch_with_forwards(
+        &mut self,
+        account: &str,
+        messages: &[(ReceivedReply, Option<ForwardMarker>)],
+        cursor: Option<(&str, &str)>,
+        receipts: &[ReceiptBinding],
+        context: ReceiveContext,
+    ) -> Result<ReceivedWithUnread> {
+        self.receive_batch_with_recalls(account, messages, cursor, receipts, context, &[])
+            .map(|(messages, unread, _)| (messages, unread))
+    }
+
+    #[cfg(feature = "messaging")]
+    pub(crate) fn receive_batch_with_recalls(
+        &mut self,
+        account: &str,
+        messages: &[(ReceivedReply, Option<ForwardMarker>)],
+        cursor: Option<(&str, &str)>,
+        receipts: &[ReceiptBinding],
+        context: ReceiveContext,
+        notices: &[RecallNotice],
+    ) -> Result<ReceivedWithRecalls> {
+        self.receive_batch_inner(
+            account,
+            messages
+                .iter()
+                .map(|((m, c, info, media, quote), forward)| {
+                    (
+                        m,
+                        c,
+                        info.as_ref(),
+                        media.as_ref(),
+                        quote.as_ref(),
+                        forward.as_ref(),
+                    )
+                }),
+            messages.len(),
+            cursor,
+            ReceiveExtras {
+                attention: Some((receipts, context)),
+                notices,
+            },
         )
     }
 
@@ -582,20 +835,24 @@ impl MessageStore {
                     &'a Option<String>,
                     Option<&'a InfoMessageContent>,
                     Option<&'a MediaMessageContent>,
+                    Option<&'a QuoteContent>,
+                    Option<&'a ForwardMarker>,
                 ),
             > + Clone,
         message_count: usize,
         cursor: Option<(&str, &str)>,
-    ) -> Result<Vec<(Message, Conversation)>> {
+        extras: ReceiveExtras<'_>,
+    ) -> Result<ReceivedWithRecalls> {
         validate_id(account).map_err(|_| FailureReason::Validation)?;
         if message_count > MAX_PAGE_SIZE {
             bail!(FailureReason::Validation);
         }
         let mut info_bytes = 0usize;
-        for (m, _, info, media) in messages.clone() {
+        for (m, _, info, media, quote, _) in messages.clone() {
             m.validate().map_err(|_| FailureReason::Validation)?;
             info_bytes = info_bytes.saturating_add(info.map_or(0, |info| info.as_json().len()));
             info_bytes = info_bytes.saturating_add(media.map_or(0, |media| media.as_json().len()));
+            info_bytes = info_bytes.saturating_add(quote.map_or(0, |quote| quote.as_json().len()));
             if m.account_id != account
                 || (info.is_some() && m.sticker.is_some())
                 || (info.is_some() && (media.is_some() || m.media.is_some()))
@@ -613,13 +870,142 @@ impl MessageStore {
                 bail!(FailureReason::Validation);
             }
         }
+        let receipts = if let Some((bindings, _)) = extras.attention {
+            read_state::validate_bindings(
+                account,
+                messages.clone().map(|(message, ..)| message),
+                bindings,
+            )?
+        } else {
+            Default::default()
+        };
+        let fresh = extras
+            .attention
+            .is_some_and(|(_, context)| context == ReceiveContext::LiveFresh);
         let tx = self.conn.transaction()?;
+        #[cfg(feature = "messaging")]
+        let changes = {
+            if extras.notices.len() > MAX_PAGE_SIZE {
+                bail!(FailureReason::Validation);
+            }
+            let mut changes = Vec::new();
+            for notice in extras.notices {
+                if let Some(change) = recall::apply_notice(&tx, account, notice)? {
+                    changes.push(change);
+                }
+            }
+            changes
+        };
+        #[cfg(not(feature = "messaging"))]
+        let changes = Vec::new();
+        let mut unread = Vec::new();
         let mut result = Vec::with_capacity(message_count);
-        for (m, client_id, info, media) in messages {
+        for (source, client_id, info, media, quote, _marker) in messages {
+            #[cfg(feature = "messaging")]
+            if structured_webchat_conflicts_with_send_echo(&tx, source, _marker)? {
+                continue;
+            }
+            let binding = receipts
+                .get(&(source.thread_id.as_str(), source.id.as_str()))
+                .copied();
+            let new_unread_candidate = if fresh
+                && info.is_none()
+                && binding.is_some_and(|r| r.counts_unread)
+                && source.sender != account
+                && source.sender != "0"
+            {
+                !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)",
+                    params![account, source.thread_id, source.id],
+                    |row| row.get::<_, bool>(0),
+                )?
+            } else {
+                false
+            };
+            let mut message = source.clone();
+            let m = &mut message;
+            #[cfg(feature = "messaging")]
+            let recalled = {
+                let plain = info.is_none()
+                    && media.is_none()
+                    && quote.is_none()
+                    && m.quote.is_none()
+                    && m.sticker.is_none()
+                    && m.media.is_none()
+                    && m.reply_reference().is_some()
+                    && !matches!(
+                        _marker,
+                        Some(ForwardMarker::Parsed(_) | ForwardMarker::Unavailable)
+                    );
+                let recalled = recall::redact_replay(&tx, m, plain)?;
+                if recalled && plain {
+                    recall::settle_recalled_own_echo(&tx, source)?;
+                }
+                recalled
+            };
+            #[cfg(not(feature = "messaging"))]
+            let recalled = {
+                let recalled = recall::materialized(&tx, m)?;
+                if recalled {
+                    recall::redact(m);
+                }
+                recalled
+            };
+            let info = info.filter(|_| !recalled);
+            let media = media.filter(|_| !recalled);
+            let quote = quote.filter(|_| !recalled);
+            #[cfg(feature = "messaging")]
+            if let Some(quote) = &mut m.quote {
+                recall::redact_quote(&tx, &m.account_id, &m.thread_id, quote)?;
+            }
+            let mut previous_reply = m.clone();
+            previous_reply.source_client_id = None;
+            previous_reply.quote = None;
+            previous_reply.reply_blocked = false;
+            message_reply::hydrate(&tx, &mut previous_reply)?;
             let mut adjusted = 0;
+            #[cfg(feature = "messaging")]
+            let bound_forward = if !recalled && info.is_none() && media.is_none() && quote.is_none()
+            {
+                forward::reconcile_received(&tx, m, client_id.as_deref(), _marker)?
+            } else {
+                None
+            };
+            #[cfg(feature = "messaging")]
+            let is_forwarded = bound_forward.is_some()
+                || matches!(
+                    _marker,
+                    Some(ForwardMarker::Parsed(_) | ForwardMarker::Unavailable)
+                )
+                || (m.sender == account
+                    && forward::server_reserved(&tx, account, &m.thread_id, &m.id)?);
+            #[cfg(not(feature = "messaging"))]
+            let is_forwarded = false;
+            #[cfg(feature = "messaging")]
+            let is_structured_webchat = matches!(_marker, Some(ForwardMarker::StructuredWebchat));
+            #[cfg(not(feature = "messaging"))]
+            let is_structured_webchat = false;
+            #[cfg(feature = "messaging")]
+            if let Some(bound) = &bound_forward {
+                adjusted += usize::from(bound.retimed);
+            }
+            if is_forwarded {
+                m.reply_blocked = true;
+            }
+            if let Some(media) = media.filter(|_| !is_forwarded) {
+                if attachments::reconcile_received(&tx, m, client_id.as_deref(), media)? {
+                    adjusted += 1;
+                }
+                if photos::reconcile_received(&tx, m, client_id.as_deref(), media)? {
+                    adjusted += 1;
+                }
+            }
             // System/info events can carry source cliMsgId values but are not
             // acknowledgements of the user's plain-text send intent.
-            if m.sender == account
+            if !recalled
+                && !is_forwarded
+                && !is_structured_webchat
+                && m.sender == account
                 && info.is_none()
                 && media.is_none()
                 && m.media.is_none()
@@ -673,6 +1059,21 @@ impl MessageStore {
                             anyhow::Error::new(mismatch).context(FailureReason::OutgoingMismatch)
                         );
                     }
+                    if let Some(expected) =
+                        message_reply::outgoing(&tx, account, client_id.parse()?)?
+                    {
+                        m.quote = Some(
+                            m.quote
+                                .as_ref()
+                                .map(|quote| message_reply::merge_quote(&expected, quote))
+                                .transpose()?
+                                .unwrap_or(expected),
+                        );
+                    }
+                    if m.source_client_id.is_none() || previous_id.as_deref() == Some(m.id.as_str())
+                    {
+                        m.source_client_id = Some(client_id.clone());
+                    }
                     if repair_body {
                         let rich:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM message_content WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)",params![account,m.thread_id,m.id],|row|row.get(0))?;
                         if rich {
@@ -697,11 +1098,39 @@ impl MessageStore {
             }
             let sticker_enriched = m.sticker.is_some() && message_content::load(&tx, m)?.is_none();
             let media_enriched = media.is_some() && !message_media::exists(&tx, m)?;
-            let inserted = insert_validated_with_media(&tx, std::iter::once((m, info, media)))?;
+            let inserted = insert_validated_with_media(&tx, std::iter::once((&*m, info, media)))?;
+            if let Some(binding) = binding.filter(|_| !recalled) {
+                if read_state::persist(&tx, source, binding, new_unread_candidate, info.is_none())?
+                {
+                    unread.push((m.thread_id.clone(), m.id.clone()));
+                }
+            }
+            #[cfg(feature = "messaging")]
+            let forward_enriched = match (bound_forward, _marker.filter(|_| !recalled)) {
+                (Some(bound), _) => {
+                    forward::persist(&tx, m, &ForwardMarker::Parsed(bound.reference))?
+                }
+                (_, Some(marker)) => forward::persist(&tx, m, marker)?,
+                _ => false,
+            };
+            #[cfg(not(feature = "messaging"))]
+            let forward_enriched = false;
+            let quote_enriched = message_reply::persist(&tx, m, quote)?;
+            let reply_enriched = quote_enriched
+                || (m.source_client_id.is_some()
+                    && m.source_client_id != previous_reply.source_client_id)
+                || (m.quote.is_some() && m.quote != previous_reply.quote)
+                || (m.reply_blocked && !previous_reply.reply_blocked);
             if adjusted > 0 {
                 tx.execute("UPDATE conversations SET last_message_at_ms=(SELECT MAX(sent_at_ms) FROM messages WHERE account_id=?1 AND thread_id=?2) WHERE account_id=?1 AND thread_id=?2",params![account,m.thread_id])?;
             }
-            if inserted > 0 || adjusted > 0 || sticker_enriched || media_enriched {
+            if inserted > 0
+                || adjusted > 0
+                || sticker_enriched
+                || media_enriched
+                || reply_enriched
+                || forward_enriched
+            {
                 let c = tx.query_row(
                     CONVERSATION_SQL,
                     params![account, m.thread_id, MAX_PREVIEW_CHARS as i64],
@@ -709,6 +1138,7 @@ impl MessageStore {
                 )?;
                 let mut hydrated = m.clone();
                 hydrated.media = message_media::projection(&tx, m)?;
+                message_reply::hydrate(&tx, &mut hydrated)?;
                 result.push((hydrated, c));
             }
         }
@@ -716,7 +1146,7 @@ impl MessageStore {
             tx.execute("INSERT INTO receive_cursors(account_id,queue,last_id) VALUES(?1,?2,?3) ON CONFLICT(account_id,queue) DO UPDATE SET last_id=CASE WHEN length(excluded.last_id)>length(last_id) OR (length(excluded.last_id)=length(last_id) AND excluded.last_id>last_id) THEN excluded.last_id ELSE last_id END",params![account,queue,id])?;
         }
         tx.commit()?;
-        Ok(result)
+        Ok((result, unread, changes))
     }
 
     /// Explicit bounded worker-side access; pages never load full rich payloads.
@@ -783,6 +1213,10 @@ impl MessageStore {
             let message = statement
                 .query_row(params![account, thread, id], |row| {
                     Ok(Message {
+                        reply_blocked: false,
+                        recalled: false,
+                        source_client_id: None,
+                        quote: None,
                         account_id: row.get(0)?,
                         thread_id: row.get(1)?,
                         id: row.get(2)?,
@@ -796,6 +1230,7 @@ impl MessageStore {
                 .optional()?;
             if let Some(mut message) = message {
                 message.media = message_media::projection(&self.conn, &message)?;
+                message_reply::hydrate(&self.conn, &mut message)?;
                 message
                     .validate()
                     .map_err(|_| FailureReason::ConflictingMetadata)?;
@@ -872,6 +1307,10 @@ impl MessageStore {
         }
         let row = |r: &rusqlite::Row<'_>| {
             Ok(Message {
+                reply_blocked: false,
+                recalled: false,
+                source_client_id: None,
+                quote: None,
                 account_id: r.get(0)?,
                 thread_id: r.get(1)?,
                 id: r.get(2)?,
@@ -899,6 +1338,7 @@ impl MessageStore {
         };
         for message in &mut result {
             message.media = message_media::projection(&self.conn, message)?;
+            message_reply::hydrate(&self.conn, message)?;
             message
                 .validate()
                 .map_err(|_| FailureReason::ConflictingMetadata)?;
@@ -924,6 +1364,11 @@ impl MessageStore {
         for (thread, id) in messages {
             validate_id(thread)?;
             validate_id(id)?;
+            tx.execute(
+                "DELETE FROM message_unread WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
+                params![account, thread, id],
+            )?;
+            tx.execute("DELETE FROM read_receipt_outbox WHERE account_id=?1 AND thread_id=?2 AND message_id=?3", params![account, thread, id])?;
             if tx.execute(
                 "INSERT OR IGNORE INTO list_silent_messages(account_id,thread_id,message_id)
                     SELECT account_id,thread_id,message_id FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
@@ -1022,6 +1467,10 @@ mod tests {
     use super::*;
     fn m(account: &str, thread: &str, id: &str, ts: i64) -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: account.into(),
             thread_id: thread.into(),
             id: id.into(),
@@ -1278,6 +1727,10 @@ mod list_silence_tests {
     use super::*;
     fn incoming(thread: &str, id: &str, text: &str, ts: i64) -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "11".into(),
             thread_id: thread.into(),
             id: id.into(),
@@ -1417,6 +1870,10 @@ mod live_storage_tests {
     }
     fn echo(id: &str, ts: i64) -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "11".into(),
             thread_id: "d:22".into(),
             id: id.into(),
@@ -1426,6 +1883,11 @@ mod live_storage_tests {
             media: None,
             sent_at_ms: ts,
         }
+    }
+    fn acknowledged_echo(id: &str, ts: i64) -> Message {
+        let mut message = echo(id, ts);
+        message.source_client_id = Some("1700000000000".into());
+        message
     }
     #[test]
     fn client_ids_are_persisted_monotonic_scoped_safe_integers_and_unknown_is_never_replayed() {
@@ -1460,7 +1922,7 @@ mod live_storage_tests {
                 .unwrap();
             assert_eq!(
                 s.page("11", "d:22", None, 10).unwrap(),
-                vec![echo("900", 20)]
+                vec![acknowledged_echo("900", 20)]
             );
             assert!(s.accept_outgoing("11", id, "901", None).is_err());
             assert!(s
@@ -1535,7 +1997,10 @@ mod live_storage_tests {
             assert_eq!(result.len(), 1);
             assert_eq!(
                 s.page("11", "d:22", None, 10).unwrap(),
-                vec![received.clone()]
+                vec![Message {
+                    source_client_id: Some("1700000000000".into()),
+                    ..received.clone()
+                }]
             );
             assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "100");
             let body: String = s
@@ -1684,7 +2149,7 @@ mod live_storage_tests {
                 .unwrap();
             assert_eq!(
                 s.page("11", "d:22", None, 10).unwrap(),
-                vec![echo("900", 20)]
+                vec![acknowledged_echo("900", 20)]
             );
             assert!(s
                 .receive_batch(
@@ -1704,7 +2169,7 @@ mod live_storage_tests {
         s.accept_outgoing("11", id, "900", Some(19)).unwrap();
         assert_eq!(
             s.page("11", "d:22", None, 10).unwrap(),
-            vec![echo("900", 20)]
+            vec![acknowledged_echo("900", 20)]
         );
     }
     #[test]
@@ -1757,7 +2222,7 @@ mod live_storage_tests {
             assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "100");
             assert_eq!(
                 s.page("11", "d:22", None, 10).unwrap(),
-                vec![echo("900", 19)]
+                vec![acknowledged_echo("900", 19)]
             );
             let state: String = s
                 .conn
@@ -1800,7 +2265,7 @@ mod live_storage_tests {
         assert_eq!(classify_failure(&error), FailureReason::ConflictingEcho);
         assert_eq!(
             s.page("11", "d:22", None, 10).unwrap(),
-            vec![echo("900", 19)]
+            vec![acknowledged_echo("900", 19)]
         );
         assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "1");
         let third = s.prepare_outgoing("11", "d:33", "other thread", 1).unwrap();
@@ -1842,7 +2307,7 @@ mod live_storage_tests {
         assert_eq!(classify_failure(&error), FailureReason::Sqlite);
         assert_eq!(
             s.page("11", "d:22", None, 10).unwrap(),
-            vec![echo("900", 19)]
+            vec![acknowledged_echo("900", 19)]
         );
         assert_eq!(s.receive_cursor("11", "510_0").unwrap(), "100");
         assert_eq!(s.conversations("11", 10).unwrap()[0].last_message_at_ms, 19);
@@ -1901,6 +2366,10 @@ mod live_storage_tests {
                 "11",
                 &[(
                     Message {
+                        reply_blocked: false,
+                        recalled: false,
+                        source_client_id: None,
+                        quote: None,
                         text: "conflict".into(),
                         ..m.clone()
                     },
@@ -1929,5 +2398,150 @@ mod live_storage_tests {
         assert_eq!(c.title, "Known friend");
         assert_eq!(c.last_message_at_ms, 20);
         assert_eq!(c.last_text, "hello");
+    }
+}
+
+#[cfg(all(test, feature = "messaging"))]
+mod file_plaintext_ack_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn structured_webchat_never_settles_outgoing_and_does_not_hold_the_cursor() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let client = store
+            .prepare_outgoing("11", "d:22", "same projection", 1700000000000)
+            .unwrap();
+        store.record_outgoing_ack("11", client, "992").unwrap();
+        let row = |id: &str, sender: &str, text: &str| Message {
+            account_id: "11".into(),
+            thread_id: "d:22".into(),
+            id: id.into(),
+            sender: sender.into(),
+            text: text.into(),
+            sent_at_ms: 1700000000001,
+            quote: None,
+            sticker: None,
+            media: None,
+            source_client_id: None,
+            reply_blocked: true,
+            recalled: false,
+        };
+        let rows = [
+            (
+                (
+                    row("992", "11", "same projection"),
+                    Some(client.to_string()),
+                    None,
+                    None,
+                    None,
+                ),
+                Some(ForwardMarker::StructuredWebchat),
+            ),
+            (
+                (
+                    row("993", "22", "independent rich text"),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                Some(ForwardMarker::StructuredWebchat),
+            ),
+        ];
+        for expected_rows in [1, 0] {
+            let (published, unread) = store
+                .receive_batch_with_forwards(
+                    "11",
+                    &rows,
+                    Some(("510_1", "100")),
+                    &[],
+                    ReceiveContext::OfflineSync,
+                )
+                .unwrap();
+            assert_eq!(published.len(), expected_rows);
+            assert!(unread.is_empty());
+        }
+        assert_eq!(store.receive_cursor("11", "510_1").unwrap(), "100");
+        let page = store.page("11", "d:22", None, 10).unwrap();
+        assert_eq!(page, [rows[1].0 .0.clone()]);
+        let state: String = store
+            .conn
+            .query_row(
+                "SELECT state FROM outgoing WHERE account_id='11' AND client_id=?1",
+                [client.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "acknowledged");
+    }
+
+    #[test]
+    fn own_file_hint_never_acknowledges_a_plaintext_intent_without_a_typed_file_ledger() {
+        for kind in ["share.file", "chat.photo"] {
+            for content in [
+                json!({"title":"synthetic.txt","href":"https://files.example.test/file","params":{"fileSize":3,"fileExt":"txt"}}),
+                json!({"title":"synthetic.txt","href":"https://files.example.test/file","params":{"fileSize":3,"fileExt":"txt","secureKey":"synthetic-key"}}),
+                json!({"unknown":{"retained":true},"params":{"futureSchema":{"opaque":7}}}),
+            ] {
+                let mut store = MessageStore::in_memory().unwrap();
+                let client = store
+                    .prepare_outgoing("11", "d:22", "pending ordinary text", 1700000000000)
+                    .unwrap();
+                let payload = json!({"error_code":0,"data":{"msgs":[{"uidFrom":"11","idTo":"22","msgId":"991","cliMsgId":client,"ts":"1700000000001","msgType":kind,"content":content}]}});
+                let mut incoming =
+                    crate::protocol::messaging::incoming_messages("11", &payload).unwrap();
+                let file = incoming.pop().unwrap();
+                assert_eq!(file.client_id, Some(client.to_string()));
+                let received = store
+                    .receive_batch_with_replies(
+                        "11",
+                        &[(
+                            file.message,
+                            file.client_id,
+                            file.info,
+                            file.media,
+                            file.quote_content,
+                        )],
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    received.len(),
+                    1,
+                    "Independent file history can be retained"
+                );
+                let (state, server): (String, Option<String>) = store
+                .conn
+                .query_row(
+                    "SELECT state,server_id FROM outgoing WHERE account_id='11' AND client_id=?1",
+                    [client.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+                assert_eq!(state, "sending");
+                assert_eq!(server, None, "A file hint cannot bind a plain-text ACK");
+                assert_eq!(
+                    store
+                        .conn
+                        .query_row("SELECT count(*) FROM attachment_outbox", [], |row| row
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    store
+                        .conn
+                        .query_row(
+                            "SELECT count(*) FROM messages WHERE body='pending ordinary text'",
+                            [],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    0,
+                    "No accepted plain-text echo may be synthesized"
+                );
+            }
+        }
     }
 }

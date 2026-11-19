@@ -399,6 +399,10 @@ async fn authenticated_preview_source_shapes_and_rejections_preserve_local_state
             commits: 0,
         };
         let cached = crate::domain::Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "11".into(),
             thread_id: "d:12".into(),
             id: "499".into(),
@@ -687,6 +691,7 @@ async fn unsupported_friend_presentation_preserves_cached_identity_and_reports_p
         .apply_directory_batch(&DirectoryBatch {
             message_info: Vec::new(),
             message_media: Vec::new(),
+            message_quotes: Vec::new(),
             account_id: "11".into(),
             entries: vec![DirectoryRecord {
                 remote_id: "13".into(),

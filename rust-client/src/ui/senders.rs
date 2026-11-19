@@ -106,16 +106,25 @@ mod cache {
             // The normal pane is PAGE_SIZE=50; the defensive cap also bounds
             // malformed fixture input, preferring the latest visible messages.
             let mut ids = Vec::new();
-            for message in model.messages.iter().rev().filter(|message| {
-                message.account_id == account
-                    && message.thread_id == thread
-                    && message.sender != account
-            }) {
-                if !ids.contains(&message.sender) && validate_id(&message.sender).is_ok() {
-                    ids.push(message.sender.clone());
-                    if ids.len() == MAX_SENDER_NAMES {
-                        break;
+            for message in model
+                .messages
+                .iter()
+                .rev()
+                .filter(|message| message.account_id == account && message.thread_id == thread)
+            {
+                for owner in std::iter::once(message.sender.as_str())
+                    .chain(message.quote.as_ref().map(|quote| quote.owner_id.as_str()))
+                {
+                    if owner != account
+                        && !ids.iter().any(|id| id == owner)
+                        && validate_id(owner).is_ok()
+                        && ids.len() < MAX_SENDER_NAMES
+                    {
+                        ids.push(owner.to_owned());
                     }
+                }
+                if ids.len() == MAX_SENDER_NAMES {
+                    break;
                 }
             }
             ids.sort_unstable();
@@ -250,6 +259,10 @@ mod cache {
             };
             model.messages = (1..=50)
                 .map(|i| Message {
+                    reply_blocked: false,
+                    recalled: false,
+                    source_client_id: None,
+                    quote: None,
                     account_id: "11".into(),
                     thread_id: "g:90".into(),
                     id: i.to_string(),
@@ -356,6 +369,10 @@ mod tests {
     use super::*;
     fn message() -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "11".into(),
             thread_id: "d:22".into(),
             id: "7".into(),
@@ -376,6 +393,7 @@ mod tests {
             last_message_at_ms: 1,
             last_text: "Synthetic".into(),
             last_sender: "22".into(),
+            group_left: false,
         };
         assert_eq!(
             label(&message, Some("11"), None, Some(&conversation), None).name,
@@ -442,12 +460,14 @@ mod tests {
                         Some("11"),
                         &name,
                         &name,
+                        &name,
                         None,
                         #[cfg(feature = "messaging")]
                         None,
                         #[cfg(feature = "messaging")]
                         None,
                         0,
+                        None,
                     );
                 });
             },
@@ -464,6 +484,7 @@ mod tests {
             last_message_at_ms: 1,
             last_text: String::new(),
             last_sender: String::new(),
+            group_left: false,
         };
         let unknown = label(&message, Some("11"), None, Some(&conversation), None);
         assert_eq!((unknown.name, unknown.avatar), ("Người gửi", "?"));

@@ -204,6 +204,10 @@ fn demo_screenshot() {
                 )?;
                 let messages: Vec<_> = (0..75)
                     .map(|i| Message {
+                        reply_blocked: false,
+                        recalled: false,
+                        source_client_id: None,
+                        quote: None,
                         account_id: crate::app::DEMO_ACCOUNT.into(),
                         thread_id: "welcome".into(),
                         id: format!("search-page-{i:03}"),
@@ -291,6 +295,10 @@ fn seed_shared_items(profile: &Profile) -> anyhow::Result<()> {
     let mut text = |id: &str, body: &str, at: i64| {
         batch.push((
             crate::domain::Message {
+                reply_blocked: false,
+                recalled: false,
+                source_client_id: None,
+                quote: None,
                 account_id: crate::app::DEMO_ACCOUNT.into(),
                 thread_id: "demo-design".into(),
                 id: id.into(),
@@ -313,6 +321,10 @@ fn seed_shared_items(profile: &Profile) -> anyhow::Result<()> {
     let media = |id: &str, kind: MediaKind, content: serde_json::Value, at: i64| {
         let content = MediaMessageContent::new(kind, &content).expect("synthetic content");
         let message = crate::domain::Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: crate::app::DEMO_ACCOUNT.into(),
             thread_id: "demo-design".into(),
             id: id.into(),

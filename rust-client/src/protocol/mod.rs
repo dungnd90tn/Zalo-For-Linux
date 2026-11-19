@@ -6,18 +6,32 @@ pub mod client;
 #[cfg(feature = "messaging")]
 pub mod directory;
 #[cfg(feature = "messaging")]
+pub(crate) mod forward;
+#[cfg(feature = "messaging")]
+pub(crate) mod group_actions;
+#[cfg(feature = "messaging")]
+pub(crate) mod group_roster;
+#[cfg(feature = "messaging")]
 pub(crate) mod hidden;
 #[cfg(feature = "network")]
 pub mod http;
 #[cfg(feature = "messaging")]
 pub mod messaging;
+#[cfg(feature = "messaging")]
+pub mod photo;
 pub mod qr;
+#[cfg(feature = "messaging")]
+pub(crate) mod read_state;
+#[cfg(feature = "messaging")]
+pub(crate) mod recall;
 #[cfg(feature = "live-login")]
 pub mod session;
 #[cfg(feature = "messaging")]
 pub mod signal;
 #[cfg(feature = "trust-wasm")]
 pub mod trust;
+#[cfg(feature = "messaging")]
+pub mod upload;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

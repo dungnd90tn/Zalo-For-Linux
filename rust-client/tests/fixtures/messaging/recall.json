@@ -1,0 +1,66 @@
+{
+  "provenance": "Original undoMessage request builder with synthetic IDs and identity AES. Group method shown for contrast; native scope is ordinary direct text.",
+  "direct": [
+    {
+      "name": "direct_own_text",
+      "peer": "22",
+      "msgId": "9001",
+      "clientId": 7001,
+      "cliMsgIdUndo": "8001",
+      "request": {
+        "path": "/api/message/undo",
+        "host": "chat.example.test",
+        "query": {
+          "zpw_ver": "681",
+          "zpw_type": "24"
+        },
+        "payload": {
+          "msgId": "9001",
+          "toid": "22",
+          "clientId": 7001,
+          "cliMsgIdUndo": "8001"
+        },
+        "metric": 11281
+      }
+    },
+    {
+      "name": "direct_large_exact_message_id",
+      "peer": "22",
+      "msgId": "900719925474099123",
+      "clientId": 7002,
+      "cliMsgIdUndo": "8002",
+      "request": {
+        "path": "/api/message/undo",
+        "host": "chat.example.test",
+        "query": {
+          "zpw_ver": "681",
+          "zpw_type": "24"
+        },
+        "payload": {
+          "msgId": "900719925474099123",
+          "toid": "22",
+          "clientId": 7002,
+          "cliMsgIdUndo": "8002"
+        },
+        "metric": 11281
+      }
+    }
+  ],
+  "group": {
+    "path": "/api/group/undomsg",
+    "host": "group.example.test",
+    "query": {
+      "zpw_ver": "681",
+      "zpw_type": "24"
+    },
+    "payload": {
+      "msgId": "9001",
+      "grid": "77",
+      "clientId": 7001,
+      "visibility": 0,
+      "cliMsgIdUndo": "8001",
+      "imei": "synthetic-device"
+    },
+    "metric": 11192
+  }
+}

@@ -1,5 +1,6 @@
 //! A file the user chose to send, checked before anything is sent or stored. Inspecting a path
 //! touches the filesystem, so callers run [`Attachment::inspect`] on a background thread.
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// The original client's `small_file_size_limit`: larger files go through Zalo Cloud, which this
@@ -32,7 +33,7 @@ impl std::fmt::Display for AttachmentError {
 }
 impl std::error::Error for AttachmentError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Attachment {
     pub path: PathBuf,
     /// File name without directories, exactly as it will be shown and sent.
@@ -40,9 +41,21 @@ pub struct Attachment {
     /// Lowercase extension without the dot; empty when there is none.
     pub extension: String,
     pub size_bytes: u64,
+    identity: (u64, u64, u64, i64, i64, i64, i64),
+}
+impl std::fmt::Debug for Attachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Attachment")
+            .field("size_bytes", &self.size_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Attachment {
+    #[cfg(feature = "messaging")]
+    pub(crate) fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        self.identity == file_identity(metadata)
+    }
     /// Check `path` and read its size. Follows symbolic links like a file dialog does, but only
     /// a regular file qualifies; the file content is not read.
     pub fn inspect(path: &Path) -> Result<Self, AttachmentError> {
@@ -83,8 +96,21 @@ impl Attachment {
             name,
             extension,
             size_bytes,
+            identity: file_identity(&metadata),
         })
     }
+}
+
+fn file_identity(m: &std::fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
+    (
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    )
 }
 
 #[cfg(test)]
@@ -107,6 +133,18 @@ mod tests {
             .write_all(bytes)
             .unwrap();
         path
+    }
+
+    #[test]
+    fn diagnostics_do_not_expose_the_selected_path_or_file_name() {
+        let dir = temp_dir("private-account-diagnostics");
+        let path = write(&dir, "Confidential-name.pdf", &[7u8; 42]);
+        let attachment = Attachment::inspect(&path).unwrap();
+        let debug = format!("{attachment:?}");
+        assert!(!debug.contains("private-account"));
+        assert!(!debug.contains("Confidential-name"));
+        assert!(debug.contains("42"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

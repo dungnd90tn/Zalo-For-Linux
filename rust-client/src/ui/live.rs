@@ -47,6 +47,18 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub delivery: super::delivery::DeliveryBook,
     #[cfg(feature = "messaging")]
+    pub attention: super::attention::Attention,
+    #[cfg(feature = "messaging")]
+    pub forwarding: super::forward::Forwarding,
+    #[cfg(feature = "messaging")]
+    pub recall: super::recall::Recall,
+    #[cfg(feature = "messaging")]
+    pub groups: super::group_members::Groups,
+    #[cfg(feature = "messaging")]
+    pub uploads: super::file_uploads::Uploads,
+    #[cfg(feature = "messaging")]
+    pub photo_preview: super::photos::Preview,
+    #[cfg(feature = "messaging")]
     pub directory: super::directory::DirectoryView,
     #[cfg(feature = "messaging")]
     pub stickers: super::stickers::StickerCache,
@@ -102,6 +114,18 @@ impl LiveState {
             #[cfg(feature = "messaging")]
             delivery: Default::default(),
             #[cfg(feature = "messaging")]
+            attention: Default::default(),
+            #[cfg(feature = "messaging")]
+            forwarding: Default::default(),
+            #[cfg(feature = "messaging")]
+            recall: Default::default(),
+            #[cfg(feature = "messaging")]
+            groups: Default::default(),
+            #[cfg(feature = "messaging")]
+            uploads: Default::default(),
+            #[cfg(feature = "messaging")]
+            photo_preview: Default::default(),
+            #[cfg(feature = "messaging")]
             directory: Default::default(),
             #[cfg(feature = "messaging")]
             stickers: Default::default(),
@@ -154,6 +178,7 @@ impl LiveState {
         };
         let repaint = self.context.clone();
         self.privacy.reset_worker();
+        self.attention = Default::default();
         self.sender_names = Default::default();
         self.hydration = Default::default();
         self.media = Default::default();
@@ -199,6 +224,11 @@ impl LiveState {
                 // A terminal generic fault must not hide the preceding typed diagnostic.
                 self.reason.get_or_insert_with(|| error.clone());
                 self.delivery.interrupted();
+                self.uploads.worker_closed();
+                self.forwarding.worker_closed();
+                self.recall.worker_closed();
+                self.groups.worker_closed();
+                self.photo_preview.clear();
             }
             _ => {}
         }
@@ -221,6 +251,11 @@ impl LiveState {
             model.apply_live(event, &account.id, latest_page);
         }
         self.delivery.interrupted();
+        self.uploads.worker_closed();
+        self.forwarding.worker_closed();
+        self.recall.worker_closed();
+        self.groups.worker_closed();
+        self.photo_preview.clear();
         self.directory.worker_closed();
         self.sender_names.worker_closed();
         self.hydration.worker_closed();
@@ -228,6 +263,7 @@ impl LiveState {
             self.connection = LiveConnection::Offline;
         }
         self.worker = None;
+        self.attention = Default::default();
         self.privacy.reset_worker();
         self.privacy.status = crate::app::live::LivePrivacyStatus::Failed;
     }
@@ -486,6 +522,8 @@ impl NativeApp {
                     #[cfg(feature = "messaging")]
                     {
                         state.directory = Default::default();
+                        state.uploads = Default::default();
+                        state.photo_preview.clear();
                         state.stickers = Default::default();
                         state.media = Default::default();
                         state.avatars = Default::default();
@@ -508,6 +546,12 @@ impl NativeApp {
                         state.reason = None;
                         state.connection = LiveConnection::Offline;
                         state.delivery = Default::default();
+                        state.attention = Default::default();
+                        state.forwarding = Default::default();
+                        state.recall = Default::default();
+                        state.groups = Default::default();
+                        state.uploads = Default::default();
+                        state.photo_preview.clear();
                         state.directory = Default::default();
                         state.stickers = Default::default();
                         state.media = Default::default();
@@ -605,6 +649,23 @@ impl NativeApp {
             return;
         }
         // Durable settlement is independent of whether its conversation is still visible.
+        state.uploads.observe(&event);
+        state
+            .attention
+            .scope(Some((account_id.clone(), Some(state.login.generation()))));
+        state.attention.observe(&event, &self.model);
+        state.forwarding.observe(&event);
+        state.recall.observe(&event);
+        if let LiveEvent::Recalled {
+            thread,
+            message_id,
+            actor_id,
+            ..
+        } = &event
+        {
+            self.drafts
+                .remove_recalled_reply(&account_id, thread, message_id, actor_id);
+        }
         self.drafts.apply_live(&event, &account_id);
         match &event {
             LiveEvent::Sent {
@@ -651,6 +712,9 @@ impl NativeApp {
             }
         ) {
             state.worker = None;
+            state.forwarding.worker_closed();
+            state.recall.worker_closed();
+            state.groups.worker_closed();
             state.privacy.reset_worker();
             state.privacy.status = crate::app::live::LivePrivacyStatus::Failed;
             self.quarantine_privacy(state, ctx, true);
@@ -693,8 +757,21 @@ impl NativeApp {
         let Some(event) = state.privacy.project(event) else {
             return;
         };
+        state.groups.observe(&event);
         state.privacy.observe_conversation(&event);
         self.quarantine_privacy(state, ctx, false);
+        if let LiveEvent::Recalled {
+            thread, message_id, ..
+        } = &event
+        {
+            state
+                .media
+                .close_recalled_viewer(&account_id, thread, message_id);
+            if self.model.selected.as_deref() == Some(thread) {
+                self.model.overview = Default::default();
+                state.hydration.invalidate(&account_id, &self.model, ctx);
+            }
+        }
         state.sender_names.apply(&event, &account_id, &self.model);
         state.avatars.scope(&account_id, state.privacy.revision);
         state.avatars.apply(&event);
@@ -809,6 +886,12 @@ impl NativeApp {
                             state.reason = None;
                             state.connection = LiveConnection::Offline;
                             state.delivery = Default::default();
+                            state.attention = Default::default();
+                            state.forwarding = Default::default();
+                            state.recall = Default::default();
+                            state.groups = Default::default();
+                            state.uploads = Default::default();
+                            state.photo_preview.clear();
                             state.directory = Default::default();
                             state.stickers = Default::default();
                             state.media = Default::default();
@@ -1122,6 +1205,11 @@ pub(in crate::ui) mod tests {
                 server_time_seconds: None,
                 parameter_encryption: None,
                 services: Default::default(),
+                file_chunk_size: 256_000,
+                photo_upload_route: None,
+                photo_limits: Default::default(),
+                seen_v2: true,
+                recall_max_age_ms: Some(300_000),
                 chat_poll: vec![],
                 control_poll: vec![],
                 websocket: vec![],
@@ -1365,6 +1453,7 @@ pub(in crate::ui) mod tests {
             last_message_at_ms: 0,
             last_text: String::new(),
             last_sender: String::new(),
+            group_left: false,
         });
         app.model.selected = Some(thread.into());
         app.drafts.select(thread).unwrap();
@@ -1625,6 +1714,10 @@ pub(in crate::ui) mod tests {
         let (mut app, root) = fixture(&ctx);
         let thread = "d:22";
         let original = crate::domain::Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             sticker: None,
             media: None,
             account_id: "11".into(),
@@ -1646,6 +1739,7 @@ pub(in crate::ui) mod tests {
                 last_message_at_ms: 100,
                 last_text: original.text.clone(),
                 last_sender: "22".into(),
+                group_left: false,
             }],
         };
         app.live
@@ -1683,6 +1777,7 @@ pub(in crate::ui) mod tests {
             .apply_directory_batch(&DirectoryBatch {
                 message_info: Vec::new(),
                 message_media: Vec::new(),
+                message_quotes: Vec::new(),
                 account_id: "11".into(),
                 entries: vec![entry.clone()],
                 messages: vec![],
@@ -1794,6 +1889,10 @@ pub(in crate::ui) mod tests {
                 let (mut app, root) = fixture(&ctx);
                 app.live.as_mut().unwrap().connection = connection;
                 let message = crate::domain::Message {
+                    reply_blocked: false,
+                    recalled: false,
+                    source_client_id: None,
+                    quote: None,
                     sticker: None,
                     media: None,
                     account_id: "11".into(),
@@ -1813,6 +1912,7 @@ pub(in crate::ui) mod tests {
                             last_message_at_ms: message.sent_at_ms,
                             last_text: message.text.clone(),
                             last_sender: "22".into(),
+                            group_left: false,
                         },
                     },
                     "11",
@@ -2149,6 +2249,9 @@ pub(in crate::ui) mod tests {
                     if let Some(live) = self.app.live.as_mut() {
                         live.privacy = super::super::privacy::Privacy::fixture_ready();
                         live.directory.fixture_rows();
+                        if std::env::var_os("ZALO_UI_FIXTURE_PHOTO").is_some() {
+                            live.uploads.photo_available = true;
+                        }
                     }
                 }
                 if !self.menu_opened && std::env::var_os("ZALO_UI_FIXTURE_MESSAGE_MENU").is_some() {
@@ -2180,7 +2283,15 @@ pub(in crate::ui) mod tests {
         let sender_mode = std::env::var("ZALO_UI_FIXTURE_SENDERS").ok();
         let info_mode = std::env::var_os("ZALO_UI_FIXTURE_INFO").is_some();
         let media_mode = std::env::var("ZALO_UI_FIXTURE_MEDIA").ok();
+        let attention_scene = std::env::var("ZALO_UI_FIXTURE_ATTENTION").ok();
+        let forward_scene = std::env::var("ZALO_UI_FIXTURE_FORWARD").ok();
+        let recall_scene = std::env::var("ZALO_UI_FIXTURE_RECALL").ok();
+        let group_scene = std::env::var("ZALO_UI_FIXTURE_GROUP").ok();
         let cached = media_mode.is_some()
+            || forward_scene.is_some()
+            || recall_scene.is_some()
+            || group_scene.is_some()
+            || attention_scene.is_some()
             || sticker
             || directory
             || sender_mode.is_some()
@@ -2227,7 +2338,11 @@ pub(in crate::ui) mod tests {
                 }
                 let (mut app, path) = fixture(&cc.egui_ctx);
                 *root.lock().unwrap() = Some(path);
-                if online {
+                if online
+                    || forward_scene.is_some()
+                    || recall_scene.is_some()
+                    || group_scene.is_some()
+                {
                     app.live.as_mut().unwrap().connection = LiveConnection::Online;
                     // Synthetic visual state only; no production authentication claim.
                     app.fixture_connection = Some(LiveConnection::Online);
@@ -2240,6 +2355,10 @@ pub(in crate::ui) mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (thread, sender, text))| crate::domain::Message {
+                        reply_blocked: false,
+                        recalled: false,
+                        source_client_id: None,
+                        quote: None,
                         sticker: None,
                         media: None,
                         account_id: "11".into(),
@@ -2263,12 +2382,85 @@ pub(in crate::ui) mod tests {
                             last_message_at_ms: m.sent_at_ms,
                             last_text: m.text.clone(),
                             last_sender: m.sender.clone(),
+                            group_left: false,
                         })
                         .collect();
                     app.model.selected = Some("d:22".into());
                     app.model.messages = vec![messages[0].clone()];
                     app.drafts.select("d:22").unwrap();
                     app.drafts.active.text = "Bản nháp ngoại tuyến".into();
+                }
+                if let Some(scene) = attention_scene.as_deref() {
+                    let mut outgoing = app.model.messages[0].clone();
+                    outgoing.id = "902".into();
+                    outgoing.sender = "11".into();
+                    outgoing.text = "Mình đã gửi bản kiểm thử.".into();
+                    outgoing.sent_at_ms += 6000;
+                    app.model.messages.push(outgoing);
+                    app.model.conversations[0].title = "Nguyễn Minh".into();
+                    app.model.conversations[1].title = "Đặng Hà".into();
+                    app.compact_list = scene == "filter" || scene == "list";
+                    let state = app.live.as_mut().unwrap();
+                    state
+                        .attention
+                        .fixture(&app.model, state.login.generation(), scene);
+                }
+                if let Some(scene) = forward_scene.as_deref() {
+                    app.model.messages[0].id = "901".into();
+                    app.model.messages[0].source_client_id = Some("900".into());
+                    let state = app.live.as_mut().unwrap();
+                    state.forwarding.fixture(
+                        "11",
+                        Some(state.login.generation()),
+                        app.model.generation,
+                        scene,
+                    );
+                }
+                if let Some(scene) = recall_scene.as_deref() {
+                    let message = &mut app.model.messages[0];
+                    message.id = "901".into();
+                    message.sender = "11".into();
+                    message.source_client_id = Some("900".into());
+                    if scene == "recalled" {
+                        message.recalled = true;
+                        message.text = crate::domain::RECALLED_TEXT.into();
+                        message.reply_blocked = true;
+                        message.source_client_id = None;
+                        app.model.conversations[0].last_text = crate::domain::RECALLED_TEXT.into();
+                        app.model.conversations[0].last_sender = "11".into();
+                    } else {
+                        let state = app.live.as_mut().unwrap();
+                        state.recall.fixture(
+                            Some(state.login.generation()),
+                            app.model.generation,
+                            scene,
+                        );
+                    }
+                }
+                if let Some(scene) = group_scene.as_deref() {
+                    let group = "g:70";
+                    app.model.conversations[0].id = group.into();
+                    app.model.conversations[0].title = "Nhóm thiết kế sản phẩm".into();
+                    app.model.conversations[0].group_left = scene == "left";
+                    app.model.messages[0].thread_id = group.into();
+                    app.model.selected = Some(group.into());
+                    app.drafts.select(group).unwrap();
+                    app.drafts.active.text = "Bản nháp được giữ lại".into();
+                    app.conversation_details = Some(("11".into(), group.into()));
+                    let state = app.live.as_mut().unwrap();
+                    state.groups.fixture(
+                        super::super::group_members::Scope {
+                            account: "11".into(),
+                            auth: Some(state.login.generation()),
+                            thread: group.into(),
+                            generation: app.model.generation,
+                            privacy_revision: state.privacy.revision,
+                        },
+                        scene,
+                    );
+                    if scene == "left" {
+                        app.conversation_details = None;
+                    }
                 }
                 if sticker {
                     use crate::domain::{Message, StickerDescriptor, LEGACY_STICKER_PLACEHOLDER};
@@ -2308,6 +2500,10 @@ pub(in crate::ui) mod tests {
                         .into_iter()
                         .enumerate()
                         .map(|(i, sticker)| Message {
+                            reply_blocked: false,
+                            recalled: false,
+                            source_client_id: None,
+                            quote: None,
                             account_id: "11".into(),
                             thread_id: "d:22".into(),
                             id: format!("fixture-sticker-{i}"),
@@ -2383,6 +2579,7 @@ pub(in crate::ui) mod tests {
                         .apply_directory_batch(&DirectoryBatch {
                             message_info: Vec::new(),
                             message_media: Vec::new(),
+                            message_quotes: Vec::new(),
                             account_id: "11".into(),
                             entries,
                             messages: vec![],
@@ -2426,6 +2623,10 @@ pub(in crate::ui) mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (sender, text))| Message {
+                        reply_blocked: false,
+                        recalled: false,
+                        source_client_id: None,
+                        quote: None,
                         account_id: "11".into(),
                         thread_id: thread.into(),
                         id: format!("sender-fixture-{i}"),
@@ -2444,6 +2645,7 @@ pub(in crate::ui) mod tests {
                         .apply_directory_batch(&DirectoryBatch {
                             message_info: Vec::new(),
                             message_media: Vec::new(),
+                            message_quotes: Vec::new(),
                             account_id: "11".into(),
                             entries,
                             messages: vec![],
@@ -2507,6 +2709,7 @@ pub(in crate::ui) mod tests {
                         .apply_directory_batch(&DirectoryBatch {
                             message_info: Vec::new(),
                             message_media: Vec::new(),
+                            message_quotes: Vec::new(),
                             account_id: "11".into(),
                             entries,
                             messages: vec![],
@@ -2537,7 +2740,239 @@ pub(in crate::ui) mod tests {
                 if std::env::var_os("ZALO_UI_FIXTURE_AVATARS").is_some() {
                     fixture_avatars(&mut app, &cc.egui_ctx);
                 }
+                if std::env::var_os("ZALO_UI_FIXTURE_REPLY").is_some() {
+                    use crate::domain::{Message, MessageQuote};
+                    let original = Message {
+                        reply_blocked: false,
+                        recalled: false,
+                        account_id: "11".into(),
+                        thread_id: "d:22".into(),
+                        id: "89001".into(),
+                        source_client_id: Some("99001".into()),
+                        sender: "22".into(),
+                        text:
+                            "Chiều nay mình họp lúc 15 giờ nhé.\nMang theo bản thiết kế mới nhất."
+                                .into(),
+                        sticker: None,
+                        media: None,
+                        quote: None,
+                        sent_at_ms: 1_700_000_000_000,
+                    };
+                    let quote = MessageQuote::from_message(&original).unwrap();
+                    let messages = vec![
+                        original.clone(),
+                        Message {
+                            reply_blocked: false,
+                            recalled: false,
+                            account_id: "11".into(),
+                            thread_id: "d:22".into(),
+                            id: "89002".into(),
+                            source_client_id: Some("99002".into()),
+                            sender: "11".into(),
+                            text: "Mình sẽ có mặt đúng giờ.".into(),
+                            sticker: None,
+                            media: None,
+                            quote: Some(quote.clone()),
+                            sent_at_ms: 1_700_000_060_000,
+                        },
+                        Message {
+                            reply_blocked: false,
+                            recalled: false,
+                            account_id: "11".into(),
+                            thread_id: "d:22".into(),
+                            id: "89003".into(),
+                            source_client_id: Some("99003".into()),
+                            sender: "22".into(),
+                            text: "Cảm ơn bạn, hẹn gặp lại!".into(),
+                            sticker: None,
+                            media: None,
+                            quote: Some(quote),
+                            sent_at_ms: 1_700_000_120_000,
+                        },
+                    ];
+                    let mut store = crate::store::MessageStore::open(
+                        &app._profile.paths.data_dir.join("messages.sqlite"),
+                    )
+                    .unwrap();
+                    store.insert_batch(&messages).unwrap();
+                    app.model.conversations = vec![Conversation {
+                        id: "d:22".into(),
+                        title: "Đặng Minh · dữ liệu tổng hợp".into(),
+                        last_message_at_ms: 1_700_000_120_000,
+                        last_text: "Cảm ơn bạn, hẹn gặp lại!".into(),
+                        last_sender: "22".into(),
+                        group_left: false,
+                    }];
+                    app.model.selected = Some("d:22".into());
+                    app.model.messages = store.page("11", "d:22", None, 50).unwrap();
+                    app.drafts.select("d:22").unwrap();
+                    app.drafts.active.text = "Tôi đã cập nhật bản thiết kế mới.".into();
+                    app.drafts
+                        .active
+                        .set_reply(original.reply_reference().unwrap());
+                }
+                if std::env::var_os("ZALO_UI_FIXTURE_PHOTO").is_some() {
+                    let path = app._profile.paths.data_dir.join("synthetic-preview.png");
+                    let image = image::RgbImage::from_fn(640, 400, |x, y| {
+                        image::Rgb([(x * 200 / 640) as u8, (y * 200 / 400) as u8, 140])
+                    });
+                    image.save(&path).unwrap();
+                    let source = crate::domain::Attachment::inspect(&path).unwrap();
+                    let photo = crate::app::live::runtime::photo::prepare_fixture(
+                        &app._profile,
+                        &source,
+                        "11",
+                        "d:22",
+                    )
+                    .unwrap();
+                    app.model.selected = Some("d:22".into());
+                    app.drafts.select("d:22").unwrap();
+                    app.drafts.active.clear_reply();
+                    app.drafts.active.text = "Ảnh HD đã chuẩn bị · nội dung tổng hợp.".into();
+                    let mut request = 0;
+                    app.drafts
+                        .active
+                        .prepare_live_photo(
+                            app.model.generation,
+                            "d:22".into(),
+                            source,
+                            |command| {
+                                if let LiveCommand::PreparePhoto { request_id, .. } = command {
+                                    request = request_id;
+                                }
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                    let event = LiveEvent::PhotoPrepared {
+                        account_id: "11".into(),
+                        generation: app.model.generation,
+                        thread: "d:22".into(),
+                        request_id: request,
+                        result: Ok(photo),
+                    };
+                    app.drafts.apply_live(&event, "11");
+                    app.live.as_mut().unwrap().uploads.photo_available = true;
+                    if let Ok(mode) = std::env::var("ZALO_UI_FIXTURE_PHOTO_UPLOAD") {
+                        use crate::app::live::{FileTransferPhase, TransferKind};
+                        let prepared = app.drafts.active.photo().unwrap().clone();
+                        let mut upload_request = 0;
+                        app.drafts
+                            .active
+                            .send_live_photo(app.model.generation, "d:22".into(), |command| {
+                                if let LiveCommand::SendPhoto { request_id, .. } = command {
+                                    upload_request = request_id;
+                                }
+                                Ok(())
+                            })
+                            .unwrap();
+                        let phase = match mode.as_str() {
+                            "waiting" => FileTransferPhase::WaitingForResource,
+                            "finalizing" => FileTransferPhase::Finalizing,
+                            "failed" => FileTransferPhase::Failed,
+                            "unknown" => FileTransferPhase::Unknown,
+                            _ => FileTransferPhase::Uploading,
+                        };
+                        let event = LiveEvent::FileTransfer {
+                            kind: TransferKind::Photo,
+                            account_id: "11".into(),
+                            thread: "d:22".into(),
+                            request_id: upload_request,
+                            phase,
+                            uploaded: prepared.size_bytes() / 2,
+                            total: prepared.size_bytes(),
+                            message: None,
+                        };
+                        let state = app.live.as_mut().unwrap();
+                        state
+                            .uploads
+                            .submitted_photo("d:22", upload_request, prepared);
+                        state.uploads.observe(&event);
+                        app.drafts.apply_live(&event, "11");
+                    }
+                }
+                if let Ok(mode) = std::env::var("ZALO_UI_FIXTURE_FILE_UPLOAD") {
+                    use crate::{
+                        app::live::FileTransferPhase,
+                        domain::{Attachment, FileDescriptor, MediaDescriptor, Message},
+                    };
+                    let path = app._profile.paths.data_dir.join("Bao-cao-tong-hop.pdf");
+                    std::fs::write(&path, vec![7u8; 24_576]).unwrap();
+                    let attachment = Attachment::inspect(&path).unwrap();
+                    app.model.selected = Some("d:22".into());
+                    let file_message = Message {
+                        account_id: "11".into(),
+                        thread_id: "d:22".into(),
+                        id: "98101".into(),
+                        sender: "22".into(),
+                        source_client_id: None,
+                        quote: None,
+                        reply_blocked: true,
+                        recalled: false,
+                        sticker: None,
+                        text: "Báo cáo.pdf".into(),
+                        sent_at_ms: 1_700_000_000_000,
+                        media: Some(MediaDescriptor::File(FileDescriptor {
+                            title: "Báo cáo.pdf".into(),
+                            extension: "pdf".into(),
+                            size_bytes: Some(24_576),
+                            url: None,
+                            encrypted: false,
+                            is_folder: false,
+                        })),
+                    };
+                    app.model.messages = vec![
+                        file_message.clone(),
+                        Message {
+                            id: "98102".into(),
+                            sender: "11".into(),
+                            sent_at_ms: 1_700_000_030_000,
+                            ..file_message
+                        },
+                    ];
+                    app.model.conversations = vec![Conversation {
+                        id: "d:22".into(),
+                        title: "Nhóm kiểm thử tệp · dữ liệu tổng hợp".into(),
+                        last_message_at_ms: 1_700_000_030_000,
+                        last_text: "Báo cáo.pdf".into(),
+                        last_sender: "11".into(),
+                        group_left: false,
+                    }];
+                    app.drafts.select("d:22").unwrap();
+                    app.drafts.active.clear_reply();
+                    app.drafts.active.text = "Nội dung này được giữ lại để gửi riêng.".into();
+                    app.drafts.active.set_attachment(attachment.clone());
+                    app.drafts
+                        .active
+                        .send_live_file(1, "d:22".into(), |_| Ok(()))
+                        .unwrap();
+                    let phase = match mode.as_str() {
+                        "waiting" => FileTransferPhase::WaitingForResource,
+                        "finalizing" => FileTransferPhase::Finalizing,
+                        "failed" => FileTransferPhase::Failed,
+                        "unknown" => FileTransferPhase::Unknown,
+                        _ => FileTransferPhase::Uploading,
+                    };
+                    let event = LiveEvent::FileTransfer {
+                        kind: crate::app::live::TransferKind::File,
+                        account_id: "11".into(),
+                        thread: "d:22".into(),
+                        request_id: 1,
+                        phase,
+                        uploaded: attachment.size_bytes / 2,
+                        total: attachment.size_bytes,
+                        message: None,
+                    };
+                    let state = app.live.as_mut().unwrap();
+                    state.uploads.available = true;
+                    state.uploads.submitted("d:22", 1, attachment);
+                    state.uploads.observe(&event);
+                    app.drafts.apply_live(&event, "11");
+                }
                 if media_mode.as_deref() == Some("files")
+                    || forward_scene.is_some()
+                    || recall_scene.is_some()
+                    || group_scene.is_some()
                     || std::env::var_os("ZALO_UI_FIXTURE_AVATARS").is_some()
                 {
                     fixture_content_worker(&mut app, &cc.egui_ctx);
@@ -2654,6 +3089,10 @@ pub(in crate::ui) mod tests {
             .map(|(i, (kind, source, failed))| {
                 let content = MediaMessageContent::new(kind, &source).unwrap();
                 let message = Message {
+                    reply_blocked: false,
+                    recalled: false,
+                    source_client_id: None,
+                    quote: None,
                     account_id: "11".into(),
                     thread_id: thread.into(),
                     id: format!("fixture-media-{i}"),
@@ -2676,6 +3115,10 @@ pub(in crate::ui) mod tests {
         if mode == "files" {
             messages.push((
                 Message {
+                    reply_blocked: false,
+                    recalled: false,
+                    source_client_id: None,
+                    quote: None,
                     account_id: "11".into(),
                     thread_id: thread.into(),
                     id: "fixture-short-own".into(),

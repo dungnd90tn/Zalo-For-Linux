@@ -332,15 +332,85 @@ impl PreloginConfig {
         })
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhotoUploadRoute {
+    File,
+    Photo,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhotoLimits {
+    pub width: u32,
+    pub height: u32,
+    pub size: u64,
+    pub input_width: u32,
+    pub input_height: u32,
+    pub input_size: u64,
+}
+impl Default for PhotoLimits {
+    fn default() -> Self {
+        Self {
+            width: 2560,
+            height: 2560,
+            size: 5 * 1024 * 1024,
+            input_width: 30000,
+            input_height: 30000,
+            input_size: 20 * 1024 * 1024,
+        }
+    }
+}
+pub const DEFAULT_RECALL_MAX_AGE_MS: i64 = 300_000;
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub trusted_qr: bool,
     pub server_time_seconds: Option<i64>,
     pub parameter_encryption: Option<bool>,
     pub services: BTreeMap<String, Vec<Url>>,
+    pub file_chunk_size: usize,
+    pub photo_upload_route: Option<PhotoUploadRoute>,
+    pub photo_limits: PhotoLimits,
+    pub seen_v2: bool,
+    pub recall_max_age_ms: Option<i64>,
     pub chat_poll: Vec<Url>,
     pub control_poll: Vec<Url>,
     pub websocket: Vec<Url>,
+}
+/// Optional authenticated feature settings have used both spellings and legacy aliases.
+/// Null means source defaults; conflicting/malformed nonnull aliases never authorize a capability.
+fn feature_config<'a>(
+    value: &'a Value,
+    name: &str,
+) -> std::result::Result<Option<&'a Value>, BootstrapError> {
+    for path in ["/settings/features", "/setttings/features"] {
+        if value
+            .pointer(path)
+            .is_some_and(|v| !v.is_null() && !v.is_object())
+        {
+            return Err(BootstrapError::Malformed);
+        }
+    }
+    let mut selected = None;
+    for parent in [
+        "",
+        "/settings",
+        "/setttings",
+        "/settings/features",
+        "/setttings/features",
+    ] {
+        if let Some(config) = value
+            .pointer(&format!("{parent}/{name}"))
+            .filter(|v| !v.is_null())
+        {
+            if !config.is_object() {
+                return Err(BootstrapError::Malformed);
+            }
+            if selected.is_some_and(|old| old != config) {
+                return Err(BootstrapError::Malformed);
+            }
+            selected = Some(config);
+        }
+    }
+    Ok(selected)
 }
 impl ServerConfig {
     pub fn parse(value: &Value) -> std::result::Result<Self, BootstrapError> {
@@ -394,7 +464,14 @@ impl ServerConfig {
         // candidate is validated independently; discarded routes grant no cookies.
         // `chat_e2e` / `group_e2e` serve the end-to-end encrypted send endpoints (`CHAT_E2EE` and
         // `CHAT_E2EE_GROUP` in the original). They are optional like the directory services.
-        for name in ["profile", "conversation", "chat_e2e", "group_e2e"] {
+        for name in [
+            "profile",
+            "conversation",
+            "chat_e2e",
+            "group_e2e",
+            "file",
+            "up_file",
+        ] {
             let mut endpoints =
                 endpoint_list(modern.and_then(|map| map.get(name)), false).unwrap_or_default();
             if endpoints.is_empty() {
@@ -407,6 +484,127 @@ impl ServerConfig {
                 services.insert(name.into(), endpoints);
             }
         }
+        // Native implements the source's raw async-file handler only. An advertised
+        // multi-site/cloud handler is a separate protocol and cannot fall back silently.
+        let multi_site = feature_config(value, "multi_site_upload");
+        let sharefile = feature_config(value, "sharefile");
+        let raw_file_handler = sharefile.is_ok()
+            && match multi_site {
+                Ok(config) => config.is_none_or(|config| {
+                    ["enable_multi_site_api", "enable_my_cloud"]
+                        .iter()
+                        .all(|flag| {
+                            config
+                                .get(*flag)
+                                .filter(|v| !v.is_null())
+                                .is_none_or(|v| v.as_bool() == Some(false))
+                        })
+                }),
+                Err(_) => false,
+            };
+        let file_chunk_size = sharefile
+            .ok()
+            .flatten()
+            .and_then(|config| config.get("chunk_size_file"))
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str()?.parse::<u64>().ok())
+            })
+            .filter(|size| (64_000..=1_048_576).contains(size))
+            .map(|size| size as usize)
+            .unwrap_or(256_000);
+        if !raw_file_handler {
+            services.remove("file");
+        }
+        let photo_config = feature_config(value, "file_photo_limit");
+        let photo_aliases_valid = photo_config.is_ok();
+        let photo_config = photo_config.ok().flatten();
+        let photo_shape_valid = photo_config.is_none_or(|config| {
+            config
+                .get("resolutionLimit")
+                .filter(|v| !v.is_null())
+                .is_none_or(|resolution| {
+                    resolution.is_object()
+                        && resolution
+                            .get("hd")
+                            .filter(|v| !v.is_null())
+                            .is_none_or(Value::is_object)
+                })
+        });
+        let mut photo_upload_route = if !raw_file_handler
+            || !services.contains_key("file")
+            || !photo_aliases_valid
+            || !photo_shape_valid
+        {
+            None
+        } else {
+            match photo_config
+                .and_then(|config| config.get("enable_new_endpoint_upload_photo"))
+                .filter(|v| !v.is_null())
+            {
+                None => Some(PhotoUploadRoute::File),
+                Some(v) if v.as_u64() == Some(0) => Some(PhotoUploadRoute::File),
+                Some(v) if v.as_u64() == Some(1) && services.contains_key("up_file") => {
+                    Some(PhotoUploadRoute::Photo)
+                }
+                _ => None,
+            }
+        };
+        let mut photo_limits = PhotoLimits::default();
+        if let Some(config) = photo_config {
+            let bounded = |name: &str, default: u64| -> Option<u64> {
+                let field = config.pointer(&format!("/resolutionLimit/hd/{name}"));
+                match field {
+                    None | Some(Value::Null) => Some(default),
+                    Some(value) => value.as_u64().filter(|n| *n > 0).map(|n| n.min(default)),
+                }
+            };
+            let parsed = (
+                bounded("width", 2560),
+                bounded("height", 2560),
+                bounded("size", 5 * 1024 * 1024),
+                bounded("maxInputWidth", 30000),
+                bounded("maxInputHeight", 30000),
+                bounded("maxInputSize", 20 * 1024 * 1024),
+            );
+            if let (
+                Some(width),
+                Some(height),
+                Some(size),
+                Some(input_width),
+                Some(input_height),
+                Some(input_size),
+            ) = parsed
+            {
+                photo_limits = PhotoLimits {
+                    width: width as u32,
+                    height: height as u32,
+                    size,
+                    input_width: input_width as u32,
+                    input_height: input_height as u32,
+                    input_size,
+                };
+            } else {
+                photo_upload_route = None;
+            }
+        }
+        let seen_v2 = feature_config(value, "ack_seen").is_ok_and(|config| {
+            config
+                .and_then(|v| v.get("v2_enable"))
+                .is_none_or(|v| v.is_null() || v.as_bool() == Some(true) || v.as_i64() == Some(1))
+        });
+        let recall_settings = [
+            value.pointer("/settings/common/recallMessageMaxTime"),
+            value.pointer("/setttings/common/recallMessageMaxTime"),
+        ];
+        // Keep the source's five-minute default. Malformed aliases disable
+        // this optional mutation, without making login or history unavailable.
+        let recall_max_age_ms = match recall_settings {
+            [Some(a), Some(b)] if a != b => None,
+            [Some(window), _] | [_, Some(window)] => window.as_i64().filter(|ms| *ms > 0),
+            _ => Some(DEFAULT_RECALL_MAX_AGE_MS),
+        };
         let trusted = value
             .pointer("/setttings/authen/trusted_device")
             .or_else(|| value.pointer("/settings/authen/trusted_device"));
@@ -419,6 +617,11 @@ impl ServerConfig {
             server_time_seconds,
             parameter_encryption,
             services,
+            photo_upload_route,
+            photo_limits,
+            seen_v2,
+            recall_max_age_ms,
+            file_chunk_size,
             // The native runtime uses WebSockets, not legacy chat/control LP.
             // Unconsumed LP routes cannot reject login or authorize cookies.
             chat_poll: Vec::new(),

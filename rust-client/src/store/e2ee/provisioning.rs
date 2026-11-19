@@ -1171,6 +1171,10 @@ mod tests {
             .unwrap();
         store
             .insert_batch(&[Message {
+                reply_blocked: false,
+                recalled: false,
+                source_client_id: None,
+                quote: None,
                 account_id: "123".into(),
                 thread_id: "d:456".into(),
                 id: "old-history".into(),

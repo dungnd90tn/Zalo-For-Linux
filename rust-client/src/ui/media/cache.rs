@@ -77,6 +77,16 @@ impl Default for MediaCache {
     }
 }
 impl MediaCache {
+    pub(crate) fn close_recalled_viewer(&mut self, account: &str, thread: &str, id: &str) {
+        if self.viewer.as_ref().is_some_and(|viewer| {
+            viewer.key.account_id == account
+                && viewer.key.thread_id == thread
+                && viewer.key.message_id == id
+        }) {
+            self.viewer = None;
+        }
+    }
+
     pub fn scope(&mut self, account: &str, thread: &str, generation: u64) {
         if self.account.as_deref() != Some(account) {
             *self = Self::default();
