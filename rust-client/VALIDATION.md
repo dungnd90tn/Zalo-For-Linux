@@ -1471,3 +1471,31 @@ ASCII. With the Telex word still composing, the first Enter committed the word
 and enabled Send, and the second Enter submitted exactly one synthetic row.
 After a space committed the composition, one Enter submitted. Extra Enter
 presses produced no duplicate rows.
+
+## Built-in sticker sending and message reactions (2.0.5 preview)
+
+The all-feature suite passed 817 Rust tests with five opt-in tests ignored.
+Strict all-feature Clippy, default all-target compilation, formatting, the
+original sticker oracle, 19 Python tooling tests and five IME adapter tests
+also passed. Loopback TLS/WSS covers sticker requests for direct chats and
+groups, ACK and echo correlation, persistence of ambiguous attempts after
+restart, and reaction acceptance, replay, and removal. The schema 16 to 17
+regression checks saved history, the cursor, and unresolved text sends.
+
+The private X11 fixture `ui::live::tests::signed_in_offline_native_window_fixture`
+shows the picker, reaction badge, or reaction menu with
+`ZALO_UI_FIXTURE_INTERACTIONS=stickers|reactions|reaction-menu`. Review covered
+Light and Dark at 640×480 and 1200×780 with synthetic content. Connection traces
+showed zero Internet connections for every capture. Keyboard regressions verify
+that a single selection dispatches to the current conversation and preserves
+the composer draft. The screenshots use synthetic sticker thumbnails.
+
+An optimized standard `live` build passed the schema 17 release smoke with
+19 synthetic messages across six conversations, restart preservation, profile
+locking and private diagnostic files. The workspace preview still reports
+version 2.0.4 until the 2.0.5 release is finalized.
+
+Real-account acceptance is pending for both workflows. Reaction totals cover
+confirmed local sends and authenticated notices the worker has processed.
+Receiving updates through the separate control stream and historical reaction
+replay require further work.

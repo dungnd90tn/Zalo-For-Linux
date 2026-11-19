@@ -69,8 +69,29 @@ impl Default for StickerCache {
 impl StickerCache {
     /// Called only for visible typed stickers in an authenticated live account.
     pub fn visible(&mut self, ctx: &egui::Context, sticker: StickerDescriptor) -> Presentation {
+        self.presentation(ctx, sticker, true)
+    }
+
+    /// The picker shows still previews, so opening it does not animate an entire pack.
+    pub fn thumbnail(&mut self, ctx: &egui::Context, sticker: StickerDescriptor) -> Presentation {
+        self.presentation(ctx, sticker, false)
+    }
+
+    fn presentation(
+        &mut self,
+        ctx: &egui::Context,
+        sticker: StickerDescriptor,
+        animate: bool,
+    ) -> Presentation {
         if let Some(texture) = self.textures.get(&sticker) {
-            return present(ctx, texture);
+            return if animate {
+                present(ctx, texture)
+            } else {
+                Presentation::Image {
+                    texture: texture.handle.clone(),
+                    uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                }
+            };
         }
         match self.states.get(&sticker) {
             Some(State::Pending) => return Presentation::Loading,

@@ -612,6 +612,7 @@ pub struct Incoming {
 pub(crate) struct IncomingBatch {
     pub messages: Vec<Incoming>,
     pub recalls: Vec<super::recall::RecallNotice>,
+    pub reactions: Vec<super::reactions::ReactionNotice>,
 }
 // Stickers carry a catalog address, never an image URL. Unknown/malformed media
 // stays an explicit placeholder without poisoning other messages in a batch.
@@ -758,6 +759,18 @@ fn incoming_with_reason(
                 result
                     .recalls
                     .extend(super::recall::direct_notice(account, v).ok());
+                continue;
+            }
+            if scope == IncomingScope::AuthenticatedQueue && message_type == "chat.reaction" {
+                // The old chat route carries reaction actions alongside messages.
+                // A notice never becomes an ordinary timeline row or a receipt.
+                if field != "pageMsgs" {
+                    use super::reactions::{parse_notice, MAX_NOTICES};
+                    if let Ok(parsed) = parse_notice(account, kind, v, true) {
+                        let remaining = MAX_NOTICES - result.reactions.len();
+                        result.reactions.extend(parsed.into_iter().take(remaining));
+                    }
+                }
                 continue;
             }
             context.message_kind = Some(match message_type {
@@ -1025,14 +1038,17 @@ fn incoming_with_reason(
                         client_id.clone(),
                     )
                 });
-            // An information event is never an acknowledgement of a reserved
-            // plain-text send, even when its server-supplied cliMsgId matches.
-            // Only a plain text message can acknowledge a plain-text send.
+            // Keep correlation hints only for payloads with a typed outbox.
+            // Sticker hints never participate in text-send correlation.
             let client_id = client_id.filter(|_| {
                 info.is_none()
                     && !structured_webchat
                     && ((media.is_none() && message_type == "webchat")
-                        || matches!(message_type, "share.file" | "chat.photo"))
+                        || matches!(message_type, "share.file" | "chat.photo")
+                        || (sticker.is_some_and(StickerDescriptor::is_builtin)
+                            && legacy
+                            && v.get("ttl")
+                                .is_none_or(|value| value.is_null() || value.as_u64() == Some(0))))
             });
             let reference = v.get("reference").filter(|value| !value.is_null());
             let forward = if structured_webchat {

@@ -1,8 +1,6 @@
-# Legacy sticker reception
+# Ordinary sticker reception and sending
 
-This implementation derives from this repository's own current PC bundle, not
-another client. It adds still thumbnail reception; it does not send stickers or
-activate the future Signal pipeline.
+The native client derives sticker support from the PC bundle in this repository.
 
 `chat.sticker` normalizes to the ordinary sticker type (N315674/N367947).
 The original sender creates `content:{id,catId,type}` (N137013–137074); the receiver
@@ -69,8 +67,20 @@ stalled requests and queue waits without joining on the rendering thread.
 
 A sticker message is drawn as the picture alone: no bubble fill, border or padding, and exactly
 as wide as the picture (or its sender/status line when that is wider). An unavailable image
-remains a truthful local placeholder and does not change messaging connection state. Effect
-stickers, catalog refresh and sticker sending remain separate work.
+remains a truthful local placeholder and does not change messaging connection state.
+
+## Sending built-in stickers
+
+The picker lists the 30 built-in descriptors. N400154–400182 sends an encrypted
+form to `/api/message/sticker` or `/api/group/sticker` on the configured chat or
+group service. The worker requires a verified ordinary visible conversation,
+standard group visibility and a fresh auto-delete check. Search, downloaded
+sticker packs and encrypted sticker sending are outside this scope.
+
+Schema 17 keeps sticker attempts in `sticker_outbox`. A matching ACK or exact own
+echo can confirm an attempt. A timeout leaves the attempt unconfirmed across
+restart and blocks resubmission of that sticker in the same conversation. Sticker
+ACKs and echoes leave the text outbox and composer draft alone.
 
 Offline checks:
 

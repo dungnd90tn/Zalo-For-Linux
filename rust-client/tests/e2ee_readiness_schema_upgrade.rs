@@ -72,7 +72,7 @@ fn version_eight_upgrade_preserves_bytes_and_never_guesses_init_from_body() {
         drop(MessageStore::open(&db.0).unwrap());
         assert_eq!(snapshot(&db.0), before);
         let conn = Connection::open(&db.0).unwrap();
-        assert_eq!(version(&conn), 16);
+        assert_eq!(version(&conn), 17);
         assert_eq!(
             conn.query_row("SELECT count(*) FROM e2ee_peer_init_outbox", [], |row| row
                 .get::<_, i64>(
@@ -114,7 +114,7 @@ fn migration_failure_rolls_back_new_intent_table_and_schema_version() {
         .unwrap();
     drop(conn);
     drop(MessageStore::open(&db.0).unwrap());
-    assert_eq!(version(&Connection::open(&db.0).unwrap()), 16);
+    assert_eq!(version(&Connection::open(&db.0).unwrap()), 17);
 }
 
 #[test]
@@ -158,9 +158,9 @@ fn future_schema_is_refused_without_mutating_existing_rows() {
     let before = snapshot(&db.0);
     Connection::open(&db.0)
         .unwrap()
-        .execute_batch("PRAGMA user_version=17;")
+        .execute_batch("PRAGMA user_version=18;")
         .unwrap();
     assert!(MessageStore::open(&db.0).is_err());
     assert_eq!(snapshot(&db.0), before);
-    assert_eq!(version(&Connection::open(&db.0).unwrap()), 17);
+    assert_eq!(version(&Connection::open(&db.0).unwrap()), 18);
 }

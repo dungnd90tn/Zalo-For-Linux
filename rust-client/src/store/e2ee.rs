@@ -3685,7 +3685,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                16
+                17
             );
             for table in [
                 "e2ee_local_candidates",
@@ -3734,7 +3734,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                16
+                17
             );
             assert_eq!(
                 store.page("123", "d:456", None, 10).unwrap()[0].id,

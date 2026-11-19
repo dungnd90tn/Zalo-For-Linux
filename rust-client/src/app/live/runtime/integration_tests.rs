@@ -35,6 +35,7 @@ enum Reply {
     EchoAfterAck(bool),
     ConflictingReceive,
     Stickers,
+    StickerSend(u8),
     RuntimeStall,
     ControlHeartbeats,
     OfflinePages,
@@ -48,6 +49,7 @@ enum Reply {
     ReadStates,
     Forward(u8),
     Recall(u8),
+    Reactions,
     GroupActions(bool),
     UpgradeForbidden,
     DesktopHeaders,
@@ -83,6 +85,7 @@ struct State {
     eligibility_mode: AtomicUsize,
     ordinary_quotes: Mutex<Vec<Value>>,
     recall_source_at: OnceLock<i64>,
+    reaction_first_client: OnceLock<u64>,
 }
 struct Fixture {
     addr: SocketAddr,
@@ -749,6 +752,19 @@ fn serve(
             ))
             .unwrap();
         }
+        if matches!(reply, Reply::Reactions) {
+            let original = json!({"uidFrom":"22","idTo":"11","msgId":"910","cliMsgId":"990",
+                "ts":1760000000000_i64,"msgType":"webchat","content":"synthetic reaction source"});
+            let peer = json!({"uidFrom":"22","msgKey":"22","msgId":"920","ts":1760000000001_i64,
+                "msgType":"chat.reaction","content":{"params":
+                    json!({"rMsg":[{"gMsgID":910,"cMsgID":990,"msgType":1}],"rIcon":"/-strong","rType":3}).to_string()}});
+            let payload = json!({"error_code":0,"data":{"msgs":[peer.clone(),original,peer]}});
+            ws.send(tungstenite::Message::Binary(
+                wire::encode_frame(501, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        }
         if let Reply::Recall(mode) = reply {
             let sent_at = *state.recall_source_at.get_or_init(now_ms);
             let original = json!({"uidFrom":"0","idTo":"22","msgId":"910","cliMsgId":"990",
@@ -906,6 +922,24 @@ fn serve(
                         .unwrap();
                     }
                     if cmd == 563 {
+                        if matches!(reply, Reply::Reactions) {
+                            if let Some(client) = state.reaction_first_client.get() {
+                                let own = json!({"uidFrom":"0","idTo":"22","msgId":"930","cliMsgId":client,
+                                    "ts":now_ms(),"msgType":"chat.reaction","content":
+                                        json!({"rMsg":[{"gMsgID":910,"cMsgID":990,"msgType":1}],"rIcon":"/-heart","rType":5}).to_string()});
+                                let payload =
+                                    json!({"error_code":0,"data":{"reacts":[own.clone(),own]}});
+                                ws.send(tungstenite::Message::Binary(
+                                    wire::encode_frame(
+                                        612,
+                                        0,
+                                        &json!({"error_code":0,"encrypt":0,"data":payload}),
+                                    )
+                                    .unwrap(),
+                                ))
+                                .unwrap();
+                            }
+                        }
                         if let Reply::EchoAfterAck(different_client_id) = reply {
                             if state.http_sends.load(Ordering::SeqCst) > 0
                                 && !state.echoed.swap(true, Ordering::SeqCst)
@@ -1348,6 +1382,55 @@ fn serve(
     let route = path.split('?').next().unwrap();
     let cipher =
         SessionCipher::from_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
+    if let Reply::StickerSend(mode) = reply {
+        if sticker_send_tests::respond(&mut stream, &state, &cipher, mode, &path, &headers, &body) {
+            return;
+        }
+    }
+    if matches!(reply, Reply::Reactions) {
+        assert!(headers.starts_with("POST "));
+        assert_eq!(path, "/api/message/reaction?zpw_ver=681&zpw_type=24");
+        let form: Vec<_> = url::form_urlencoded::parse(&body).collect();
+        assert_eq!(form.len(), 1);
+        assert_eq!(form[0].0, "params");
+        let params: Value = serde_json::from_slice(&cipher.decrypt(&form[0].1).unwrap()).unwrap();
+        assert_eq!(params["toid"], "22");
+        assert!(params.get("imei").is_none());
+        let batch = params["react_list"].as_array().unwrap();
+        assert_eq!(batch.len(), 1);
+        let client = batch[0]["clientId"].as_u64().unwrap();
+        let inner: Value = serde_json::from_str(batch[0]["message"].as_str().unwrap()).unwrap();
+        let send = state.http_sends.fetch_add(1, Ordering::SeqCst);
+        let (code, icon) = match send {
+            0 => {
+                state.reaction_first_client.set(client).unwrap();
+                (5, "/-heart")
+            }
+            1 => {
+                assert!(client > *state.reaction_first_client.get().unwrap());
+                (-1, "")
+            }
+            _ => panic!("The fixture allows two explicit actions"),
+        };
+        assert_eq!(
+            inner,
+            json!({"rMsg":[{"gMsgID":910,"cMsgID":990,"msgType":1}],
+            "source":6,"rType":code,"rIcon":icon})
+        );
+        let inner = json!({"error_code":0,"data":null});
+        let response = serde_json::to_vec(&json!({"error_code":0,"data":
+            cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()}))
+        .unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.len()
+        )
+        .unwrap();
+        stream.write_all(&response).unwrap();
+        stream.flush().unwrap();
+        return;
+    }
     if let Reply::Recall(mode) = reply {
         assert!(headers.starts_with("POST "));
         assert_eq!(path, "/api/message/undo?zpw_ver=681&zpw_type=24");
@@ -5942,6 +6025,7 @@ mod file_fixture;
 mod file_upload_tests;
 
 mod photo_upload_tests;
+mod sticker_send_tests;
 
 #[tokio::test]
 async fn actual_forward_dispatch_uses_ttl_proof_and_retains_unknown_across_restart() {
@@ -6181,6 +6265,138 @@ async fn actual_recall_dispatch_redacts_replay_and_only_settles_unknown_with_pro
             }
         );
     }
+}
+
+#[tokio::test]
+async fn actual_tls_reaction_acceptance_echo_replay_and_remove_preserve_peer_and_drafts() {
+    let fixture = Fixture::new(Reply::Reactions);
+    let config = ServerConfig::parse(&json!({
+        "zpw_service_map_v3":{
+            "chat":["https://wpa.zaloapp.com"],
+            "reaction":["https://wpa.zaloapp.com"],
+            "conversation":["https://wpa.zaloapp.com"]
+        },
+        "zpw_ws":["wss://wpa.zaloapp.com"]
+    }))
+    .unwrap();
+    let session = Arc::new(synthetic_session(fixture.profile.clone(), config));
+    let (commands, requests) = mpsc::channel(16);
+    let (events, mut incoming) = mpsc::channel(64);
+    let (stop, cancel) = watch::channel(false);
+    let actor = tokio::spawn(run_with_transports(
+        fixture.profile.clone(),
+        session,
+        requests,
+        events,
+        Arc::new(|| {}),
+        cancel,
+        fixture.transports(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut online, mut source, mut privacy, mut capable) = (false, false, false, false);
+        while !(online && source && privacy && capable) {
+            match incoming.recv().await.unwrap() {
+                LiveEvent::Connection {
+                    state: LiveConnection::Online,
+                    ..
+                } => online = true,
+                LiveEvent::PrivacyChanged { revision, .. } => privacy |= revision > 1,
+                LiveEvent::ReactionCapability { available, .. } => capable = available,
+                LiveEvent::Received { message, .. } => {
+                    assert_eq!(message.id, "910");
+                    source = true;
+                }
+                _ => {}
+            }
+        }
+        for (request_id, action) in [
+            (1, ReactionAction::Add(ReactionKind::Heart)),
+            (2, ReactionAction::RemoveAll),
+        ] {
+            commands
+                .send(LiveCommand::React {
+                    request_id,
+                    thread: "d:22".into(),
+                    message_id: "910".into(),
+                    action,
+                })
+                .await
+                .unwrap();
+            loop {
+                match incoming.recv().await.unwrap() {
+                    LiveEvent::ReactionFinished {
+                        request_id: actual,
+                        outcome,
+                        ..
+                    } => {
+                        assert_eq!(actual, request_id);
+                        assert_eq!(outcome, ReactionOutcome::Accepted);
+                        break;
+                    }
+                    LiveEvent::Received { message, .. } => assert_eq!(message.id, "910"),
+                    LiveEvent::Sent { .. } | LiveEvent::SendSettled { .. } => {
+                        panic!("Reactions cannot settle the text composer");
+                    }
+                    _ => {}
+                }
+            }
+            commands
+                .send(LiveCommand::ReactionState {
+                    generation: request_id,
+                    thread: "d:22".into(),
+                    message_ids: vec!["910".into()],
+                })
+                .await
+                .unwrap();
+            loop {
+                if let LiveEvent::ReactionState {
+                    generation,
+                    messages,
+                    ..
+                } = incoming.recv().await.unwrap()
+                {
+                    assert_eq!(generation, request_id);
+                    let items = &messages[0].1;
+                    assert_eq!(
+                        items
+                            .iter()
+                            .filter(|item| item.kind == ReactionKind::Like
+                                && !item.mine
+                                && item.count == 1)
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        items
+                            .iter()
+                            .filter(|item| item.kind == ReactionKind::Heart
+                                && item.mine
+                                && item.count == 1)
+                            .count(),
+                        usize::from(request_id == 1)
+                    );
+                    assert_eq!(items.len(), if request_id == 1 { 2 } else { 1 });
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    actor.await.unwrap();
+    assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 2);
+    let store =
+        MessageStore::open(&fixture.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+    assert_eq!(store.page("11", "d:22", None, 10).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .reaction_summaries("11", "d:22", &["910".into()])
+            .unwrap()[0]
+            .1
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

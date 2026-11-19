@@ -51,7 +51,8 @@ Modal dùng `dialog.rs`: curtain theo token, header cao 56, tiêu đề 16, glyp
 | Avatar tài khoản, liên hệ và nhóm | [avatars.rs](src/ui/avatars.rs) |
 | Chưa đọc, trạng thái tin gửi, tùy chọn thông báo | [attention.rs](src/ui/attention.rs) |
 | Lượt gửi chưa rõ kết quả | [delivery.rs](src/ui/delivery.rs) |
-| Thumbnail nhãn dán | [stickers.rs](src/ui/stickers.rs) |
+| Nhận và gửi nhãn dán | [stickers.rs](src/ui/stickers.rs), [sticker_picker.rs](src/ui/sticker_picker.rs) |
+| Cảm xúc tin nhắn | [reactions.rs](src/ui/reactions.rs), [message_actions.rs](src/ui/message_actions.rs) |
 | Ảnh, thẻ OA và viewer | [media.rs](src/ui/media.rs), [worker ảnh](src/app/media.rs) |
 
 Yêu cầu: tiêu đề dài phải rút gọn, có thể xem tên đầy đủ qua hover; nội dung tin vẫn xuống dòng. Composer và nút gửi không tràn khi resize. Control phải thực hiện hành vi đã nối hoặc thực sự disabled kèm giải thích; không tạo biểu tượng bấm được nhưng không làm gì.
@@ -138,7 +139,9 @@ UI chỉ gửi command, nhận event đã kiểm tra scope và vẽ. HTTP/WSS, S
 | Tra metadata avatar / cache metadata UI | Tối đa 64 ID/lượt / 256 mục |
 | Cache GPU avatar | Tối đa 64 ảnh; payload RGBA 4 MiB |
 
-Nhãn dán hiện chỉ có thumbnail PNG tĩnh; ảnh hiển thị tối đa 130 đơn vị, lỗi có fallback. Tải ở nền, chỉ cho live/ảnh cần hiển thị, không mang cookie sang CDN. Demo không truy cập Internet. Giữ backoff 30 giây cho tải lỗi; không tải lại mỗi frame hoặc giữ RGBA sau upload GPU nếu không cần.
+Nút nhãn dán trên thanh soạn mở bộ 30 nhãn dán mặc định. Bấm một hình đã tải để gửi riêng, giữ phần chữ, trích dẫn và tệp đang soạn. Hội thoại thường đã xác minh quyền riêng tư và đang kết nối mới cho gửi. Bảng chọn dùng thumbnail tĩnh và tự đóng khi đổi hội thoại, tài khoản hoặc trang tin. Nhãn dán trong lịch sử hiển thị tối đa 130 đơn vị, hỗ trợ ảnh động khi có định dạng phù hợp và có thông báo khi thiếu ảnh. Worker tải ảnh theo nhu cầu, thử lại sau 30 giây khi lỗi và giữ cookie trong phiên Zalo.
+
+Bấm chuột phải vào tin nhắn văn bản đủ dữ liệu gốc để mở menu cảm xúc. Khi tin đang có focus, Enter hoặc Shift+F10 mở cùng menu; Tab chọn biểu tượng và Enter thực hiện. Có sáu lựa chọn Tim, Thích, Cười, Bất ngờ, Buồn và Giận. “Gỡ cảm xúc của tôi” xuất hiện khi bản lưu có cảm xúc của tài khoản hiện tại. Huy hiệu bên dưới tin dùng số đã lưu từ sự kiện xác thực và đánh dấu khi có bạn tham gia.
 
 Yêu cầu: không thêm SQL/network vào render, cache không giới hạn hoặc repaint liên tục để chờ I/O. Ngân sách payload không đo tổng RAM/VRAM; đo trước khi so với Electron.
 

@@ -3,7 +3,7 @@
 //! Decoded formats: PNG (still, or a horizontal sprite strip), JPEG, WebP (still or animated) and
 //! GIF. Detection uses the file signature, never the Content-Type: the CDN labels some JPEG
 //! bytes `image/png`.
-use crate::domain::StickerDescriptor;
+use crate::domain::{StickerDescriptor, BUILTIN_STICKER_COUNT};
 use anyhow::Result;
 use image::{AnimationDecoder, ImageDecoder};
 use lru::LruCache;
@@ -39,6 +39,10 @@ const SPRITE_FRAME_MS: u32 = 100;
 const MIN_FRAME_MS: u32 = 20;
 const MAX_FRAME_MS: u32 = 1000;
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+
+pub fn builtin_stickers() -> impl Iterator<Item = StickerDescriptor> {
+    (1..=BUILTIN_STICKER_COUNT).map(StickerDescriptor::builtin)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StickerFailure {
@@ -232,7 +236,7 @@ fn thumbnail_url(sticker: StickerDescriptor) -> Option<url::Url> {
     sticker.validate().ok()?;
     // N519573 builtin namespace is distinct from catalog sticker IDs.
     if sticker.category_id == 0 {
-        if !(1..=30).contains(&sticker.sticker_id) {
+        if !(1..=BUILTIN_STICKER_COUNT).contains(&sticker.sticker_id) {
             return None;
         }
         return url::Url::parse(&format!(

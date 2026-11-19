@@ -45,12 +45,16 @@ mod privacy_native_fixture;
 #[cfg(all(test, feature = "messaging"))]
 mod privacy_tests;
 #[cfg(feature = "messaging")]
+mod reactions;
+#[cfg(feature = "messaging")]
 mod recall;
 mod replies;
 mod senders;
 mod settings;
 #[cfg(test)]
 mod shot_fixture;
+#[cfg(feature = "messaging")]
+mod sticker_picker;
 #[cfg(feature = "messaging")]
 mod stickers;
 mod visuals;
@@ -82,6 +86,28 @@ struct ModalFocus {
     thread: Option<String>,
     generation: u64,
     auth_generation: Option<u64>,
+}
+
+#[cfg(feature = "messaging")]
+struct InteractionNotice {
+    thread: String,
+    label: &'static str,
+    updated_at: std::time::Instant,
+}
+
+#[cfg(feature = "messaging")]
+impl InteractionNotice {
+    fn new(thread: String, label: &'static str) -> Self {
+        Self {
+            thread,
+            label,
+            updated_at: std::time::Instant::now(),
+        }
+    }
+
+    fn for_thread(&self, thread: &str) -> Option<(&'static str, std::time::Instant)> {
+        (self.thread == thread).then_some((self.label, self.updated_at))
+    }
 }
 
 pub struct NativeApp {
@@ -210,6 +236,7 @@ impl NativeApp {
             if state.open_dialog
                 || state.review_dialog
                 || state.attention.settings_open
+                || state.sticker_send.is_open()
                 || state.forwarding.is_open()
                 || state.recall.is_open()
                 || state.groups.is_open()
@@ -230,6 +257,13 @@ impl NativeApp {
                     self.message_menu
                         .as_mut()
                         .and_then(|popup| popup.focus.take())
+                })
+                .or_else(|| {
+                    #[cfg(feature = "messaging")]
+                    if let Some(state) = &mut self.live {
+                        return state.sticker_send.take_focus();
+                    }
+                    None
                 })
                 .or_else(|| self.modal_focus_snapshot(ctx));
             if let Some(focus) = &self.modal_focus {
@@ -1255,12 +1289,10 @@ impl NativeApp {
             ),
             |ui| {
                 ui.horizontal(|ui| {
-                    icon_button(
-                        ui,
-                        Icon::Smile,
-                        "Biểu cảm · chưa hỗ trợ trong bản xem trước",
-                        false,
-                    );
+                    #[cfg(feature = "messaging")]
+                    self.sticker_button(ui, enabled);
+                    #[cfg(not(feature = "messaging"))]
+                    icon_button(ui, Icon::Sticker, "Gửi nhãn dán · chưa khả dụng", false);
                     if icon_button(
                         ui,
                         Icon::Image,
@@ -1544,8 +1576,16 @@ impl NativeApp {
             self.model.pending,
             self.demo,
             self.connection_label(),
-        )
-        .map(str::to_owned);
+        );
+        #[cfg(feature = "messaging")]
+        let status = status.or_else(|| {
+            [self.sticker_status(), self.reaction_status()]
+                .into_iter()
+                .flatten()
+                .max_by_key(|(_, updated_at)| *updated_at)
+                .map(|(status, _)| status)
+        });
+        let status = status.map(str::to_owned);
         let status_height = if status.is_some() { 29.0 } else { 0.0 };
         let timeline_height = (ui.available_height() - composer_height - status_height).max(60.0);
         let timeline_rect =
@@ -1620,6 +1660,8 @@ impl NativeApp {
                                 #[cfg(feature="messaging")]
                                 if let (Some(state),Some(account),Some(thread))=(&mut self.live,own_account.as_deref(),self.model.selected.as_deref()) {state.media.scope(account,thread,self.model.generation);}
                                 let menu_scope = self.message_menu_scope();
+                                #[cfg(feature = "messaging")]
+                                let reaction_scope = self.reaction_scope();
                                 let menu_focus = self.modal_focus_snapshot(ctx);
                                 let mut previous_day = None;
                                 let focus = self
@@ -1677,12 +1719,22 @@ impl NativeApp {
                                         state.attention.paint(message, bubble.inner, ui.clip_rect(),
                                             self.model.messages.last().is_some_and(|tail| tail.id == message.id));
                                     }
-                                    if let Some(position) = message_actions::requested(ui, bubble.inner, message) {
+                                    let menu_position = message_actions::requested(ui, bubble.inner, message);
+                                    #[cfg(feature = "messaging")]
+                                    let menu_position = menu_position.or_else(|| {
+                                        reaction_scope.as_ref()?;
+                                        reactions::keyboard_menu(ui, message, bubble.inner)
+                                    });
+                                    if let Some(position) = menu_position {
                                         if let Some(scope) = &menu_scope {
                                             self.message_menu = Some(message_actions::Popup::new(
                                                 scope.clone(), message.id.clone(), position, menu_focus.clone(),
                                             ));
                                         }
+                                    }
+                                    #[cfg(feature = "messaging")]
+                                    if let (Some(state), Some(scope)) = (&self.live, &reaction_scope) {
+                                        reactions::paint_badge(ui, state, scope, message, bubble.inner);
                                     }
                                     let bubble = bubble.response;
                                     if let Some((_, shown_at)) = focused {
@@ -1887,6 +1939,8 @@ impl NativeApp {
         self.show_account_popup(ctx);
         self.show_message_menu(ctx);
         #[cfg(feature = "messaging")]
+        self.show_sticker_picker(ctx);
+        #[cfg(feature = "messaging")]
         if !self.settings_open && !application_information {
             self.hidden_pin_dialog(ctx);
         }
@@ -2090,6 +2144,7 @@ impl eframe::App for NativeApp {
         self.sync_message_menu();
         #[cfg(feature = "messaging")]
         {
+            self.sync_sticker_picker(ctx);
             self.sync_forward();
             self.sync_recall();
             self.sync_groups(ctx);
@@ -2123,6 +2178,7 @@ impl eframe::App for NativeApp {
             self.show_forward_picker(ctx);
             self.show_recall_confirmation(ctx);
             self.show_group_dialogs(ctx);
+            self.sync_reactions(ctx);
             self.finish_attention_frame(ctx);
         }
     }
@@ -2651,7 +2707,7 @@ fn sticker_placeholder(ui: &mut egui::Ui, label: &str) -> egui::Response {
             ui.vertical_centered(|ui| {
                 ui.add_space(25.0);
                 let (rect, _) = ui.allocate_exact_size(vec2(25.0, 25.0), Sense::hover());
-                icon(ui, rect, Icon::Smile, colors.text_secondary);
+                icon(ui, rect, Icon::Sticker, colors.text_secondary);
                 ui.add(
                     egui::Label::new(
                         RichText::new(label)

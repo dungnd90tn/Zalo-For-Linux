@@ -3,12 +3,12 @@ use super::{ModalFocus, NativeApp};
 use crate::domain::{MediaDescriptor, Message};
 use eframe::egui::{self, vec2};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct Scope {
-    account: String,
-    thread: String,
-    generation: u64,
-    auth_generation: Option<u64>,
+    pub(super) account: String,
+    pub(super) thread: String,
+    pub(super) generation: u64,
+    pub(super) auth_generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -128,6 +128,44 @@ pub(super) fn external_url(raw: &str) -> Option<String> {
     .then(|| url.to_string())
 }
 
+pub(super) fn popup_tab(ctx: &egui::Context, focus: Option<egui::Id>) -> Option<bool> {
+    // egui may try to move focus to a disabled background widget. Restore
+    // the popup's action focus before collecting the visible controls.
+    if let Some(id) = focus {
+        ctx.memory_mut(|memory| memory.request_focus(id));
+    }
+    ctx.input_mut(|input| {
+        if input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
+            Some(false)
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+            Some(true)
+        } else {
+            None
+        }
+    })
+}
+
+pub(super) fn focus_popup_actions(
+    ctx: &egui::Context,
+    tab: Option<bool>,
+    buttons: &[egui::Id],
+    action_focus: &mut Option<egui::Id>,
+) {
+    let Some(forward) = tab.filter(|_| !buttons.is_empty()) else {
+        return;
+    };
+    let focus = action_focus.or_else(|| ctx.memory(|memory| memory.focused()));
+    let current = buttons.iter().position(|id| Some(*id) == focus);
+    let next = match (current, forward) {
+        (Some(index), true) => (index + 1) % buttons.len(),
+        (Some(index), false) => (index + buttons.len() - 1) % buttons.len(),
+        (None, true) => 0,
+        (None, false) => buttons.len() - 1,
+    };
+    ctx.memory_mut(|memory| memory.request_focus(buttons[next]));
+    *action_focus = Some(buttons[next]);
+}
+
 impl NativeApp {
     pub(super) fn message_menu_scope(&self) -> Option<Scope> {
         let thread = self.model.selected.clone()?;
@@ -198,6 +236,7 @@ impl NativeApp {
         let Some(popup) = self.message_menu.clone() else {
             return;
         };
+        self.latch_modal_input(ctx);
         let Some(message) = self.menu_message(&popup) else {
             return;
         };
@@ -213,6 +252,12 @@ impl NativeApp {
         #[cfg(feature = "messaging")]
         let own = self.account_id() == Some(message.sender.as_str());
         let reply = message.reply_reference();
+        #[cfg(feature = "messaging")]
+        let reaction_scope = self
+            .reaction_scope()
+            .filter(|_| super::reactions::supports(message));
+        #[cfg(feature = "messaging")]
+        let mut reaction_selected = None;
         let group_left = self.selected_group_left();
         let can_reply = !self.demo
             && !group_left
@@ -238,29 +283,16 @@ impl NativeApp {
             self.message_menu = None;
             return;
         }
-        self.latch_modal_input(ctx);
         let width = 244.0_f32.min(ctx.screen_rect().width() - 32.0);
+        #[cfg(feature = "messaging")]
+        let width = if reaction_scope.is_some() {
+            super::reactions::POPUP_WIDTH
+        } else {
+            width
+        };
         let mut copied = false;
         let mut reply_selected = false;
-        // egui 0.29 lets disabled background widgets consume the automatic Tab stop.
-        // Keep navigation within the visible actions and assign focus after rendering them.
-        let tab = ctx.input_mut(|input| {
-            if input.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
-                Some(false)
-            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
-                Some(true)
-            } else {
-                None
-            }
-        });
-        // Shift+Tab may leave an automatic focus request for the next frame, pointing
-        // at a disabled background widget. Reconcile it with this popup's scoped action.
-        if let Some(id) = popup.action_focus {
-            ctx.memory_mut(|memory| memory.request_focus(id));
-        }
-        let focus = popup
-            .action_focus
-            .or_else(|| ctx.memory(|memory| memory.focused()));
+        let tab = popup_tab(ctx, popup.action_focus);
         let mut buttons = Vec::with_capacity(actions.len());
         let response = egui::Area::new(egui::Id::new((
             "scoped_message_actions",
@@ -280,6 +312,11 @@ impl NativeApp {
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_width(width);
+                #[cfg(feature = "messaging")]
+                if let Some(scope) = &reaction_scope {
+                    reaction_selected =
+                        super::reactions::show_menu(ui, self, scope, message, &mut buttons);
+                }
                 for action in actions {
                     let button = ui.add_sized(vec2(width, 44.0), egui::Button::new(action.label));
                     buttons.push(button.id);
@@ -330,21 +367,17 @@ impl NativeApp {
                 }
             });
         });
-        if let Some(forward) = tab {
-            let current = buttons.iter().position(|id| Some(*id) == focus);
-            let next = match (current, forward) {
-                (Some(index), true) => (index + 1) % buttons.len(),
-                (Some(index), false) => (index + buttons.len() - 1) % buttons.len(),
-                (None, true) => 0,
-                (None, false) => buttons.len() - 1,
-            };
-            ctx.memory_mut(|memory| memory.request_focus(buttons[next]));
-            if let Some(popup) = &mut self.message_menu {
-                popup.action_focus = Some(buttons[next]);
-            }
+        if let Some(popup) = &mut self.message_menu {
+            focus_popup_actions(ctx, tab, &buttons, &mut popup.action_focus);
         }
         let escape =
             ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        #[cfg(feature = "messaging")]
+        if let (Some(action), Some(scope)) = (reaction_selected, reaction_scope) {
+            self.message_menu = None;
+            self.react(&scope, &popup.message, action);
+            return;
+        }
         if reply_selected {
             if let Some(reply) = reply {
                 self.drafts.active.set_reply(reply);
@@ -560,6 +593,117 @@ mod tests {
                     modifiers: Default::default(),
                 },
             ]
+        }
+
+        fn key(key: egui::Key) -> Vec<egui::Event> {
+            [true, false]
+                .into_iter()
+                .map(|pressed| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: Default::default(),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn compact_sticker_picker_keyboard_dispatches_one_scoped_sticker_and_keeps_draft() {
+            use crate::app::live::{LiveCommand, LiveConnection, LiveWorker};
+            let ctx = egui::Context::default();
+            let size = vec2(640.0, 480.0);
+            let (mut app, root) = fixture(&ctx);
+            let draft = app.drafts.active.text.clone();
+            let (worker, mut commands, _events) = LiveWorker::presentation_fixture("11");
+            {
+                let state = app.live.as_mut().unwrap();
+                state.connection = LiveConnection::Online;
+                state.worker = Some(worker);
+                state.sticker_fixture_open = true;
+                super::super::super::sticker_picker::fixture_thumbnails(&mut state.stickers, &ctx);
+            }
+            for _ in 0..3 {
+                let _ = frame(&mut app, &ctx, size, vec![]);
+            }
+            let out = frame(&mut app, &ctx, size, key(egui::Key::Tab));
+            assert!(text_rect(&out, "Nhãn dán mặc định").top() >= 8.0);
+            let focus = ctx.memory(|memory| memory.focused()).unwrap();
+            let rect = ctx.read_response(focus).unwrap().rect;
+            assert_eq!(rect.width(), 44.0);
+            assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(rect));
+            let _ = frame(&mut app, &ctx, size, key(egui::Key::Enter));
+            let sends: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok())
+                .filter(|command| matches!(command, LiveCommand::SendSticker { .. }))
+                .collect();
+            assert!(matches!(
+                sends.as_slice(),
+                [LiveCommand::SendSticker { request_id: 1, thread, sticker }]
+                    if thread == "d:22" && *sticker == crate::domain::StickerDescriptor::builtin(1)
+            ));
+            assert_eq!(app.drafts.active.text, draft);
+            assert!(!app.drafts.active.in_flight());
+            assert!(!app.live.as_ref().unwrap().sticker_send.is_open());
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn reaction_menu_keyboard_dispatch_uses_its_verified_scope_without_changing_draft_or_counts(
+        ) {
+            use crate::app::live::{
+                LiveCommand, LiveConnection, LiveEvent, LiveWorker, ReactionAction, ReactionKind,
+            };
+            let ctx = egui::Context::default();
+            let size = vec2(640.0, 480.0);
+            let (mut app, root) = fixture(&ctx);
+            let draft = app.drafts.active.text.clone();
+            app.model.messages[0].id = "901".into();
+            app.model.messages[0].source_client_id = Some("1901".into());
+            let scope = app.reaction_scope().unwrap();
+            let (worker, mut commands, _events) = LiveWorker::presentation_fixture("11");
+            {
+                let state = app.live.as_mut().unwrap();
+                state.connection = LiveConnection::Online;
+                state.worker = Some(worker);
+                state.reactions.seed(scope.clone(), "901");
+                state.reactions.fixture = false;
+                state
+                    .reactions
+                    .observe_outcome(&LiveEvent::ReactionCapability {
+                        account_id: "11".into(),
+                        available: true,
+                    });
+            }
+            let _ = frame(&mut app, &ctx, size, vec![]);
+            app.message_menu = Some(Popup::new(
+                scope,
+                "901".into(),
+                egui::pos2(250.0, 70.0),
+                None,
+            ));
+            for _ in 0..2 {
+                let _ = frame(&mut app, &ctx, size, vec![]);
+            }
+            let _ = frame(&mut app, &ctx, size, key(egui::Key::Tab));
+            let out = frame(&mut app, &ctx, size, key(egui::Key::Enter));
+            let sends: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok())
+                .filter(|command| matches!(command, LiveCommand::React { .. }))
+                .collect();
+            assert!(matches!(
+                sends.as_slice(),
+                [LiveCommand::React { request_id: 1, thread, message_id, action: ReactionAction::Add(ReactionKind::Heart) }]
+                    if thread == "d:22" && message_id == "901"
+            ));
+            assert!(
+                text_rect(&out, "3").is_positive(),
+                "displayed count remains the saved projection"
+            );
+            assert_eq!(app.drafts.active.text, draft);
+            assert!(!app.drafts.active.in_flight());
+            assert!(app.message_menu.is_none());
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
         }
 
         #[test]

@@ -77,6 +77,21 @@ impl Projection {
                     entries.retain(|entry| !self.hidden.contains(&entry.thread_id));
                 }
             }
+            LiveEvent::ReactionState {
+                thread, messages, ..
+            } if !self.confirmed
+                || self.status != LivePrivacyStatus::Ready
+                || self.hidden.contains(thread) =>
+            {
+                messages.clear();
+            }
+            LiveEvent::ReactionsChanged { thread, .. }
+                if !self.confirmed
+                    || self.status != LivePrivacyStatus::Ready
+                    || self.hidden.contains(thread) =>
+            {
+                return None;
+            }
             LiveEvent::PhotoPrepared { result, thread, .. } if !self.permits(thread) => {
                 *result = Err(PhotoPreparationFailure::Cancelled);
             }

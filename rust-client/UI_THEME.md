@@ -94,7 +94,9 @@ input still scrolls. Source typography and theme colors remain unchanged.
 Unavailable live actions
 remain disabled. The demo composer saves only locally; live text sends require a
 verified session and supported conversation capability. Enter submits when
-eligible and outside IME composition; Ctrl+Enter (or Shift+Enter) inserts a newline. Media
-upload, sticker sending/animation and production E2EE remain unsupported. Current
+eligible and outside IME composition; Ctrl+Enter (or Shift+Enter) inserts a newline.
+The sticker picker uses the original toolbar glyph and the cached built-in pack.
+The message menu and reaction count badge use the six original PNG reaction
+sprites. Current
 flows and agent acceptance rules are documented in
 [UI_DESIGN.md](UI_DESIGN.md).

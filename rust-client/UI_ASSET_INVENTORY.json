@@ -74654,8 +74654,8 @@
     "native_icon_classes": [
       "fa-back",
       "fa-chatbar-attach",
-      "fa-chatbar-emoji",
       "fa-chatbar-photo",
+      "fa-chatbar-sticker",
       "fa-check",
       "fa-cloud",
       "fa-icon-outline-lock",
@@ -74673,11 +74673,6 @@
     "native_token_names": [
       "--G60",
       "--WA100",
-      "--accent-blue-bg",
-      "--accent-green-bg",
-      "--accent-orange-bg",
-      "--accent-purple-bg",
-      "--accent-stealblue-bg",
       "--bg-message-info",
       "--blue-message",
       "--border",
@@ -74701,6 +74696,18 @@
       "--layer-background-navbar-normal",
       "--layer-background-navbar-selected",
       "--layer-background-selected",
+      "--redesign-accent-ink",
+      "--redesign-accent-soft",
+      "--redesign-avatar-1",
+      "--redesign-avatar-2",
+      "--redesign-avatar-3",
+      "--redesign-avatar-4",
+      "--redesign-avatar-5",
+      "--redesign-avatar-6",
+      "--redesign-border-strong",
+      "--redesign-chip-on-bg",
+      "--redesign-chip-on-text",
+      "--redesign-text-tertiary",
       "--surface-background",
       "--text-disabled",
       "--text-errors",
@@ -75097,6 +75104,7 @@
       "fa-chat_bubble_icon_misscall",
       "fa-chat_bubble_voice_btn_stop",
       "fa-chatbar-contact",
+      "fa-chatbar-emoji",
       "fa-chatbar-file",
       "fa-chatbar-folder",
       "fa-chatbar-icon-cloud",
@@ -75116,7 +75124,6 @@
       "fa-chatbar-rtf",
       "fa-chatbar-screenshot",
       "fa-chatbar-screenshot-z",
-      "fa-chatbar-sticker",
       "fa-chatbar-todo",
       "fa-check-circle",
       "fa-check-circle-o",
@@ -76003,6 +76010,7 @@
       "--Y85",
       "--Y90",
       "--Y95",
+      "--accent-blue-bg",
       "--accent-blue-bg-bold",
       "--accent-blue-bg-subtle",
       "--accent-blue-border",
@@ -76014,6 +76022,7 @@
       "--accent-blue-text",
       "--accent-blue-text-bold",
       "--accent-blue-text-subtle",
+      "--accent-green-bg",
       "--accent-green-bg-bold",
       "--accent-green-bg-subtle",
       "--accent-green-border",
@@ -76037,6 +76046,7 @@
       "--accent-grey-text",
       "--accent-grey-text-bold",
       "--accent-grey-text-subtle",
+      "--accent-orange-bg",
       "--accent-orange-bg-bold",
       "--accent-orange-bg-subtle",
       "--accent-orange-border",
@@ -76060,6 +76070,7 @@
       "--accent-pink-text",
       "--accent-pink-text-bold",
       "--accent-pink-text-subtle",
+      "--accent-purple-bg",
       "--accent-purple-bg-bold",
       "--accent-purple-bg-subtle",
       "--accent-purple-border",
@@ -76107,6 +76118,7 @@
       "--accent-steal-text",
       "--accent-steal-text-bold",
       "--accent-steal-text-subtle",
+      "--accent-stealblue-bg",
       "--accent-stealblue-bg-bold",
       "--accent-stealblue-bg-subtle",
       "--accent-stealblue-border",
@@ -145487,7 +145499,7 @@
       "Plus",
       "Phone",
       "Video",
-      "Smile",
+      "Sticker",
       "Image",
       "Paperclip",
       "Back",
@@ -145555,9 +145567,9 @@
         "variant": "Video"
       },
       {
-        "codepoint": "U+EA5C",
-        "css_class": "fa-chatbar-emoji",
-        "variant": "Smile"
+        "codepoint": "U+EA71",
+        "css_class": "fa-chatbar-sticker",
+        "variant": "Sticker"
       },
       {
         "codepoint": "U+EA6A",
@@ -145762,7 +145774,43 @@
       {
         "role": "date_text",
         "source_tokens": [
-          "--text-secondary"
+          "--redesign-text-tertiary"
+        ]
+      },
+      {
+        "role": "text_tertiary",
+        "source_tokens": [
+          "--redesign-text-tertiary"
+        ]
+      },
+      {
+        "role": "border_strong",
+        "source_tokens": [
+          "--redesign-border-strong"
+        ]
+      },
+      {
+        "role": "accent_soft",
+        "source_tokens": [
+          "--redesign-accent-soft"
+        ]
+      },
+      {
+        "role": "accent_ink",
+        "source_tokens": [
+          "--redesign-accent-ink"
+        ]
+      },
+      {
+        "role": "chip_on_bg",
+        "source_tokens": [
+          "--redesign-chip-on-bg"
+        ]
+      },
+      {
+        "role": "chip_on_text",
+        "source_tokens": [
+          "--redesign-chip-on-text"
         ]
       },
       {
@@ -145798,23 +145846,24 @@
       {
         "role": "avatar_accents",
         "source_tokens": [
-          "--accent-blue-bg",
-          "--accent-green-bg",
-          "--accent-orange-bg",
-          "--accent-purple-bg",
-          "--accent-stealblue-bg"
+          "--redesign-avatar-1",
+          "--redesign-avatar-2",
+          "--redesign-avatar-3",
+          "--redesign-avatar-4",
+          "--redesign-avatar-5",
+          "--redesign-avatar-6"
         ]
       }
     ],
     "source": {
-      "bytes": 13394,
+      "bytes": 16381,
       "path": "rust-client/src/ui/visuals.rs",
-      "sha256": "9957862d3e42925bda09c00f6112f96a36fe7a693b1ef104cf0c84ac92cee8c6"
+      "sha256": "ef2a178d2ba8c467b945d02ab65fb3b4b956890bb2da89d4f3e6a6b550597f87"
     },
     "theme_source": {
-      "bytes": 17405,
+      "bytes": 23031,
       "path": "rust-client/src/theme.rs",
-      "sha256": "f69c8eced82d9456dcb471017731265605de2811066029d1227065e8c47469a0"
+      "sha256": "2fe2704c66c677322cddc760c0e34bff641f1cb82e2837ea96326c0e7399324e"
     }
   },
   "schema_version": 1,

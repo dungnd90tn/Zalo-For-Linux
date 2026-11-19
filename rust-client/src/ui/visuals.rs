@@ -93,7 +93,7 @@ pub enum Icon {
     Plus,
     Phone,
     Video,
-    Smile,
+    Sticker,
     Image,
     Paperclip,
     Back,
@@ -112,7 +112,7 @@ pub fn icon(ui: &Ui, rect: Rect, kind: Icon, color: Color32) {
         Icon::Plus => "fa-outline-plus",
         Icon::Phone => "fa-outline-call",
         Icon::Video => "fa-outline-video",
-        Icon::Smile => "fa-chatbar-emoji",
+        Icon::Sticker => "fa-chatbar-sticker",
         Icon::Image => "fa-chatbar-photo",
         Icon::Paperclip => "fa-chatbar-attach",
         Icon::Back => "fa-back",
@@ -171,6 +171,7 @@ pub fn icon_button(ui: &mut Ui, kind: Icon, label: &str, enabled: bool) -> egui:
         },
     );
     focus_outline(ui, &response, rect, 12.0);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     response.on_hover_text(label).on_disabled_hover_text(label)
 }
 

@@ -6,8 +6,18 @@ Ghi chú đóng gói mới nhất nằm trong [bản 2.0.4-3](../changelogs/RELE
 
 ## Chưa phát hành (dự kiến 2.0.5)
 
+### Thêm mới
+
+- Gửi 30 nhãn dán mặc định từ nút nhãn dán cạnh ô soạn trong chat cá nhân và nhóm thường đủ điều kiện. Bấm vào một nhãn dán để gửi ngay. Bản nháp đang soạn được giữ lại.
+- Bấm chuột phải vào tin văn bản đủ điều kiện để thả tim, thích, cười, bất ngờ, buồn hoặc giận. Có thể gỡ tất cả cảm xúc của mình trên tin đó. Tổng hiển thị dựa trên các lượt mà ứng dụng đã ghi nhận.
+
+### Thay đổi
+
+- Hồ sơ nâng lên **schema 17** và giữ lịch sử đã lưu. Các bản dựng cũ hơn không mở được hồ sơ đã nâng cấp.
+
 ### Ưu tiên kiểm chứng
 
+- Thử gửi nhãn dán và thêm/gỡ cảm xúc qua điện thoại và Linux trong cả chat cá nhân và nhóm thường. Xác nhận cập nhật từ thiết bị khác và sau khi kết nối lại.
 - Xác nhận phiên đã lưu giữ Online sau đồng bộ. Thử gửi bằng **Enter** và nút **Gửi** khi bật/tắt x-unikey, trên X11 và Wayland.
 - Kiểm chứng trên tài khoản thử các luồng trả lời, gửi tệp và ảnh, thông báo, chuyển tiếp, thu hồi và thao tác nhóm. Ghi kết quả theo từng luồng trong [VALIDATION.md](VALIDATION.md).
 - Khi chốt mã, cập nhật phiên bản Native trong `Cargo.toml` và `Cargo.lock`, chốt ghi chú 2.0.5, build gói `.deb`/`.rpm` và kiểm tra nâng cấp từ `2.0.4-3`. Thẻ phát hành phải khớp phiên bản Native.

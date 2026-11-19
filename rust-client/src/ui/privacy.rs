@@ -396,6 +396,12 @@ impl Privacy {
                     return None;
                 }
             }
+            LiveEvent::ReactionState { thread, .. }
+            | LiveEvent::ReactionsChanged { thread, .. } => {
+                if !self.list_visible(thread) {
+                    return None;
+                }
+            }
             LiveEvent::PrivacyChanged { .. }
             | LiveEvent::HiddenMatches { .. }
             | LiveEvent::HiddenUnlockResult { .. }
@@ -483,6 +489,7 @@ impl NativeApp {
             state.photo_preview.clear();
             state.avatars = Default::default();
             state.stickers = Default::default();
+            state.reactions.reset_view();
             state.directory.privacy_reset(ctx, state.privacy.ready());
             state.forwarding.clear_picker();
             state.recall.clear_confirmation();
@@ -503,6 +510,8 @@ impl NativeApp {
         }
         if !state.privacy.cancel(state.worker.as_ref()) {
             state.worker = None;
+            state.sticker_send.worker_closed();
+            state.reactions.worker_closed();
             state.forwarding.worker_closed();
             state.recall.worker_closed();
             state.groups.worker_closed();

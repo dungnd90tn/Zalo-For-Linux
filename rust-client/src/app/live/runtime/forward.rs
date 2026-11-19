@@ -49,15 +49,13 @@ pub(super) fn normal_scope_revision(
 }
 
 pub(super) struct TargetTtlProof {
-    target: String,
+    target: Target,
     checked_at: Instant,
 }
 
 impl TargetTtlProof {
-    fn applies(&self, target: &Target) -> bool {
-        target.kind == ThreadKind::Direct
-            && self.target == target.remote_id
-            && self.checked_at.elapsed() <= TTL_SNAPSHOT_AGE
+    pub(super) fn applies(&self, target: &Target) -> bool {
+        self.target == *target && self.checked_at.elapsed() <= TTL_SNAPSHOT_AGE
     }
 }
 
@@ -108,9 +106,6 @@ pub(super) async fn verify_target_ttl(
     session: &VerifiedSession,
     target: &Target,
 ) -> Result<TargetTtlProof> {
-    if target.kind != ThreadKind::Direct {
-        return Err(WireError::Unsupported.into());
-    }
     let mut url = service_url(session, "conversation", TTL_PATH)?;
     let params = session.encrypt_payload(b"{}")?;
     url.query_pairs_mut().append_pair("params", &params);
@@ -124,7 +119,7 @@ pub(super) async fn verify_target_ttl(
         return Err(WireError::Unsupported.into());
     }
     Ok(TargetTtlProof {
-        target: target.remote_id.clone(),
+        target: target.clone(),
         checked_at,
     })
 }
