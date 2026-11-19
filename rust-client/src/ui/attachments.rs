@@ -18,17 +18,109 @@ pub(super) enum Picked {
     Cancelled,
     Failed(String),
 }
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PickerKind {
+    #[default]
+    File,
+    Photo,
+}
 
 #[derive(Default)]
 pub(super) struct AttachmentPicker {
+    kind: PickerKind,
     pending: Option<mpsc::Receiver<Picked>>,
     /// The conversation the choice was started in; a result for another one is dropped.
     for_thread: Option<String>,
+    for_account: Option<String>,
+    for_auth_generation: Option<u64>,
     /// The last problem, shown in the attachment tray until the user dismisses it or chooses again.
     pub notice: Option<String>,
 }
 
 impl AttachmentPicker {
+    pub fn open_scoped_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        thread: Option<&str>,
+        account: &str,
+        auth_generation: Option<u64>,
+    ) {
+        if self.busy() {
+            return;
+        }
+        self.for_account = Some(account.into());
+        self.for_auth_generation = auth_generation;
+        self.kind = PickerKind::File;
+        self.open_dialog(ctx, thread);
+    }
+    #[cfg(feature = "messaging")]
+    pub fn open_photo_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        thread: Option<&str>,
+        account: &str,
+        auth_generation: Option<u64>,
+    ) {
+        if self.busy() {
+            return;
+        }
+        self.for_account = Some(account.into());
+        self.for_auth_generation = auth_generation;
+        self.kind = PickerKind::Photo;
+        self.open_dialog(ctx, thread);
+    }
+    fn photo_scope(
+        &self,
+        account: &str,
+        auth_generation: Option<u64>,
+        thread: Option<&str>,
+    ) -> bool {
+        self.kind == PickerKind::Photo
+            && self.for_account.as_deref() == Some(account)
+            && self.for_auth_generation == auth_generation
+            && self.for_thread.as_deref() == thread
+    }
+    #[cfg(feature = "messaging")]
+    pub fn invalidate_photo_choice(&mut self) {
+        if self.kind == PickerKind::Photo {
+            self.notice = None;
+            self.for_thread = None;
+            self.for_account = None;
+        }
+    }
+    #[cfg(feature = "messaging")]
+    fn inspect_photo_scoped(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        thread: Option<&str>,
+        account: &str,
+        auth_generation: Option<u64>,
+    ) {
+        if self.busy() {
+            return;
+        }
+        self.for_account = Some(account.into());
+        self.for_auth_generation = auth_generation;
+        self.kind = PickerKind::Photo;
+        self.inspect(ctx, path, thread);
+    }
+    fn inspect_scoped(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        thread: Option<&str>,
+        account: &str,
+        auth_generation: Option<u64>,
+    ) {
+        if self.busy() {
+            return;
+        }
+        self.for_account = Some(account.into());
+        self.for_auth_generation = auth_generation;
+        self.kind = PickerKind::File;
+        self.inspect(ctx, path, thread);
+    }
     pub fn busy(&self) -> bool {
         self.pending.is_some()
     }
@@ -39,14 +131,33 @@ impl AttachmentPicker {
         }
         self.notice = None;
         self.for_thread = thread.map(str::to_owned);
-        let Some((program, args)) = dialog_command() else {
+        let Some((program, mut args)) = dialog_command() else {
             self.notice = Some(
                 "Không tìm thấy zenity hoặc kdialog để mở hộp thoại. Hãy kéo thả tệp vào cửa sổ."
                     .into(),
             );
             return;
         };
-        self.spawn(ctx, move || run_dialog(&program, &args));
+        let kind = self.kind;
+        if kind == PickerKind::Photo {
+            for arg in &mut args {
+                if arg == "--title=Chọn tệp để gửi" {
+                    *arg = "--title=Chọn ảnh HD".into();
+                }
+            }
+            if program.file_name().is_some_and(|name| name == "zenity") {
+                args.push("--file-filter=Ảnh JPEG, PNG, WebP | *.jpg *.jpeg *.png *.webp *.JPG *.JPEG *.PNG *.WEBP".into());
+            } else {
+                args.push("*.jpg *.jpeg *.png *.webp|Ảnh JPEG, PNG, WebP".into());
+            }
+        }
+        self.spawn(ctx, move || {
+            if kind == PickerKind::Photo {
+                run_dialog_kind(&program, &args, kind)
+            } else {
+                run_dialog(&program, &args)
+            }
+        });
     }
     /// Inspect a path that arrived by drag-and-drop.
     pub fn inspect(&mut self, ctx: &egui::Context, path: PathBuf, thread: Option<&str>) {
@@ -55,7 +166,8 @@ impl AttachmentPicker {
         }
         self.notice = None;
         self.for_thread = thread.map(str::to_owned);
-        self.spawn(ctx, move || inspect_path(&path));
+        let kind = self.kind;
+        self.spawn(ctx, move || inspect_path_kind(&path, kind));
     }
     fn spawn(&mut self, ctx: &egui::Context, work: impl FnOnce() -> Picked + Send + 'static) {
         let (sender, receiver) = mpsc::channel();
@@ -93,6 +205,20 @@ fn inspect_path(path: &Path) -> Picked {
         Ok(attachment) => Picked::File(attachment),
         Err(error) => Picked::Failed(error.to_string()),
     }
+}
+fn inspect_path_kind(path: &Path, kind: PickerKind) -> Picked {
+    let picked = inspect_path(path);
+    if kind == PickerKind::Photo {
+        if let Picked::File(file) = &picked {
+            if file.size_bytes > 20 * 1024 * 1024 {
+                return Picked::Failed("Ảnh nguồn lớn hơn 20 MiB; hãy chọn ảnh nhỏ hơn.".into());
+            }
+            if !matches!(file.extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+                return Picked::Failed("Ảnh HD chỉ nhận JPEG, PNG hoặc WebP tĩnh. Dùng Đính kèm tệp nếu muốn gửi định dạng khác.".into());
+            }
+        }
+    }
+    picked
 }
 
 /// The first dialog program found on `PATH` with its arguments, preferring the GNOME one.
@@ -135,6 +261,9 @@ fn is_executable(path: &Path) -> bool {
 /// Run a dialog program and turn its answer into a choice. Exit status 1 is the dialogs'
 /// convention for "cancelled"; any other failure is reported, never guessed at.
 fn run_dialog(program: &Path, args: &[OsString]) -> Picked {
+    run_dialog_kind(program, args, PickerKind::File)
+}
+fn run_dialog_kind(program: &Path, args: &[OsString], kind: PickerKind) -> Picked {
     let output = match Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -156,7 +285,7 @@ fn run_dialog(program: &Path, args: &[OsString]) -> Picked {
     if first.is_empty() {
         return Picked::Cancelled;
     }
-    inspect_path(Path::new(first))
+    inspect_path_kind(Path::new(first), kind)
 }
 
 /// Height of the tray above the composer's toolbar while a file, a problem or a check is shown.
@@ -167,10 +296,59 @@ pub(super) fn size_text(bytes: u64) -> String {
 }
 
 impl NativeApp {
+    pub(super) fn photo_picker_pending(&self) -> bool {
+        self.attachments.photo_scope(
+            self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT),
+            self.auth_generation(),
+            self.model.selected.as_deref(),
+        ) && (self.attachments.busy() || self.attachments.notice.is_some())
+    }
+    pub(super) fn photo_selected(&self) -> bool {
+        self.drafts.active.has_photo_intent() || self.photo_picker_pending()
+    }
+    #[cfg(feature = "messaging")]
+    pub(super) fn photo_picker_notice(&self) -> Option<&str> {
+        self.photo_picker_pending()
+            .then_some(self.attachments.notice.as_deref())
+            .flatten()
+    }
+    #[cfg(not(feature = "messaging"))]
+    pub(super) fn photo_can_choose(&self) -> bool {
+        false
+    }
+    #[cfg(not(feature = "messaging"))]
+    pub(super) fn photo_can_send(&self) -> bool {
+        false
+    }
+    #[cfg(not(feature = "messaging"))]
+    pub(super) fn photo_tray_height(&self) -> f32 {
+        0.0
+    }
+    #[cfg(not(feature = "messaging"))]
+    pub(super) fn photo_send_label(&self) -> &'static str {
+        "Gửi ảnh"
+    }
+    #[cfg(not(feature = "messaging"))]
+    pub(super) fn file_can_choose(&self) -> bool {
+        self.demo && self.drafts.active.reply().is_none() && !self.photo_selected()
+    }
+    #[cfg(not(feature = "messaging"))]
+    pub(super) fn file_can_send(&self) -> bool {
+        false
+    }
+    #[cfg(not(feature = "messaging"))]
+    pub(super) fn file_upload_visible(&self) -> bool {
+        false
+    }
+    #[cfg(not(feature = "messaging"))]
+    pub(super) fn file_send_label(&self) -> &'static str {
+        "Gửi tệp"
+    }
     pub(super) fn attachment_tray_height(&self) -> f32 {
         if self.drafts.active.attachment().is_some()
-            || self.attachments.busy()
-            || self.attachments.notice.is_some()
+            || (self.attachments.kind == PickerKind::File
+                && (self.attachments.busy() || self.attachments.notice.is_some()))
+            || self.file_upload_visible()
         {
             TRAY_HEIGHT
         } else {
@@ -189,32 +367,88 @@ impl NativeApp {
                 .filter_map(|file| file.path.clone())
                 .collect()
         });
-        if let Some(first) = dropped.first() {
-            if !accepting {
-                self.attachments.notice = Some(reason.to_owned());
-            } else {
-                let thread = self.model.selected.clone();
-                self.attachments
-                    .inspect(ctx, first.clone(), thread.as_deref());
-                if dropped.len() > 1 {
-                    // Shown once the first file has been checked; one file goes per message.
-                    self.attachments.notice =
-                        Some("Mỗi lần chỉ gửi một tệp; đã chọn tệp đầu tiên.".into());
+        if let Some(first) = dropped.first().filter(|_| !self.attachments.busy()) {
+            let thread = self.model.selected.clone();
+            let account = self
+                .account_id()
+                .unwrap_or(crate::app::DEMO_ACCOUNT)
+                .to_owned();
+            let auth_generation = self.auth_generation();
+            let extension = first
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let image = matches!(
+                extension.as_str(),
+                "jpg" | "jpeg" | "png" | "webp" | "gif" | "jxl" | "bmp" | "avif" | "heic"
+            );
+            let photo_drop = !self.demo && image && !ctx.input(|input| input.modifiers.shift);
+            #[cfg(feature = "messaging")]
+            if photo_drop {
+                self.drafts.active.edited();
+                if self.photo_can_choose() {
+                    self.attachments.inspect_photo_scoped(
+                        ctx,
+                        first.clone(),
+                        thread.as_deref(),
+                        &account,
+                        auth_generation,
+                    );
+                } else {
+                    self.attachments.kind = PickerKind::Photo;
+                    self.attachments.for_thread = thread.clone();
+                    self.attachments.for_account = Some(account.clone());
+                    self.attachments.for_auth_generation = auth_generation;
+                    self.attachments.notice = Some(
+                        "Chưa thể chọn ảnh HD. Bỏ tệp hoặc trích dẫn và kiểm tra kết nối.".into(),
+                    );
                 }
+            }
+            if !photo_drop {
+                if !accepting {
+                    self.attachments.notice = Some(reason.into());
+                } else {
+                    self.attachments.inspect_scoped(
+                        ctx,
+                        first.clone(),
+                        thread.as_deref(),
+                        &account,
+                        auth_generation,
+                    );
+                }
+            }
+            if dropped.len() > 1 {
+                self.attachments.notice =
+                    Some("Mỗi lần chỉ chọn một mục; đã chọn mục đầu tiên.".into());
             }
         }
         match self.attachments.poll() {
             Some(Picked::File(attachment)) => {
-                if self.attachments.for_thread.as_deref() == self.model.selected.as_deref() {
+                let account = self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT);
+                let scoped = self.attachments.for_thread.as_deref()
+                    == self.model.selected.as_deref()
+                    && self.attachments.for_account.as_deref() == Some(account)
+                    && self.attachments.for_auth_generation == self.auth_generation();
+                if scoped && self.attachments.kind == PickerKind::Photo {
+                    self.attachments.notice = None;
+                    #[cfg(feature = "messaging")]
+                    self.begin_photo_preparation(attachment);
+                } else if scoped
+                    && accepting
+                    && self.drafts.active.reply().is_none()
+                    && !self.photo_selected()
+                {
                     self.drafts.active.set_attachment(attachment);
-                    // Keep the "one file at a time" note from a multi-file drop; clear others.
                 } else {
-                    self.attachments.notice =
-                        Some("Đã đổi hội thoại trước khi chọn xong; hãy chọn lại tệp.".into());
+                    self.attachments.notice = Some(
+                        "Đã đổi phiên hoặc hội thoại trước khi chọn xong; hãy chọn lại tệp.".into(),
+                    );
                 }
             }
-            Some(Picked::Cancelled) | None => {}
+            Some(Picked::Cancelled) => self.attachments.notice = None,
             Some(Picked::Failed(message)) => self.attachments.notice = Some(message),
+            None => {}
         }
     }
 
@@ -232,41 +466,84 @@ impl NativeApp {
         let badge = egui::Rect::from_min_size(tray.min + vec2(14.0, 8.0), vec2(40.0, 40.0));
         let close = egui::Rect::from_center_size(
             pos2(tray.right() - 30.0, tray.center().y),
-            vec2(36.0, 36.0),
+            vec2(44.0, 44.0),
         );
         let text_left = badge.right() + 12.0;
         let text_width = (close.left() - text_left - 8.0).max(0.0);
-        let (title, subtitle, glyph, dismiss) = if let Some(file) = self.drafts.active.attachment()
-        {
-            (
-                file.name.clone(),
-                if file.extension.is_empty() {
-                    size_text(file.size_bytes)
-                } else {
-                    format!(
-                        "{} · {}",
-                        file.extension.to_uppercase(),
+        #[cfg(feature = "messaging")]
+        let transfer =
+            self.live
+                .as_ref()
+                .and_then(|state| state.uploads.transfer.as_ref())
+                .filter(|job| {
+                    job.busy()
+                        || job.review()
+                        || self.model.selected.as_deref().is_some_and(|thread| {
+                            job.is_retry(thread, self.drafts.active.attachment())
+                        })
+                })
+                .map(|job| {
+                    let visible = self.model.selected.as_deref() == Some(job.thread.as_str())
+                        && self.privacy_visible(&job.thread);
+                    let title = if visible {
+                        job.filename().unwrap_or("Lượt gửi tệp").to_owned()
+                    } else {
+                        "Đang xử lý một lượt gửi tệp".into()
+                    };
+                    let subtitle = if visible {
+                        job.label()
+                    } else {
+                        job.generic_label()
+                    };
+                    let progress = (visible && job.busy() && job.total > 0)
+                        .then(|| (job.uploaded as f64 / job.total as f64).clamp(0.0, 1.0) as f32);
+                    let dismiss = if job.can_cancel() {
+                        Dismiss::TransferCancel
+                    } else if job.review() {
+                        Dismiss::TransferReview
+                    } else if visible && !job.busy() && !job.review() {
+                        Dismiss::Attachment
+                    } else {
+                        Dismiss::None
+                    };
+                    (title, subtitle, dismiss, progress)
+                });
+        #[cfg(not(feature = "messaging"))]
+        let transfer: Option<(String, String, Dismiss, Option<f32>)> = None;
+        let progress = transfer.as_ref().and_then(|(_, _, _, progress)| *progress);
+        let (title, subtitle, glyph, dismiss) =
+            if let Some((title, subtitle, dismiss, _)) = transfer {
+                (title, subtitle, "fa-chatbar-file", dismiss)
+            } else if let Some(file) = self.drafts.active.attachment() {
+                (
+                    file.name.clone(),
+                    if file.extension.is_empty() {
                         size_text(file.size_bytes)
-                    )
-                },
-                "fa-chatbar-file",
-                Dismiss::Attachment,
-            )
-        } else if self.attachments.busy() {
-            (
-                "Đang kiểm tra tệp…".to_owned(),
-                String::new(),
-                "fa-chatbar-file",
-                Dismiss::None,
-            )
-        } else {
-            (
-                self.attachments.notice.clone().unwrap_or_default(),
-                String::new(),
-                "fa-warning-lock-send-message",
-                Dismiss::Notice,
-            )
-        };
+                    } else {
+                        format!(
+                            "{} · {}",
+                            file.extension.to_uppercase(),
+                            size_text(file.size_bytes)
+                        )
+                    },
+                    "fa-chatbar-file",
+                    Dismiss::Attachment,
+                )
+            } else if self.attachments.busy() {
+                (
+                    "Đang kiểm tra tệp…".to_owned(),
+                    String::new(),
+                    "fa-chatbar-file",
+                    Dismiss::None,
+                )
+            } else {
+                (
+                    self.attachments.notice.clone().unwrap_or_default(),
+                    String::new(),
+                    "fa-warning-lock-send-message",
+                    Dismiss::Notice,
+                )
+            };
         let problem = matches!(dismiss, Dismiss::Notice);
         ui.painter().rect_filled(
             badge,
@@ -315,6 +592,13 @@ impl NativeApp {
                 colors.text_secondary,
             );
         }
+        if let Some(progress) = progress {
+            let line = egui::Rect::from_min_size(
+                tray.left_bottom() + vec2(12.0, -3.0),
+                vec2((tray.width() - 24.0).max(0.0) * progress, 3.0),
+            );
+            ui.painter().rect_filled(line, 1.5, colors.primary);
+        }
         if dismiss == Dismiss::None {
             return;
         }
@@ -324,7 +608,11 @@ impl NativeApp {
         }
         visuals::source_icon(ui, close.shrink(10.0), "fa-close", colors.text_secondary);
         visuals::focus_outline(ui, &response, close, 10.0);
-        let label = if dismiss == Dismiss::Attachment {
+        let label = if dismiss == Dismiss::TransferReview {
+            "Đóng cảnh báo và bỏ tệp khỏi bản nháp đang mở · không gửi lại lượt cũ"
+        } else if dismiss == Dismiss::TransferCancel {
+            "Hủy gửi tệp · giữ tệp và nội dung đang soạn"
+        } else if dismiss == Dismiss::Attachment {
             "Bỏ tệp đính kèm"
         } else {
             "Đóng thông báo"
@@ -332,6 +620,10 @@ impl NativeApp {
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
         if response.clicked() {
             match dismiss {
+                #[cfg(feature = "messaging")]
+                Dismiss::TransferCancel => self.cancel_file_upload(),
+                #[cfg(feature = "messaging")]
+                Dismiss::TransferReview => self.dismiss_file_review(),
                 Dismiss::Attachment => self.drafts.active.clear_attachment(),
                 _ => self.attachments.notice = None,
             }
@@ -346,6 +638,8 @@ enum Dismiss {
     None,
     Attachment,
     Notice,
+    TransferCancel,
+    TransferReview,
 }
 
 #[cfg(test)]
@@ -408,7 +702,11 @@ mod tests {
             "multi",
             &format!("echo '{}|/does/not/matter'", file.display()),
         );
-        assert!(matches!(run_dialog(&multi, &[]), Picked::File(_)));
+        let picked = run_dialog(&multi, &[]);
+        assert!(
+            matches!(&picked, Picked::File(_)),
+            "multi-answer chooser returned {picked:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -493,6 +791,7 @@ mod flow_tests {
                 last_message_at_ms: 1,
                 last_text: "xin chào".into(),
                 last_sender: "x".into(),
+                group_left: false,
             }];
             app.model.selected = Some("welcome".into());
             app.model.generation = 1;
@@ -677,7 +976,7 @@ mod flow_tests {
         let all = texts(&demo.idle());
         assert!(
             all.iter()
-                .any(|t| t.contains("Gửi tệp tới Zalo chưa được hỗ trợ")),
+                .any(|t| t.contains("Chưa thể gửi tệp trong phiên này")),
             "{all:?}"
         );
         assert!(demo.app.drafts.active.attachment().is_none());
@@ -702,6 +1001,49 @@ mod flow_tests {
             .attachments
             .notice
             .as_deref()
-            .is_some_and(|n| n.contains("đổi hội thoại")));
+            .is_some_and(|n| n.contains("hãy chọn lại tệp")));
+    }
+
+    #[test]
+    fn late_picker_result_cannot_cross_account_auth_generation_or_a_new_quote() {
+        for changed in ["account", "auth-generation", "quote"] {
+            let mut demo = Demo::new();
+            demo.app.drafts.active.text = "Bản nháp phải được giữ lại".into();
+            let attachment =
+                Attachment::inspect(&file(&demo.root, "Tệp tổng hợp.pdf", 32)).unwrap();
+            let (tx, rx) = mpsc::channel();
+            tx.send(Picked::File(attachment)).unwrap();
+            demo.app.attachments.pending = Some(rx);
+            demo.app.attachments.for_thread = Some("welcome".into());
+            demo.app.attachments.for_account = Some(
+                if changed == "account" {
+                    "another-account"
+                } else {
+                    crate::app::DEMO_ACCOUNT
+                }
+                .into(),
+            );
+            demo.app.attachments.for_auth_generation = (changed == "auth-generation").then_some(99);
+            if changed == "quote" {
+                demo.app
+                    .drafts
+                    .active
+                    .set_reply(crate::domain::ReplyReference {
+                        account_id: crate::app::DEMO_ACCOUNT.into(),
+                        thread_id: "welcome".into(),
+                        message_id: "9001".into(),
+                        sender: "22".into(),
+                        text: "Trích dẫn được giữ lại".into(),
+                    });
+            }
+            let ctx = demo.ctx.clone();
+            demo.app.poll_attachments(&ctx, true, "Không thể chọn tệp");
+            assert!(demo.app.drafts.active.attachment().is_none(), "{changed}");
+            assert_eq!(demo.app.drafts.active.text, "Bản nháp phải được giữ lại");
+            assert!(demo.app.attachments.notice.is_some());
+            if changed == "quote" {
+                assert!(demo.app.drafts.active.reply().is_some());
+            }
+        }
     }
 }

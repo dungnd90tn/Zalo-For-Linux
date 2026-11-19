@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 pub(super) struct Projection {
     pub status: LivePrivacyStatus,
     pub revision: u64,
+    pub confirmed: bool,
     pub hidden: BTreeSet<String>,
     pub unlocked: Option<String>,
 }
@@ -16,6 +17,7 @@ impl Default for Projection {
         Self {
             status: LivePrivacyStatus::Ready,
             revision: 0,
+            confirmed: false,
             hidden: BTreeSet::new(),
             unlocked: None,
         }
@@ -28,6 +30,56 @@ impl Projection {
     }
     pub fn event(&self, mut event: LiveEvent) -> Option<LiveEvent> {
         match &mut event {
+            LiveEvent::GroupMembers {
+                thread,
+                privacy_revision,
+                page,
+                ..
+            } => {
+                if !self.confirmed
+                    || self.status != LivePrivacyStatus::Ready
+                    || *privacy_revision != self.revision
+                    || self.hidden.contains(thread)
+                {
+                    *page = None;
+                }
+            }
+            LiveEvent::GroupInviteTargets {
+                thread,
+                privacy_revision,
+                targets,
+                ..
+            } => {
+                if !self.confirmed
+                    || self.status != LivePrivacyStatus::Ready
+                    || *privacy_revision != self.revision
+                    || self.hidden.contains(thread)
+                {
+                    *targets = None;
+                } else if let Some(targets) = targets {
+                    targets
+                        .retain(|target| !self.hidden.contains(&format!("d:{}", target.contact)));
+                }
+            }
+            LiveEvent::ForwardTargets {
+                source_thread,
+                entries,
+                failed,
+                ..
+            } => {
+                if !self.confirmed
+                    || self.status != LivePrivacyStatus::Ready
+                    || self.hidden.contains(source_thread)
+                {
+                    entries.clear();
+                    *failed = true;
+                } else {
+                    entries.retain(|entry| !self.hidden.contains(&entry.thread_id));
+                }
+            }
+            LiveEvent::PhotoPrepared { result, thread, .. } if !self.permits(thread) => {
+                *result = Err(PhotoPreparationFailure::Cancelled);
+            }
             LiveEvent::Avatars { avatars, .. } => {
                 avatars.retain(|entry| self.permits(&entry.thread_id))
             }
@@ -41,6 +93,24 @@ impl Projection {
             LiveEvent::HiddenMatches { candidates, .. } => candidates.retain(|c| {
                 self.status != LivePrivacyStatus::Checking && self.hidden.contains(&c.thread_id)
             }),
+            LiveEvent::FileAccepted {
+                kind,
+                account_id,
+                thread,
+                request_id,
+                ..
+            } if !self.permits(thread) => {
+                return Some(LiveEvent::FileTransfer {
+                    kind: *kind,
+                    account_id: account_id.clone(),
+                    thread: thread.clone(),
+                    request_id: *request_id,
+                    phase: FileTransferPhase::Accepted,
+                    uploaded: 0,
+                    total: 0,
+                    message: None,
+                });
+            }
             LiveEvent::Sent {
                 account_id,
                 thread,
@@ -73,7 +143,8 @@ impl Projection {
             LiveEvent::Opened { conversation, .. } if !self.permits(&conversation.id) => {
                 return None
             }
-            LiveEvent::Page { thread, .. }
+            LiveEvent::Recalled { thread, .. }
+            | LiveEvent::Page { thread, .. }
             | LiveEvent::Overview { thread, .. }
             | LiveEvent::OverviewFailed { thread, .. }
             | LiveEvent::SearchResults { thread, .. }
@@ -163,6 +234,7 @@ impl Privacy {
             .write()
             .map_err(|_| anyhow::anyhow!("Privacy state unavailable"))?;
         state.status = status;
+        state.confirmed = false;
         state.revision = state.revision.wrapping_add(1);
         state.hidden = hidden.into_iter().collect();
         state.unlocked = None;
@@ -285,6 +357,7 @@ impl Privacy {
                 state.revision = state.revision.wrapping_add(1);
             }
             state.status = LivePrivacyStatus::Ready;
+            state.confirmed = true;
             state.hidden = snapshot.threads.iter().cloned().collect();
             state.unlocked = unlocked;
         }
@@ -495,6 +568,7 @@ mod avatar_tests {
         let mut state = Projection {
             status: LivePrivacyStatus::Checking,
             revision: 1,
+            confirmed: true,
             hidden: ["g:22".into()].into_iter().collect(),
             unlocked: None,
         };
@@ -538,6 +612,7 @@ mod search_tests {
         let mut state = Projection {
             status: LivePrivacyStatus::Ready,
             revision: 1,
+            confirmed: true,
             hidden: ["d:22".into()].into_iter().collect(),
             unlocked: None,
         };

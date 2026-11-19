@@ -5,6 +5,229 @@ use super::*;
 use rusqlite::{types::Value as SqlValue, Connection as Sqlite};
 use std::{path::Path, sync::Arc};
 
+async fn stored_session(db: &Database, uid: &str, device: e2ee::Platform) -> (String, Value) {
+    let uid = uid.to_owned();
+    db.call(move |store| {
+        let local = e2ee::LocalNamespace {
+            epoch: store.e2ee_current_local("11")?.unwrap().to_string(),
+            platform: e2ee::Platform::Pc,
+        };
+        let active = store.e2ee_active_peer("11", &local, &uid, device)?.unwrap();
+        let namespace = active.namespace.epoch.clone();
+        let record = store
+            .e2ee_snapshot(
+                "11",
+                &[e2ee::RecordKey::Session {
+                    local,
+                    peer: active.namespace,
+                }],
+            )?
+            .records
+            .into_iter()
+            .next()
+            .unwrap();
+        let encoded: String = serde_json::from_slice(&record.value)?;
+        Ok((namespace, serde_json::from_str(&encoded)?))
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn readiness_renews_only_the_unknown_iid_device_and_archives_its_previous_session() {
+    let bundles = vec![
+        wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await,
+        wire_bundle(zalo_signal_engine::SignalPlatform::Web, 1).await,
+    ];
+    let root =
+        std::env::temp_dir().join(format!("zalo-renewal-archive-{:x}", rand::random::<u64>()));
+    let profile = Arc::new(crate::profile::Profile::at_root(&root, "fixture").unwrap());
+    let path = profile.paths.data_dir.join("messages.sqlite");
+    seed_identity(&path);
+    let db = Database::open(profile, "11".into()).await.unwrap();
+    assert!(check(&db, &bundles, Mode::Normal, 33_000_000)
+        .await
+        .0
+        .is_ok());
+    let mobile = stored_session(&db, "22", e2ee::Platform::Mobile).await;
+    let web = stored_session(&db, "22", e2ee::Platform::Web).await;
+    let before = durable_crypto(&path);
+    let (renewed, seen, _) = check(&db, &bundles, Mode::UnknownIid, 33_000_128).await;
+    let renewed = renewed.expect("Verified matching bundle must permit bounded session renewal");
+    let inits: Vec<_> = seen.iter().filter(|(cmd, _)| *cmd == 543).collect();
+    assert_eq!(inits.len(), 1);
+    assert_eq!(inits[0].1["uidTo"], "22");
+    assert_eq!(inits[0].1["data"].as_array().unwrap().len(), 1);
+    assert_eq!(inits[0].1["data"][0]["deviceId"], 0);
+    let after_mobile = stored_session(&db, "22", e2ee::Platform::Mobile).await;
+    assert_eq!(
+        after_mobile.0, mobile.0,
+        "Renewal keeps the trusted namespace"
+    );
+    assert_eq!(stored_session(&db, "22", e2ee::Platform::Web).await, web);
+    let old_sessions = mobile.1["sessions"].as_object().unwrap();
+    let sessions = after_mobile.1["sessions"].as_object().unwrap();
+    assert_eq!(sessions.len(), old_sessions.len() + 1);
+    for key in old_sessions.keys() {
+        assert!(sessions[key]["indexInfo"]["closed"].as_i64().unwrap() >= 0);
+    }
+    assert_eq!(
+        sessions
+            .values()
+            .filter(|session| session["indexInfo"]["closed"] == -1)
+            .count(),
+        1
+    );
+    assert_eq!(
+        durable_crypto(&path)[4],
+        before[4],
+        "Trust bindings cannot change during same-identity renewal"
+    );
+    let prepared = super::super::e2ee_send::prepare_checked(
+        &db,
+        "11",
+        "22",
+        "Tin tổng hợp sau làm mới phiên",
+        1_700_000_003_000,
+        Arc::new(renewed),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.devices, 2);
+    let (_, seen, _) = check(&db, &bundles, Mode::Normal, 33_000_256).await;
+    assert!(
+        seen.iter().all(|(cmd, _)| *cmd != 543),
+        "Known metadata does not repeat renewal"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn unknown_metadata_never_authorizes_changed_registration_or_an_invalid_signed_bundle() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let bundles = vec![wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await];
+    let root =
+        std::env::temp_dir().join(format!("zalo-renewal-reject-{:x}", rand::random::<u64>()));
+    let profile = Arc::new(crate::profile::Profile::at_root(&root, "fixture").unwrap());
+    let path = profile.paths.data_dir.join("messages.sqlite");
+    seed_identity(&path);
+    let db = Database::open(profile, "11".into()).await.unwrap();
+    assert!(check(&db, &bundles, Mode::Normal, 34_000_000)
+        .await
+        .0
+        .is_ok());
+    for case in 0..3 {
+        let mut invalid = bundles.clone();
+        match case {
+            0 => {
+                let old = invalid[0]["preKey"]["iKey"]["id"].as_u64().unwrap();
+                invalid[0]["preKey"]["iKey"]["id"] = json!((old + 1) % 16384);
+            }
+            1 => invalid[0]["preKey"]["signature"] = json!(STANDARD.encode([0u8; 64])),
+            _ => invalid[0] = wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await,
+        }
+        let before = durable_crypto(&path);
+        let (result, seen, _) =
+            check(&db, &invalid, Mode::UnknownIid, 34_000_128 + case * 128).await;
+        assert!(result.is_err());
+        assert!(seen.iter().all(|(cmd, _)| *cmd != 543));
+        assert_eq!(
+            durable_crypto(&path),
+            before,
+            "Refused renewal cannot modify durable crypto state"
+        );
+    }
+    // An incoming prekey can make the opaque session newer than the binding
+    // timestamp. The original then keeps that session open and archives the
+    // proposed one: readiness must not mistake this for a completed renewal.
+    let (key, timestamp) = db
+        .call(|store| {
+            let local = e2ee::LocalNamespace {
+                epoch: store.e2ee_current_local("11")?.unwrap().to_string(),
+                platform: e2ee::Platform::Pc,
+            };
+            let active = store
+                .e2ee_active_peer("11", &local, "22", e2ee::Platform::Mobile)?
+                .unwrap();
+            Ok((
+                serde_json::to_string(&e2ee::RecordKey::SessionTimestamp {
+                    local,
+                    peer: active.namespace,
+                })?,
+                active.session_timestamp + 1,
+            ))
+        })
+        .await
+        .unwrap();
+    let conn = Sqlite::open(&path).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE e2ee_records SET value=?1 WHERE account='11' AND key=?2",
+            rusqlite::params![serde_json::to_vec(&timestamp).unwrap(), key]
+        )
+        .unwrap(),
+        1
+    );
+    drop(conn);
+    let before = durable_crypto(&path);
+    let (result, seen, _) = check(&db, &bundles, Mode::UnknownIid, 34_000_640).await;
+    assert!(
+        result.is_err(),
+        "An older binding timestamp cannot authorize session renewal"
+    );
+    assert!(seen.iter().all(|(cmd, _)| *cmd != 543));
+    assert_eq!(durable_crypto(&path), before);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn interrupted_renewal_and_own_device_init_never_authorize_chat_or_repeat_the_handshake() {
+    for (mode, target) in [
+        (Mode::UnknownIidStateDuringInit, "22"),
+        (Mode::OwnStateDuringInit, "11"),
+    ] {
+        let bundles = vec![
+            wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await,
+            wire_bundle(zalo_signal_engine::SignalPlatform::Web, 1).await,
+        ];
+        let root = std::env::temp_dir().join(format!(
+            "zalo-renewal-interrupt-{:x}",
+            rand::random::<u64>()
+        ));
+        let profile = Arc::new(crate::profile::Profile::at_root(&root, "fixture").unwrap());
+        let path = profile.paths.data_dir.join("messages.sqlite");
+        seed_identity(&path);
+        let db = Database::open(profile, "11".into()).await.unwrap();
+        assert!(check(&db, &bundles, Mode::Normal, 35_000_000)
+            .await
+            .0
+            .is_ok());
+        let (result, seen, events) = check(&db, &bundles, mode, 35_000_128).await;
+        assert!(
+            result.is_err(),
+            "A session state transition invalidates the initialization wait"
+        );
+        let inits: Vec<_> = seen.iter().filter(|(cmd, _)| *cmd == 543).collect();
+        assert_eq!(inits.len(), 1);
+        assert_eq!(inits[0].1["uidTo"], target);
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, LiveEvent::Sent { .. })));
+        let before = durable_crypto(&path);
+        let (retry, seen, _) = check(&db, &bundles, Mode::Normal, 35_000_256).await;
+        assert!(retry.is_err());
+        assert!(
+            seen.is_empty(),
+            "Unknown initialization blocks before any repeated network operation"
+        );
+        assert_eq!(durable_crypto(&path), before);
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 fn durable_crypto(path: &Path) -> Vec<Vec<Vec<SqlValue>>> {
     let conn = Sqlite::open(path).unwrap();
     [
@@ -32,6 +255,100 @@ fn durable_crypto(path: &Path) -> Vec<Vec<Vec<SqlValue>>> {
         rows.collect::<rusqlite::Result<_>>().unwrap()
     })
     .collect()
+}
+
+fn assert_no_first_use_commit(path: &Path, initial_records: &[Vec<SqlValue>]) {
+    let state = durable_crypto(path);
+    assert_eq!(
+        state[0], initial_records,
+        "Failed preparation cannot commit crypto records"
+    );
+    assert!(state[1].is_empty(), "Unsent reservation must be removed");
+    assert!(
+        state[2].is_empty(),
+        "Discarded reservations cannot leave init intent"
+    );
+    let conn = Sqlite::open(path).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM e2ee_peer_epochs WHERE active=1",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "Unverified candidates cannot become trusted"
+    );
+}
+
+#[tokio::test]
+async fn first_use_fanout_one_invalid_signature_discards_every_overlay_and_retry_verifies_again() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let bundles = vec![
+        wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await,
+        wire_bundle(zalo_signal_engine::SignalPlatform::Web, 1).await,
+    ];
+    let root =
+        std::env::temp_dir().join(format!("zalo-first-use-fanout-{:x}", rand::random::<u64>()));
+    let profile = Arc::new(crate::profile::Profile::at_root(&root, "fixture").unwrap());
+    let path = profile.paths.data_dir.join("messages.sqlite");
+    seed_identity(&path);
+    let db = Database::open(profile, "11".into()).await.unwrap();
+    let records = durable_crypto(&path).remove(0);
+    let mut invalid = bundles.clone();
+    invalid[1]["preKey"]["signature"] = json!(STANDARD.encode([0u8; 64]));
+    for sequence in [36_000_000, 36_000_128] {
+        let (failed, seen, _) = check(&db, &invalid, Mode::Normal, sequence).await;
+        assert!(failed.is_err());
+        assert!(seen.iter().all(|(cmd, _)| *cmd != 543));
+        assert_no_first_use_commit(&path, &records);
+    }
+    let conn = Sqlite::open(&path).unwrap();
+    assert!(
+        conn.query_row(
+            "SELECT count(*) FROM e2ee_peer_epochs WHERE active=-1",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap()
+            <= 2,
+        "Repeated failure must not grow candidates per device"
+    );
+    drop(conn);
+    let (ready, seen, _) = check(&db, &bundles, Mode::Normal, 36_000_256).await;
+    assert!(
+        ready.is_ok(),
+        "A fresh verified retry can initialize both devices"
+    );
+    assert_eq!(seen.iter().filter(|(cmd, _)| *cmd == 543).count(), 1);
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn first_use_own_device_invalid_signature_cannot_activate_own_or_peer_bindings() {
+    let bundles = vec![
+        wire_bundle(zalo_signal_engine::SignalPlatform::Mobile, 0).await,
+        wire_bundle(zalo_signal_engine::SignalPlatform::Web, 1).await,
+    ];
+    let root = std::env::temp_dir().join(format!("zalo-first-use-own-{:x}", rand::random::<u64>()));
+    let profile = Arc::new(crate::profile::Profile::at_root(&root, "fixture").unwrap());
+    let path = profile.paths.data_dir.join("messages.sqlite");
+    seed_identity(&path);
+    let db = Database::open(profile, "11".into()).await.unwrap();
+    let records = durable_crypto(&path).remove(0);
+    let (failed, seen, _) = check(&db, &bundles, Mode::OwnBadSignature, 37_000_000).await;
+    assert!(failed.is_err());
+    assert!(seen.iter().all(|(cmd, _)| *cmd != 543));
+    assert_no_first_use_commit(&path, &records);
+    let (ready, seen, _) = check(&db, &bundles, Mode::OwnMissing, 37_000_128).await;
+    assert!(ready.is_ok());
+    let inits: Vec<_> = seen.iter().filter(|(cmd, _)| *cmd == 543).collect();
+    assert_eq!(inits.len(), 2);
+    assert_eq!(inits[0].1["uidTo"], "11");
+    assert_eq!(inits[1].1["uidTo"], "22");
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

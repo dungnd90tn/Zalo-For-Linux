@@ -954,6 +954,186 @@ impl MessageStore {
         );
         Ok(())
     }
+    /// Only a marked, still-reserved initialization may prepare first-use trust.
+    pub fn e2ee_validate_init_reservation(
+        &self,
+        owner: &str,
+        local: &LocalNamespace,
+        client_id: u64,
+    ) -> Result<()> {
+        account(owner)?;
+        integer(client_id)?;
+        validate_address(
+            &self.conn,
+            owner,
+            &RecordKey::LocalIdentity {
+                local: local.clone(),
+            },
+            true,
+        )?;
+        let marked: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM e2ee_outbox o JOIN e2ee_peer_init_outbox i ON i.account=o.account AND i.client_id=o.client_id WHERE o.account=?1 AND o.client_id=?2 AND o.local_epoch=?3 AND o.platform=?4 AND o.state='reserved')",
+            params![owner, client_id as i64, epoch(&local.epoch)?, local.platform.wire()],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            marked,
+            "First-use preparation requires a reserved initialization intent"
+        );
+        Ok(())
+    }
+    /// Validate an untrusted candidate without making it an active binding.
+    pub fn e2ee_validate_first_use_identity(
+        &self,
+        owner: &str,
+        local: &LocalNamespace,
+        peer: &PeerNamespace,
+        binding: &VerifiedBinding,
+    ) -> Result<()> {
+        account(owner)?;
+        account(&peer.uid)?;
+        ensure!(
+            binding.platform == peer.platform,
+            "First-use platform mismatch"
+        );
+        let fingerprint = binding.fingerprint()?;
+        validate_address(
+            &self.conn,
+            owner,
+            &RecordKey::LocalIdentity {
+                local: local.clone(),
+            },
+            true,
+        )?;
+        let matches: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM e2ee_peer_epochs p WHERE p.account=?1 AND p.local_epoch=?2 AND p.peer_epoch=?3 AND p.uid=?4 AND p.platform=?5 AND p.registration_id=?6 AND p.fingerprint=?7 AND p.session_ts=?8 AND p.active=-1 AND NOT EXISTS(SELECT 1 FROM e2ee_peer_epochs a WHERE a.account=p.account AND a.local_epoch=p.local_epoch AND a.uid=p.uid AND a.platform=p.platform AND a.active=1))",
+            params![owner, epoch(&local.epoch)?, epoch(&peer.epoch)?, peer.uid, peer.platform.wire(), binding.registration_id, fingerprint, integer(binding.session_timestamp)?],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            matches,
+            "First-use candidate differs from its reserved namespace"
+        );
+        Ok(())
+    }
+
+    /// Reuse one untrusted proposal per device across failed first-use attempts.
+    /// Existing rotations, trusted bindings and referenced candidates are untouched.
+    pub fn e2ee_reserve_first_use_peer(
+        &mut self,
+        owner: &str,
+        local: &LocalNamespace,
+        uid: &str,
+        binding: &VerifiedBinding,
+    ) -> Result<(PeerNamespace, u64)> {
+        account(owner)?;
+        account(uid)?;
+        let fingerprint = binding.fingerprint()?;
+        let tx = self.conn.transaction()?;
+        validate_address(
+            &tx,
+            owner,
+            &RecordKey::LocalIdentity {
+                local: local.clone(),
+            },
+            true,
+        )?;
+        let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM e2ee_peer_epochs WHERE account=?1 AND local_epoch=?2 AND uid=?3 AND platform=?4 AND active=1)", params![owner, epoch(&local.epoch)?, uid, binding.platform.wire()], |row| row.get(0))?;
+        ensure!(
+            !active,
+            "First-use cannot replace an active trusted binding"
+        );
+        let pending: bool = tx.query_row(
+            PEER_INIT_PENDING_SQL,
+            params![
+                owner,
+                epoch(&local.epoch)?,
+                local.platform.wire(),
+                format!("d:{uid}")
+            ],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            !pending,
+            "An encrypted initialization is not durably confirmed"
+        );
+        let candidate: Option<(i64, u16, Vec<u8>, i64)> = tx.query_row(
+            "SELECT peer_epoch,registration_id,fingerprint,session_ts FROM e2ee_peer_epochs WHERE account=?1 AND local_epoch=?2 AND uid=?3 AND platform=?4 AND active=-1 ORDER BY peer_epoch LIMIT 1",
+            params![owner, epoch(&local.epoch)?, uid, binding.platform.wire()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        let next = if let Some((existing, registration, old_fingerprint, timestamp)) = candidate {
+            let peer = PeerNamespace {
+                uid: uid.into(),
+                platform: binding.platform,
+                epoch: existing.to_string(),
+            };
+            let local_platform = serde_json::to_value(local.platform)?
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid local platform"))?
+                .to_owned();
+            let peer_platform = serde_json::to_value(binding.platform)?
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid peer platform"))?
+                .to_owned();
+            let referenced: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM e2ee_records WHERE account=?1 AND ((json_extract(key,'$.local.epoch')=?2 AND json_extract(key,'$.local.platform')=?3) AND ((json_extract(key,'$.peer.epoch')=?4 AND json_extract(key,'$.peer.uid')=?5 AND json_extract(key,'$.peer.platform')=?6) OR (json_extract(key,'$.sender.epoch')=?4 AND json_extract(key,'$.sender.uid')=?5 AND json_extract(key,'$.sender.platform')=?6)))) OR EXISTS(SELECT 1 FROM e2ee_outbox o,json_each(o.peer_bindings) p WHERE o.account=?1 AND o.local_epoch=?7 AND json_extract(p.value,'$.epoch')=?4 AND json_extract(p.value,'$.uid')=?5 AND json_extract(p.value,'$.platform')=?6)",
+                params![owner, local.epoch, local_platform, peer.epoch, uid, peer_platform, epoch(&local.epoch)?],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                !referenced,
+                "First-use candidate already has durable references"
+            );
+            if registration != binding.registration_id || old_fingerprint != fingerprint {
+                tx.execute("UPDATE e2ee_peer_epochs SET registration_id=?4,fingerprint=?5,session_ts=?6 WHERE account=?1 AND local_epoch=?2 AND peer_epoch=?3 AND active=-1", params![owner, epoch(&local.epoch)?, existing, binding.registration_id, fingerprint, integer(binding.session_timestamp)?])?;
+                tx.execute(
+                    "UPDATE e2ee_accounts SET revision=revision+1 WHERE account=?1",
+                    [owner],
+                )?;
+            } else {
+                tx.commit()?;
+                return Ok((peer, timestamp as u64));
+            }
+            existing
+        } else {
+            let previous: i64 = tx.query_row(
+                "SELECT next_peer FROM e2ee_accounts WHERE account=?1",
+                [owner],
+                |row| row.get(0),
+            )?;
+            let next = previous
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Peer epoch exhausted"))?;
+            tx.execute(
+                "INSERT INTO e2ee_peer_epochs VALUES(?1,?2,?3,?4,?5,?6,?7,?8,-1)",
+                params![
+                    owner,
+                    epoch(&local.epoch)?,
+                    next,
+                    uid,
+                    binding.platform.wire(),
+                    binding.registration_id,
+                    fingerprint,
+                    integer(binding.session_timestamp)?
+                ],
+            )?;
+            tx.execute(
+                "UPDATE e2ee_accounts SET next_peer=?2,revision=revision+1 WHERE account=?1",
+                params![owner, next],
+            )?;
+            next
+        };
+        tx.commit()?;
+        Ok((
+            PeerNamespace {
+                uid: uid.into(),
+                platform: binding.platform,
+                epoch: next.to_string(),
+            },
+            binding.session_timestamp,
+        ))
+    }
     /// Allocate only after an explicit verified local registration transition.
     /// Previous epochs/records remain available; reconnect alone never calls this.
     pub fn e2ee_register_local(
@@ -2045,6 +2225,10 @@ impl MessageStore {
         );
         let existing:Option<i64>=tx.query_row("SELECT sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",params![owner,thread,server_id],|r|r.get(0)).optional()?;
         let message = Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: owner.into(),
             thread_id: thread.clone(),
             id: server_id.into(),
@@ -2108,6 +2292,158 @@ mod tests {
             .e2ee_register_peer("123", &local, "456", None, &binding(Platform::Mobile, 2))
             .unwrap();
         (store, local, peer)
+    }
+    #[test]
+    fn first_use_retries_reuse_one_untrusted_candidate_without_changing_active_trust() {
+        let (mut store, local, trusted) = setup();
+        let mut proposal = binding(Platform::Web, 3);
+        let (candidate, timestamp) = store
+            .e2ee_reserve_first_use_peer("123", &local, "789", &proposal)
+            .unwrap();
+        assert_eq!(timestamp, 100);
+        let revision_before = revision(&store.conn, "123").unwrap();
+        proposal.session_timestamp = 200;
+        let (again, timestamp) = store
+            .e2ee_reserve_first_use_peer("123", &local, "789", &proposal)
+            .unwrap();
+        assert!(again == candidate);
+        assert_eq!(
+            timestamp, 100,
+            "A matching retry retains its original timestamp"
+        );
+        assert_eq!(revision(&store.conn, "123").unwrap(), revision_before);
+        for byte in 4..40 {
+            proposal.identity_key[1] = byte;
+            proposal.session_timestamp += 1;
+            let (again, timestamp) = store
+                .e2ee_reserve_first_use_peer("123", &local, "789", &proposal)
+                .unwrap();
+            assert!(again == candidate);
+            assert_eq!(timestamp, proposal.session_timestamp);
+        }
+        assert!(store
+            .e2ee_active_peer("123", &local, "789", Platform::Web)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM e2ee_peer_epochs WHERE account='123' AND uid='789'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .e2ee_active_peer("123", &local, "456", Platform::Mobile)
+                .unwrap()
+                .unwrap()
+                .namespace
+                == trusted
+        );
+        assert!(store
+            .e2ee_reserve_first_use_peer("123", &local, "456", &binding(Platform::Mobile, 7))
+            .is_err());
+        assert!(store
+            .e2ee_reserve_first_use_peer("999", &local, "789", &proposal)
+            .is_err());
+    }
+
+    #[test]
+    fn first_use_candidate_references_and_unknown_intent_prevent_replacement() {
+        let (mut store, local, _) = setup();
+        let proposal = binding(Platform::Web, 3);
+        let (candidate, _) = store
+            .e2ee_reserve_first_use_peer("123", &local, "789", &proposal)
+            .unwrap();
+        let mut changed = binding(Platform::Web, 4);
+        changed.session_timestamp = 200;
+        for key in [
+            RecordKey::Session {
+                local: local.clone(),
+                peer: candidate.clone(),
+            },
+            RecordKey::PeerIdentity {
+                local: local.clone(),
+                peer: candidate.clone(),
+            },
+            RecordKey::SessionTimestamp {
+                local: local.clone(),
+                peer: candidate.clone(),
+            },
+            RecordKey::GroupSender {
+                local: local.clone(),
+                group: "555".into(),
+                sender: candidate.clone(),
+            },
+        ] {
+            let encoded = key.encoded().unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO e2ee_records(account,key,value) VALUES('123',?1,x'01')",
+                    [&encoded],
+                )
+                .unwrap();
+            assert!(
+                store
+                    .e2ee_reserve_first_use_peer("123", &local, "789", &changed)
+                    .is_err(),
+                "A persisted engine reference cannot be rebound"
+            );
+            store
+                .e2ee_validate_first_use_identity("123", &local, &candidate, &proposal)
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "DELETE FROM e2ee_records WHERE account='123' AND key=?1",
+                    [&encoded],
+                )
+                .unwrap();
+        }
+        let init = store
+            .e2ee_reserve_send("123", &local, "d:789", "fixture", 1000)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE e2ee_outbox SET peer_bindings=?2 WHERE account='123' AND client_id=?1",
+                params![
+                    init as i64,
+                    serde_json::to_string(&vec![candidate.clone()]).unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(
+            store
+                .e2ee_reserve_first_use_peer("123", &local, "789", &changed)
+                .is_err(),
+            "A persisted outbox reference cannot be rebound"
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE e2ee_outbox SET peer_bindings=NULL WHERE account='123' AND client_id=?1",
+                [init as i64],
+            )
+            .unwrap();
+        store
+            .e2ee_mark_peer_init("123", &local, "789", init)
+            .unwrap();
+        assert!(
+            store
+                .e2ee_reserve_first_use_peer("123", &local, "789", &changed)
+                .is_err(),
+            "A typed unresolved initialization cannot be replaced"
+        );
+        assert!(store.e2ee_discard_reserved("123", init).unwrap());
+        assert!(store
+            .e2ee_reserve_first_use_peer("123", &local, "789", &changed)
+            .is_ok());
     }
     #[test]
     fn typed_init_intent_scopes_pending_state_and_cascades_reserved_discard() {
@@ -2306,6 +2642,10 @@ mod tests {
     }
     fn message(id: &str) -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "123".into(),
             thread_id: "d:456".into(),
             id: id.into(),
@@ -3345,7 +3685,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                9
+                16
             );
             for table in [
                 "e2ee_local_candidates",
@@ -3394,7 +3734,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                9
+                16
             );
             assert_eq!(
                 store.page("123", "d:456", None, 10).unwrap()[0].id,

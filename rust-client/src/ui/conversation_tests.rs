@@ -24,11 +24,15 @@ fn row_frame(ctx: &egui::Context, events: Vec<egui::Event>, enabled: bool) -> eg
                             last_message_at_ms: 1_700_000_000_000,
                             last_text: "Cũng lâu lâu rồi ko biết họ có ý gì ko nữa".into(),
                             last_sender: "33".into(),
+                            group_left: false,
                         },
                         "Datanomics",
-                        true,
                         Some("11"),
                         None,
+                        ConversationRowState {
+                            selected: true,
+                            unread: 0,
+                        },
                     ));
                 });
             });
@@ -135,6 +139,10 @@ fn short_bubbles_hug_content_and_long_messages_stay_inside_wide_and_compact_boun
                             message_bubble(
                                 ui,
                                 &Message {
+                                    reply_blocked: false,
+                                    recalled: false,
+                                    source_client_id: None,
+                                    quote: None,
                                     account_id: "11".into(),
                                     thread_id: "d:22".into(),
                                     id: "synthetic".into(),
@@ -148,12 +156,14 @@ fn short_bubbles_hug_content_and_long_messages_stay_inside_wide_and_compact_boun
                                 Some("11"),
                                 "Nguyễn Minh",
                                 "Nguyễn Minh",
+                                "Nguyễn Minh",
                                 None,
                                 #[cfg(feature = "messaging")]
                                 None,
                                 #[cfg(feature = "messaging")]
                                 None,
                                 1,
+                                None,
                             );
                         });
                     },
@@ -249,6 +259,10 @@ fn sticker_messages_have_no_bubble_and_fit_the_picture() {
                         message_bubble(
                             ui,
                             &Message {
+                                reply_blocked: false,
+                                recalled: false,
+                                source_client_id: None,
+                                quote: None,
                                 account_id: "11".into(),
                                 thread_id: "d:22".into(),
                                 id: "sticker".into(),
@@ -262,10 +276,12 @@ fn sticker_messages_have_no_bubble_and_fit_the_picture() {
                             Some("11"),
                             "Nguyễn Minh",
                             "Nguyễn Minh",
+                            "Nguyễn Minh",
                             None,
                             Some(&mut cache),
                             None,
                             1,
+                            None,
                         );
                     });
                 },

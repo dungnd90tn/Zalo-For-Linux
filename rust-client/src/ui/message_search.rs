@@ -205,6 +205,10 @@ impl NativeApp {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 for hit in &results.hits {
                     let probe = Message {
+                        reply_blocked: false,
+                        recalled: false,
+                        source_client_id: None,
+                        quote: None,
                         account_id: account
                             .clone()
                             .unwrap_or_else(|| crate::app::DEMO_ACCOUNT.into()),
@@ -344,6 +348,7 @@ mod tests {
                             last_message_at_ms: 0,
                             last_text: String::new(),
                             last_sender: String::new(),
+                            group_left: false,
                         },
                     );
                 });

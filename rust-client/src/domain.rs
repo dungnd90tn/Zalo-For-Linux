@@ -1,13 +1,20 @@
 //! Validated values shared by storage, background workers, and presentation.
+pub mod read_state;
 use anyhow::{bail, Result};
 use rand::RngCore;
+pub use read_state::{
+    DeliveryState, MessageDelivery, NotificationPreferences, ReceiptBinding, ReceiptReference,
+    ReceiptUpdate, ReceiveContext, ServerReadWatermark, ThreadReadState,
+};
 use serde::{Deserialize, Serialize};
 
 pub mod attachment;
 pub(crate) mod info;
 pub mod media;
 pub mod overview;
+pub mod reply;
 pub mod search;
+pub use reply::{MessageQuote, MessageQuoteBinding, QuoteContent, ReplyReference};
 #[cfg(feature = "messaging")]
 pub(crate) mod system;
 pub use attachment::{Attachment, AttachmentError, MAX_DIRECT_FILE_BYTES};
@@ -18,6 +25,8 @@ pub use media::{
 };
 pub use overview::{ConversationOverview, SharedItem, SharedKind, OVERVIEW_ITEM_LIMIT};
 pub use search::{MessageHit, MessageSearch, SEARCH_RESULT_LIMIT};
+
+pub const RECALLED_TEXT: &str = "Tin nhắn đã thu hồi";
 
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 200;
@@ -171,6 +180,14 @@ pub struct Message {
     pub sender: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_client_id: Option<String>,
+    #[serde(default)]
+    pub reply_blocked: bool,
+    #[serde(default)]
+    pub recalled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<MessageQuote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticker: Option<StickerDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaDescriptor>,
@@ -178,11 +195,35 @@ pub struct Message {
 }
 
 impl Message {
+    pub fn is_recalled(&self) -> bool {
+        self.recalled
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_id(&self.account_id)?;
         validate_id(&self.thread_id)?;
         validate_id(&self.id)?;
         validate_id(&self.sender)?;
+        if self
+            .source_client_id
+            .as_deref()
+            .is_some_and(|id| !reply::valid_source_id(id))
+        {
+            bail!("Invalid source client ID");
+        }
+        if self.recalled
+            && (self.text != RECALLED_TEXT
+                || !self.reply_blocked
+                || self.source_client_id.is_some()
+                || self.quote.is_some()
+                || self.sticker.is_some()
+                || self.media.is_some())
+        {
+            bail!("Recalled row must contain only its neutral projection");
+        }
+        if let Some(quote) = &self.quote {
+            quote.validate()?;
+        }
         if let Some(media) = &self.media {
             media.validate()?;
             if self.sticker.is_some() || self.text != media.kind().legacy_placeholder() {
@@ -233,6 +274,8 @@ pub struct Conversation {
     /// Actual latest message, limited to Unicode characters for list snapshots.
     pub last_text: String,
     pub last_sender: String,
+    /// A confirmed exit leaves this saved thread available only for reading.
+    pub group_left: bool,
 }
 
 pub fn validate_id(id: &str) -> Result<()> {
@@ -306,6 +349,10 @@ mod tests {
     #[test]
     fn rejects_oversized_text_and_invalid_ids() {
         let mut m = Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "a".into(),
             thread_id: "t".into(),
             id: "m".into(),

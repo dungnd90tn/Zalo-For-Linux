@@ -178,6 +178,10 @@ mod tests {
 
     fn message(id: &str, text: &str, at: i64) -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "11".into(),
             thread_id: "d:22".into(),
             id: id.into(),

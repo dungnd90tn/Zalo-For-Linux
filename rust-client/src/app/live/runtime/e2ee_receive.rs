@@ -360,6 +360,10 @@ impl Receiver {
         let plaintext = String::from_utf8(verified.plaintext().to_vec())
             .map_err(|_| anyhow::anyhow!("the decrypted message is not text"))?;
         let stored = Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: owner.clone(),
             thread_id: thread,
             id: server_id,
@@ -652,6 +656,7 @@ mod tests {
         let db = Database::open(profile, "11".into()).await.unwrap();
         let (tx, mut rx) = mpsc::channel(32);
         let events = Events {
+            unread: None,
             account: "11".into(),
             tx,
             repaint: Arc::new(|| {}),
@@ -756,6 +761,7 @@ mod tests {
         let db = Database::open(profile, "11".into()).await.unwrap();
         let (tx, mut rx) = mpsc::channel(8);
         let events = Events {
+            unread: None,
             account: "11".into(),
             tx,
             repaint: Arc::new(|| {}),

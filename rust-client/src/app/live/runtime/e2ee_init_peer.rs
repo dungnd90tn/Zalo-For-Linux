@@ -10,7 +10,7 @@
 //! messages can follow. Devices that already have a session here are left alone, so a repeat sends nothing.
 //! The init text is bookkeeping only and never becomes a chat message.
 use super::e2ee_init_devices::INIT_TEXT;
-use super::e2ee_send_probe::{recipient_for, GENERATION, MAX_TRIES};
+use super::e2ee_send_probe::{init_recipient_for, GENERATION, MAX_TRIES};
 use super::signal_transport::Report;
 use super::*;
 use crate::{
@@ -156,10 +156,12 @@ impl Connection {
         found: signal::FetchedBundles,
         report: &mut Report,
     ) -> Result<&'static str> {
-        self.handshake_devices_inner(db, owner, local, peer, found, report, None)
+        self.handshake_devices_inner(db, owner, local, peer, found, report, None, false)
             .await
     }
 
+    /// Only the freshly verified devices selected by readiness are supplied:
+    /// force their bundles through the engine even when a cached session exists.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handshake_checked_devices(
         &mut self,
@@ -179,6 +181,7 @@ impl Connection {
             found,
             &mut Report::discard(),
             Some((events, deadline)),
+            true,
         )
         .await
     }
@@ -193,6 +196,7 @@ impl Connection {
         found: signal::FetchedBundles,
         report: &mut Report,
         events: Option<(&Events, tokio::time::Instant)>,
+        force_selected: bool,
     ) -> Result<&'static str> {
         let (owner, local, peer) = (owner.to_owned(), local.clone(), peer.to_owned());
         report.line(&format!(
@@ -224,6 +228,10 @@ impl Connection {
         );
         let planned = db
             .call(move |store| {
+                anyhow::ensure!(
+                    !store.e2ee_peer_init_pending(&o, &l, &p)?,
+                    "An encrypted initialization is not durably confirmed"
+                );
                 let mut recipients = Vec::new();
                 let mut skipped = 0usize;
                 for bundle in &found.bundles {
@@ -233,16 +241,37 @@ impl Connection {
                         &p,
                         super::e2ee_send_probe::platform(bundle.device),
                     )? {
-                        let key = e2ee::RecordKey::Session {
-                            local: l.clone(),
-                            peer: active.namespace,
-                        };
-                        if !store.e2ee_snapshot(&o, &[key])?.records.is_empty() {
-                            skipped += 1;
-                            continue;
+                        if force_selected {
+                            // ProcessBundle archives the open session only when
+                            // its stored engine timestamp is not newer than the
+                            // trusted binding timestamp supplied to the engine.
+                            // Never report a renewal that would keep the old one.
+                            let timestamp = store.e2ee_snapshot(
+                                &o,
+                                &[e2ee::RecordKey::SessionTimestamp {
+                                    local: l.clone(),
+                                    peer: active.namespace.clone(),
+                                }],
+                            )?;
+                            for record in timestamp.records {
+                                let value: u64 = serde_json::from_slice(&record.value)?;
+                                anyhow::ensure!(
+                                    value <= active.session_timestamp,
+                                    "The encrypted session is newer than its trusted binding; renewal requires verification"
+                                );
+                            }
+                        } else {
+                            let key = e2ee::RecordKey::Session {
+                                local: l.clone(),
+                                peer: active.namespace,
+                            };
+                            if !store.e2ee_snapshot(&o, &[key])?.records.is_empty() {
+                                skipped += 1;
+                                continue;
+                            }
                         }
                     }
-                    match recipient_for(store, &o, &l, &p, bundle, now_ms)? {
+                    match init_recipient_for(store, &o, &l, &p, bundle, now_ms)? {
                         Ok(recipient) => recipients.push(recipient),
                         Err(note) => anyhow::bail!(note),
                     }
@@ -255,7 +284,7 @@ impl Connection {
                     let _ = store.e2ee_discard_reserved(&o, client_id);
                     return Err(error);
                 }
-                match co.plan_personal(store, client_id, INIT_TEXT, recipients, &g, &c) {
+                match co.plan_personal_init(store, client_id, INIT_TEXT, recipients, &g, &c) {
                     Ok(plan) => Ok((skipped, Some((client_id, plan)))),
                     Err(error) => {
                         let _ = store.e2ee_discard_reserved(&o, client_id);
@@ -683,5 +712,95 @@ pub(super) mod tests {
             .await
             .unwrap());
         std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_use_signature_cannot_poison_the_checked_handshake() {
+        use super::super::e2ee_readiness::tests::{check, Mode};
+        let valid = wire_bundle(engine::SignalPlatform::Mobile, 0).await;
+        let mut invalid = valid.clone();
+        let mut signature = STANDARD
+            .decode(invalid["preKey"]["signature"].as_str().unwrap())
+            .unwrap();
+        signature[0] ^= 1;
+        invalid["preKey"]["signature"] = json!(STANDARD.encode(signature));
+        let scratch = std::env::temp_dir().join(format!(
+            "zalo-first-use-signature-{:x}",
+            rand::random::<u64>()
+        ));
+        let profile = Arc::new(crate::profile::Profile::at_root(&scratch, "fixture").unwrap());
+        let path = profile.paths.data_dir.join("messages.sqlite");
+        seed_identity(&path);
+        let db = Database::open(profile, "11".into()).await.unwrap();
+        let records = || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let mut query = conn
+                .prepare("SELECT key,value FROM e2ee_records WHERE account='11' ORDER BY key")
+                .unwrap();
+            let rows = query
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        let before = records();
+        let (failed, seen, _) = check(&db, &[invalid], Mode::Normal, 38_000_000).await;
+        assert!(failed.is_err());
+        assert!(seen.iter().all(|(cmd, _)| *cmd != 543));
+        assert_eq!(
+            records(),
+            before,
+            "A rejected signature cannot commit private records"
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for table in ["e2ee_outbox", "e2ee_peer_init_outbox"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM e2ee_peer_epochs WHERE active=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        // The same first-use identity can still complete a genuine handshake.
+        let (ready, seen, _) = check(&db, &[valid], Mode::Normal, 38_000_128).await;
+        assert!(ready.is_ok());
+        assert_eq!(seen.iter().filter(|(cmd, _)| *cmd == 543).count(), 1);
+        db.call(|store| {
+            let local = e2ee::LocalNamespace {
+                epoch: "1".into(),
+                platform: e2ee::Platform::Pc,
+            };
+            let active = store
+                .e2ee_active_peer("11", &local, "22", e2ee::Platform::Mobile)?
+                .unwrap();
+            assert!(!store
+                .e2ee_snapshot(
+                    "11",
+                    &[e2ee::RecordKey::Session {
+                        local,
+                        peer: active.namespace
+                    }]
+                )?
+                .records
+                .is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(db);
+        let _ = std::fs::remove_dir_all(scratch);
     }
 }

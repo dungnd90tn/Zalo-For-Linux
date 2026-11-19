@@ -1,0 +1,335 @@
+{
+  "provenance": "Exact original ordinary DM/group quote builders, transformQuoteMessage and TTL helpers; synthetic IDs/text, identity AES stand-in. Native deliberately requires real source cliMsgId and rejects ephemeral sources rather than fabricating metadata. Transport/acceptance is not established.",
+  "cases": [
+    {
+      "name": "direct_text",
+      "group": false,
+      "quote": {
+        "fromUid": "22",
+        "msgId": "9001",
+        "cliMsgId": "8001",
+        "cliMsgType": 1,
+        "ts": 1700000000123,
+        "textParams": [
+          "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          ""
+        ]
+      },
+      "native_supported": true,
+      "output": {
+        "endpoint": {
+          "domainType": "chat",
+          "path": "/api/message/quote",
+          "query": {
+            "zpw_ver": 800,
+            "zpw_type": 24
+          }
+        },
+        "payload": {
+          "toid": "22",
+          "message": "Trả lời tổng hợp",
+          "clientId": 7001,
+          "qmsgOwner": "22",
+          "qmsgId": "9001",
+          "qmsgCliId": "8001",
+          "qmsgType": 1,
+          "qmsgTs": 1700000000123,
+          "qmsg": "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          "imei": "synthetic-device",
+          "qmsgTTL": 0,
+          "ttl": 0
+        },
+        "metric": 11771
+      }
+    },
+    {
+      "name": "group_text",
+      "group": true,
+      "quote": {
+        "fromUid": "22",
+        "msgId": "9001",
+        "cliMsgId": "8001",
+        "cliMsgType": 1,
+        "ts": 1700000000123,
+        "textParams": [
+          "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          ""
+        ]
+      },
+      "native_supported": true,
+      "output": {
+        "endpoint": {
+          "domainType": "group",
+          "path": "/api/group/quote",
+          "query": {
+            "zpw_ver": 800,
+            "zpw_type": 24
+          }
+        },
+        "payload": {
+          "grid": "77",
+          "message": "Trả lời tổng hợp",
+          "clientId": 7001,
+          "language": "VN",
+          "qmsgOwner": "22",
+          "qmsgId": "9001",
+          "qmsgCliId": "8001",
+          "qmsgType": 1,
+          "qmsg": "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          "qmsgTs": 1700000000123,
+          "visibility": 0,
+          "qmsgTTL": 0,
+          "ttl": 0
+        },
+        "metric": 11197
+      }
+    },
+    {
+      "name": "direct_missing_client_id",
+      "group": false,
+      "quote": {
+        "fromUid": "22",
+        "msgId": "9001",
+        "cliMsgType": 1,
+        "ts": 1700000000123,
+        "textParams": [
+          "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          ""
+        ]
+      },
+      "native_supported": false,
+      "output": {
+        "endpoint": {
+          "domainType": "chat",
+          "path": "/api/message/quote",
+          "query": {
+            "zpw_ver": 800,
+            "zpw_type": 24
+          }
+        },
+        "payload": {
+          "toid": "22",
+          "message": "Trả lời tổng hợp",
+          "clientId": 7001,
+          "qmsgOwner": "22",
+          "qmsgId": "9001",
+          "qmsgType": 1,
+          "qmsgTs": 1700000000123,
+          "qmsg": "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          "imei": "synthetic-device",
+          "qmsgTTL": 0,
+          "ttl": 0
+        },
+        "metric": 11771
+      }
+    },
+    {
+      "name": "group_missing_client_id",
+      "group": true,
+      "quote": {
+        "fromUid": "22",
+        "msgId": "9001",
+        "cliMsgType": 1,
+        "ts": 1700000000123,
+        "textParams": [
+          "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          ""
+        ]
+      },
+      "native_supported": false,
+      "output": {
+        "endpoint": {
+          "domainType": "group",
+          "path": "/api/group/quote",
+          "query": {
+            "zpw_ver": 800,
+            "zpw_type": 24
+          }
+        },
+        "payload": {
+          "grid": "77",
+          "message": "Trả lời tổng hợp",
+          "clientId": 7001,
+          "language": "VN",
+          "qmsgOwner": "22",
+          "qmsgId": "9001",
+          "qmsgType": 1,
+          "qmsg": "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          "qmsgTs": 1700000000123,
+          "visibility": 0,
+          "qmsgTTL": 0,
+          "ttl": 0
+        },
+        "metric": 11197
+      }
+    },
+    {
+      "name": "direct_numeric_ids",
+      "group": false,
+      "quote": {
+        "fromUid": 22,
+        "msgId": 9001,
+        "cliMsgId": 8001,
+        "cliMsgType": 1,
+        "ts": 1700000000123,
+        "textParams": [
+          "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          ""
+        ]
+      },
+      "native_supported": true,
+      "output": {
+        "endpoint": {
+          "domainType": "chat",
+          "path": "/api/message/quote",
+          "query": {
+            "zpw_ver": 800,
+            "zpw_type": 24
+          }
+        },
+        "payload": {
+          "toid": "22",
+          "message": "Trả lời tổng hợp",
+          "clientId": 7001,
+          "qmsgOwner": 22,
+          "qmsgId": 9001,
+          "qmsgCliId": 8001,
+          "qmsgType": 1,
+          "qmsgTs": 1700000000123,
+          "qmsg": "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          "imei": "synthetic-device",
+          "qmsgTTL": 0,
+          "ttl": 0
+        },
+        "metric": 11771
+      }
+    },
+    {
+      "name": "group_own_message",
+      "group": true,
+      "quote": {
+        "fromUid": "11",
+        "msgId": "9001",
+        "cliMsgId": "8002",
+        "cliMsgType": 1,
+        "ts": 1700000000123,
+        "textParams": [
+          "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          ""
+        ]
+      },
+      "native_supported": true,
+      "output": {
+        "endpoint": {
+          "domainType": "group",
+          "path": "/api/group/quote",
+          "query": {
+            "zpw_ver": 800,
+            "zpw_type": 24
+          }
+        },
+        "payload": {
+          "grid": "77",
+          "message": "Trả lời tổng hợp",
+          "clientId": 7001,
+          "language": "VN",
+          "qmsgOwner": "11",
+          "qmsgId": "9001",
+          "qmsgCliId": "8002",
+          "qmsgType": 1,
+          "qmsg": "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          "qmsgTs": 1700000000123,
+          "visibility": 0,
+          "qmsgTTL": 0,
+          "ttl": 0
+        },
+        "metric": 11197
+      }
+    },
+    {
+      "name": "direct_ephemeral_target",
+      "group": false,
+      "quote": {
+        "fromUid": "22",
+        "msgId": "9001",
+        "cliMsgId": "8001",
+        "cliMsgType": 1,
+        "ts": 1700000000123,
+        "textParams": [
+          "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          ""
+        ],
+        "ttl": 60000
+      },
+      "native_supported": false,
+      "output": {
+        "endpoint": {
+          "domainType": "chat",
+          "path": "/api/message/quote",
+          "query": {
+            "zpw_ver": 800,
+            "zpw_type": 24
+          }
+        },
+        "payload": {
+          "toid": "22",
+          "message": "Trả lời tổng hợp",
+          "clientId": 7001,
+          "qmsgOwner": "22",
+          "qmsgId": "9001",
+          "qmsgCliId": "8001",
+          "qmsgType": 1,
+          "qmsgTs": 1700000000123,
+          "qmsg": "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          "imei": "synthetic-device",
+          "qmsgTTL": 60000,
+          "ttl": 0
+        },
+        "metric": 11771
+      }
+    },
+    {
+      "name": "group_ttl_options",
+      "group": true,
+      "quote": {
+        "fromUid": "22",
+        "msgId": "9001",
+        "cliMsgId": "8001",
+        "cliMsgType": 1,
+        "ts": 1700000000123,
+        "textParams": [
+          "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          ""
+        ],
+        "ttl": 60000
+      },
+      "native_supported": false,
+      "output": {
+        "endpoint": {
+          "domainType": "group",
+          "path": "/api/group/quote",
+          "query": {
+            "zpw_ver": 800,
+            "zpw_type": 24
+          }
+        },
+        "payload": {
+          "grid": "77",
+          "message": "Trả lời tổng hợp",
+          "clientId": 7001,
+          "language": "VN",
+          "qmsgOwner": "22",
+          "qmsgId": "9001",
+          "qmsgCliId": "8001",
+          "qmsgType": 1,
+          "qmsg": "Tin gốc tiếng Việt\n\"trích dẫn\" 😀",
+          "qmsgTs": 1700000000123,
+          "visibility": 0,
+          "qmsgTTL": 60000,
+          "ttl": 1000
+        },
+        "metric": 11197
+      }
+    }
+  ]
+}

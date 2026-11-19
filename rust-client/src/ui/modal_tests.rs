@@ -76,6 +76,7 @@ fn conversation(id: &str, title: &str) -> Conversation {
         last_message_at_ms: 0,
         last_text: String::new(),
         last_sender: String::new(),
+        group_left: false,
     }
 }
 

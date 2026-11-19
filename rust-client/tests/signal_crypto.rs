@@ -13,6 +13,9 @@ use zalo_rust::{
 };
 use zalo_signal_engine as engine;
 
+#[path = "signal_crypto/first_use_tests.rs"]
+mod first_use_tests;
+
 fn local(platform: engine::SignalPlatform) -> engine::LocalNamespace {
     engine::LocalNamespace {
         epoch: engine::RegistrationEpoch::new(1).unwrap(),
@@ -398,6 +401,171 @@ fn copy_recipient(recipient: &Recipient, prekey: (u32, [u8; 33])) -> Recipient {
             prekey: Some(prekey),
         }),
     }
+}
+
+#[tokio::test]
+async fn forced_renewal_preserves_trust_and_durable_unconfirmed_intent() {
+    const INIT: &str = r#"{"subDevice":[]}"#;
+    let path = ephemeral_path();
+    let bob = receiver(engine::SignalPlatform::Mobile).await;
+    let (mut store, local, alice) = fixture_store(&path);
+    let initial = recipient(&mut store, &local, &bob, false);
+    let mut invalid = copy_recipient(&initial, bob.bundle.prekeys[1]);
+    invalid.bundle.as_mut().unwrap().signature[0] ^= 1;
+    let renewal = copy_recipient(&initial, bob.bundle.prekeys[2]);
+    let namespace = initial.trust.peer.clone();
+    let session_key = skey(engine::RecordKey::Session {
+        local: local_engine(&local),
+        peer: namespace.clone(),
+    });
+    let gate = e2ee::GenerationGate::new(1).unwrap();
+    let cancel = Cancellation::default();
+    let mut coordinator = Coordinator::new(
+        engine::AccountId::new("101").unwrap(),
+        1,
+        local_engine(&local),
+    )
+    .unwrap();
+
+    let first = store
+        .e2ee_reserve_send("101", &local, "d:202", INIT, 1000)
+        .unwrap();
+    store
+        .e2ee_mark_peer_init("101", &local, "202", first)
+        .unwrap();
+    let plan = coordinator
+        .plan_personal(&mut store, first, INIT, vec![initial], &gate, &cancel)
+        .unwrap();
+    let prepared = coordinator
+        .prepare_personal(plan, &gate, &cancel)
+        .await
+        .unwrap();
+    store.e2ee_commit_verified_send(&prepared, &gate).unwrap();
+    store.e2ee_begin_dispatch("101", first, 1, &gate).unwrap();
+    store
+        .e2ee_confirm_peer_init("101", &local, "202", first, "init-first")
+        .unwrap();
+    let before = store
+        .e2ee_snapshot("101", std::slice::from_ref(&session_key))
+        .unwrap();
+    assert_eq!(before.records.len(), 1);
+
+    // Renewal must verify the new signed bundle even when a usable session exists.
+    // An invalid signature must not retire the trusted binding or alter its ratchet.
+    let failed = store
+        .e2ee_reserve_send("101", &local, "d:202", INIT, 1001)
+        .unwrap();
+    store
+        .e2ee_mark_peer_init("101", &local, "202", failed)
+        .unwrap();
+    let plan = coordinator
+        .plan_personal(&mut store, failed, INIT, vec![invalid], &gate, &cancel)
+        .unwrap();
+    assert!(coordinator
+        .prepare_personal(plan, &gate, &cancel)
+        .await
+        .is_err());
+    assert!(store.e2ee_discard_reserved("101", failed).unwrap());
+    assert!(!store.e2ee_peer_init_pending("101", &local, "202").unwrap());
+    let after_failure = store
+        .e2ee_snapshot("101", std::slice::from_ref(&session_key))
+        .unwrap();
+    assert_eq!(after_failure.records[0].value, before.records[0].value);
+
+    let renewed = store
+        .e2ee_reserve_send("101", &local, "d:202", INIT, 1002)
+        .unwrap();
+    store
+        .e2ee_mark_peer_init("101", &local, "202", renewed)
+        .unwrap();
+    let plan = coordinator
+        .plan_personal(&mut store, renewed, INIT, vec![renewal], &gate, &cancel)
+        .unwrap();
+    let prepared = coordinator
+        .prepare_personal(plan, &gate, &cancel)
+        .await
+        .unwrap();
+    store.e2ee_commit_verified_send(&prepared, &gate).unwrap();
+    let after_renewal = store
+        .e2ee_snapshot("101", std::slice::from_ref(&session_key))
+        .unwrap();
+    assert_ne!(after_renewal.records[0].value, before.records[0].value);
+    let exact = store
+        .e2ee_outgoing("101", renewed)
+        .unwrap()
+        .ciphertext
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&exact).unwrap();
+    let records: Vec<serde_json::Value> =
+        serde_json::from_str(payload["listParams"].as_str().unwrap()).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        decrypt(&bob, records[0]["message"].as_str().unwrap(), alice).await,
+        INIT.as_bytes()
+    );
+    store.e2ee_begin_dispatch("101", renewed, 1, &gate).unwrap();
+    store.e2ee_send_failed("101", renewed, false).unwrap();
+    drop(store);
+
+    // A committed renewal without a correlated service ACK survives restart as
+    // pending, even though its replacement ratchet is already stored locally.
+    let mut reopened = MessageStore::open(&path).unwrap();
+    assert!(reopened
+        .e2ee_peer_init_pending("101", &local, "202")
+        .unwrap());
+    assert!(!reopened
+        .e2ee_peer_init_pending("101", &local, "101")
+        .unwrap());
+    let active = reopened
+        .e2ee_active_peer("101", &local, "202", e2ee::Platform::Mobile)
+        .unwrap()
+        .unwrap();
+    assert!(local_engine_peer(&active.namespace) == namespace);
+    assert_eq!(active.registration_id, bob.bundle.registration_id);
+    assert_eq!(active.session_timestamp, 100);
+    reopened
+        .e2ee_validate_peer_identity(
+            "101",
+            &local,
+            &active.namespace,
+            bob.bundle.registration_id,
+            &bob.bundle.identity_key,
+            100,
+        )
+        .unwrap();
+    assert_eq!(
+        reopened
+            .e2ee_snapshot("101", &[session_key])
+            .unwrap()
+            .records[0]
+            .value,
+        after_renewal.records[0].value
+    );
+    let outgoing = reopened.e2ee_outgoing("101", renewed).unwrap();
+    assert!(outgoing.state == e2ee::SendState::Unknown);
+    assert_eq!(outgoing.ciphertext.unwrap(), exact);
+    assert!(reopened
+        .e2ee_begin_dispatch("101", renewed, 1, &gate)
+        .is_err());
+    assert!(reopened
+        .e2ee_confirm_peer_init("101", &local, "101", renewed, "init-renewed")
+        .is_err());
+    assert!(reopened
+        .e2ee_peer_init_pending("101", &local, "202")
+        .unwrap());
+    reopened
+        .e2ee_confirm_peer_init("101", &local, "202", renewed, "init-renewed")
+        .unwrap();
+    assert!(!reopened
+        .e2ee_peer_init_pending("101", &local, "202")
+        .unwrap());
+    assert!(reopened.page("101", "d:202", None, 10).unwrap().is_empty());
+    drop(reopened);
+    let _ = std::fs::remove_file(path);
+}
+
+fn local_engine_peer(peer: &e2ee::PeerNamespace) -> engine::PeerNamespace {
+    serde_json::from_value(serde_json::to_value(peer).unwrap()).unwrap()
 }
 
 #[tokio::test]

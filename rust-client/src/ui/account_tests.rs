@@ -12,6 +12,7 @@ fn fixture(ctx: &egui::Context) -> (NativeApp, std::path::PathBuf) {
         last_message_at_ms: 1_700_000_000_000,
         last_text: "Tin đã lưu".into(),
         last_sender: "22".into(),
+        group_left: false,
     }];
     app.model.selected = Some("d:22".into());
     app.drafts.select("d:22").unwrap();
@@ -193,6 +194,7 @@ fn popup_blocks_submit_and_outside_click_then_restores_the_scoped_editor() {
         last_message_at_ms: 0,
         last_text: String::new(),
         last_sender: "33".into(),
+        group_left: false,
     });
     app.focus_composer = true;
     settle(&mut app, &ctx, size);

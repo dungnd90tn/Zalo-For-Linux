@@ -322,6 +322,8 @@ impl NativeApp {
             }
         });
 
+        #[cfg(feature = "messaging")]
+        self.group_section(ui, thread);
         self.message_search_section(ui, thread);
 
         let overview = self.model.overview(&thread.id).cloned();
@@ -532,6 +534,7 @@ mod tests {
                 last_message_at_ms: 1_700_100_000_000,
                 last_text: "xin chào".into(),
                 last_sender: "22".into(),
+                group_left: false,
             }];
             app.model.selected = Some("d:22".into());
             app.drafts.select("d:22").unwrap();

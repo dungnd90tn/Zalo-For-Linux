@@ -1,0 +1,800 @@
+{
+  "provenance": "Exact original FileAsync/getInfoUploadFileFromData, ordinary buildSendChunksInfo/getUrl, getExtension/formatFileNameBeforeSend, buildParams/sendMsgFileAsync. Synthetic bytes/IDs; identity AES and no-network transport stubs. Resource completion is not final message acceptance.",
+  "cases": [
+    {
+      "group": false,
+      "name": "Tài liệu.txt",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/message/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22T%C3%A0i%20li%E1%BB%87u.txt%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Tài liệu.txt",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "Tài liệu.txt"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/message/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22T%C3%A0i%20li%E1%BB%87u.txt%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Tài liệu.txt",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "Tài liệu.txt"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/message/asyncfile/msg?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "fileId": "synthetic-file",
+          "checksum": "21200d172bacc46003bc2576c19b7b47",
+          "checksumSha": "",
+          "extension": "txt",
+          "totalSize": 6,
+          "fileName": "Tài liệu.txt",
+          "clientId": 7001,
+          "fType": 1,
+          "fileCount": 0,
+          "fdata": "{}",
+          "toid": "22",
+          "fileUrl": "https://files.example.test/resource",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": false,
+      "name": "Bao cáo.PDF",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/message/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22Bao%20ca%CC%81o.PDF%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Bao cáo.PDF",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "Bao cáo.PDF"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/message/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22Bao%20ca%CC%81o.PDF%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Bao cáo.PDF",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "Bao cáo.PDF"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/message/asyncfile/msg?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "fileId": "synthetic-file",
+          "checksum": "21200d172bacc46003bc2576c19b7b47",
+          "checksumSha": "",
+          "extension": "PDF",
+          "totalSize": 6,
+          "fileName": "Bao cáo.PDF",
+          "clientId": 7001,
+          "fType": 1,
+          "fileCount": 0,
+          "fdata": "{}",
+          "toid": "22",
+          "fileUrl": "https://files.example.test/resource",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": false,
+      "name": "archive.longextension",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/message/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22archive.longextension%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "archive.longextension",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "archive.longextension"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/message/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22archive.longextension%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "archive.longextension",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "archive.longextension"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/message/asyncfile/msg?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "fileId": "synthetic-file",
+          "checksum": "21200d172bacc46003bc2576c19b7b47",
+          "checksumSha": "",
+          "extension": "",
+          "totalSize": 6,
+          "fileName": "archive.longextension",
+          "clientId": 7001,
+          "fType": 1,
+          "fileCount": 0,
+          "fdata": "{}",
+          "toid": "22",
+          "fileUrl": "https://files.example.test/resource",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": false,
+      "name": "unicode.😀😀😀😀",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/message/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22unicode.%F0%9F%98%80%F0%9F%98%80%F0%9F%98%80%F0%9F%98%80%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "unicode.😀😀😀😀",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "unicode.😀😀😀😀"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/message/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22unicode.%F0%9F%98%80%F0%9F%98%80%F0%9F%98%80%F0%9F%98%80%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "unicode.😀😀😀😀",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "unicode.😀😀😀😀"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/message/asyncfile/msg?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "fileId": "synthetic-file",
+          "checksum": "21200d172bacc46003bc2576c19b7b47",
+          "checksumSha": "",
+          "extension": "",
+          "totalSize": 6,
+          "fileName": "unicode.😀😀😀😀",
+          "clientId": 7001,
+          "fType": 1,
+          "fileCount": 0,
+          "fdata": "{}",
+          "toid": "22",
+          "fileUrl": "https://files.example.test/resource",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": false,
+      "name": "Tài liệu.Ả",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/message/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22T%C3%A0i%20li%E1%BB%87u.%E1%BA%A2%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Tài liệu.Ả",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "Tài liệu.Ả"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/message/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22T%C3%A0i%20li%E1%BB%87u.%E1%BA%A2%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22toid%22%3A%2222%22%7D&type=2",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Tài liệu.Ả",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "toid": "22"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "Tài liệu.Ả"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/message/asyncfile/msg?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "fileId": "synthetic-file",
+          "checksum": "21200d172bacc46003bc2576c19b7b47",
+          "checksumSha": "",
+          "extension": "Ả",
+          "totalSize": 6,
+          "fileName": "Tài liệu.Ả",
+          "clientId": 7001,
+          "fType": 1,
+          "fileCount": 0,
+          "fdata": "{}",
+          "toid": "22",
+          "fileUrl": "https://files.example.test/resource",
+          "ttl": 0,
+          "imei": "synthetic-device"
+        }
+      }
+    },
+    {
+      "group": true,
+      "name": "Tài liệu.txt",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/group/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22T%C3%A0i%20li%E1%BB%87u.txt%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Tài liệu.txt",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "Tài liệu.txt"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/group/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22T%C3%A0i%20li%E1%BB%87u.txt%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Tài liệu.txt",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "Tài liệu.txt"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/group/asyncfile/msg?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "fileId": "synthetic-file",
+          "checksum": "21200d172bacc46003bc2576c19b7b47",
+          "checksumSha": "",
+          "extension": "txt",
+          "totalSize": 6,
+          "fileName": "Tài liệu.txt",
+          "clientId": 7001,
+          "fType": 1,
+          "fileCount": 0,
+          "fdata": "{}",
+          "grid": "33",
+          "fileUrl": "https://files.example.test/resource",
+          "ttl": 0
+        }
+      }
+    },
+    {
+      "group": true,
+      "name": "Bao cáo.PDF",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/group/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22Bao%20ca%CC%81o.PDF%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Bao cáo.PDF",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "Bao cáo.PDF"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/group/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22Bao%20ca%CC%81o.PDF%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Bao cáo.PDF",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "Bao cáo.PDF"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/group/asyncfile/msg?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "fileId": "synthetic-file",
+          "checksum": "21200d172bacc46003bc2576c19b7b47",
+          "checksumSha": "",
+          "extension": "PDF",
+          "totalSize": 6,
+          "fileName": "Bao cáo.PDF",
+          "clientId": 7001,
+          "fType": 1,
+          "fileCount": 0,
+          "fdata": "{}",
+          "grid": "33",
+          "fileUrl": "https://files.example.test/resource",
+          "ttl": 0
+        }
+      }
+    },
+    {
+      "group": true,
+      "name": "archive.longextension",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/group/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22archive.longextension%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "archive.longextension",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "archive.longextension"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/group/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22archive.longextension%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "archive.longextension",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "archive.longextension"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/group/asyncfile/msg?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "fileId": "synthetic-file",
+          "checksum": "21200d172bacc46003bc2576c19b7b47",
+          "checksumSha": "",
+          "extension": "",
+          "totalSize": 6,
+          "fileName": "archive.longextension",
+          "clientId": 7001,
+          "fType": 1,
+          "fileCount": 0,
+          "fdata": "{}",
+          "grid": "33",
+          "fileUrl": "https://files.example.test/resource",
+          "ttl": 0
+        }
+      }
+    },
+    {
+      "group": true,
+      "name": "unicode.😀😀😀😀",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/group/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22unicode.%F0%9F%98%80%F0%9F%98%80%F0%9F%98%80%F0%9F%98%80%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "unicode.😀😀😀😀",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "unicode.😀😀😀😀"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/group/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22unicode.%F0%9F%98%80%F0%9F%98%80%F0%9F%98%80%F0%9F%98%80%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "unicode.😀😀😀😀",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "unicode.😀😀😀😀"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/group/asyncfile/msg?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "fileId": "synthetic-file",
+          "checksum": "21200d172bacc46003bc2576c19b7b47",
+          "checksumSha": "",
+          "extension": "",
+          "totalSize": 6,
+          "fileName": "unicode.😀😀😀😀",
+          "clientId": 7001,
+          "fType": 1,
+          "fileCount": 0,
+          "fdata": "{}",
+          "grid": "33",
+          "fileUrl": "https://files.example.test/resource",
+          "ttl": 0
+        }
+      }
+    },
+    {
+      "group": true,
+      "name": "Tài liệu.Ả",
+      "checksum": "21200d172bacc46003bc2576c19b7b47",
+      "chunks": [
+        {
+          "url": "https://files.example.test/api/group/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22T%C3%A0i%20li%E1%BB%87u.%E1%BA%A2%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A1%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Tài liệu.Ả",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 1,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    0,
+                    1,
+                    2,
+                    255
+                  ]
+                ],
+                "name": "Tài liệu.Ả"
+              }
+            ]
+          ]
+        },
+        {
+          "url": "https://files.example.test/api/group/asyncfile/upload?zpw_ver=800&zpw_type=24&params=%7B%22totalChunk%22%3A2%2C%22fileName%22%3A%22T%C3%A0i%20li%E1%BB%87u.%E1%BA%A2%22%2C%22clientId%22%3A7001%2C%22totalSize%22%3A6%2C%22imei%22%3A%22synthetic-device%22%2C%22chunkId%22%3A2%2C%22grid%22%3A%2233%22%7D&type=11",
+          "payload": {
+            "totalChunk": 2,
+            "fileName": "Tài liệu.Ả",
+            "clientId": 7001,
+            "totalSize": 6,
+            "imei": "synthetic-device",
+            "chunkId": 2,
+            "grid": "33"
+          },
+          "multipart": [
+            [
+              "chunkContent",
+              {
+                "parts": [
+                  [
+                    10,
+                    13
+                  ]
+                ],
+                "name": "Tài liệu.Ả"
+              }
+            ]
+          ]
+        }
+      ],
+      "final": {
+        "url": "https://files.example.test/api/group/asyncfile/msg?zpw_ver=800&zpw_type=24",
+        "payload": {
+          "fileId": "synthetic-file",
+          "checksum": "21200d172bacc46003bc2576c19b7b47",
+          "checksumSha": "",
+          "extension": "Ả",
+          "totalSize": 6,
+          "fileName": "Tài liệu.Ả",
+          "clientId": 7001,
+          "fType": 1,
+          "fileCount": 0,
+          "fdata": "{}",
+          "grid": "33",
+          "fileUrl": "https://files.example.test/resource",
+          "ttl": 0
+        }
+      }
+    }
+  ]
+}

@@ -84,6 +84,10 @@ mod tests {
 
     fn message(account: &str, thread: &str, id: &str) -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: account.into(),
             thread_id: thread.into(),
             id: id.into(),
@@ -358,7 +362,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            9
+            16
         );
         assert_eq!(store.page("11", "g:22", None, 10).unwrap(), vec![m]);
         assert_eq!(store.page("11", "d:22", None, 10).unwrap(), vec![sticker]);

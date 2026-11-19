@@ -3,6 +3,7 @@ mod account;
 #[cfg(all(test, feature = "messaging"))]
 mod account_tests;
 mod attachments;
+mod attention;
 #[cfg(feature = "messaging")]
 mod avatars;
 #[cfg(test)]
@@ -12,6 +13,14 @@ mod delivery;
 mod dialog;
 #[cfg(feature = "messaging")]
 mod directory;
+#[cfg(feature = "messaging")]
+mod file_uploads;
+#[cfg(feature = "messaging")]
+mod forward;
+#[cfg(feature = "messaging")]
+mod group_actions;
+#[cfg(feature = "messaging")]
+mod group_members;
 #[cfg(feature = "messaging")]
 mod hydration;
 mod information;
@@ -28,11 +37,16 @@ mod message_search;
 #[cfg(all(test, feature = "messaging"))]
 mod modal_tests;
 #[cfg(feature = "messaging")]
+mod photos;
+#[cfg(feature = "messaging")]
 mod privacy;
 #[cfg(all(test, feature = "messaging"))]
 mod privacy_native_fixture;
 #[cfg(all(test, feature = "messaging"))]
 mod privacy_tests;
+#[cfg(feature = "messaging")]
+mod recall;
+mod replies;
 mod senders;
 mod settings;
 #[cfg(test)]
@@ -193,7 +207,13 @@ impl NativeApp {
                 return true;
             }
             #[cfg(feature = "messaging")]
-            if state.open_dialog || state.review_dialog {
+            if state.open_dialog
+                || state.review_dialog
+                || state.attention.settings_open
+                || state.forwarding.is_open()
+                || state.recall.is_open()
+                || state.groups.is_open()
+            {
                 return true;
             }
         }
@@ -297,7 +317,19 @@ impl NativeApp {
         }
         "Chưa đăng nhập"
     }
+    fn selected_group_left(&self) -> bool {
+        self.model.selected.as_deref().is_some_and(|thread| {
+            self.model
+                .conversations
+                .iter()
+                .any(|conversation| conversation.id == thread && conversation.group_left)
+        })
+    }
+
     fn live_can_send(&self) -> bool {
+        if self.selected_group_left() {
+            return false;
+        }
         #[cfg(feature = "live-login")]
         {
             !self.model.pending
@@ -445,7 +477,16 @@ impl NativeApp {
     }
 
     fn send_local(&mut self) {
-        if self.modal_blocked || self.modal_open() {
+        if self.modal_blocked || self.modal_open() || self.selected_group_left() {
+            return;
+        }
+        if self.drafts.active.reply().is_some_and(|reply| {
+            self.account_id() != Some(reply.account_id.as_str())
+                || self.model.selected.as_deref() != Some(reply.thread_id.as_str())
+        }) {
+            self.model.status =
+                "Tin nhắn được trích dẫn không thuộc hội thoại đang mở. Bản nháp được giữ lại."
+                    .into();
             return;
         }
         #[cfg(feature = "messaging")]
@@ -456,6 +497,16 @@ impl NativeApp {
                 .as_deref()
                 .is_some_and(|thread| !self.privacy_visible(thread))
         {
+            return;
+        }
+        #[cfg(feature = "messaging")]
+        if self.photo_selected() && !self.demo {
+            self.send_live_photo();
+            return;
+        }
+        #[cfg(feature = "messaging")]
+        if self.drafts.active.attachment().is_some() && !self.demo {
+            self.send_live_attachment();
             return;
         }
         #[cfg(feature = "messaging")]
@@ -809,14 +860,28 @@ impl NativeApp {
                     });
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    visuals::chip(ui, "Tất cả", true, true, "Tất cả hội thoại");
-                    visuals::chip(
+                    if visuals::chip(
+                        ui,
+                        "Tất cả",
+                        !self.unread_filter(),
+                        true,
+                        "Tất cả hội thoại",
+                    )
+                    .clicked()
+                    {
+                        self.set_unread_filter(false);
+                    }
+                    if visuals::chip(
                         ui,
                         "Chưa đọc",
-                        false,
-                        false,
-                        "Chưa hỗ trợ: bản xem trước chưa lưu trạng thái chưa đọc",
-                    );
+                        self.unread_filter(),
+                        open_live,
+                        "Hội thoại có tin mới chưa đọc trên thiết bị này",
+                    )
+                    .clicked()
+                    {
+                        self.set_unread_filter(true);
+                    }
                     let count = self
                         .model
                         .conversations
@@ -832,6 +897,7 @@ impl NativeApp {
                                 true
                             }
                         })
+                        .filter(|thread| !self.unread_filter() || self.unread_count(&thread.id) > 0)
                         .count();
                     let label =
                         format!("{count} hội thoại{}", if self.demo { " demo" } else { "" });
@@ -864,6 +930,10 @@ impl NativeApp {
                     if !self.privacy_list_visible(&thread.id) {
                         continue;
                     }
+                    let unread = self.unread_count(&thread.id);
+                    if self.unread_filter() && unread == 0 {
+                        continue;
+                    }
                     let title = display_title(thread);
                     if !self.search_folded.is_empty()
                         && !fold_search(&title).contains(&self.search_folded)
@@ -889,9 +959,12 @@ impl NativeApp {
                         width,
                         thread,
                         &title,
-                        self.model.selected.as_deref() == Some(&thread.id),
                         self.account_id(),
                         texture.as_ref(),
+                        ConversationRowState {
+                            selected: self.model.selected.as_deref() == Some(&thread.id),
+                            unread,
+                        },
                     )
                     .clicked()
                     {
@@ -899,7 +972,7 @@ impl NativeApp {
                     }
                 }
                 #[cfg(feature = "messaging")]
-                let hidden_matches = self.hidden_search_rows(ui);
+                let hidden_matches = !self.unread_filter() && self.hidden_search_rows(ui);
                 #[cfg(not(feature = "messaging"))]
                 let hidden_matches = false;
                 if matches == 0 && !hidden_matches {
@@ -909,6 +982,8 @@ impl NativeApp {
                         ui.label(
                             RichText::new(if searching {
                                 "Không tìm thấy hội thoại"
+                            } else if self.unread_filter() {
+                                "Không có hội thoại chưa đọc"
                             } else {
                                 "Chưa có cuộc trò chuyện"
                             })
@@ -918,6 +993,8 @@ impl NativeApp {
                         ui.label(
                             RichText::new(if searching {
                                 "Thử tìm bằng tên khác hoặc bỏ dấu tiếng Việt."
+                            } else if self.unread_filter() {
+                                "Chọn Tất cả để xem các hội thoại đã đọc."
                             } else if self.is_signed_in() {
                                 "Mở Danh bạ để bắt đầu trò chuyện."
                             } else {
@@ -1042,6 +1119,8 @@ impl NativeApp {
                 ui.label(
                     RichText::new(if self.demo {
                         "Hội thoại minh họa · ngoại tuyến"
+                    } else if self.selected_group_left() {
+                        "Đã rời nhóm"
                     } else if self
                         .model
                         .selected
@@ -1116,7 +1195,9 @@ impl NativeApp {
                 .is_none_or(|thread| self.privacy_visible(thread));
         #[cfg(not(feature = "messaging"))]
         let privacy_enabled = true;
+        let group_left = self.selected_group_left();
         let enabled = privacy_enabled
+            && !group_left
             && ui.is_enabled()
             && !self.modal_blocked
             && !self.modal_open()
@@ -1132,17 +1213,27 @@ impl NativeApp {
         ui.painter().rect_filled(rect, 16.0, colors.surface);
         ui.painter()
             .rect_stroke(rect, 16.0, Stroke::new(1.0_f32, colors.border_strong));
-        // Files can only be attached offline, in the demo: sending one to Zalo needs the upload
-        // protocol, which has not been verified against the real server (PROTOCOL_FILES.md).
-        let attach_here = enabled && self.demo;
-        self.poll_attachments(
-            ctx,
-            attach_here,
-            "Gửi tệp tới Zalo chưa được hỗ trợ: giao thức tải lên chưa được kiểm chứng với máy chủ thật.",
-        );
-        let tray_height = self.attachment_tray_height();
-        if tray_height > 0.0 {
-            self.attachment_tray(ui, rect);
+        let attach_here = enabled && self.file_can_choose();
+        let attach_reason = if self.drafts.active.reply().is_some() {
+            "Chưa hỗ trợ gửi tệp kèm trích dẫn. Hủy trả lời trước khi chọn tệp."
+        } else if self.file_upload_visible() {
+            "Một lượt gửi tệp đang được xử lý hoặc cần kiểm tra kết quả."
+        } else {
+            "Chưa thể gửi tệp trong phiên này. Kết nối lại để kiểm tra quyền gửi."
+        };
+        self.poll_attachments(ctx, attach_here, attach_reason);
+        let reply_height = self.reply_tray_height();
+        let tray_height = reply_height + self.attachment_tray_height() + self.photo_tray_height();
+        #[cfg(feature = "messaging")]
+        self.photo_tray(ui, rect);
+        if reply_height > 0.0 {
+            self.reply_tray(ui, rect);
+        }
+        if self.attachment_tray_height() > 0.0 {
+            self.attachment_tray(
+                ui,
+                egui::Rect::from_min_max(rect.min + vec2(0.0, reply_height), rect.max),
+            );
         }
         if attach_here && ctx.input(|input| !input.raw.hovered_files.is_empty()) {
             ui.painter()
@@ -1170,32 +1261,53 @@ impl NativeApp {
                         "Biểu cảm · chưa hỗ trợ trong bản xem trước",
                         false,
                     );
-                    icon_button(
+                    if icon_button(
                         ui,
                         Icon::Image,
-                        "Gửi ảnh · chưa hỗ trợ trong bản xem trước",
-                        false,
-                    );
+                        "Ảnh HD · JPEG/PNG/WebP tĩnh, tối đa 20 MiB · nén JPEG, không gửi bản gốc",
+                        enabled && self.photo_can_choose() && !self.attachments.busy(),
+                    )
+                    .clicked()
+                    {
+                        #[cfg(feature = "messaging")]
+                        self.choose_hd_photo(ctx);
+                    }
                     if icon_button(
                         ui,
                         Icon::Paperclip,
                         if self.demo {
                             "Đính kèm tệp · chỉ lưu cục bộ trong bản demo"
+                        } else if !attach_here {
+                            attach_reason
                         } else {
-                            "Đính kèm · chưa hỗ trợ: giao thức tải tệp lên Zalo chưa được kiểm chứng"
+                            "Chọn tệp · quyền gửi được kiểm tra trước khi tải lên"
                         },
                         attach_here && !self.attachments.busy(),
                     )
                     .clicked()
                     {
                         let thread = self.model.selected.clone();
-                        self.attachments.open_dialog(ctx, thread.as_deref());
+                        let account = self
+                            .account_id()
+                            .unwrap_or(crate::app::DEMO_ACCOUNT)
+                            .to_owned();
+                        let auth_generation = self.auth_generation();
+                        self.attachments.open_scoped_dialog(
+                            ctx,
+                            thread.as_deref(),
+                            &account,
+                            auth_generation,
+                        );
                     }
                     if rect.width() >= 480.0 {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(8.0);
                             ui.label(
-                                RichText::new(if self.demo {
+                                RichText::new(if group_left {
+                                    "Đã rời nhóm · chỉ xem lịch sử"
+                                } else if self.drafts.active.attachment().is_some() {
+                                    "Tệp gửi riêng · nội dung chữ được giữ lại"
+                                } else if self.demo {
                                     "CHỈ LƯU CỤC BỘ · Enter để lưu · Ctrl+Enter xuống dòng"
                                 } else {
                                     "Enter để gửi · Ctrl+Enter để xuống dòng"
@@ -1269,7 +1381,11 @@ impl NativeApp {
                                 enabled,
                                 egui::TextEdit::multiline(&mut self.drafts.active.text)
                                     .id(composer_id)
-                                    .hint_text("Nhập tin nhắn…")
+                                    .hint_text(if group_left {
+                                        "Đã rời nhóm"
+                                    } else {
+                                        "Nhập tin nhắn…"
+                                    })
                                     .desired_rows(1)
                                     .min_size(size)
                                     .desired_width(size.x)
@@ -1279,8 +1395,11 @@ impl NativeApp {
                             )
                         })
                         .inner;
-                    let response =
-                        response.on_hover_text("Enter để gửi · Ctrl+Enter để xuống dòng");
+                    let response = response.on_hover_text(if group_left {
+                        "Bản nháp được giữ trên máy"
+                    } else {
+                        "Enter để gửi · Ctrl+Enter để xuống dòng"
+                    });
                     if response.changed() {
                         self.drafts.active.edited();
                         #[cfg(feature = "messaging")]
@@ -1297,10 +1416,21 @@ impl NativeApp {
                 });
                 let can_send = enabled
                     && !ime_active
-                    && (self.demo || self.live_can_send())
+                    && (self.demo
+                        || if self.photo_selected() {
+                            self.photo_can_send()
+                        } else if self.drafts.active.attachment().is_some() {
+                            self.file_can_send()
+                        } else {
+                            self.live_can_send()
+                        })
                     && !self.drafts.active.in_flight()
+                    && !(self.demo && self.drafts.active.reply().is_some())
+                    && !(self.drafts.active.reply().is_some()
+                        && self.drafts.active.attachment().is_some())
                     && (!self.drafts.active.text.trim().is_empty()
-                        || self.drafts.active.attachment().is_some());
+                        || self.drafts.active.attachment().is_some()
+                        || self.photo_selected());
                 let response = ui
                     .add_enabled_ui(can_send, |ui| {
                         ui.interact(send_rect, ui.id().with("send_local"), Sense::click())
@@ -1319,7 +1449,15 @@ impl NativeApp {
                 ui.painter().text(
                     send_rect.center(),
                     Align2::CENTER_CENTER,
-                    if self.demo { "Lưu" } else { "Gửi" },
+                    if self.demo {
+                        "Lưu"
+                    } else if self.photo_selected() {
+                        self.photo_send_label()
+                    } else if self.drafts.active.attachment().is_some() {
+                        self.file_send_label()
+                    } else {
+                        "Gửi"
+                    },
                     FontId::new(
                         visuals::TEXT_BODY,
                         egui::FontFamily::Name("Zalo Semibold".into()),
@@ -1334,12 +1472,38 @@ impl NativeApp {
                 if response.clicked() {
                     send = true;
                 }
+                #[cfg(feature = "messaging")]
+                let connection_hint = self.live.as_ref().filter(|_| !self.demo).and_then(|state| {
+                    use crate::app::live::LiveConnection;
+                    match state.connection {
+                        LiveConnection::Connecting | LiveConnection::Reconnecting => {
+                            Some("Đang kết nối Zalo. Hãy chờ kết nối để gửi tin nhắn.")
+                        }
+                        LiveConnection::Offline => {
+                            Some("Đang ngoại tuyến. Kết nối lại để gửi tin nhắn.")
+                        }
+                        LiveConnection::Expired => {
+                            Some("Phiên đăng nhập đã hết hạn. Đăng nhập lại để gửi tin nhắn.")
+                        }
+                        LiveConnection::Online => None,
+                    }
+                });
+                #[cfg(not(feature = "messaging"))]
+                let connection_hint: Option<&str> = None;
                 let unavailable = if !enabled {
                     "Đăng nhập và chọn một cuộc trò chuyện để soạn tin."
                 } else if ime_active {
                     "Hoàn tất phần nhập đang soạn trước khi gửi."
                 } else if self.drafts.active.in_flight() {
                     "Đang chờ kết quả lượt gửi trước; bản nháp được giữ nguyên."
+                } else if self.drafts.active.reply().is_some()
+                    && self.drafts.active.attachment().is_some()
+                {
+                    "Chưa hỗ trợ gửi tệp kèm trích dẫn. Giữ hoặc bỏ từng phần trước khi gửi."
+                } else if let Some(hint) = connection_hint {
+                    hint
+                } else if self.photo_selected() {
+                    "Chờ xử lý và xem ảnh HD trước khi gửi; bỏ ảnh để chỉ gửi nội dung đang soạn."
                 } else if self.drafts.active.text.trim().is_empty()
                     && self.drafts.active.attachment().is_none()
                 {
@@ -1372,7 +1536,9 @@ impl NativeApp {
         }
         let composer_height =
             composer_height(ui.available_height(), &self.drafts.active.text, compact)
-                + self.attachment_tray_height();
+                + self.attachment_tray_height()
+                + self.photo_tray_height()
+                + self.reply_tray_height();
         let status = timeline_status(
             &self.model.status,
             self.model.pending,
@@ -1478,6 +1644,7 @@ impl NativeApp {
                                     let sender=senders::label(message,own_account.as_deref(),Some(&own_name),self.model.conversations.iter().find(|thread|thread.id==message.thread_id),resolved);
                                     // Own the small label before independently borrowing the texture cache.
                                     let sender_name=sender.name.to_owned();let sender_avatar=sender.avatar.to_owned();
+                                    let quote_sender = message.quote.as_ref().map(|quote| self.reply_sender_label(&message.thread_id, &quote.owner_id)).unwrap_or_default();
                                     #[cfg(feature = "messaging")]
                                     let avatar_texture = self.live.as_mut().and_then(|state| {
                                         let identity = format!("d:{}",message.sender);
@@ -1488,19 +1655,28 @@ impl NativeApp {
                                     #[cfg(not(feature = "messaging"))]
                                     let avatar_texture: Option<egui::TextureHandle> = None;
                                     #[cfg(feature = "messaging")]
+                                    let delivery_label = self.delivery_label(message);
+                                    #[cfg(not(feature = "messaging"))]
+                                    let delivery_label = None;
+                                    #[cfg(feature = "messaging")]
                                     let (sticker_cache,media_cache) = match self.live.as_mut() {
                                         Some(state) if state.account.is_some() => (Some(&mut state.stickers),Some(&mut state.media)),
                                         _ => (None,None),
                                     };
                                     let focused = focus.as_ref().filter(|(id, _)| *id == message.id);
                                     let backdrop = ui.painter().add(egui::Shape::Noop);
-                                    let bubble = ui.scope(|ui| message_bubble(ui, message, compact, own_account.as_deref(), &sender_name,&sender_avatar,avatar_texture.as_ref(),
+                                    let bubble = ui.scope(|ui| message_bubble(ui, message, compact, own_account.as_deref(), &sender_name,&quote_sender,&sender_avatar,avatar_texture.as_ref(),
                                         #[cfg(feature = "messaging")]
                                         sticker_cache,
                                         #[cfg(feature = "messaging")]
                                         media_cache,
-                                        self.model.generation,
+                                        self.model.generation, delivery_label,
                                     ));
+                                    #[cfg(feature = "messaging")]
+                                    if let Some(state) = self.live.as_mut().filter(|_| ui.is_enabled()) {
+                                        state.attention.paint(message, bubble.inner, ui.clip_rect(),
+                                            self.model.messages.last().is_some_and(|tail| tail.id == message.id));
+                                    }
                                     if let Some(position) = message_actions::requested(ui, bubble.inner, message) {
                                         if let Some(scope) = &menu_scope {
                                             self.message_menu = Some(message_actions::Popup::new(
@@ -1894,9 +2070,33 @@ impl eframe::App for NativeApp {
                 state.connection = connection;
             }
         }
+        #[cfg(feature = "messaging")]
+        {
+            let scope =
+                self.account_id()
+                    .zip(self.model.selected.as_deref())
+                    .map(|(account, thread)| {
+                        (
+                            account.to_owned(),
+                            thread.to_owned(),
+                            self.auth_generation(),
+                        )
+                    });
+            if let Some(state) = &mut self.live {
+                state.photo_preview.scope(scope);
+            }
+        }
         self.sync_account_popup();
         self.sync_message_menu();
+        #[cfg(feature = "messaging")]
+        {
+            self.sync_forward();
+            self.sync_recall();
+            self.sync_groups(ctx);
+        }
         self.update_modal_input(ctx);
+        #[cfg(feature = "messaging")]
+        self.begin_attention_frame(ctx);
         #[cfg(feature = "live-login")]
         {
             if self.show_login(ctx) {
@@ -1916,6 +2116,14 @@ impl eframe::App for NativeApp {
             self.latch_modal_input(ctx);
             self.settings
                 .show(ctx, &mut self.settings_open, &mut self.theme);
+        }
+        #[cfg(feature = "messaging")]
+        {
+            self.show_notification_settings(ctx);
+            self.show_forward_picker(ctx);
+            self.show_recall_confirmation(ctx);
+            self.show_group_dialogs(ctx);
+            self.finish_attention_frame(ctx);
         }
     }
 }
@@ -1991,14 +2199,19 @@ fn composer_height(available_height: f32, draft: &str, compact: bool) -> f32 {
     }
 }
 
+struct ConversationRowState {
+    selected: bool,
+    unread: u64,
+}
+
 fn conversation_row(
     ui: &mut egui::Ui,
     width: f32,
     thread: &Conversation,
     title: &str,
-    selected: bool,
     account: Option<&str>,
     texture: Option<&egui::TextureHandle>,
+    ConversationRowState { selected, unread }: ConversationRowState,
 ) -> egui::Response {
     let colors = crate::theme::palette(ui.ctx());
     let (rect, _) = ui.allocate_exact_size(vec2(width, CONVERSATION_ROW_HEIGHT), Sense::hover());
@@ -2062,7 +2275,7 @@ fn conversation_row(
     row_text(
         ui,
         content.min + vec2(0.0, 26.0),
-        content.width().max(0.0),
+        (content.width() - if unread > 0 && !selected { 39.0 } else { 0.0 }).max(0.0),
         &preview.replace(['\n', '\r'], " "),
         FontId::proportional(visuals::TEXT_SMALL),
         if ui.is_enabled() {
@@ -2071,12 +2284,19 @@ fn conversation_row(
             colors.text_disabled
         },
     );
+    if !selected {
+        attention::badge(ui, rect, unread);
+    }
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,
             ui.is_enabled(),
             selected,
-            title,
+            if unread > 0 {
+                format!("{title} · {unread} tin chưa đọc")
+            } else {
+                title.to_owned()
+            },
         )
     });
     response.on_hover_text(title)
@@ -2129,21 +2349,27 @@ fn message_bubble(
     compact: bool,
     account: Option<&str>,
     sender_name: &str,
+    quote_sender_name: &str,
     sender_avatar: &str,
     avatar_texture: Option<&egui::TextureHandle>,
     #[cfg(feature = "messaging")] sticker_cache: Option<&mut stickers::StickerCache>,
     #[cfg(feature = "messaging")] media_cache: Option<&mut media::MediaCache>,
     generation: u64,
+    delivery: Option<&str>,
 ) -> egui::Rect {
     let colors = crate::theme::palette(ui.ctx());
     let own = is_own_sender(&message.sender, account);
+    let status = (own && !message.is_recalled()).then_some(delivery.unwrap_or("Đã lưu trên máy"));
     // Own plain text gets the solid accent bubble with on-color text. Media, stickers and cards
     // draw their own labels in the standard text roles, so they keep the surface bubble.
-    let accent = own && message.media.is_none() && message.sticker.is_none();
+    let accent =
+        own && !message.is_recalled() && message.media.is_none() && message.sticker.is_none();
     // A sticker is the picture alone: no bubble fill, border or padding around it.
     let bare = message.sticker.is_some();
     let ink = if accent {
         colors.on_color
+    } else if message.is_recalled() {
+        colors.text_secondary
     } else {
         colors.text_primary
     };
@@ -2165,7 +2391,7 @@ fn message_bubble(
             max_bubble,
         )
     });
-    let content_width = body
+    let mut content_width = body
         .as_ref()
         .map(|body| {
             let sender_width = if own {
@@ -2181,13 +2407,8 @@ fn message_bubble(
                     .x
                     .min(max_bubble)
             };
-            let (time, status) = status_galleys(
-                ui,
-                message.sent_at_ms,
-                own,
-                account.is_some(),
-                colors.text_secondary,
-            );
+            let (time, status) =
+                status_galleys(ui, message.sent_at_ms, status, colors.text_secondary);
             let status_width = time.size().x
                 + status.as_ref().map_or(0.0, |status| {
                     ui.spacing().item_spacing.x * 2.0 + 12.0 + status.size().x
@@ -2215,13 +2436,8 @@ fn message_bubble(
                     .size()
                     .x
             };
-            let (time, status) = status_galleys(
-                ui,
-                message.sent_at_ms,
-                own,
-                account.is_some(),
-                colors.text_secondary,
-            );
+            let (time, status) =
+                status_galleys(ui, message.sent_at_ms, status, colors.text_secondary);
             let status_width = time.size().x
                 + status.as_ref().map_or(0.0, |status| {
                     ui.spacing().item_spacing.x * 2.0 + 12.0 + status.size().x
@@ -2231,6 +2447,9 @@ fn message_bubble(
                 .max(status_width)
                 .min(max_bubble)
         });
+    if message.quote.is_some() {
+        content_width = content_width.max(240.0_f32.min(max_bubble));
+    }
     ui.with_layout(
         if own {
             Layout::right_to_left(Align::Min)
@@ -2285,6 +2504,9 @@ fn message_bubble(
                                 .truncate(),
                             )
                             .on_hover_text(sender_name);
+                        }
+                        if let Some(quote) = &message.quote {
+                            replies::quote_block(ui, quote_sender_name, &quote.text, content_width);
                         }
                         if message.media.is_some() {
                             #[cfg(feature = "messaging")]
@@ -2359,7 +2581,7 @@ fn message_bubble(
                                 .wrap(),
                             );
                         }
-                        message_status(ui, message.sent_at_ms, own, account.is_some(), accent);
+                        message_status(ui, message.sent_at_ms, status, accent);
                     });
                 });
             frame.response.rect
@@ -2368,7 +2590,7 @@ fn message_bubble(
     .inner
 }
 
-fn message_status(ui: &mut egui::Ui, sent_at_ms: i64, own: bool, live: bool, accent: bool) {
+fn message_status(ui: &mut egui::Ui, sent_at_ms: i64, status: Option<&str>, accent: bool) {
     let colors = crate::theme::palette(ui.ctx());
     // Time and delivery text sit on the accent fill for own plain text; keep them readable there.
     let meta = if accent {
@@ -2376,7 +2598,7 @@ fn message_status(ui: &mut egui::Ui, sent_at_ms: i64, own: bool, live: bool, acc
     } else {
         colors.text_secondary
     };
-    let (time, status) = status_galleys(ui, sent_at_ms, own, live, meta);
+    let (time, status) = status_galleys(ui, sent_at_ms, status, meta);
     let gap = ui.spacing().item_spacing.x;
     let width = time.size().x
         + status
@@ -2406,26 +2628,14 @@ fn message_status(ui: &mut egui::Ui, sent_at_ms: i64, own: bool, live: bool, acc
 fn status_galleys(
     ui: &egui::Ui,
     sent_at_ms: i64,
-    own: bool,
-    live: bool,
+    status: Option<&str>,
     color: egui::Color32,
 ) -> (Arc<egui::Galley>, Option<Arc<egui::Galley>>) {
     let font = FontId::proportional(visuals::TEXT_SMALL);
     let time = ui
         .painter()
         .layout_no_wrap(clock_label(sent_at_ms), font.clone(), color);
-    let status = own.then(|| {
-        ui.painter().layout_no_wrap(
-            if live {
-                "Zalo đã nhận"
-            } else {
-                "Đã lưu trên máy"
-            }
-            .into(),
-            font,
-            color,
-        )
-    });
+    let status = status.map(|status| ui.painter().layout_no_wrap(status.into(), font, color));
     (time, status)
 }
 
@@ -2567,6 +2777,7 @@ mod tests {
             last_message_at_ms: 0,
             last_text: String::new(),
             last_sender: String::new(),
+            group_left: false,
         };
         assert_eq!(display_title(&thread), "Cuộc trò chuyện");
         assert_eq!(thread.id, "d:123");

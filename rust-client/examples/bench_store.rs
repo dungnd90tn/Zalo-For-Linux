@@ -21,7 +21,9 @@ impl Drop for Scratch {
 }
 
 fn sample(index: usize) -> Message {
-    Message {
+    Message {reply_blocked: false, recalled: false,
+            source_client_id: None,
+            quote: None,
         account_id: ACCOUNT.into(), thread_id: THREAD.into(), id: format!("{index:010}"),
         sender: "synthetic-sender".into(),
         text: format!("Synthetic message {index:010}: bounded transactions and indexed cursor pagination with twenty timestamp ties."),

@@ -101,11 +101,31 @@ fn wire_failure(stage: DirectoryStage, error: wire::DirectoryError) -> Directory
 }
 /// The runtime implements this using its existing bounded Database actor. A sink
 /// must not publish metadata before its transaction commits. No second writer.
+use crate::domain::read_state::{ReceiptBinding, ReceiptUpdate, ServerReadWatermark};
+
 pub trait DirectorySink: Send {
     fn apply(
         &mut self,
         batch: DirectoryBatch,
     ) -> impl Future<Output = Result<(), DirectoryFailure>> + Send;
+
+    fn apply_preview(
+        &mut self,
+        batch: DirectoryBatch,
+        _receipts: Vec<ReceiptBinding>,
+        _forwards: Vec<crate::store::ForwardBinding>,
+        _recalls: Vec<crate::protocol::recall::RecallNotice>,
+    ) -> impl Future<Output = Result<(), DirectoryFailure>> + Send {
+        self.apply(batch)
+    }
+
+    fn apply_preview_status(
+        &mut self,
+        _deliveries: Vec<ReceiptUpdate>,
+        _watermarks: Vec<ServerReadWatermark>,
+    ) -> impl Future<Output = Result<(), DirectoryFailure>> + Send {
+        std::future::ready(Ok(()))
+    }
 }
 #[derive(Debug, Clone, Default)]
 pub struct DirectoryReport {
@@ -404,8 +424,15 @@ impl DirectoryFetcher {
             let count = previews.messages.len();
             let unsupported = previews.unsupported_encrypted;
             let batches = preview_batches(session.account_id(), previews, observed_at_ms)?;
-            for batch in batches {
-                sink.apply(batch).await?;
+            for (batch, receipts, forwards, recalls) in batches {
+                sink.apply_preview(batch, receipts, forwards, recalls)
+                    .await?;
+            }
+            let statuses =
+                crate::protocol::read_state::statuses_from_data(session.account_id(), &data);
+            if !statuses.deliveries.is_empty() || !statuses.watermarks.is_empty() {
+                sink.apply_preview_status(statuses.deliveries, statuses.watermarks)
+                    .await?;
             }
             Ok::<(usize, usize), DirectoryFailure>((count, unsupported))
         }
@@ -446,11 +473,18 @@ impl DirectoryFetcher {
 }
 /// Match full scoped identities before any sink call, then move metadata with
 /// its owning message chunk. Neither rich content nor message bodies are cloned.
+type PreviewBatch = (
+    DirectoryBatch,
+    Vec<ReceiptBinding>,
+    Vec<crate::store::ForwardBinding>,
+    Vec<crate::protocol::recall::RecallNotice>,
+);
+
 fn preview_batches(
     account: &str,
     page: wire::PreviewPage,
     observed_at_ms: i64,
-) -> Result<Vec<DirectoryBatch>, DirectoryFailure> {
+) -> Result<Vec<PreviewBatch>, DirectoryFailure> {
     let invalid = || {
         let mut error = schema_failure(
             DirectoryStage::Previews,
@@ -510,6 +544,51 @@ fn preview_batches(
             return Err(invalid());
         }
     }
+    let mut quote_metadata = std::collections::BTreeMap::new();
+    for quote in page.message_quotes {
+        if quote.account_id != account {
+            return Err(invalid());
+        }
+        info_bytes = info_bytes.saturating_add(quote.content.as_json().len());
+        if info_bytes > crate::domain::MAX_INFO_BATCH_BYTES {
+            return Err(failure(
+                DirectoryStage::Previews,
+                DirectoryCategory::Resource,
+            ));
+        }
+        let key = (
+            quote.account_id.clone(),
+            quote.thread_id.clone(),
+            quote.message_id.clone(),
+        );
+        if quote_metadata.insert(key, quote).is_some() {
+            return Err(invalid());
+        }
+    }
+    let mut receipt_metadata: std::collections::BTreeMap<_, _> = page
+        .receipts
+        .into_iter()
+        .map(|binding| {
+            (
+                (
+                    binding.account_id.clone(),
+                    binding.thread_id.clone(),
+                    binding.message_id.clone(),
+                ),
+                binding,
+            )
+        })
+        .collect();
+    let mut forward_metadata: std::collections::BTreeMap<_, _> = page
+        .forwards
+        .into_iter()
+        .map(|binding| {
+            (
+                (binding.thread_id.clone(), binding.message_id.clone()),
+                binding,
+            )
+        })
+        .collect();
     let mut identities = std::collections::HashSet::new();
     for message in &page.messages {
         let key = (
@@ -533,6 +612,24 @@ fn preview_batches(
     }
     let mut messages = page.messages.into_iter();
     let mut batches = Vec::new();
+    let mut notices = page.recalls.into_iter().peekable();
+    // Establish tombstones before publishing previews that may replay the original.
+    while notices.peek().is_some() {
+        batches.push((
+            DirectoryBatch {
+                account_id: account.into(),
+                entries: Vec::new(),
+                messages: Vec::new(),
+                message_info: Vec::new(),
+                message_media: Vec::new(),
+                message_quotes: Vec::new(),
+                observed_at_ms,
+            },
+            Vec::new(),
+            Vec::new(),
+            notices.by_ref().take(wire::DIRECTORY_BATCH_SIZE).collect(),
+        ));
+    }
     loop {
         let messages: Vec<_> = messages.by_ref().take(wire::DIRECTORY_BATCH_SIZE).collect();
         if messages.is_empty() {
@@ -540,12 +637,24 @@ fn preview_batches(
         }
         let mut message_info = Vec::new();
         let mut message_media = Vec::new();
+        let mut message_quotes = Vec::new();
+        let mut receipts = Vec::new();
+        let mut forwards = Vec::new();
         for message in &messages {
             let key = (
                 message.account_id.clone(),
                 message.thread_id.clone(),
                 message.id.clone(),
             );
+            if let Some(receipt) = receipt_metadata.remove(&key) {
+                receipts.push(receipt);
+            }
+            if let Some(forward) = forward_metadata.remove(&(key.1.clone(), key.2.clone())) {
+                forwards.push(forward);
+            }
+            if let Some(quote) = quote_metadata.remove(&key) {
+                message_quotes.push(quote);
+            }
             if let Some(media) = media_metadata.remove(&key) {
                 message_media.push(media);
             }
@@ -553,16 +662,27 @@ fn preview_batches(
                 message_info.push(info);
             }
         }
-        batches.push(DirectoryBatch {
-            account_id: account.into(),
-            entries: Vec::new(),
-            messages,
-            message_info,
-            message_media,
-            observed_at_ms,
-        });
+        batches.push((
+            DirectoryBatch {
+                account_id: account.into(),
+                entries: Vec::new(),
+                messages,
+                message_info,
+                message_media,
+                message_quotes,
+                observed_at_ms,
+            },
+            receipts,
+            forwards,
+            Vec::new(),
+        ));
     }
-    if !metadata.is_empty() || !media_metadata.is_empty() {
+    if !metadata.is_empty()
+        || !media_metadata.is_empty()
+        || !quote_metadata.is_empty()
+        || !receipt_metadata.is_empty()
+        || !forward_metadata.is_empty()
+    {
         return Err(invalid());
     }
     Ok(batches)
@@ -644,6 +764,7 @@ async fn apply_entries<S: DirectorySink>(
             messages: Vec::new(),
             message_info: Vec::new(),
             message_media: Vec::new(),
+            message_quotes: Vec::new(),
             observed_at_ms,
         })
         .await?;

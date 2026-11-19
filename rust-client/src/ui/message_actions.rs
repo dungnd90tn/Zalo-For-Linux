@@ -47,6 +47,9 @@ struct Action {
 // Only presentation fields are copied. Never expose raw content, encrypted keys or placeholders.
 fn actions(message: &Message) -> Vec<Action> {
     let mut result = Vec::with_capacity(2);
+    if message.is_recalled() {
+        return result;
+    }
     let (label, parts, link) = match &message.media {
         Some(MediaDescriptor::Photo(photo)) => (
             "Sao chép chú thích",
@@ -165,8 +168,13 @@ impl NativeApp {
         let live_modal = self.live.as_ref().is_some_and(|state| {
             let open = state.logout_dialog;
             #[cfg(feature = "messaging")]
-            let open =
-                open || state.open_dialog || state.review_dialog || state.privacy.prompt.is_some();
+            let open = open
+                || state.open_dialog
+                || state.review_dialog
+                || state.privacy.prompt.is_some()
+                || state.forwarding.is_open()
+                || state.recall.is_open()
+                || state.groups.is_open();
             open
         });
         #[cfg(not(feature = "live-login"))]
@@ -194,6 +202,38 @@ impl NativeApp {
             return;
         };
         let actions = actions(message);
+        #[cfg(feature = "messaging")]
+        let can_forward = self.can_forward(message);
+        #[cfg(feature = "messaging")]
+        let mut forward_selected = false;
+        #[cfg(feature = "messaging")]
+        let can_recall = self.can_recall(message);
+        #[cfg(feature = "messaging")]
+        let mut recall_selected = false;
+        #[cfg(feature = "messaging")]
+        let own = self.account_id() == Some(message.sender.as_str());
+        let reply = message.reply_reference();
+        let group_left = self.selected_group_left();
+        let can_reply = !self.demo
+            && !group_left
+            && reply.is_some()
+            && self.drafts.active.attachment().is_none()
+            && !self.photo_selected();
+        let reply_unavailable = if self.demo {
+            "Bản demo chưa hỗ trợ trả lời tin nhắn Zalo."
+        } else if group_left {
+            "Bạn đã rời nhóm. Lịch sử vẫn có thể xem."
+        } else if message.media.is_some() || message.sticker.is_some() {
+            "Hiện chỉ hỗ trợ trả lời tin nhắn văn bản."
+        } else if self.photo_selected() {
+            "Bỏ ảnh trước khi trả lời tin nhắn."
+        } else if self.drafts.active.attachment().is_some() {
+            "Bỏ tệp đính kèm trước khi trả lời tin nhắn văn bản."
+        } else if message.reply_blocked {
+            "Loại tin nhắn này chưa hỗ trợ trả lời."
+        } else {
+            "Tin nhắn đã lưu chưa có đủ thông tin gốc để trả lời."
+        };
         if actions.is_empty() {
             self.message_menu = None;
             return;
@@ -201,6 +241,7 @@ impl NativeApp {
         self.latch_modal_input(ctx);
         let width = 244.0_f32.min(ctx.screen_rect().width() - 32.0);
         let mut copied = false;
+        let mut reply_selected = false;
         // egui 0.29 lets disabled background widgets consume the automatic Tab stop.
         // Keep navigation within the visible actions and assign focus after rendering them.
         let tab = ctx.input_mut(|input| {
@@ -247,6 +288,46 @@ impl NativeApp {
                         copied = true;
                     }
                 }
+                let button = ui
+                    .add_enabled_ui(can_reply, |ui| {
+                        ui.add_sized(vec2(width, 44.0), egui::Button::new("Trả lời"))
+                    })
+                    .inner;
+                if can_reply {
+                    buttons.push(button.id);
+                }
+                reply_selected = button.clicked();
+                button.on_disabled_hover_text(reply_unavailable);
+                #[cfg(feature = "messaging")]
+                if !self.demo {
+                    let button = ui
+                        .add_enabled_ui(can_forward, |ui| {
+                            ui.add_sized(vec2(width, 44.0), egui::Button::new("Chuyển tiếp"))
+                        })
+                        .inner;
+                    if can_forward {
+                        buttons.push(button.id);
+                    }
+                    forward_selected = button.clicked();
+                    button.on_disabled_hover_text(
+                        "Chỉ hỗ trợ tin văn bản cá nhân đủ dữ liệu gốc khi đang kết nối.",
+                    );
+                }
+                #[cfg(feature = "messaging")]
+                if !self.demo && own {
+                    let button = ui
+                        .add_enabled_ui(can_recall, |ui| {
+                            ui.add_sized(vec2(width, 44.0), egui::Button::new("Thu hồi"))
+                        })
+                        .inner;
+                    if can_recall {
+                        buttons.push(button.id);
+                    }
+                    recall_selected = button.clicked();
+                    button.on_disabled_hover_text(
+                        "Chỉ hỗ trợ tin văn bản cá nhân đã gửi khi đang kết nối.",
+                    );
+                }
             });
         });
         if let Some(forward) = tab {
@@ -264,7 +345,29 @@ impl NativeApp {
         }
         let escape =
             ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        if copied || escape || (!popup.just_opened && response.response.clicked_elsewhere()) {
+        if reply_selected {
+            if let Some(reply) = reply {
+                self.drafts.active.set_reply(reply);
+                self.focus_composer = true;
+            }
+        }
+        #[cfg(feature = "messaging")]
+        if forward_selected {
+            self.message_menu = None;
+            self.open_forward(&popup.message);
+            return;
+        }
+        #[cfg(feature = "messaging")]
+        if recall_selected {
+            self.message_menu = None;
+            self.open_recall(&popup.message);
+            return;
+        }
+        if copied
+            || reply_selected
+            || escape
+            || (!popup.just_opened && response.response.clicked_elsewhere())
+        {
             self.message_menu = None;
         } else if let Some(popup) = &mut self.message_menu {
             popup.just_opened = false;
@@ -279,6 +382,10 @@ mod tests {
 
     fn message() -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "11".into(),
             thread_id: "d:22".into(),
             id: "copy-1".into(),
@@ -396,6 +503,7 @@ mod tests {
                 last_message_at_ms: message.sent_at_ms,
                 last_text: message.text.clone(),
                 last_sender: message.sender.clone(),
+                group_left: false,
             }];
             app.model.selected = Some(message.thread_id.clone());
             app.model.messages = vec![message];
@@ -452,6 +560,182 @@ mod tests {
                     modifiers: Default::default(),
                 },
             ]
+        }
+
+        #[test]
+        fn stale_account_or_thread_reply_never_dispatches_or_discards_the_draft() {
+            for (account, thread) in [("33", "d:22"), ("11", "g:22")] {
+                let ctx = egui::Context::default();
+                let (mut app, root) = fixture(&ctx);
+                let reply = crate::domain::ReplyReference {
+                    account_id: account.into(),
+                    thread_id: thread.into(),
+                    message_id: "90001".into(),
+                    sender: "22".into(),
+                    text: "Trích dẫn phải được giữ lại".into(),
+                };
+                app.drafts.active.set_reply(reply.clone());
+                let draft = app.drafts.active.text.clone();
+                app.send_local();
+                assert_eq!(app.drafts.active.reply(), Some(&reply));
+                assert_eq!(app.drafts.active.text, draft);
+                assert!(!app.drafts.active.in_flight());
+                assert!(app.model.status.contains("không thuộc hội thoại đang mở"));
+                drop(app);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+
+        #[test]
+        fn unsupported_reply_buttons_explain_missing_references_media_and_ttl() {
+            for (case, reason) in [
+                (
+                    "missing-cli",
+                    "Tin nhắn đã lưu chưa có đủ thông tin gốc để trả lời.",
+                ),
+                ("media", "Hiện chỉ hỗ trợ trả lời tin nhắn văn bản."),
+                ("ttl", "Loại tin nhắn này chưa hỗ trợ trả lời."),
+            ] {
+                let ctx = egui::Context::default();
+                let (mut app, root) = fixture(&ctx);
+                ctx.style_mut(|style| style.interaction.tooltip_delay = 0.0);
+                let message = &mut app.model.messages[0];
+                message.id = "90001".into();
+                message.source_client_id = Some("90002".into());
+                match case {
+                    "missing-cli" => message.source_client_id = None,
+                    "media" => {
+                        message.media = Some(MediaDescriptor::File(FileDescriptor {
+                            title: "Báo cáo.pdf".into(),
+                            size_bytes: Some(1024),
+                            extension: "pdf".into(),
+                            url: None,
+                            encrypted: false,
+                            is_folder: false,
+                        }))
+                    }
+                    "ttl" => {
+                        let payload = serde_json::json!({"error_code":0,"data":{"msgs":[{
+                            "uidFrom":"22","idTo":"11","msgId":"90001","cliMsgId":"90002",
+                            "ts":"1700000000000","msgType":"webchat","content":"Tin có thời hạn","ttl":60000
+                        }]}});
+                        *message = crate::protocol::messaging::incoming_messages("11", &payload)
+                            .unwrap()
+                            .remove(0)
+                            .message;
+                        assert!(message.reply_blocked);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(message.reply_reference().is_none());
+                let draft = app.drafts.active.text.clone();
+                let size = vec2(640.0, 480.0);
+                let _ = frame(&mut app, &ctx, size, vec![]);
+                app.message_menu = Some(Popup::new(
+                    app.message_menu_scope().unwrap(),
+                    "90001".into(),
+                    egui::pos2(100.0, 120.0),
+                    None,
+                ));
+                let _ = frame(&mut app, &ctx, size, vec![]);
+                let output = frame(&mut app, &ctx, size, vec![]);
+                let reply = text_rect(&output, "Trả lời").center();
+                let _ = frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(reply)]);
+                let _ = frame(&mut app, &ctx, size, vec![]);
+                let output = frame(&mut app, &ctx, size, vec![]);
+                assert!(
+                    output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.job.text == reason)),
+                    "Missing disabled explanation for {case}"
+                );
+                let _ = frame(
+                    &mut app,
+                    &ctx,
+                    size,
+                    pointer(reply, egui::PointerButton::Primary, true),
+                );
+                let _ = frame(
+                    &mut app,
+                    &ctx,
+                    size,
+                    pointer(reply, egui::PointerButton::Primary, false),
+                );
+                assert!(app.drafts.active.reply().is_none());
+                assert_eq!(app.drafts.active.text, draft);
+                assert!(!app.drafts.active.in_flight());
+                drop(app);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+
+        #[test]
+        fn reply_action_and_cancel_preserve_text_with_real_source_reference() {
+            for dark in [false, true] {
+                for size in [vec2(1200.0, 780.0), vec2(640.0, 480.0)] {
+                    let ctx = egui::Context::default();
+                    let (mut app, root) = fixture(&ctx);
+                    crate::theme::apply(
+                        &ctx,
+                        if dark {
+                            crate::theme::ThemeMode::Dark
+                        } else {
+                            crate::theme::ThemeMode::Light
+                        },
+                    );
+                    app.model.messages[0].id = "90001".into();
+                    app.model.messages[0].source_client_id = Some("90002".into());
+                    let draft = app.drafts.active.text.clone();
+                    let _ = frame(&mut app, &ctx, size, vec![]);
+                    app.message_menu = Some(Popup::new(
+                        app.message_menu_scope().unwrap(),
+                        "90001".into(),
+                        egui::pos2(size.x - 20.0, size.y - 20.0),
+                        None,
+                    ));
+                    let _ = frame(&mut app, &ctx, size, vec![]);
+                    let output = frame(&mut app, &ctx, size, vec![]);
+                    let reply = text_rect(&output, "Trả lời").center();
+                    let _ = frame(
+                        &mut app,
+                        &ctx,
+                        size,
+                        pointer(reply, egui::PointerButton::Primary, true),
+                    );
+                    let _ = frame(
+                        &mut app,
+                        &ctx,
+                        size,
+                        pointer(reply, egui::PointerButton::Primary, false),
+                    );
+                    assert!(app.message_menu.is_none());
+                    assert_eq!(app.drafts.active.reply().unwrap().message_id, "90001");
+                    assert_eq!(app.drafts.active.text, draft);
+                    let _ = frame(&mut app, &ctx, size, vec![]);
+                    let output = frame(&mut app, &ctx, size, vec![]);
+                    let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                    assert!(bounds.contains_rect(text_rect(&output, "Trả lời Hội thoại tổng hợp")));
+                    assert!(bounds.contains_rect(text_rect(&output, "Gửi")));
+                    let close = crate::theme::catalog::glyph("fa-close_24").unwrap();
+                    let cancel = text_rect(&output, &close.text).center();
+                    let _ = frame(
+                        &mut app,
+                        &ctx,
+                        size,
+                        pointer(cancel, egui::PointerButton::Primary, true),
+                    );
+                    let _ = frame(
+                        &mut app,
+                        &ctx,
+                        size,
+                        pointer(cancel, egui::PointerButton::Primary, false),
+                    );
+                    assert!(app.drafts.active.reply().is_none());
+                    assert_eq!(app.drafts.active.text, draft);
+                    assert!(!app.drafts.active.in_flight());
+                    drop(app);
+                    let _ = std::fs::remove_dir_all(root);
+                }
+            }
         }
 
         #[test]

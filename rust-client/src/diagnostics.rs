@@ -35,6 +35,7 @@ pub enum Stage {
     InputMethod,
     StickerAssets,
     MediaAssets,
+    Notifications,
     Startup,
     Shutdown,
     Profile,
@@ -425,8 +426,16 @@ impl Sink {
 }
 static GLOBAL: OnceLock<Mutex<Option<(u64, Sink)>>> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(all(test, feature = "messaging"))]
+tokio::task_local! {
+    static SCOPED_TEST_SINK: Sink;
+}
 /// Returns immediately, including when the log queue is full or unavailable.
 pub fn record(event: Event) {
+    #[cfg(all(test, feature = "messaging"))]
+    if SCOPED_TEST_SINK.try_with(|sink| sink.record(event)).is_ok() {
+        return;
+    }
     if let Some(global) = GLOBAL.get() {
         if let Ok(guard) = global.try_lock() {
             if let Some((_, sink)) = guard.as_ref() {
@@ -448,6 +457,18 @@ impl Logger {
     #[cfg(all(test, feature = "messaging"))]
     pub(crate) fn isolated_for_test(cache: &Path, verbose: bool) -> Result<Self> {
         Self::spawn(cache, verbose, FILE_LIMIT)
+    }
+    /// A fixture may drive the real writer without sharing its log slot or
+    /// hitting the nonblocking global lookup of unrelated parallel clients.
+    #[cfg(all(test, feature = "messaging"))]
+    pub(crate) fn scope_test<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> impl std::future::Future<Output = F::Output> + use<F> {
+        SCOPED_TEST_SINK.scope(
+            self.sink.as_ref().expect("open fixture logger").clone(),
+            future,
+        )
     }
     pub fn start(cache: &Path, verbose: bool) -> Result<Self> {
         let logger = Self::spawn(cache, verbose, FILE_LIMIT)?;

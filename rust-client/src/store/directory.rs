@@ -79,6 +79,7 @@ pub struct DirectoryBatch {
     pub messages: Vec<Message>,
     pub message_info: Vec<MessageInfoBinding>,
     pub message_media: Vec<MessageMediaBinding>,
+    pub message_quotes: Vec<crate::domain::MessageQuoteBinding>,
     pub observed_at_ms: i64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,12 +245,54 @@ impl MessageStore {
     /// Metadata and messages commit together. A conflict rolls back both; partial
     /// network snapshots never delete cached contacts, groups, messages or outbox.
     pub fn apply_directory_batch(&mut self, batch: &DirectoryBatch) -> Result<DirectoryCommit> {
+        self.apply_directory_batch_with_receipts(batch, &[])
+    }
+
+    pub(crate) fn apply_directory_batch_with_receipts(
+        &mut self,
+        batch: &DirectoryBatch,
+        refs: &[crate::domain::read_state::ReceiptBinding],
+    ) -> Result<DirectoryCommit> {
+        self.apply_directory_batch_with_forward(batch, refs, &[])
+    }
+
+    pub(crate) fn apply_directory_batch_with_forward(
+        &mut self,
+        batch: &DirectoryBatch,
+        refs: &[crate::domain::read_state::ReceiptBinding],
+        forwards: &[super::ForwardBinding],
+    ) -> Result<DirectoryCommit> {
+        self.apply_directory_batch_inner(batch, refs, forwards, &[])
+            .map(|(commit, _)| commit)
+    }
+
+    #[cfg(feature = "messaging")]
+    pub(crate) fn apply_directory_batch_with_forwards_and_recalls(
+        &mut self,
+        batch: &DirectoryBatch,
+        refs: &[crate::domain::read_state::ReceiptBinding],
+        forwards: &[super::ForwardBinding],
+        notices: &[super::RecallNotice],
+    ) -> Result<(DirectoryCommit, Vec<super::recall::RecallChange>)> {
+        self.apply_directory_batch_inner(batch, refs, forwards, notices)
+    }
+
+    fn apply_directory_batch_inner(
+        &mut self,
+        batch: &DirectoryBatch,
+        refs: &[crate::domain::read_state::ReceiptBinding],
+        _forwards: &[super::ForwardBinding],
+        _notices: &[super::RecallNotice],
+    ) -> Result<(DirectoryCommit, Vec<super::recall::RecallChange>)> {
+        let refs =
+            super::read_state::validate_bindings(&batch.account_id, batch.messages.iter(), refs)?;
         validate_id(&batch.account_id)?;
         if batch.observed_at_ms < 1
             || batch.entries.len() > DIRECTORY_LIMIT
             || batch.messages.len() > MAX_PAGE_SIZE
             || batch.message_info.len() > MAX_PAGE_SIZE
             || batch.message_media.len() > MAX_PAGE_SIZE
+            || batch.message_quotes.len() > MAX_PAGE_SIZE
         {
             bail!("Directory batch exceeds its resource limit");
         }
@@ -306,7 +349,49 @@ impl MessageStore {
                 bail!("Invalid directory media metadata binding");
             }
         }
+        #[cfg(feature = "messaging")]
+        let forwards = {
+            let mut result = HashMap::with_capacity(_forwards.len().min(MAX_PAGE_SIZE));
+            if _forwards.len() > MAX_PAGE_SIZE {
+                bail!("Directory forward batch exceeds its resource limit");
+            }
+            for binding in _forwards {
+                let key = (binding.thread_id.as_str(), binding.message_id.as_str());
+                if !message_keys.contains_key(&key) || result.insert(key, &binding.marker).is_some()
+                {
+                    bail!("Invalid directory forward binding");
+                }
+            }
+            result
+        };
         let tx = self.conn.transaction()?;
+        #[cfg(feature = "messaging")]
+        let changes = {
+            if _notices.len() > MAX_PAGE_SIZE {
+                bail!("Directory recall batch exceeds its resource limit");
+            }
+            let mut changes = Vec::new();
+            for notice in _notices {
+                if let Some(change) = super::recall::apply_notice(&tx, &batch.account_id, notice)? {
+                    changes.push(change);
+                }
+            }
+            changes
+        };
+        #[cfg(not(feature = "messaging"))]
+        let changes = Vec::new();
+        let mut quotes = HashMap::with_capacity(batch.message_quotes.len());
+        for quote in &batch.message_quotes {
+            let key = (quote.thread_id.as_str(), quote.message_id.as_str());
+            info_bytes = info_bytes.saturating_add(quote.content.as_json().len());
+            if quote.account_id != batch.account_id
+                || !message_keys.contains_key(&key)
+                || quotes.insert(key, &quote.content).is_some()
+                || info_bytes > MAX_INFO_BATCH_BYTES
+            {
+                bail!("Invalid directory quote metadata binding");
+            }
+        }
         let count: usize = tx.query_row(
             "SELECT count(*) FROM directory_entries WHERE account_id=?1",
             [&batch.account_id],
@@ -314,6 +399,11 @@ impl MessageStore {
         )?;
         let mut new_rows = 0;
         for entry in &batch.entries {
+            if entry.is_group
+                && super::group_actions::left(&tx, &batch.account_id, &entry.thread_id())?
+            {
+                continue;
+            }
             let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM directory_entries WHERE account_id=?1 AND thread_id=?2)",params![batch.account_id,entry.thread_id()],|r|r.get(0))?;
             if !exists {
                 new_rows += 1;
@@ -331,6 +421,11 @@ impl MessageStore {
                 is_blocked=COALESCE(excluded.is_blocked,directory_entries.is_blocked),member_count=COALESCE(excluded.member_count,directory_entries.member_count),observed_at_ms=excluded.observed_at_ms
                 WHERE excluded.observed_at_ms>=directory_entries.observed_at_ms")?;
             for entry in &batch.entries {
+                if entry.is_group
+                    && super::group_actions::left(&tx, &batch.account_id, &entry.thread_id())?
+                {
+                    continue;
+                }
                 metadata_rows += statement.execute(params![
                     batch.account_id,
                     entry.thread_id(),
@@ -346,20 +441,56 @@ impl MessageStore {
                 ])?;
             }
         }
-        let inserted_messages = insert_validated_with_media(
-            &tx,
-            batch.messages.iter().map(|message| {
-                (
+        let mut inserted_messages = 0;
+        for source in &batch.messages {
+            let key = (source.thread_id.as_str(), source.id.as_str());
+            #[cfg(feature = "messaging")]
+            if super::structured_webchat_conflicts_with_send_echo(
+                &tx,
+                source,
+                forwards.get(&key).copied(),
+            )? {
+                continue;
+            }
+            let info = infos.get(&key).copied();
+            let media = media_map.get(&key).copied();
+            let quote = quotes.get(&key).copied();
+            #[cfg(feature = "messaging")]
+            let redacted = {
+                let plain = info.is_none()
+                    && media.is_none()
+                    && quote.is_none()
+                    && source.quote.is_none()
+                    && source.sticker.is_none()
+                    && source.media.is_none()
+                    && source.reply_reference().is_some()
+                    && !matches!(
+                        forwards.get(&key),
+                        Some(super::ForwardMarker::Parsed(_) | super::ForwardMarker::Unavailable)
+                    );
+                super::recall::redacted_copy(&tx, source, plain)?
+            };
+            #[cfg(not(feature = "messaging"))]
+            let redacted: Option<Message> = None;
+            let message = redacted.as_ref().unwrap_or(source);
+            let recalled = message.is_recalled();
+            inserted_messages += insert_validated_with_media(
+                &tx,
+                std::iter::once((
                     message,
-                    infos
-                        .get(&(message.thread_id.as_str(), message.id.as_str()))
-                        .copied(),
-                    media_map
-                        .get(&(message.thread_id.as_str(), message.id.as_str()))
-                        .copied(),
-                )
-            }),
-        )?;
+                    info.filter(|_| !recalled),
+                    media.filter(|_| !recalled),
+                )),
+            )?;
+            #[cfg(feature = "messaging")]
+            if let Some(marker) = forwards.get(&key).filter(|_| !recalled) {
+                super::forward::persist(&tx, message, marker)?;
+            }
+            super::message_reply::persist(&tx, message, quote.filter(|_| !recalled))?;
+            if let Some(binding) = refs.get(&key).filter(|_| !recalled) {
+                super::read_state::persist(&tx, message, binding, false, true)?;
+            }
+        }
         {
             let mut rename = tx.prepare_cached("UPDATE conversations SET title=(SELECT display_name FROM directory_entries d WHERE d.account_id=?1 AND d.thread_id=?2)
                 WHERE account_id=?1 AND thread_id=?2 AND EXISTS(SELECT 1 FROM directory_entries d WHERE d.account_id=?1 AND d.thread_id=?2)")?;
@@ -368,10 +499,13 @@ impl MessageStore {
             }
         }
         tx.commit()?;
-        Ok(DirectoryCommit {
-            metadata_rows,
-            inserted_messages,
-        })
+        Ok((
+            DirectoryCommit {
+                metadata_rows,
+                inserted_messages,
+            },
+            changes,
+        ))
     }
     /// Indexed keyset pages. Separate group/direct cursors avoid ID collisions.
     pub fn directory_page(
@@ -396,7 +530,8 @@ impl MessageStore {
             bail!("Invalid directory cursor");
         }
         let mut statement = self.conn.prepare_cached("SELECT remote_id,is_group,display_name,avatar_url,is_friend,is_blocked,member_count FROM directory_entries
-            WHERE account_id=?1 AND is_group=?2 AND NOT (is_group=0 AND remote_id=account_id) AND NOT EXISTS(SELECT 1 FROM temp.live_privacy p WHERE p.account_id=directory_entries.account_id AND p.ready=0) AND NOT EXISTS(SELECT 1 FROM temp.live_hidden h WHERE h.account_id=directory_entries.account_id AND h.thread_id=directory_entries.thread_id) AND (display_name,thread_id)>(?3,?4) AND (?5='' OR instr(search_name,?5)>0 OR instr(remote_id,?5)>0)
+            WHERE account_id=?1 AND is_group=?2 AND NOT (is_group=0 AND remote_id=account_id) AND NOT EXISTS(SELECT 1 FROM temp.live_privacy p WHERE p.account_id=directory_entries.account_id AND p.ready=0) AND NOT EXISTS(SELECT 1 FROM temp.live_hidden h WHERE h.account_id=directory_entries.account_id AND h.thread_id=directory_entries.thread_id) AND NOT EXISTS(SELECT 1 FROM group_left l WHERE l.account_id=directory_entries.account_id AND l.thread_id=directory_entries.thread_id)
+            AND (display_name,thread_id)>(?3,?4) AND (?5='' OR instr(search_name,?5)>0 OR instr(remote_id,?5)>0)
             ORDER BY display_name,thread_id LIMIT ?6")?;
         let records = statement
             .query_map(
@@ -426,7 +561,7 @@ impl MessageStore {
     pub fn directory_record(&self, account: &str, thread: &str) -> Result<Option<DirectoryRecord>> {
         validate_id(account)?;
         validate_id(thread)?;
-        if !self.live_thread_visible(account, thread)? {
+        if !self.live_thread_visible(account, thread)? || self.group_has_left(account, thread)? {
             return Ok(None);
         }
         Ok(self.conn.query_row("SELECT remote_id,is_group,display_name,avatar_url,is_friend,is_blocked,member_count FROM directory_entries WHERE account_id=?1 AND thread_id=?2",params![account,thread],|row|Ok(DirectoryRecord {
@@ -453,6 +588,7 @@ mod tests {
             messages: vec![],
             message_info: vec![],
             message_media: vec![],
+            message_quotes: vec![],
             observed_at_ms: observed,
         };
         store
@@ -506,6 +642,7 @@ mod tests {
                 messages: vec![],
                 message_info: vec![],
                 message_media: vec![],
+                message_quotes: vec![],
                 observed_at_ms: 1,
             })
             .unwrap();
@@ -517,6 +654,7 @@ mod tests {
                 messages: vec![],
                 message_info: vec![],
                 message_media: vec![],
+                message_quotes: vec![],
                 observed_at_ms: 1,
             })
             .unwrap();
@@ -597,6 +735,10 @@ mod tests {
     }
     fn message(account: &str, id: &str, text: &str) -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: account.into(),
             thread_id: "d:12".into(),
             id: id.into(),
@@ -614,6 +756,7 @@ mod tests {
             messages: vec![message(account, "501", "actual synthetic preview")],
             message_info: vec![],
             message_media: vec![],
+            message_quotes: vec![],
             observed_at_ms: 1000,
         }
     }
@@ -880,6 +1023,7 @@ mod tests {
                     messages: vec![],
                     message_info: vec![],
                     message_media: vec![],
+                    message_quotes: vec![],
                     observed_at_ms: 100,
                 })
                 .unwrap();
@@ -893,6 +1037,7 @@ mod tests {
                 messages: vec![],
                 message_info: vec![],
                 message_media: vec![],
+                message_quotes: vec![],
                 observed_at_ms: 101,
             })
             .unwrap();
@@ -918,6 +1063,7 @@ mod tests {
                 messages: vec![],
                 message_info: vec![],
                 message_media: vec![],
+                message_quotes: vec![],
                 observed_at_ms: 102,
             })
             .unwrap();
@@ -942,7 +1088,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            9
+            16
         );
         assert_eq!(
             store.page("11", "d:12", None, 10).unwrap()[0].text,

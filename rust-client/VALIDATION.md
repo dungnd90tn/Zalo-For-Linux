@@ -1101,3 +1101,373 @@ reports `network_used=false`. The new 21,591,264-byte artifact is
 It was not installed or opened with a real profile. Final whole-crate formatting
 and diff checks also pass; release/smoke logs are
 `target/device-readiness-qa-{release,smoke}.log`.
+
+## Essential send continuation: checked renewal and own devices (2026-11-12)
+
+The optional `signal-crypto` normal composer now renews an existing session when
+fresh 563 metadata has no IID, provided fresh re-init 541 data matches its trusted
+IID and identity. Only selected devices renew; the original engine archives their
+previous sessions without changing trusted namespaces or known-good sessions.
+A stored engine timestamp newer than its binding rejects renewal before any
+reservation, because the engine would retain the old open session in that case.
+Missing own-device sessions initialize first, followed by peer initialization,
+with a separate correlated 543 service confirmation for each UID group.
+
+The original-library oracle independently exercises equal/older timestamp
+behavior, closed-session retention, and trust/signature rejection. Real-engine
+runtime cases check targeted renewal, unmodified unaffected devices, prepared
+recipient coverage, changed IID/identity and invalid-signature refusal, the newer
+timestamp guard, and interrupted peer/own initialization. The disk integration
+case checks that a failed renewal leaves existing trust/ratchet bytes untouched;
+successful renewed init ciphertext decrypts correctly; an unknown dispatch keeps
+its exact bytes and typed intent across restart, refuses redispatch and wrong-scope
+confirmation, and never becomes chat history. No real account or server was used.
+
+Verification used the same pinned Rust 1.99.1, direct compiler paths, isolated
+`target/e2ee-qa-cargo`, locked offline dependencies and synthetic loopback fixtures:
+
+```sh
+node tests/fixtures/messaging/session_renewal_oracle.cjs
+node tests/fixtures/messaging/device_readiness_oracle.cjs
+cargo test --locked --offline --all-features --lib readiness -- --test-threads=2
+cargo test --locked --offline --all-features --test signal_crypto forced_renewal_preserves_trust_and_durable_unconfirmed_intent
+cargo test --locked --offline --all-features -- --test-threads=2
+cargo clippy --locked --offline --all-features --all-targets -- -D warnings
+cargo check --locked --offline --features live --all-targets
+```
+
+Focused readiness/renewal tests pass **seven**; the independent disk integration
+case passes, including a final rerun after test-only lint corrections. The original
+session-renewal oracle and the existing **ten refusal/seven metadata cases** pass.
+The full matrix passes **656 tests**, with **four ignored**: 623 library and 33
+other tests. Strict all-feature/all-target Clippy, formatting and diff checks pass.
+The `live` all-target compile check passes, and its dependency tree excludes Signal,
+QuickJS and libsignal-core. Logs are ignored
+`target/essential-renewal-{focused,all-tests,store-final,clippy,live-check,live-tree}.log`.
+
+No schema or package version changed; the database remains schema nine. This
+checkpoint did not build a new release, install an app, open a personal profile,
+rotate real keys, send a real message, commit or push. Existing 2.0.4 packages do
+not contain this workspace change. Standard `live` continues to exclude the engine.
+548 processing, persistent stale state, general stale renewal, identity-change
+confirmation and full E2EE offline-queue ordering remain pending. First-use
+registration, including a newly discovered own device, can still leave a new
+binding without a session after signature failure; old trusted bindings are not
+silently replaced. Legacy unmarked unknown init attempts remain outside the typed
+pending-intent guarantee. These synthetic results do not certify production E2EE.
+
+## Atomic first-use initialization (2026-11-12)
+
+Peer/own-device initialization now reserves untrusted inactive candidates and uses
+the typed-init-only planner. It binds candidate account/local epoch, address, IID,
+fingerprint and timestamp to the actual recipients, requires signed bundles and
+commits activation with verified engine records and exact init outbox bytes in one
+revision-CAS transaction. The regular personal-message planner stays active-only.
+Repeated failed proposals reuse a candidate per scoped device; persisted engine or
+outbox references and unresolved typed-init intent prevent rebinding.
+
+Eight focused tests pass: five library and three direct coordinator cases. They
+cover invalid first-use peer/own/multi-device signatures, bounded candidate reuse,
+all personal/group-sender record references and outbox references, typed-purpose
+and bundle requirements, cancellation, revision/local-epoch changes, SQL abort,
+successful atomic activation, restart and unknown-init protection. The full
+all-feature suite passes **664 tests with four ignored** (628 library, 36 other).
+Commands, using the existing pinned offline toolchain/cache and synthetic profiles:
+
+```sh
+cargo test --locked --offline --all-features first_use -- --test-threads=2
+cargo test --locked --offline --all-features -- --test-threads=2
+```
+
+Strict all-feature/all-target Clippy (`-D warnings`), standard-`live` all-target
+compile, formatting and diff checks also pass. Logs are ignored
+`target/atomic-first-use-{focused,all-tests,clippy,live-check}.log`.
+
+No schema/version change or new release/install was made. Inactive proposals may
+remain after failure/restart; no new active init trust is established before the
+verified commit. Existing active bindings are not replaced. Inbound receive and
+the explicit diagnostic dry probe retain their older eager first-use registration;
+this checkpoint does not claim atomicity for those paths. Standard `live` still
+excludes the optional engine. No real account/server was used, and these tests do
+not establish production interoperability.
+
+## Ordinary personal/group text replies (2026-11-12)
+
+The native message menu and composer now support ordinary text replies with
+account/thread-scoped quote drafts. The worker resolves the original message ID
+against canonical SQLite data before reserving a quote request; UI text/name
+snapshots are not wire authority. Real source client IDs are retained, without
+substituting server IDs. Missing IDs, nonzero/unknown TTL, formatting/mentions,
+information/media/encrypted sources and E2EE reply sending remain unsupported.
+Explicit source ineligibility is sticky across replay, while an ordinary replay
+merely lacking optional metadata keeps known client IDs.
+
+Schema ten adds `message_reply` and `outgoing_reply` sidecars, preserving legacy
+history, cursors, ordinary/E2EE outbox bytes and typed init intent. Complete bounded
+quote JSON stays worker-side (128 KiB); history receives normalized projections
+(256 KiB ceiling), under the existing aggregate rich-batch budget. Unknown layouts
+render an honest fallback. No downgrade is provided; older binaries refuse this
+schema. Existing rows without source IDs stay unavailable for reply until a
+consistent actual replay enriches them.
+
+The original JavaScript oracle passes eight cases for direct/group endpoints,
+payload fields, default TTLs, missing source client IDs and group `imei` omission.
+Independent protocol/store cases exercise account/thread isolation, canonical
+target rereading, hidden-policy and E2EE rejection before reservation, raw quote
+retention, numeric/string reference normalization across transports, enrichment,
+conflicting-ID/cursor rollback, sticky source revocation, SQL reservation/echo
+failure, schema-nine migration rollback and restart. Durable outgoing quote data
+repairs own echoes missing quote fields. The existing account/thread/body/server-ID
+ACK proof also preserves the canonical outgoing client ID when a later own echo
+carries a foreign correlation hint; unrelated messages cannot use that fallback.
+Composer regressions keep newer text/quote edits across late ACKs and preserve text
+when cancelling a reply.
+
+The all-feature matrix passes **686 tests with four ignored**: 638 library and
+48 CLI/integration tests. A final integration-only run passes 32 tests after a
+test-only future-schema expectation correction; the successful unchanged library
+result remains valid. Logs are ignored `target/ordinary-reply-all-tests.log` and
+`target/ordinary-reply-integration-final.log`; fixture verification is
+`node tests/fixtures/messaging/reply_oracle.cjs`. Strict all-feature/all-target
+Clippy, formatting and diff checks pass. `check.sh` passes the default library
+suite (259 passed, one ignored), default integrations, five IME adapter tests,
+19 Python tests and dependency/headless CLI guards. The separate standard-`live`
+all-target compile check passes. Logs are ignored
+`target/ordinary-reply-{clippy,default-check,live-check}.log`.
+
+Synthetic native-window captures cover Light/Dark at **1200×780** and **640×480**;
+the manager inspected the reply banner and quote bubbles in all four. These are
+app-only synthetic views from a private Xvfb fixture at native pixels-per-point
+one, without personal profiles or network access. Files are
+`/tmp/zalo-reply-{1200,640}-{light,dark}.png`; a fifth capture,
+`/tmp/zalo-reply-menu-640-dark.png`, shows the enabled reply context menu. Logs use
+`target/ordinary-reply-ui-{1200,640}-{light,dark}.log` and
+`target/ordinary-reply-ui-menu.log`.
+
+An optimized standard-`live` build and schema-ten release smoke pass: 19 synthetic
+messages in six conversations, restart/legacy preservation, private profile
+permissions and external process-lock refusal, with `network_used=false`. The
+21,707,456-byte `target/release/zalo-rust` reports version 2.0.4; SHA-256 is
+`8da01b478b8462122af8f90d7fbefe14eacf332f6b81bf97e5f39d53a2a7de05`.
+Build/smoke logs are `target/ordinary-reply-{live-release,live-smoke}.log`.
+The binary was not installed or opened with a real account, and existing
+`dist/rust` DEB/RPM artifacts were not rebuilt. These are synthetic proofs, not
+real-server reply acceptance. Forwarding, reactions, mentions and recall/delete
+are outside this milestone.
+
+## Ordinary single-file upload (2026-11-12)
+
+Single ordinary files now use the current FILE chunk/resource/async-message flow;
+photo upload remains pending. The exact-source VM oracle passes ten cases,
+including original filename spelling, NFC final names and uppercase Unicode
+extensions. Six local TLS test functions cover 16 flow variants, including
+PING/history/reconnect cooperation while HTTP upload is pending. Scoped storage
+checks cover exact immutable final payloads, one active upload, restart
+classification, unknown duplicate protection, account isolation, ACK-before-echo
+repair, real own-file reconciliation and schema-ten-to-eleven migration/rollback.
+Neither resource completion nor placeholder text can settle a send. These checks
+use synthetic metadata and private profiles, not real-service uploads.
+
+The final all-feature suite passes **720 tests, four ignored** (663 library and
+57 CLI/integration). Strict all-feature/all-target Clippy, messaging-only and
+standard-live all-target compile checks, formatting and diff checks pass.
+`check.sh` passes 293 Rust tests with one ignored, including five IME regressions,
+19 Python tests, dependency guards and headless CLI checks. Logs are
+`target/file-upload-{all-features,fmt,check,messaging-check,live-check,clippy}-qa.log`.
+Four actual native-window captures at 1200×780 and 640×480 in Light/Dark were
+reviewed by the manager: `/tmp/zalo-file-{light,dark}-{1200,640}.png`. They verify
+synthetic selection/progress/failure presentation, without personal account data.
+
+The optimized standard-live executable reports version 2.0.4, is **22,114,592
+bytes**, and has SHA-256
+`de0982ad9b77bf85cd388ed9ddf5c662ee8277600ca605353dd32cbb0e3da1fe`.
+The manager independently verified its size/hash. Schema-eleven release smoke
+passes with 19 synthetic messages in six conversations, restart idempotency,
+legacy preservation, private permissions, process locking and
+`network_used=false`. Logs are `target/file-upload-{release,smoke}-qa.log`.
+The executable was not installed, existing DEB/RPM artifacts were not rebuilt,
+and no commit or real-account upload acceptance occurred. Photo upload, transfer
+resume and encrypted attachments are outside this milestone.
+
+## Ordinary single-photo HD upload (2026-11-12)
+
+PHOTO sending has synthetic verification for bounded static-image preparation,
+exact-processed-JPEG preview, caption/revision preservation and typed durable
+resource/ACK recovery. Eight original-source PHOTO oracle cases pass; the ten
+FILE oracle cases remain green. Six local TLS functions cover 15 PHOTO flow
+variants. Codec, protocol, scoped storage and recovery checks cover orientation,
+metadata removal, alpha compositing, input/output budgets, immutable payloads,
+cross-FILE isolation, caption-changed unknown duplicates, SQL rollback and
+schema-eleven preservation. These are local fixtures, not real-service photo
+acceptance. Original-byte sending, albums, animation and encrypted photos remain
+outside this milestone.
+
+The final all-feature suite passes **755 tests, four ignored**. `check.sh`
+passes 301 Rust tests and 19 Python tests. Formatting, strict all-feature/all-target
+Clippy, messaging-only and standard-live all-target checks pass. The manager
+reviewed all eight native Light/Dark wide/compact captures:
+`/tmp/zalo-photo-{preview,uploading}-{light,dark}-{1200,640}.png`.
+They show synthetic exact-byte preview/caption and upload state using isolated
+profiles; no personal image or account was inspected.
+
+The optimized version-2.0.4 standard-live executable is **22,515,520 bytes**,
+SHA-256 `df08be7037f3f2757c210d67793434a18f6a0f3899f5e09fb47022a58b265bb2`.
+Schema-twelve release smoke passes without network access, including synthetic
+restart, legacy preservation, private permissions and process locking. The
+executable was not installed, packages were not rebuilt and no commit or
+real-account photo upload acceptance occurred.
+
+## Ordinary unread, read status and Linux desktop alerts (2026-11-19)
+
+The locked, offline all-feature suite passed **765 tests, five ignored**.
+The focused storage cases verify that schema twelve upgrades without adding
+unread to history, and that new unread keys, the message and its cursor roll
+back together. They cover replay, hidden chats, separate account preferences,
+explicit visible IDs, missing client ID enrichment, monotonic remote
+watermarks and delivery updates that arrive before the owned message.
+Three protocol cases check the direct/group V2 fields, fail-closed mute
+parsing using server seconds, and rejection of ambiguous status and
+subchatbox watermarks. The original-source reply (8), file (10) and photo (8)
+oracle cases still pass.
+
+A local TLS/WSS worker test loads a timeline with two unread rows and confirms
+that loading does not send a read receipt. An explicit visible-ID command
+clears both local unread rows and issues exactly one HTTP receipt, for the row
+that carries its actual source client ID. The focused presentation test
+requires a previously painted frame and current focus/scope before
+submitting visible IDs.
+
+The ignored desktop integration test was run separately against a new private
+D-Bus daemon and a fake `org.freedesktop.Notifications` service. It verifies
+the generic alert, replacement ID, opt-in preview, activation and dismissal.
+The ten synthetic native-window captures exercise the conversation and
+notification settings at 1200×780 and 640×480 in Light and Dark, plus the
+compact unread filter in both themes. Capture files are
+`/tmp/zalo-attn-{chat,settings}-{light,dark}-{1200,640}.ppm` and
+`/tmp/zalo-attn-filter-{light,dark}-640.ppm`.
+
+These checks use isolated profiles and local services. Real-service receipt
+interoperability and operation across Linux desktop environments remain to be
+confirmed.
+
+Formatting and strict all-target, all-feature Clippy passed. The standard-live
+version-2.0.4 release executable was **24,965,056 bytes**, SHA-256
+`6e1833077f39d3cc0cfb9e3e6e43ed8ee57e567b0d23290313f5de3088597c8b`.
+The schema-thirteen smoke test passed with 19 synthetic messages in six
+conversations, restart and legacy-history preservation, private permissions,
+process locking and `network_used=false`.
+
+## Ordinary direct text forwarding (2026-11-19)
+
+The locked, offline all-feature suite passed **776 tests, five ignored**.
+Formatting and strict all-feature, all-target Clippy passed. The focused
+forward suite passed **11 tests**. The original-source forward oracle passed
+five synthetic cases. Scope and storage regressions cover verified source and
+friend destination, hidden/blocked/cross-account rejection, cursor rollback,
+typed echo and delayed ACK binding, unknown-intent persistence and local ACK
+repair. A local TLS/WSS worker test exercises destination TTL proof, the exact
+forward request and an unknown result surviving restart without a resend.
+
+The manager reviewed all eight synthetic native-window captures at 1200×780
+and 640×480 in Light and Dark. They cover the recipient picker and its
+unknown-result state:
+`/tmp/zalo-forward-{picker,unknown}-{light,dark}-{1200,640}.ppm`.
+They exercise presentation and scope without accessing a production account.
+The supported slice is one first-generation ordinary direct text message to
+one direct friend. Production interoperability remains to be confirmed.
+
+The standard-live version-2.0.4 release executable was **25,199,424 bytes**,
+SHA-256 `10742ea85d4b0ad9e0b2faa77d8240eb527acb8d43c213a3511ce2fc22cb8588`.
+The schema-fourteen release smoke passed, with `network_used=false`.
+
+## Ordinary direct text recall (2026-11-19)
+
+The focused suite passed **10 tests**, including four storage cases. The
+three-case original-source oracle passed. The regressions cover exact
+direct request fields, eligible source and age, authenticated original/event
+ID separation, quote and outgoing projection redaction, same-thread scope,
+late replay, cursor rollback, and restart repair after a durable ACK.
+A message that literally contains the recall label remains ordinary until
+the store records verified recall evidence. The native UI cases preserve
+draft text and reject settlement for unrelated account or request IDs.
+
+A synthetic TLS/WSS worker drives an ordinary direct recall through the live
+actor. It verifies the authenticated request, sticky redaction on replay,
+and an unknown result that can settle only with verified notice/ACK evidence.
+These checks establish local behavior. Production interoperability remains
+to be confirmed.
+
+The locked, offline all-feature suite passed **786 tests, five ignored**.
+Formatting and strict all-feature/all-target Clippy passed. The manager
+reviewed all 12 native-window captures for confirmation, unknown outcome
+and recalled content in Light and Dark at 1200×780 and 640×480:
+`/tmp/zalo-recall-{confirm,unknown,recalled}-{light,dark}-{1200,640}.ppm`.
+
+The standard-live version-2.0.4 release binary was **25,353,280 bytes**,
+SHA-256 `f8dab32bc9b8259f24d655321ebad5e0556d91f574782bcc56efb4eac6511060`.
+Schema-fifteen release smoke passed without using the network.
+
+## Ordinary group roster, invite and leave (2026-11-19)
+
+The focused group suite passed **28 tests**, with three roster and two
+group-action original-source oracle cases passing separately. Coverage
+includes bound ordinary membership and permissions, filtering private
+member IDs before profile lookup, invalid or stale continuation, exact
+invite and leave forms, scoped SQLite settlement, restart uncertainty,
+absence without membership proof, and confirmed archive with unchanged
+history. The actual local TLS/WSS worker exercises the authenticated
+roster/profile/mutation requests, permission filtering and durable
+outcome handling.
+
+The manager reviewed all 24 synthetic native-window captures in Light
+and Dark at 1200×780 and 640×480. The scenes cover details, roster, invite,
+leave confirmation, unknown outcome and confirmed read-only history:
+`/tmp/zalo-group-{details,roster,invite,leave,unknown,left}-{light,dark}-{1200,640}.ppm`.
+The supported slice is an ordinary group with at most 100 members,
+a page of at most 50 visible members, and one recipient per invitation.
+Production interoperability remains to be confirmed.
+
+The locked, offline all-feature suite passed **801 tests, five ignored** with
+`RUST_TEST_THREADS=4`. Strict all-feature/all-target Clippy, formatting and
+all 19 Python tests passed. The heartbeat fixture uses an isolated test
+logger and retains its exact structural diagnostic assertions.
+
+The default-concurrency run had one `[Receive/Network]` socket error in the
+existing `media_preview_and_socket_orders_preserve_complete_metadata_across_chunks_and_restart`
+fixture. Its assertions were kept. The same fixture and the complete suite
+passed with four test threads.
+
+The standard-live version-2.0.4 release executable was **25,578,752 bytes**,
+SHA-256 `d08ddca1b344fabb01ccec5c7da837c45ecb85ec051cfcbde814a9068c9a5c73`.
+Schema-sixteen release smoke passed without using the network. It used
+19 synthetic messages in six conversations and checked restart, preservation
+of legacy and local history, process locking, profile permissions and
+informational diagnostics. The separate
+`cargo check --all-targets --no-default-features` passed.
+
+## Structured chat sync and disabled send (2026-11-19)
+
+The installed 2.0.4-2 client reached Online, then a structural diagnostic
+recorded `Synchronization/Protocol` while processing command 510, subcommand 1.
+The reason `MessageContent`, message kind `webchat` and field type `object`
+identified the rejected queue row. Stalled synchronization disabled Send.
+The original renderer's `getTextFromContent` recognizes an `rtf` object's
+`title`. Authenticated queue and verified preview now display that bounded
+title or a placeholder for other structured objects. These rows carry no
+ordinary send, reply, forward, recall or remote-read proof.
+[Original renderer](../pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js#L548349)
+
+Three focused regressions passed. The parser covers a rich-text title, an
+opaque object, an oversized title and normal neighbors, with strict and
+encrypted parsing preserved. The SQLite test verifies replay, cursor advance
+and rejection of a structured row as evidence of an outgoing send, even when
+the IDs match. The local TLS/WSS worker commits a mixed page, stays Online and
+sends an ordinary message through a synthetic HTTP endpoint. Real-account
+acceptance remains to be verified.
+
+The 2.0.4-2 executable was also exercised in offline demo mode with actual
+IBus x-unikey on an isolated X11 display. With x-unikey off, Enter submitted
+ASCII. With the Telex word still composing, the first Enter committed the word
+and enabled Send, and the second Enter submitted exactly one synthetic row.
+After a space committed the composition, one Enter submitted. Extra Enter
+presses produced no duplicate rows.

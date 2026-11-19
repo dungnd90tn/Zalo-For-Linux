@@ -135,6 +135,7 @@ mod tests {
         let db = Database::open(profile, "11".into()).await.unwrap();
         let (tx, mut rx) = mpsc::channel(8);
         let events = Events {
+            unread: None,
             account: "11".into(),
             tx,
             repaint: Arc::new(|| {}),

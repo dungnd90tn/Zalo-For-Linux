@@ -366,9 +366,9 @@ impl Drop for Worker {
 
 pub fn seed_demo(store: &mut MessageStore) -> Result<()> {
     let messages=[
-        Message{account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-1".into(),sender:"Demo guide".into(),text:"Offline native client. These messages are synthetic and stay in this demo profile.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_000},
-        Message{account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-2".into(),sender:"Demo guide".into(),text:"Try writing a message. The button stores it locally; it does not send to Zalo.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_001},
-        Message{account_id:DEMO_ACCOUNT.into(),thread_id:"architecture".into(),id:"demo-3".into(),sender:"Demo guide".into(),text:"The UI uses bounded queues. SQLite runs on a dedicated worker, and conversation pages use indexed cursors.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_002},
+        Message{reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-1".into(),sender:"Demo guide".into(),text:"Offline native client. These messages are synthetic and stay in this demo profile.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_000},
+        Message{reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-2".into(),sender:"Demo guide".into(),text:"Try writing a message. The button stores it locally; it does not send to Zalo.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_001},
+        Message{reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"architecture".into(),id:"demo-3".into(),sender:"Demo guide".into(),text:"The UI uses bounded queues. SQLite runs on a dedicated worker, and conversation pages use indexed cursors.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_002},
     ];
     store.insert_batch(&messages)?;
     store.set_title(DEMO_ACCOUNT, "welcome", "Getting started")?;
@@ -405,6 +405,10 @@ pub fn seed_demo(store: &mut MessageStore) -> Result<()> {
     for (thread, title, entries, start) in rooms {
         for (index, (sender, text)) in entries.into_iter().enumerate() {
             additional.push(Message {
+                reply_blocked: false,
+                recalled: false,
+                source_client_id: None,
+                quote: None,
                 account_id: DEMO_ACCOUNT.into(),
                 thread_id: thread.into(),
                 id: format!("{thread}-v2-{index}"),
@@ -440,6 +444,10 @@ fn store_demo_file(
         &serde_json::json!({"title": name, "params": params.to_string()}),
     )?;
     let message = Message {
+        reply_blocked: false,
+        recalled: false,
+        source_client_id: None,
+        quote: None,
         account_id: DEMO_ACCOUNT.into(),
         thread_id: thread.into(),
         id: id.clone(),
@@ -474,6 +482,10 @@ fn store_demo_message(
         .as_millis();
     let sent_at_ms = i64::try_from(now)?;
     let conversation = store.insert_with_conversation(&Message {
+        reply_blocked: false,
+        recalled: false,
+        source_client_id: None,
+        quote: None,
         account_id: DEMO_ACCOUNT.into(),
         thread_id: thread.into(),
         id: id.clone(),
@@ -489,22 +501,109 @@ fn store_demo_message(
 #[derive(Default)]
 pub struct Composer {
     pub text: String,
+    reply: Option<crate::domain::ReplyReference>,
     /// A file chosen to be sent with the next send; it belongs to this draft like the text does.
     attachment: Option<crate::domain::Attachment>,
+    attachment_revision: u64,
+    #[cfg(feature = "messaging")]
+    photo_source: Option<crate::domain::Attachment>,
+    #[cfg(feature = "messaging")]
+    photo: Option<live::PreparedPhoto>,
+    #[cfg(feature = "messaging")]
+    photo_preparation: Option<PendingPhotoPreparation>,
+    #[cfg(feature = "messaging")]
+    photo_problem: Option<String>,
+    #[cfg(feature = "messaging")]
+    photo_revision: u64,
+    #[cfg(feature = "messaging")]
+    pending_file: Option<PendingFile>,
     next_request_id: u64,
     pending: Option<(u64, u64)>,
     revision: u64,
 }
+#[cfg(feature = "messaging")]
+struct PendingFile {
+    request_id: u64,
+    thread: String,
+    revision: u64,
+    kind: live::TransferKind,
+    attachment: Option<crate::domain::Attachment>,
+    photo: Option<live::PreparedPhoto>,
+    draft_revision: u64,
+}
+#[cfg(feature = "messaging")]
+struct PendingPhotoPreparation {
+    request_id: u64,
+    thread: String,
+    generation: u64,
+    revision: u64,
+}
 impl Composer {
+    pub fn has_photo_intent(&self) -> bool {
+        #[cfg(feature = "messaging")]
+        {
+            self.photo_source.is_some()
+        }
+        #[cfg(not(feature = "messaging"))]
+        {
+            false
+        }
+    }
+    #[cfg(feature = "messaging")]
+    pub fn photo(&self) -> Option<&live::PreparedPhoto> {
+        self.photo.as_ref()
+    }
+    #[cfg(feature = "messaging")]
+    pub fn photo_source(&self) -> Option<&crate::domain::Attachment> {
+        self.photo_source.as_ref()
+    }
+    #[cfg(feature = "messaging")]
+    pub fn photo_preparing(&self) -> bool {
+        self.photo_preparation.is_some()
+    }
+    #[cfg(feature = "messaging")]
+    pub fn photo_preparation_request(&self) -> Option<u64> {
+        self.photo_preparation.as_ref().map(|p| p.request_id)
+    }
+    #[cfg(feature = "messaging")]
+    pub fn photo_problem(&self) -> Option<&str> {
+        self.photo_problem.as_deref()
+    }
+    #[cfg(feature = "messaging")]
+    pub fn clear_photo(&mut self) {
+        if self.photo_source.take().is_some() {
+            self.photo = None;
+            self.photo_preparation = None;
+            self.photo_problem = None;
+            self.photo_revision = self.photo_revision.wrapping_add(1);
+            self.edited();
+        }
+    }
+    pub fn reply(&self) -> Option<&crate::domain::ReplyReference> {
+        self.reply.as_ref()
+    }
+    pub fn set_reply(&mut self, reply: crate::domain::ReplyReference) {
+        if self.reply.as_ref() != Some(&reply) {
+            self.reply = Some(reply);
+            self.edited();
+        }
+    }
+    pub fn clear_reply(&mut self) {
+        if self.reply.take().is_some() {
+            self.edited();
+        }
+    }
     pub fn attachment(&self) -> Option<&crate::domain::Attachment> {
         self.attachment.as_ref()
     }
     pub fn set_attachment(&mut self, attachment: crate::domain::Attachment) {
         self.attachment = Some(attachment);
+        self.attachment_revision = self.attachment_revision.wrapping_add(1);
         self.edited();
     }
     pub fn clear_attachment(&mut self) {
         if self.attachment.take().is_some() {
+            self.attachment_revision = self.attachment_revision.wrapping_add(1);
             self.edited();
         }
     }
@@ -521,6 +620,11 @@ impl Composer {
         thread: String,
         enqueue: impl FnOnce(Command) -> std::result::Result<(), SubmitError>,
     ) -> std::result::Result<(), SubmitError> {
+        if self.reply.is_some() || self.has_photo_intent() {
+            // The local demo has no server reference to quote. Never silently
+            // turn an unsupported reply into an ordinary message.
+            return Err(SubmitError::Invalid);
+        }
         if self.in_flight() {
             return Err(SubmitError::Busy);
         }
@@ -589,6 +693,31 @@ impl DraftBook {
     pub fn park_active(&mut self) {
         if let Some(thread) = self.thread.take() {
             self.parked.insert(thread, std::mem::take(&mut self.active));
+        }
+    }
+
+    #[cfg(feature = "messaging")]
+    pub(crate) fn remove_recalled_reply(
+        &mut self,
+        account: &str,
+        thread: &str,
+        id: &str,
+        actor: &str,
+    ) {
+        let composer = if self.thread.as_deref() == Some(thread) {
+            Some(&mut self.active)
+        } else {
+            self.parked.get_mut(thread)
+        };
+        if let Some(composer) = composer {
+            if composer.reply().is_some_and(|reply| {
+                reply.account_id == account
+                    && reply.thread_id == thread
+                    && reply.message_id == id
+                    && reply.sender == actor
+            }) {
+                composer.clear_reply();
+            }
         }
     }
 
@@ -864,6 +993,7 @@ mod tests {
             last_message_at_ms: 1,
             last_text: "stored fixture".into(),
             last_sender: "You (local demo)".into(),
+            group_left: false,
         }
     }
     #[test]
@@ -1087,6 +1217,10 @@ mod tests {
         let mut store = MessageStore::open(&path).unwrap();
         let messages: Vec<_> = (0..75)
             .map(|i| Message {
+                reply_blocked: false,
+                recalled: false,
+                source_client_id: None,
+                quote: None,
                 account_id: DEMO_ACCOUNT.into(),
                 thread_id: "search-pages".into(),
                 id: format!("p{i:03}"),
@@ -1357,6 +1491,10 @@ mod tests {
     }
     fn message(id: &str) -> Message {
         Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: DEMO_ACCOUNT.into(),
             thread_id: "welcome".into(),
             id: id.into(),

@@ -140,6 +140,50 @@ pub fn send_url(root: &Url, kind: ThreadKind, client_type: ClientType) -> Result
         .append_pair("zpw_type", client_type.api_type());
     Ok(url)
 }
+pub fn quote_parameters(
+    target: &Target,
+    text: &str,
+    client_id: u64,
+    imei: &str,
+    quote: &crate::domain::MessageQuote,
+    visibility: Option<u64>,
+) -> Result<Value, WireError> {
+    quote.validate().map_err(|_| WireError::Invalid)?;
+    if quote.ttl != Some(0)
+        || quote.message_type != 1
+        || quote.client_id.is_none()
+        || quote.owner_id.is_empty()
+        || quote.message_id.is_empty()
+    {
+        return Err(WireError::Unsupported);
+    }
+    let mut value = text_parameters(target, text, client_id, imei)?;
+    value["qmsgOwner"] = json!(quote.owner_id);
+    value["qmsgId"] = json!(quote.message_id);
+    value["qmsgCliId"] = json!(quote.client_id.as_ref().ok_or(WireError::Invalid)?);
+    value["qmsgType"] = json!(1);
+    value["qmsgTs"] = json!(quote.sent_at_ms);
+    value["qmsg"] = json!(quote.text);
+    value["qmsgTTL"] = json!(0);
+    value["ttl"] = json!(0);
+    if target.kind == ThreadKind::Group {
+        value
+            .as_object_mut()
+            .ok_or(WireError::Invalid)?
+            .remove("imei");
+        value["language"] = json!("VN");
+        value["visibility"] = json!(visibility.ok_or(WireError::Invalid)?);
+    }
+    Ok(value)
+}
+pub fn quote_url(root: &Url, kind: ThreadKind, client_type: ClientType) -> Result<Url, WireError> {
+    let mut url = send_url(root, kind, client_type)?;
+    url.set_path(match kind {
+        ThreadKind::Direct => "/api/message/quote",
+        ThreadKind::Group => "/api/group/quote",
+    });
+    Ok(url)
+}
 pub fn socket_url(root: &Url, now_ms: i64, client_type: ClientType) -> Result<Url, WireError> {
     validate_origin(root, "wss")?;
     let mut url = root.clone();
@@ -308,11 +352,11 @@ impl FrameDecoder {
     /// must also bind their worker/account to the session that opened it.
     /// `idTo` is not a universal recipient-account field in the PC protocol:
     /// incoming direct queues select the conversation by nonzero `uidFrom`.
-    pub(crate) fn incoming_messages(
+    pub(crate) fn incoming_batch(
         &self,
         account: &str,
         payload: &Value,
-    ) -> Result<Vec<Incoming>, FrameFailure> {
+    ) -> Result<IncomingBatch, FrameFailure> {
         if !self.authenticated {
             return Err(FrameFailure::new(
                 WireError::Authentication,
@@ -320,6 +364,15 @@ impl FrameDecoder {
             ));
         }
         incoming_with_scope(account, payload, IncomingScope::AuthenticatedQueue)
+    }
+    #[cfg(test)]
+    fn incoming_messages(
+        &self,
+        account: &str,
+        payload: &Value,
+    ) -> Result<Vec<Incoming>, FrameFailure> {
+        self.incoming_batch(account, payload)
+            .map(|batch| batch.messages)
     }
     pub fn decode(&mut self, bytes: &[u8]) -> Result<DecodedFrame, WireError> {
         self.decode_detailed(bytes).map_err(|failure| failure.error)
@@ -543,14 +596,22 @@ pub fn id_string(v: &Value) -> Result<String, WireError> {
 }
 #[derive(Debug)]
 pub struct Incoming {
+    pub(crate) forward: Option<super::forward::ForwardMarker>,
+    pub(crate) receipt: Option<crate::domain::read_state::ReceiptBinding>,
     pub message: Message,
     pub client_id: Option<String>,
     pub info: Option<InfoMessageContent>,
     pub media: Option<MediaMessageContent>,
+    pub quote_content: Option<crate::domain::QuoteContent>,
     pub unsupported: bool,
     /// Kept in history but never creates or reorders a conversation-list entry (see
     /// `domain::system::list_silent`). Only for messages from someone else.
     pub list_silent: bool,
+}
+#[derive(Debug, Default)]
+pub(crate) struct IncomingBatch {
+    pub messages: Vec<Incoming>,
+    pub recalls: Vec<super::recall::RecallNotice>,
 }
 // Stickers carry a catalog address, never an image URL. Unknown/malformed media
 // stays an explicit placeholder without poisoning other messages in a batch.
@@ -592,7 +653,7 @@ pub fn incoming_messages(account: &str, payload: &Value) -> Result<Vec<Incoming>
 pub(super) fn incoming_verified_preview(
     session: &super::session::VerifiedSession,
     payload: &Value,
-) -> Result<Vec<Incoming>, FrameFailure> {
+) -> Result<IncomingBatch, FrameFailure> {
     incoming_with_scope(
         session.account_id(),
         payload,
@@ -605,6 +666,7 @@ pub fn incoming_messages_detailed(
     payload: &Value,
 ) -> Result<Vec<Incoming>, FrameFailure> {
     incoming_with_scope(account, payload, IncomingScope::RecipientChecked)
+        .map(|batch| batch.messages)
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IncomingScope {
@@ -615,7 +677,7 @@ fn incoming_with_scope(
     account: &str,
     payload: &Value,
     scope: IncomingScope,
-) -> Result<Vec<Incoming>, FrameFailure> {
+) -> Result<IncomingBatch, FrameFailure> {
     let mut reason = FrameReason::BatchEnvelope;
     let mut context = FrameContext {
         status_type: FrameValueType::of(payload.get("error_code")),
@@ -636,7 +698,7 @@ fn incoming_with_reason(
     scope: IncomingScope,
     reason: &mut FrameReason,
     context: &mut FrameContext,
-) -> Result<Vec<Incoming>, WireError> {
+) -> Result<IncomingBatch, WireError> {
     numeric_id(account)?;
     service_code(payload)?;
     context.field_type = Some(FrameValueType::of(payload.get("data")));
@@ -644,7 +706,8 @@ fn incoming_with_reason(
         .get("data")
         .and_then(Value::as_object)
         .ok_or(WireError::Invalid)?;
-    let mut result = Vec::new();
+    let mut result = IncomingBatch::default();
+    let mut rows = 0;
     let mut info_bytes = 0usize;
     for (field, kind) in [
         ("msgs", ThreadKind::Direct),
@@ -664,7 +727,8 @@ fn incoming_with_reason(
         context.field_bytes = None;
         context.field_type = Some(FrameValueType::of(Some(array)));
         let array = array.as_array().ok_or(WireError::Invalid)?;
-        if array.len() + result.len() > MAX_BATCH {
+        rows += array.len();
+        if rows > MAX_BATCH {
             *reason = FrameReason::BatchLimit;
             return Err(WireError::Oversize);
         }
@@ -684,6 +748,17 @@ fn incoming_with_reason(
                     .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
             {
                 return Err(WireError::Invalid);
+            }
+            if scope == IncomingScope::AuthenticatedQueue
+                && field == "msgs"
+                && message_type == "chat.undo"
+            {
+                // A direct recall is a scoped action, never a second chat row.
+                // Unsupported or malformed actions cannot mutate history.
+                result
+                    .recalls
+                    .extend(super::recall::direct_notice(account, v).ok());
+                continue;
             }
             context.message_kind = Some(match message_type {
                 "webchat"
@@ -731,6 +806,7 @@ fn incoming_with_reason(
             {
                 return Err(WireError::Invalid);
             }
+            let receipt_recipient = to.clone();
             let peer = if kind == ThreadKind::Group || sender == account {
                 to
             } else {
@@ -776,6 +852,31 @@ fn incoming_with_reason(
             } else {
                 None
             };
+            // The PC client uses only content.title as the text of an rtf
+            // object. Other object shapes remain opaque. An authenticated
+            // queue/preview may still commit the row and its cursor; the generic
+            // recipient-checked parser and encrypted-content rules stay strict.
+            let legacy = v.get("e2eeExt").is_none()
+                && ["isE2EE", "isE2ee", "e2ee"].iter().all(|key| {
+                    v.get(key).is_none_or(|value| {
+                        value.is_null() || value == &Value::Bool(false) || value.as_u64() == Some(0)
+                    })
+                });
+            let content = v.get("content");
+            let structured_webchat = scope == IncomingScope::AuthenticatedQueue
+                && message_type == "webchat"
+                && info.is_none()
+                && legacy
+                && content.is_some_and(Value::is_object);
+            let rich_text = content
+                .filter(|_| structured_webchat)
+                .filter(|content| content.get("action").and_then(Value::as_str) == Some("rtf"))
+                .and_then(|content| content.get("title").and_then(Value::as_str))
+                .filter(|text| {
+                    text.len() <= MAX_TEXT_BYTES
+                        && !text.trim().is_empty()
+                        && !text.chars().any(|ch| matches!(ch, '\u{0}'..='\u{7}'))
+                });
             let media = if let Some(kind) = MediaKind::from_wire(message_type) {
                 // Encrypted messages cannot be projected into the legacy media path.
                 if v.get("e2eeExt").is_some()
@@ -813,23 +914,69 @@ fn incoming_with_reason(
                 })
                 .flatten()
                 .filter(|text| !text.is_empty());
-            let unsupported = message_type != "webchat"
+            let unsupported = (message_type != "webchat"
                 && sticker.is_none()
                 && media.is_none()
-                && presented.is_none();
+                && presented.is_none())
+                || (structured_webchat && rich_text.is_none());
             // Official Account broadcasts only exist in 1-1 threads; birthday cards are skipped everywhere.
             let list_silent = (kind == ThreadKind::Direct || message_type == "chat.ecard")
                 && sender != account
                 && v.get("content").is_some_and(|content| {
                     crate::domain::system::list_silent(message_type, content)
                 });
-            let message = Message {
+            let quote_content = v
+                .get("quote")
+                .filter(|value| !structured_webchat && !value.is_null())
+                .and_then(|value| crate::domain::QuoteContent::new(account, value).ok());
+            let quote = v
+                .get("quote")
+                .filter(|value| !structured_webchat && !value.is_null())
+                .map(|_| {
+                    quote_content
+                        .as_ref()
+                        .and_then(|content| content.projection(account).ok())
+                        .unwrap_or_else(crate::domain::MessageQuote::unsupported)
+                });
+            info_bytes = info_bytes.saturating_add(
+                quote_content
+                    .as_ref()
+                    .map_or(0, |content| content.as_json().len()),
+            );
+            if info_bytes > MAX_INFO_BATCH_BYTES {
+                return Err(WireError::Oversize);
+            }
+            let reply_blocked = !(message_type == "webchat"
+                && info.is_none()
+                && !structured_webchat
+                && legacy
+                && v.get("mentions").is_none_or(|value| {
+                    value.is_null() || value.as_array().is_some_and(|items| items.is_empty())
+                })
+                && v.get("textProperties")
+                    .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
+                && v.get("ttl")
+                    .is_none_or(|value| value.is_null() || value.as_u64() == Some(0)));
+            let source_client_id = if !reply_blocked {
+                v.get("cliMsgId").and_then(|value| id_string(value).ok())
+            } else {
+                None
+            };
+            let mut message = Message {
+                reply_blocked,
+                recalled: false,
+                source_client_id,
+                quote,
                 account_id: account.into(),
                 thread_id: thread,
                 id,
                 sender,
                 text: if info.is_some() {
                     info::presentation(account, v.get("content").ok_or(WireError::Invalid)?)
+                } else if structured_webchat {
+                    rich_text
+                        .unwrap_or("[Tin nhắn webchat chưa được hỗ trợ]")
+                        .into()
                 } else if let Some(text) = presented {
                     text
                 } else if message_type != "webchat" {
@@ -853,22 +1000,73 @@ fn incoming_with_reason(
             // it independently from server msgId. Zero/null carry no usable
             // client-generated correlation. Never treat these sentinels
             // as an outbox identity; durable server binding remains authoritative.
-            let client_id = match v.get("cliMsgId") {
+            let client_id = match v.get("cliMsgId").filter(|_| !structured_webchat) {
                 None | Some(Value::Null) => None,
                 Some(Value::Number(n)) if n.as_u64() == Some(0) => None,
                 Some(Value::String(s)) if s == "0" => None,
+                Some(value @ (Value::String(_) | Value::Number(_))) => id_string(value).ok(),
                 Some(value) => Some(id_string(value)?),
             };
+            let receipt = (info.is_none()
+                && !structured_webchat
+                && !list_silent
+                && !matches!(
+                    message_type,
+                    "chat.undo" | "chat.delete" | "chat.list.action"
+                )
+                && (message_type == "webchat" || sticker.is_some() || media.is_some())
+                && legacy)
+                .then(|| {
+                    super::read_state::incoming_reference(
+                        v,
+                        &message,
+                        receipt_recipient,
+                        message_type,
+                        client_id.clone(),
+                    )
+                });
             // An information event is never an acknowledgement of a reserved
             // plain-text send, even when its server-supplied cliMsgId matches.
             // Only a plain text message can acknowledge a plain-text send.
-            let client_id = client_id
-                .filter(|_| info.is_none() && media.is_none() && message_type == "webchat");
-            result.push(Incoming {
+            let client_id = client_id.filter(|_| {
+                info.is_none()
+                    && !structured_webchat
+                    && ((media.is_none() && message_type == "webchat")
+                        || matches!(message_type, "share.file" | "chat.photo"))
+            });
+            let reference = v.get("reference").filter(|value| !value.is_null());
+            let forward = if structured_webchat {
+                Some(super::forward::ForwardMarker::StructuredWebchat)
+            } else {
+                reference
+                    .and_then(super::forward::ForwardMarker::parse)
+                    .or_else(|| {
+                        (reference.is_none()
+                            && message.quote.is_none()
+                            && !list_silent
+                            && !message.reply_blocked
+                            && message.source_client_id.is_some()
+                            && message_type == "webchat")
+                            .then_some(super::forward::ForwardMarker::Ordinary)
+                    })
+            };
+            if matches!(
+                forward,
+                Some(
+                    super::forward::ForwardMarker::Parsed(_)
+                        | super::forward::ForwardMarker::Unavailable
+                )
+            ) {
+                message.reply_blocked = true;
+            }
+            result.messages.push(Incoming {
+                forward,
+                receipt,
                 message,
                 client_id,
                 info,
                 media,
+                quote_content,
                 unsupported,
                 list_silent,
             });
@@ -1175,6 +1373,55 @@ mod tests {
             authenticated: true,
         }
     }
+
+    #[test]
+    fn authenticated_structured_webchat_keeps_neighbors_without_ordinary_proof() {
+        let mut original = incoming_fixture()["data"]["msgs"][0].clone();
+        let mut rich = original.clone();
+        original["msgId"] = json!("770");
+        rich["msgId"] = json!("771");
+        rich["content"] =
+            json!({"action":"rtf","title":"Chữ định dạng","params":{"private":"ignored-style"}});
+        let mut opaque = rich.clone();
+        opaque["msgId"] = json!("772");
+        opaque["content"] = json!({"action":"unknown","title":"ignored-unknown"});
+        opaque["cliMsgId"] = json!({"unknown":"ignored-correlation"});
+        let make_payload = |messages| json!({"error_code":0,"data":{"msgs":messages}});
+        let payload = make_payload(vec![original.clone(), rich.clone(), opaque]);
+        let batch = authenticated().incoming_messages("11", &payload).unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(
+            batch[0].message,
+            authenticated()
+                .incoming_messages("11", &make_payload(vec![original]))
+                .unwrap()[0]
+                .message
+        );
+        assert_eq!(batch[1].message.text, "Chữ định dạng");
+        assert!(!batch[1].unsupported);
+        assert!(batch[2].unsupported);
+        assert_eq!(batch[2].message.text, "[Tin nhắn webchat chưa được hỗ trợ]");
+        for incoming in &batch[1..] {
+            assert_eq!(
+                incoming.forward,
+                Some(super::super::forward::ForwardMarker::StructuredWebchat)
+            );
+            assert!(incoming.message.reply_blocked);
+            assert!(incoming.message.reply_reference().is_none());
+            assert!(incoming.client_id.is_none());
+            assert!(incoming.receipt.is_none());
+        }
+        assert!(incoming_messages("11", &payload).is_err());
+        rich["content"]["title"] = json!("x".repeat(MAX_TEXT_BYTES + 1));
+        let large = authenticated()
+            .incoming_messages("11", &make_payload(vec![rich.clone()]))
+            .unwrap();
+        assert!(large[0].unsupported);
+        rich["e2eeExt"] = json!({"opaque":"not a legacy object"});
+        assert!(authenticated()
+            .incoming_messages("11", &make_payload(vec![rich]))
+            .is_err());
+    }
     #[test]
     fn an_encrypted_send_reply_is_read_from_min_global_msg_id_and_ts() {
         let ack = e2ee_send_ack(&json!({"error_code":0,"data":{
@@ -1265,9 +1512,17 @@ mod tests {
             message["content"] = case["content"].clone();
             let mut parsed = incoming_messages("11", &payload).unwrap();
             let incoming = parsed.pop().unwrap();
-            assert!(
-                !incoming.unsupported && incoming.client_id.is_none() && incoming.info.is_none()
+            assert!(!incoming.unsupported && incoming.info.is_none());
+            assert_eq!(
+                incoming.client_id.as_deref(),
+                if matches!(case["kind"].as_str(), Some("share.file" | "chat.photo")) {
+                    Some("1760000000001")
+                } else {
+                    None
+                },
+                "Only files/photos retain hints for their separate typed ledgers"
             );
+            assert!(incoming.message.reply_reference().is_none());
             assert_eq!(
                 serde_json::from_str::<Value>(incoming.media.as_ref().unwrap().as_json()).unwrap(),
                 case["content"]

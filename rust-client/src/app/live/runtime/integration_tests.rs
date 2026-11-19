@@ -17,12 +17,14 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Mutex,
+        Mutex, OnceLock,
     },
 };
 
 #[derive(Clone, Copy)]
 enum Reply {
+    FileUpload(u8),
+    PhotoUpload(u8),
     Normal,
     #[cfg(feature = "signal-crypto")]
     EncryptedSend,
@@ -39,9 +41,14 @@ enum Reply {
     OfflineCycle,
     NullableReceive(u8),
     PeerRouting(bool),
+    StructuredWebchat,
     InfoPages(bool),
     MediaPages(bool),
     RichCards,
+    ReadStates,
+    Forward(u8),
+    Recall(u8),
+    GroupActions(bool),
     UpgradeForbidden,
     DesktopHeaders,
     UpgradeStall,
@@ -55,6 +62,8 @@ enum Reply {
 }
 #[derive(Default)]
 struct State {
+    file: file_fixture::FileState,
+    photo: file_fixture::FileState,
     requests: Mutex<Vec<(String, String)>>,
     sni: Mutex<Vec<String>>,
     closed: AtomicUsize,
@@ -72,6 +81,8 @@ struct State {
     privacy_hold: AtomicBool,
     privacy_policy: AtomicUsize,
     eligibility_mode: AtomicUsize,
+    ordinary_quotes: Mutex<Vec<Value>>,
+    recall_source_at: OnceLock<i64>,
 }
 struct Fixture {
     addr: SocketAddr,
@@ -267,6 +278,7 @@ async fn device_readiness_composer_sends_exact_verified_coverage_and_settles_cor
     connection.next().await.unwrap();
     let (tx, mut rx) = mpsc::channel(32);
     let events = Events {
+        unread: None,
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
@@ -472,6 +484,7 @@ async fn device_readiness_incoming_storage_failure_escapes_command_and_never_dis
     });
     let (tx, mut rx) = mpsc::channel(32);
     let events = Events {
+        unread: None,
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
@@ -480,6 +493,7 @@ async fn device_readiness_incoming_storage_failure_escapes_command_and_never_dis
     let mut connection = Some(connection);
     let error = handle_command(
         LiveCommand::Send {
+            reply_to: None,
             generation: 79,
             thread: "d:22".into(),
             request_id: 90,
@@ -624,8 +638,23 @@ fn serve(
             return;
         }
         let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
-        write!(stream,"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").unwrap();
-        stream.flush().unwrap();
+        let upgrade = write!(stream, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n")
+            .and_then(|()| stream.flush());
+        if let Err(error) = upgrade {
+            // Cancellation can close a replacement socket while this fixture
+            // is still sending its upgrade response.
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                ),
+                "synthetic upgrade response failed: {error}"
+            );
+            state.closed.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
         let mut ws = tungstenite::WebSocket::from_raw_socket(
             stream,
             tungstenite::protocol::Role::Server,
@@ -635,6 +664,14 @@ fn serve(
                 ..Default::default()
             }),
         );
+        if let Reply::FileUpload(mode) = reply {
+            file_fixture::socket(ws, state, mode, false);
+            return;
+        }
+        if let Reply::PhotoUpload(mode) = reply {
+            file_fixture::socket(ws, state, mode, true);
+            return;
+        }
         if matches!(reply, Reply::AuthExpired | Reply::AuthMalformed) {
             let payload = if matches!(reply, Reply::AuthExpired) {
                 json!({"error_code":102})
@@ -647,7 +684,7 @@ fn serve(
             let _ = ws.read();
             return;
         }
-        let auth = json!({"error_code":0,"data":{"qCmds":if matches!(reply,Reply::InfoPages(_)|Reply::MediaPages(_)|Reply::RichCards){json!([{"cmd":511,"subCmd":1}])}else if matches!(reply,Reply::PeerRouting(_)){json!([{"cmd":510,"subCmd":1}])}else if matches!(reply,Reply::Runtime|Reply::Stickers|Reply::RuntimeStall|Reply::DirectoryStall|Reply::ControlHeartbeats){json!([{"cmd":510,"subCmd":0},{"cmd":511,"subCmd":0}])}else{json!([{"cmd":510,"subCmd":0}])}}});
+        let auth = json!({"error_code":0,"data":{"qCmds":if matches!(reply,Reply::InfoPages(_)|Reply::MediaPages(_)|Reply::RichCards){json!([{"cmd":511,"subCmd":1}])}else if matches!(reply,Reply::PeerRouting(_) | Reply::StructuredWebchat){json!([{"cmd":510,"subCmd":1}])}else if matches!(reply,Reply::Runtime|Reply::Stickers|Reply::RuntimeStall|Reply::DirectoryStall|Reply::ControlHeartbeats){json!([{"cmd":510,"subCmd":0},{"cmd":511,"subCmd":0}])}else{json!([{"cmd":510,"subCmd":0}])}}});
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         z.write_all(&serde_json::to_vec(&auth).unwrap()).unwrap();
         let auth_frame = if matches!(reply, Reply::ControlHeartbeats) {
@@ -683,6 +720,53 @@ fn serve(
                 return;
             }
             panic!("Synthetic WebSocket authentication failed: {error}");
+        }
+        if matches!(reply, Reply::ReadStates) {
+            let live = json!({"error_code":0,"data":{"msgs":[
+                {"uidFrom":"22","idTo":"11","msgId":"910","cliMsgId":"990","ts":1760000000001_i64,"msgType":"webchat","content":"first"},
+                {"uidFrom":"22","idTo":"11","msgId":"911","ts":1760000000002_i64,"msgType":"webchat","content":"next"},
+                {"uidFrom":"22","idTo":"11","msgId":"912","cliMsgId":"992","ts":1760000000003_i64,"msgType":"webchat","content":"silent","paramsExt":{"countUnread":0}}
+            ]}});
+            let history = json!({"error_code":0,"data":{"msgs":[
+                {"uidFrom":"22","idTo":"11","msgId":"909","cliMsgId":"989","ts":1760000000000_i64,"msgType":"webchat","content":"history"}
+            ]}});
+            for (cmd, payload) in [(510, history), (501, live.clone()), (501, live)] {
+                ws.send(tungstenite::Message::Binary(
+                    wire::encode_frame(cmd, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
+                        .unwrap(),
+                ))
+                .unwrap();
+            }
+        }
+        if matches!(reply, Reply::Forward(_)) {
+            let payload = json!({"error_code":0,"data":{"msgs":[
+                {"uidFrom":"33","idTo":"11","msgId":"910","cliMsgId":"990","ts":1760000000001_i64,
+                 "msgType":"webchat","content":"Tin tổng hợp được chuyển tiếp"}
+            ]}});
+            ws.send(tungstenite::Message::Binary(
+                wire::encode_frame(501, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        }
+        if let Reply::Recall(mode) = reply {
+            let sent_at = *state.recall_source_at.get_or_init(now_ms);
+            let original = json!({"uidFrom":"0","idTo":"22","msgId":"910","cliMsgId":"990",
+                "ts":sent_at,"msgType":"webchat","content":"synthetic recall source"});
+            let mut rows = Vec::new();
+            if mode == 1 && state.http_sends.load(Ordering::SeqCst) > 0 {
+                let notice = json!({"uidFrom":"0","idTo":"22","msgId":"999","ts":sent_at+1,
+                    "msgType":"chat.undo","content":{"globalMsgId":"910","cliMsgId":"990",
+                        "srcId":"11","destId":"22"}});
+                rows.extend([notice.clone(), notice]);
+            }
+            rows.push(original);
+            let payload = json!({"error_code":0,"data":{"msgs":rows}});
+            ws.send(tungstenite::Message::Binary(
+                wire::encode_frame(501, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
+                    .unwrap(),
+            ))
+            .unwrap();
         }
         loop {
             let message = match ws.read() {
@@ -734,6 +818,29 @@ fn serve(
                         ws.send(tungstenite::Message::Binary(wire::encode_frame(510, 1, &json!({"error_code":0,"encrypt":0,"data":peer_addressed_batch(first, invalid)})).unwrap())).unwrap();
                     }
                     if cmd == 510 {
+                        if matches!(reply, Reply::StructuredWebchat) {
+                            assert_eq!(bytes[3], 1);
+                            let rows = json!([
+                                {"uidFrom":"22","idTo":"11","msgId":"831","ts":"1760000000001",
+                                 "msgType":"webchat","content":"Before structured text"},
+                                {"uidFrom":"22","idTo":"11","msgId":"832","ts":"1760000000002",
+                                 "msgType":"webchat","content":{"action":"rtf","title":"Chữ định dạng","params":"ignored"}},
+                                {"uidFrom":"22","idTo":"11","msgId":"833","ts":"1760000000003",
+                                 "msgType":"webchat","content":{"private":"ignored"}},
+                                {"uidFrom":"22","idTo":"11","msgId":"834","ts":"1760000000004",
+                                 "msgType":"webchat","content":"After structured text"}
+                            ]);
+                            let payload = json!({"error_code":0,"data":{"msgs":rows,"more":false,"lastActionId":"100"}});
+                            ws.send(tungstenite::Message::Binary(
+                                wire::encode_frame(
+                                    510,
+                                    1,
+                                    &json!({"error_code":0,"encrypt":0,"data":payload}),
+                                )
+                                .unwrap(),
+                            ))
+                            .unwrap();
+                        }
                         if let Reply::NullableReceive(malformed) = reply {
                             let last_id = data["lastId"].as_u64().unwrap();
                             let first = data["first"].as_bool().unwrap();
@@ -959,12 +1066,100 @@ fn serve(
     assert!(length < wire::MAX_FRAME);
     let mut body = vec![0; length];
     stream.read_exact(&mut body).unwrap();
+    if let Reply::FileUpload(mode) = reply {
+        if file_fixture::http(&mut stream, &state, mode, &path, &headers, &body, false) {
+            return;
+        }
+    }
+    if let Reply::PhotoUpload(mode) = reply {
+        if file_fixture::http(&mut stream, &state, mode, &path, &headers, &body, true) {
+            return;
+        }
+    }
     state
         .requests
         .lock()
         .unwrap()
         .push((path.clone(), String::from_utf8(body.clone()).unwrap()));
     let route = path.split('?').next().unwrap();
+    if let Reply::GroupActions(drop_invite) = reply {
+        let cipher =
+            SessionCipher::from_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
+        let data = if route == "/api/group/getgi/v2" {
+            assert!(headers.starts_with("GET "));
+            let params = url::form_urlencoded::parse(path.split_once('?').unwrap().1.as_bytes())
+                .find(|(name, _)| name == "params")
+                .unwrap()
+                .1;
+            let parameters: Value =
+                serde_json::from_slice(&cipher.decrypt(&params).unwrap()).unwrap();
+            assert_eq!(parameters["grid"], "22");
+            json!({"groupId":"22","e2ee":false})
+        } else {
+            assert!(headers.starts_with("POST "));
+            let params = url::form_urlencoded::parse(&body)
+                .find(|(name, _)| name == "params")
+                .unwrap()
+                .1;
+            let parameters: Value =
+                serde_json::from_slice(&cipher.decrypt(&params).unwrap()).unwrap();
+            match route {
+                "/api/group/getmg-v2" => {
+                    assert_eq!(parameters, json!({"gridVerMap":"{\"22\":0}"}));
+                    json!({"gridInfoMap":{"22":{
+                        "groupId":"22","type":1,"creatorId":"77","adminIds":["33"],
+                        "totalMember":4,"memVerList":["77_1","11_2","33_3","55_0"],
+                        "setting":{"lockViewMember":1,"addMemberOnly":0,"joinAppr":0}
+                    }}})
+                }
+                "/api/social/group/members" => {
+                    assert_eq!(
+                        parameters,
+                        json!({"friend_pversion_map":["77_0","33_0","11_0"]})
+                    );
+                    json!({"profiles":{
+                        "77":{"id":"77","displayName":"Trưởng nhóm thử"},
+                        "33":{"id":"33","displayName":"Phó nhóm thử"},
+                        "11":{"id":"11","displayName":"Người thử"}
+                    }})
+                }
+                "/api/group/invite/v2" => {
+                    assert_eq!(
+                        parameters,
+                        json!({"grid":"22","members":["44"],"memberTypes":[-1],"imei":"native-fixture","clientLang":"VN"})
+                    );
+                    state.http_sends.fetch_add(1, Ordering::SeqCst);
+                    if drop_invite {
+                        return;
+                    }
+                    json!({"errorMembers":["44"],"error_data":{"240":["44"]}})
+                }
+                "/api/group/leave" => {
+                    assert_eq!(
+                        parameters,
+                        json!({"grids":["22"],"imei":"native-fixture","silent":0,"language":"VN"})
+                    );
+                    state.http_sends.fetch_add(1, Ordering::SeqCst);
+                    Value::Null
+                }
+                _ => panic!("unexpected synthetic group route: {route}"),
+            }
+        };
+        let inner = json!({"error_code":0,"data":data});
+        let encrypted = cipher
+            .encrypt(&serde_json::to_vec(&inner).unwrap())
+            .unwrap();
+        let response = serde_json::to_vec(&json!({"error_code":0,"data":encrypted})).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.len()
+        )
+        .unwrap();
+        stream.write_all(&response).unwrap();
+        stream.flush().unwrap();
+        return;
+    }
     if [
         "/api/hiddenconvers/get-all",
         "/api/group/getlg/v3",
@@ -1021,7 +1216,10 @@ fn serve(
                 {
                     std::thread::park_timeout(Duration::from_millis(2));
                 }
-                if matches!(reply, Reply::Privacy) {
+                if matches!(reply, Reply::Privacy)
+                    || (matches!(reply, Reply::FileUpload(_) | Reply::PhotoUpload(_))
+                        && state.privacy_policy.load(Ordering::SeqCst) != 0)
+                {
                     match state.privacy_policy.load(Ordering::SeqCst) {
                         0 => {
                             json!({"pin":"81dc9bdb52d04dc20036dbd8313ed055","threads":[{"is_group":0,"thread_id":"22"},{"is_group":1,"thread_id":"22"}]})
@@ -1150,6 +1348,96 @@ fn serve(
     let route = path.split('?').next().unwrap();
     let cipher =
         SessionCipher::from_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
+    if let Reply::Recall(mode) = reply {
+        assert!(headers.starts_with("POST "));
+        assert_eq!(path, "/api/message/undo?zpw_ver=681&zpw_type=24");
+        let form: Vec<_> = url::form_urlencoded::parse(&body).collect();
+        assert_eq!(form.len(), 1);
+        assert_eq!(form[0].0, "params");
+        let params: Value = serde_json::from_slice(&cipher.decrypt(&form[0].1).unwrap()).unwrap();
+        let client_id = params["clientId"].as_u64().unwrap();
+        assert!(client_id > 990);
+        assert_eq!(
+            params,
+            json!({
+                "msgId":"910","toid":"22","clientId":client_id,"cliMsgIdUndo":"990"
+            })
+        );
+        state.http_sends.fetch_add(1, Ordering::SeqCst);
+        if mode != 0 {
+            return; // The server saw the request but gave this connection no result.
+        }
+        let inner = json!({"error_code":0,"data":null});
+        let response = serde_json::to_vec(&json!({"error_code":0,"data":
+            cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()}))
+        .unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.len()
+        )
+        .unwrap();
+        stream.write_all(&response).unwrap();
+        stream.flush().unwrap();
+        return;
+    }
+    if let Reply::Forward(mode) = reply {
+        let get = route == "/api/conv/autodelete/getConvers";
+        let form = if get {
+            path.split_once('?').unwrap().1.as_bytes()
+        } else {
+            &body
+        };
+        let encrypted = url::form_urlencoded::parse(form)
+            .find(|(key, _)| key == "params")
+            .unwrap()
+            .1;
+        let parameters: Value =
+            serde_json::from_slice(&cipher.decrypt(&encrypted).unwrap()).unwrap();
+        let data = if get {
+            assert!(headers.starts_with("GET "));
+            assert_eq!(parameters, json!({}));
+            if mode == 1 {
+                json!({"convers":[{"destId":"22","isGroup":false,"ttl":60000}]})
+            } else {
+                json!({"convers":[]})
+            }
+        } else {
+            assert_eq!(route, "/api/message/mforward");
+            assert!(headers.starts_with("POST "));
+            assert_eq!(parameters["imei"], "native-fixture");
+            assert_eq!(parameters["toIds"][0]["toUid"], "22");
+            assert_eq!(parameters["toIds"][0]["ttl"], 0);
+            assert_eq!(parameters["msgType"], "1");
+            let id = parameters["toIds"][0]["clientId"].as_str().unwrap();
+            assert!(wire::numeric_id(id).is_ok());
+            let info: Value =
+                serde_json::from_str(parameters["msgInfo"].as_str().unwrap()).unwrap();
+            assert_eq!(info["message"], "Tin tổng hợp được chuyển tiếp");
+            let reference: Value =
+                serde_json::from_str(info["reference"].as_str().unwrap()).unwrap();
+            assert!(matches!(
+                crate::protocol::forward::ForwardMarker::parse(&reference),
+                Some(crate::protocol::forward::ForwardMarker::Parsed(_))
+            ));
+            state.http_sends.fetch_add(1, Ordering::SeqCst);
+            if mode == 2 {
+                return; // HTTP failed after receiving the exact request.
+            }
+            json!({"success":[{"clientId":id,"msgId":"991","ts":1760000000099_i64}],"failed":[]})
+        };
+        let inner = json!({"error_code":0,"data":data});
+        let response=serde_json::to_vec(&json!({"error_code":0,"data":cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()})).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.len()
+        )
+        .unwrap();
+        stream.write_all(&response).unwrap();
+        stream.flush().unwrap();
+        return;
+    }
     #[cfg(feature = "signal-crypto")]
     if matches!(reply, Reply::EncryptedSend) {
         assert_eq!(route, "/api/e2ee/pc/message/sms");
@@ -1196,28 +1484,58 @@ fn serve(
             .1
             .into_owned();
         let parameters: Value = serde_json::from_slice(&cipher.decrypt(&params).unwrap()).unwrap();
-        assert_eq!(parameters["message"], "Xin chào Linux");
-        assert_eq!(parameters["imei"], "native-fixture");
-        assert!(parameters["clientId"].as_u64().unwrap() <= 9_007_199_254_740_991);
-        if route == "/api/group/sendmsg" {
-            assert_eq!(parameters["grid"], "22");
-            assert_eq!(parameters["visibility"], 0);
+        if matches!(reply, Reply::ReadStates) {
+            assert_eq!(route, "/api/message/seenv2");
+            assert_eq!(path, "/api/message/seenv2?zpw_ver=681&zpw_type=24");
+            assert_eq!(parameters["imei"], "native-fixture");
+            let infos: Value =
+                serde_json::from_str(parameters["msgInfos"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                infos,
+                json!({"senderId":"22","data":[{"cmi":"990","gmi":"910","si":"22","di":"11","mt":"webchat","st":-1,"at":-1,"cmd":-1,"ts":1760000000001_i64}]})
+            );
+            state.http_sends.fetch_add(1, Ordering::SeqCst);
+            json!({"error_code":0,"data":{}})
         } else {
-            assert_eq!(route, "/api/message/sms");
-            assert_eq!(parameters["toid"], "22");
-        }
-        let server_id = if matches!(reply, Reply::EchoAfterAck(_)) {
-            if state.http_sends.fetch_add(1, Ordering::SeqCst) == 0 {
-                "901"
+            assert_eq!(parameters["message"], "Xin chào Linux");
+            let quoted = matches!(route, "/api/message/quote" | "/api/group/quote");
+            if route != "/api/group/quote" {
+                assert_eq!(parameters["imei"], "native-fixture");
             } else {
-                "902"
+                assert!(parameters.get("imei").is_none());
+                assert_eq!(parameters["language"], "VN");
             }
-        } else if route == "/api/group/sendmsg" {
-            "902"
-        } else {
-            "901"
-        };
-        json!({"error_code":0,"data":{"msgId":server_id,"ts":"1760000000001"}})
+            assert!(parameters["clientId"].as_u64().unwrap() <= 9_007_199_254_740_991);
+            if matches!(route, "/api/group/sendmsg" | "/api/group/quote") {
+                assert_eq!(parameters["grid"], "22");
+                assert_eq!(parameters["visibility"], 0);
+            } else {
+                assert!(matches!(route, "/api/message/sms" | "/api/message/quote"));
+                assert_eq!(parameters["toid"], "22");
+            }
+            if quoted {
+                assert_eq!(parameters["qmsgType"], 1);
+                assert_eq!(parameters["qmsgTTL"], 0);
+                assert_eq!(parameters["ttl"], 0);
+                state
+                    .ordinary_quotes
+                    .lock()
+                    .unwrap()
+                    .push(parameters.clone());
+            }
+            let server_id = if matches!(reply, Reply::EchoAfterAck(_)) {
+                if state.http_sends.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "901"
+                } else {
+                    "902"
+                }
+            } else if matches!(route, "/api/group/sendmsg" | "/api/group/quote") {
+                "902"
+            } else {
+                "901"
+            };
+            json!({"error_code":0,"data":{"msgId":server_id,"ts":"1760000000001"}})
+        }
     };
     let response=serde_json::to_vec(&json!({"error_code":0,"data":cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()})).unwrap();
     write!(
@@ -1327,6 +1645,7 @@ async fn real_tls_websocket_personal_and_group_text_use_production_codec_capabil
         .unwrap();
     let (tx, mut rx) = mpsc::channel(16);
     let events = Events {
+        unread: None,
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
@@ -1472,6 +1791,88 @@ async fn worker_cancel_interrupts_a_saturated_critical_event_queue_without_conta
 }
 
 #[tokio::test]
+async fn actual_structured_webchat_sync_keeps_cursor_online_and_can_send() {
+    let f = Fixture::new(Reply::StructuredWebchat);
+    let (commands, rx) = mpsc::channel(8);
+    let (tx, mut events) = mpsc::channel(16);
+    let (stop, cancel) = watch::channel(false);
+    let task = tokio::spawn(run_with_transports(
+        f.profile.clone(),
+        f.session(),
+        rx,
+        tx,
+        Arc::new(|| {}),
+        cancel,
+        f.transports(),
+    ));
+    let mut texts = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while texts.len() < 4 {
+            match events.recv().await.unwrap() {
+                LiveEvent::Received { message, .. } => texts.push(message.text),
+                LiveEvent::Diagnostic { diagnostic, .. } => {
+                    panic!("unexpected sync failure: {diagnostic}")
+                }
+                LiveEvent::Fault { error, .. } => panic!("runtime fault: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        texts,
+        [
+            "Before structured text",
+            "Chữ định dạng",
+            "[Tin nhắn webchat chưa được hỗ trợ]",
+            "After structured text",
+        ]
+    );
+    commands
+        .send(LiveCommand::Send {
+            reply_to: None,
+            generation: 1,
+            thread: "d:22".into(),
+            text: "Xin chào Linux".into(),
+            request_id: 1,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap() {
+                LiveEvent::Sent {
+                    request_id: 1,
+                    message,
+                    ..
+                } => {
+                    assert_eq!(message.id, "901");
+                    break;
+                }
+                LiveEvent::SendFailed { error, .. } | LiveEvent::Fault { error, .. } => {
+                    panic!("send fault: {error}")
+                }
+                LiveEvent::Diagnostic { diagnostic, .. } => {
+                    panic!("unexpected sync failure: {diagnostic}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = MessageStore::open(&f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+    assert_eq!(store.receive_cursor("11", "510_1").unwrap(), "100");
+    assert_eq!(store.page("11", "d:22", None, 10).unwrap().len(), 5);
+}
+
+#[tokio::test]
 async fn actual_runtime_consumes_wss_batches_and_commands_then_publishes_only_durable_received_and_sent(
 ) {
     let fixture = Fixture::new(Reply::Runtime);
@@ -1523,6 +1924,7 @@ async fn actual_runtime_consumes_wss_batches_and_commands_then_publishes_only_du
     ] {
         commands
             .send(LiveCommand::Send {
+                reply_to: None,
                 generation: 1,
                 thread: thread.into(),
                 text: "Xin chào Linux".into(),
@@ -1616,6 +2018,7 @@ async fn actual_runtime_cancels_stalled_send_without_retry_and_preserves_durable
     .unwrap();
     commands
         .send(LiveCommand::Send {
+            reply_to: None,
             generation: 1,
             thread: "d:22".into(),
             text: "Xin chào Linux".into(),
@@ -1746,12 +2149,31 @@ async fn actual_runtime_cancels_when_received_event_backpressure_blocks_the_live
     let (_commands, rx) = mpsc::channel(16);
     let (tx, mut events) = mpsc::channel(1);
     let (stop, cancel) = watch::channel(false);
+    let armed = Arc::new(AtomicBool::new(false));
+    let full_repaints = Arc::new(AtomicUsize::new(0));
+    let backpressured = Arc::new(tokio::sync::Notify::new());
+    let repaint = {
+        let (armed, full_repaints, backpressured, sender) = (
+            armed.clone(),
+            full_repaints.clone(),
+            backpressured.clone(),
+            tx.clone(),
+        );
+        Arc::new(move || {
+            if armed.load(Ordering::Acquire)
+                && sender.capacity() == 0
+                && full_repaints.fetch_add(1, Ordering::AcqRel) == 1
+            {
+                backpressured.notify_one();
+            }
+        })
+    };
     let task = tokio::spawn(run_with_transports(
         f.profile.clone(),
         f.session(),
         rx,
         tx,
-        Arc::new(|| {}),
+        repaint,
         cancel,
         transports,
     ));
@@ -1770,7 +2192,13 @@ async fn actual_runtime_cancels_when_received_event_backpressure_blocks_the_live
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // After Online has been drained, leave the one-slot queue untouched.
+    // The first callback at zero capacity follows a successful publication.
+    // A second at zero capacity comes from attempting the next publication.
+    armed.store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(5), backpressured.notified())
+        .await
+        .expect("live producer never tried to publish into the full queue");
     assert_eq!(events.len(), 1);
     stop.send(true).unwrap();
     tokio::time::timeout(Duration::from_millis(500), task)
@@ -1792,12 +2220,14 @@ async fn info_preview_and_socket_orders_keep_identical_full_metadata_without_ack
             account: "11".into(),
             db: db.handle().unwrap(),
             updates,
+            recalls: mpsc::channel(1).0,
         };
         let fetcher = DirectoryFetcher::with_client(f.client());
         let session = f.directory_session(false);
         let (_cancel, cancel) = watch::channel(false);
         let (tx, mut events) = mpsc::channel(4);
         let output = Events {
+            unread: None,
             account: "11".into(),
             tx,
             repaint: Arc::new(|| {}),
@@ -1896,12 +2326,14 @@ async fn media_preview_and_socket_orders_preserve_complete_metadata_across_chunk
             account: "11".into(),
             db: db.handle().unwrap(),
             updates,
+            recalls: mpsc::channel(1).0,
         };
         let fetcher = DirectoryFetcher::with_client(f.client());
         let session = f.directory_session(false);
         let (_cancel, cancel) = watch::channel(false);
         let (tx, mut events) = mpsc::channel(8);
         let output = Events {
+            unread: None,
             account: "11".into(),
             tx,
             repaint: Arc::new(|| {}),
@@ -2056,6 +2488,7 @@ async fn http_media_refresh_enriches_durable_legacy_placeholders_without_rewindi
     // select a conversation or ask for the newest history page.
     let (tx, mut refreshed) = mpsc::channel(4);
     let events = Events {
+        unread: None,
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
@@ -2097,6 +2530,7 @@ async fn http_media_refresh_enriches_durable_legacy_placeholders_without_rewindi
         account: "11".into(),
         db: db.handle().unwrap(),
         updates,
+        recalls: mpsc::channel(1).0,
     };
     let (_stop, cancel) = watch::channel(false);
     let report = DirectoryFetcher::with_client(f.client())
@@ -2206,6 +2640,7 @@ async fn actual_socket_media_raw_conflict_rolls_back_entire_following_page_and_c
         .unwrap();
     let (tx, mut events) = mpsc::channel(4);
     let output = Events {
+        unread: None,
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
@@ -2850,6 +3285,7 @@ async fn connection_account_and_authenticated_decoder_gate_peer_routing_before_s
         .unwrap();
     let (tx, mut received) = mpsc::channel(4);
     let mut events = Events {
+        unread: None,
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
@@ -3180,6 +3616,7 @@ async fn offline_page_budget_rejects_excess_pages_before_persistence_or_next_req
         .unwrap();
     let (tx, _events) = mpsc::channel(4);
     let events = Events {
+        unread: None,
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
@@ -3420,6 +3857,10 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
     ] {
         let f = Fixture::new(reply.unwrap_or(Reply::Normal));
         let cached = crate::domain::Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "11".into(),
             thread_id: "d:22".into(),
             id: "700".into(),
@@ -3562,6 +4003,7 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
             .unwrap();
             commands
                 .send(LiveCommand::Send {
+                    reply_to: None,
                     generation: 7,
                     thread: "d:22".into(),
                     text: "keep this offline draft".into(),
@@ -3919,8 +4361,10 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
         account: "11".into(),
         db: db.handle().unwrap(),
         updates: directory.updates_tx.clone(),
+        recalls: directory.recalls_tx.clone(),
     };
     sink.apply(DirectoryBatch {
+        message_quotes: Vec::new(),
         message_info: Vec::new(),
         message_media: Vec::new(),
         account_id: "11".into(),
@@ -3940,6 +4384,10 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
     .unwrap();
     directory.changed();
     let message = crate::domain::Message {
+        reply_blocked: false,
+        recalled: false,
+        source_client_id: None,
+        quote: None,
         account_id: "11".into(),
         thread_id: "d:33".into(),
         id: "999".into(),
@@ -3956,6 +4404,7 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
         .unwrap();
     let (tx, mut rx) = mpsc::channel(1);
     let events = Events {
+        unread: None,
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
@@ -4187,12 +4636,13 @@ fn typed_parser_failure_keeps_auth_expiry_and_diagnostic_reason_without_payloads
 async fn actual_runtime_survives_three_source_pongs_then_sends_via_layered_563_and_logs_invalid_message(
 ) {
     let f = Fixture::new(Reply::ControlHeartbeats);
-    let logger = crate::diagnostics::Logger::start(&f.profile.paths.cache_dir, false).unwrap();
+    let logger =
+        crate::diagnostics::Logger::isolated_for_test(&f.profile.paths.cache_dir, false).unwrap();
     let log_path = logger.path().to_path_buf();
     let (commands, rx) = mpsc::channel(16);
     let (tx, mut events) = mpsc::channel(32);
     let (stop, cancel) = watch::channel(false);
-    let task = tokio::spawn(run_with_transports(
+    let task = tokio::spawn(logger.scope_test(run_with_transports(
         f.profile.clone(),
         f.session(),
         rx,
@@ -4200,7 +4650,7 @@ async fn actual_runtime_survives_three_source_pongs_then_sends_via_layered_563_a
         Arc::new(|| {}),
         cancel,
         f.transports(),
-    ));
+    )));
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut received = 0;
         let mut online = false;
@@ -4256,6 +4706,7 @@ async fn actual_runtime_survives_three_source_pongs_then_sends_via_layered_563_a
     }
     commands
         .send(LiveCommand::Send {
+            reply_to: None,
             generation: 71,
             thread: "d:22".into(),
             text: "Xin chào Linux".into(),
@@ -4382,6 +4833,7 @@ async fn sender_name_commands_use_the_existing_actor_and_echo_only_the_requested
         .unwrap();
     let (tx, mut rx) = mpsc::channel(4);
     let events = Events {
+        unread: None,
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
@@ -4407,6 +4859,7 @@ async fn sender_name_commands_use_the_existing_actor_and_echo_only_the_requested
         foreign.display_name = "Tên tài khoản khác".into();
         db.call(move |store| {
             store.apply_directory_batch(&DirectoryBatch {
+                message_quotes: Vec::new(),
                 message_info: Vec::new(),
                 message_media: Vec::new(),
                 account_id: "11".into(),
@@ -4415,6 +4868,7 @@ async fn sender_name_commands_use_the_existing_actor_and_echo_only_the_requested
                 observed_at_ms: generation as i64,
             })?;
             store.apply_directory_batch(&DirectoryBatch {
+                message_quotes: Vec::new(),
                 message_info: Vec::new(),
                 message_media: Vec::new(),
                 account_id: "33".into(),
@@ -4503,6 +4957,7 @@ async fn http_ack_then_own_websocket_echo_without_matching_client_id_remains_usa
         for request_id in [1, 2] {
             commands
                 .send(LiveCommand::Send {
+                    reply_to: None,
                     generation: 1,
                     thread: "d:22".into(),
                     // The real TLS fixture decrypts the request and requires the
@@ -4725,6 +5180,10 @@ async fn hidden_policy_real_tls_search_pin_cancel_scope_and_remote_revoke() {
     db.call(|s| {
         for (thread, id) in [("d:22", "1"), ("g:22", "2"), ("d:44", "3")] {
             s.insert_batch(&[crate::domain::Message {
+                reply_blocked: false,
+                recalled: false,
+                source_client_id: None,
+                quote: None,
                 account_id: "11".into(),
                 thread_id: thread.into(),
                 id: id.into(),
@@ -4742,13 +5201,14 @@ async fn hidden_policy_real_tls_search_pin_cancel_scope_and_remote_revoke() {
     .unwrap();
     let (tx, mut rx) = mpsc::channel(64);
     let output = Events {
+        unread: None,
         account: "11".into(),
         tx,
         repaint: Arc::new(|| {}),
-        privacy: std::sync::RwLock::new(privacy::Projection {
+        privacy: Arc::new(std::sync::RwLock::new(privacy::Projection {
             status: LivePrivacyStatus::Checking,
             ..Default::default()
-        }),
+        })),
     };
     let mut policy = privacy::Privacy::new();
     assert!(db
@@ -5125,6 +5585,7 @@ async fn eligibility_send_case(mode: usize, accepted: bool) {
     .unwrap();
     commands
         .send(LiveCommand::Send {
+            reply_to: None,
             generation: 101,
             thread: "d:22".into(),
             text: "Xin chào Linux".into(),
@@ -5240,6 +5701,204 @@ async fn incomplete_or_encrypted_capability_never_sends_or_prepares_outbox() {
 }
 
 #[tokio::test]
+async fn ordinary_reply_actual_tls_uses_canonical_scoped_target_and_retains_quote_after_ack() {
+    let f = Fixture::new(Reply::Runtime);
+    let path = f.profile.paths.data_dir.join("messages.sqlite");
+    {
+        let mut store = MessageStore::open(&path).unwrap();
+        let messages = [
+            ("d:22", "7100", "22", "8100", "Tin gốc riêng tổng hợp"),
+            ("g:22", "7200", "33", "8200", "Tin gốc nhóm tổng hợp"),
+            (
+                "d:33",
+                "7300",
+                "33",
+                "8300",
+                "Không được trích dẫn sang hội thoại khác",
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(thread, id, sender, client, text)| crate::domain::Message {
+                reply_blocked: false,
+                recalled: false,
+                account_id: "11".into(),
+                thread_id: thread.into(),
+                id: id.into(),
+                sender: sender.into(),
+                text: text.into(),
+                source_client_id: Some(client.into()),
+                quote: None,
+                sticker: None,
+                media: None,
+                sent_at_ms: 1_700_000_000_123,
+            },
+        )
+        .collect::<Vec<_>>();
+        store.insert_batch(&messages).unwrap();
+    }
+    let (commands, rx) = mpsc::channel(16);
+    let (tx, mut events) = mpsc::channel(32);
+    let (stop, cancel) = watch::channel(false);
+    let task = tokio::spawn(run_with_transports(
+        f.profile.clone(),
+        f.session(),
+        rx,
+        tx,
+        Arc::new(|| {}),
+        cancel,
+        f.transports(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut received = 0;
+        while received < 2 {
+            match events.recv().await.unwrap() {
+                LiveEvent::Received { .. } => received += 1,
+                LiveEvent::Fault { error, .. } => panic!("Reply startup failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    for (thread, source, client, owner, text, request_id) in [
+        ("d:22", "7100", "8100", "22", "Tin gốc riêng tổng hợp", 610),
+        ("g:22", "7200", "8200", "33", "Tin gốc nhóm tổng hợp", 611),
+    ] {
+        // The UI supplies only an ID. The worker must re-read owner, source
+        // cliMsgId and content from this account/thread's committed history.
+        commands
+            .send(LiveCommand::Send {
+                generation: 6,
+                thread: thread.into(),
+                text: "Xin chào Linux".into(),
+                reply_to: Some(source.into()),
+                request_id,
+            })
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    LiveEvent::Sent {
+                        request_id: ack,
+                        message,
+                        ..
+                    } if ack == request_id => break message,
+                    LiveEvent::SendFailed { error, .. } | LiveEvent::Fault { error, .. } => {
+                        panic!("Reply failed: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let quote = message
+            .quote
+            .expect("Durable ACK echo must retain its quote");
+        assert_eq!(
+            (
+                quote.owner_id.as_str(),
+                quote.message_id.as_str(),
+                quote.client_id.as_deref(),
+                quote.text.as_str()
+            ),
+            (owner, source, Some(client), text)
+        );
+        let sent = f
+            .state
+            .ordinary_quotes
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(sent["qmsgId"], source);
+        assert_eq!(sent["qmsgCliId"], client);
+        assert_eq!(sent["qmsgOwner"], owner);
+        assert_eq!(sent["qmsg"], text);
+    }
+    for (source, mode, request_id) in [("7300", 0, 612), ("9999", 0, 613), ("7100", 20, 614)] {
+        f.state.eligibility_mode.store(mode, Ordering::SeqCst);
+        commands
+            .send(LiveCommand::Send {
+                generation: 6,
+                thread: "d:22".into(),
+                text: "Xin chào Linux".into(),
+                reply_to: Some(source.into()),
+                request_id,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    LiveEvent::SendFailed {
+                        request_id: failed,
+                        unknown_delivery,
+                        server_accepted,
+                        ..
+                    } if failed == request_id => {
+                        assert!(!unknown_delivery && !server_accepted);
+                        break;
+                    }
+                    LiveEvent::Sent { .. } => panic!(
+                        "Unavailable or encrypted replies must never downgrade to plain text"
+                    ),
+                    LiveEvent::Fault { error, .. } => {
+                        panic!("Reply refusal must preserve the worker: {error}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(f.state.ordinary_quotes.lock().unwrap().len(), 2);
+    {
+        let requests = f.state.requests.lock().unwrap();
+        assert!(!requests.iter().any(|(path, _)| matches!(
+            path.split('?').next(),
+            Some("/api/message/sms" | "/api/group/sendmsg" | "/api/e2ee/pc/message/sms")
+        )));
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM outgoing", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM outgoing_reply", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = MessageStore::open(&path).unwrap();
+    for (thread, server) in [("d:22", "901"), ("g:22", "902")] {
+        assert!(store
+            .page("11", thread, None, 20)
+            .unwrap()
+            .iter()
+            .find(|m| m.id == server)
+            .unwrap()
+            .quote
+            .is_some());
+    }
+}
+
+#[tokio::test]
 async fn encrypted_state_change_during_verification_keeps_draft_without_send_or_ack() {
     eligibility_send_case(30, false).await;
 }
@@ -5277,4 +5936,478 @@ async fn opening_a_conversation_refreshes_names_and_avatars_at_most_every_two_mi
     let result = (&mut directory.running.as_mut().unwrap().task).await;
     directory.completed(result, session, db.handle().unwrap(), &transports);
     assert_eq!(friend_lists(), 2);
+}
+
+mod file_fixture;
+mod file_upload_tests;
+
+mod photo_upload_tests;
+
+#[tokio::test]
+async fn actual_forward_dispatch_uses_ttl_proof_and_retains_unknown_across_restart() {
+    for (mode, expected) in [
+        (0, ForwardOutcome::Accepted),
+        (1, ForwardOutcome::Unavailable),
+        (2, ForwardOutcome::Unknown),
+    ] {
+        let fixture = Fixture::new(Reply::Forward(mode));
+        let config = ServerConfig::parse(&json!({
+            "zpw_service_map_v3":{
+                "chat":["https://wpa.zaloapp.com"],"conversation":["https://wpa.zaloapp.com"],
+                "file":["https://wpa.zaloapp.com"]
+            },
+            "zpw_ws":["wss://wpa.zaloapp.com"]
+        }))
+        .unwrap();
+        let session = Arc::new(synthetic_session(fixture.profile.clone(), config));
+        let db_path = fixture.profile.paths.data_dir.join("messages.sqlite");
+        {
+            let mut store = MessageStore::open(&db_path).unwrap();
+            store
+                .apply_directory_batch(&DirectoryBatch {
+                    account_id: "11".into(),
+                    entries: vec![crate::store::directory::DirectoryRecord {
+                        remote_id: "22".into(),
+                        is_group: false,
+                        display_name: "Liên hệ tổng hợp".into(),
+                        avatar_url: None,
+                        is_friend: Some(true),
+                        is_blocked: Some(false),
+                        member_count: None,
+                    }],
+                    messages: vec![],
+                    message_info: vec![],
+                    message_media: vec![],
+                    message_quotes: vec![],
+                    observed_at_ms: now_ms(),
+                })
+                .unwrap();
+        }
+        let command = |request_id| LiveCommand::Forward {
+            request_id,
+            source_thread: "d:33".into(),
+            source_message_id: "910".into(),
+            target_thread: "d:22".into(),
+        };
+        let runs = if mode == 2 { 2 } else { 1 };
+        for run in 0..runs {
+            let (commands, requests) = mpsc::channel(16);
+            let (events, mut incoming) = mpsc::channel(64);
+            let (stop, cancel) = watch::channel(false);
+            let actor = tokio::spawn(run_with_transports(
+                fixture.profile.clone(),
+                session.clone(),
+                requests,
+                events,
+                Arc::new(|| {}),
+                cancel,
+                fixture.transports(),
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut online, mut source) = (false, run > 0);
+                while !online || !source {
+                    match incoming.recv().await.unwrap() {
+                        LiveEvent::Connection {
+                            state: LiveConnection::Online,
+                            ..
+                        } => online = true,
+                        LiveEvent::Received { message, .. } if message.id == "910" => source = true,
+                        _ => {}
+                    }
+                }
+                let request_id = run + 1;
+                commands.send(command(request_id)).await.unwrap();
+                loop {
+                    match incoming.recv().await.unwrap() {
+                        LiveEvent::ForwardFinished {
+                            request_id: actual,
+                            source_thread,
+                            source_message_id,
+                            target_thread,
+                            outcome,
+                            ..
+                        } => {
+                            assert_eq!(actual, request_id);
+                            assert_eq!(
+                                (
+                                    source_thread.as_str(),
+                                    source_message_id.as_str(),
+                                    target_thread.as_str()
+                                ),
+                                ("d:33", "910", "d:22")
+                            );
+                            assert_eq!(outcome, expected, "mode {mode}, run {run}");
+                            break;
+                        }
+                        LiveEvent::Sent { .. } | LiveEvent::SendSettled { .. } => {
+                            panic!("Forward must not settle composer drafts");
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            stop.send(true).unwrap();
+            actor.await.unwrap();
+        }
+        assert_eq!(
+            fixture.state.http_sends.load(Ordering::SeqCst),
+            usize::from(mode != 1)
+        );
+        let store = MessageStore::open(&db_path).unwrap();
+        let messages = store.page("11", "d:22", None, 10).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.id == "991")
+                .count(),
+            usize::from(mode == 0)
+        );
+    }
+}
+
+#[tokio::test]
+async fn actual_recall_dispatch_redacts_replay_and_only_settles_unknown_with_proof() {
+    for mode in 0..3 {
+        let fixture = Fixture::new(Reply::Recall(mode));
+        let session = fixture.session();
+        let db_path = fixture.profile.paths.data_dir.join("messages.sqlite");
+        for run in 0..2 {
+            let (commands, requests) = mpsc::channel(16);
+            let (events, mut incoming) = mpsc::channel(64);
+            let (stop, cancel) = watch::channel(false);
+            let actor = tokio::spawn(run_with_transports(
+                fixture.profile.clone(),
+                session.clone(),
+                requests,
+                events,
+                Arc::new(|| {}),
+                cancel,
+                fixture.transports(),
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut online, mut source, mut projection) = (false, run > 0, false);
+                let late_notice = run == 1 && mode == 1;
+                while !online || !source || (late_notice && !projection) {
+                    match incoming.recv().await.unwrap() {
+                        LiveEvent::Connection {
+                            state: LiveConnection::Online,
+                            ..
+                        } => online = true,
+                        LiveEvent::Received { message, .. } => {
+                            assert_eq!(message.id, "910");
+                            source = true;
+                        }
+                        LiveEvent::Recalled {
+                            thread,
+                            message_id,
+                            actor_id,
+                            message,
+                            ..
+                        } => {
+                            assert_eq!(
+                                (thread.as_str(), message_id.as_str(), actor_id.as_str()),
+                                ("d:22", "910", "11")
+                            );
+                            assert!(message.unwrap().is_recalled());
+                            projection = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if (run == 1 && mode == 0) || late_notice {
+                    return;
+                }
+                let request_id = run + 1;
+                commands
+                    .send(LiveCommand::Recall {
+                        request_id,
+                        thread: "d:22".into(),
+                        message_id: "910".into(),
+                    })
+                    .await
+                    .unwrap();
+                loop {
+                    match incoming.recv().await.unwrap() {
+                        LiveEvent::Recalled { message, .. } => {
+                            assert!(message.unwrap().is_recalled());
+                            projection = true;
+                        }
+                        LiveEvent::RecallFinished {
+                            request_id: actual,
+                            thread,
+                            message_id,
+                            outcome,
+                            ..
+                        } => {
+                            assert_eq!(actual, request_id);
+                            assert_eq!((thread.as_str(), message_id.as_str()), ("d:22", "910"));
+                            assert_eq!(
+                                outcome,
+                                if mode == 0 {
+                                    RecallOutcome::Accepted
+                                } else {
+                                    RecallOutcome::Unknown
+                                }
+                            );
+                            assert_eq!(projection, mode == 0);
+                            break;
+                        }
+                        LiveEvent::Sent { .. } | LiveEvent::SendSettled { .. } => {
+                            panic!("Recall must not settle composer drafts");
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            stop.send(true).unwrap();
+            actor.await.unwrap();
+        }
+        assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 1);
+        let store = MessageStore::open(&db_path).unwrap();
+        let messages = store.page("11", "d:22", None, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "910");
+        assert_eq!(messages[0].is_recalled(), mode != 2);
+        assert_eq!(
+            messages[0].text,
+            if mode == 2 {
+                "synthetic recall source"
+            } else {
+                crate::domain::RECALLED_TEXT
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn actual_group_roster_restricts_profiles_and_mutations_are_durable() {
+    for lose_invite in [false, true] {
+        let fixture = Fixture::new(Reply::GroupActions(lose_invite));
+        let session = fixture.directory_session(false);
+        for run in 0..=usize::from(lose_invite) {
+            let db = Database::open(fixture.profile.clone(), "11".into())
+                .await
+                .unwrap();
+            db.call(move |store| {
+                if run == 0 {
+                    store.apply_directory_batch(&DirectoryBatch {
+                        account_id: "11".into(),
+                        entries: vec![
+                            crate::store::directory::DirectoryRecord {
+                                remote_id: "22".into(),
+                                is_group: true,
+                                display_name: "Nhóm tổng hợp".into(),
+                                avatar_url: None,
+                                is_friend: None,
+                                is_blocked: None,
+                                member_count: Some(4),
+                            },
+                            crate::store::directory::DirectoryRecord {
+                                remote_id: "44".into(),
+                                is_group: false,
+                                display_name: "Bạn tổng hợp".into(),
+                                avatar_url: None,
+                                is_friend: Some(true),
+                                is_blocked: Some(false),
+                                member_count: None,
+                            },
+                        ],
+                        messages: vec![],
+                        message_info: vec![],
+                        message_media: vec![],
+                        message_quotes: vec![],
+                        observed_at_ms: now_ms(),
+                    })?;
+                }
+                store.replace_live_privacy("11", &[], None)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let (tx, _received) = mpsc::channel(16);
+            let events = Events {
+                account: "11".into(),
+                tx,
+                repaint: Arc::new(|| {}),
+                unread: None,
+                privacy: Arc::new(std::sync::RwLock::new(privacy::Projection {
+                    confirmed: true,
+                    revision: 7,
+                    ..Default::default()
+                })),
+            };
+            let mut groups = group_actions::Groups::default();
+            let client = fixture.client();
+            if run == 0 {
+                assert!(groups
+                    .command(
+                        LiveCommand::GroupMembers {
+                            request_id: 1,
+                            thread: "g:22".into(),
+                            privacy_revision: 7,
+                            after: None,
+                        },
+                        true,
+                        &db,
+                        &events,
+                        &session,
+                        &client,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none());
+                let result = tokio::time::timeout(Duration::from_secs(5), groups.next())
+                    .await
+                    .unwrap();
+                let LiveEvent::GroupMembers {
+                    page: Some(page),
+                    request_id: 1,
+                    ..
+                } = result
+                else {
+                    panic!("expected a bound group member page");
+                };
+                assert!(page.restricted);
+                assert_eq!(page.total, Some(4));
+                assert!(page.permissions.invite && page.permissions.leave);
+                assert_eq!(
+                    page.members
+                        .iter()
+                        .map(|member| (member.id.as_str(), member.name.as_deref()))
+                        .collect::<Vec<_>>(),
+                    [
+                        ("77", Some("Trưởng nhóm thử")),
+                        ("33", Some("Phó nhóm thử")),
+                        ("11", Some("Người thử"))
+                    ]
+                );
+            }
+            let expected = if lose_invite {
+                GroupActionOutcome::Unknown
+            } else {
+                GroupActionOutcome::ApprovalPending
+            };
+            for request_id in 2..=3 {
+                assert!(groups
+                    .command(
+                        LiveCommand::GroupInvite {
+                            request_id,
+                            thread: "g:22".into(),
+                            privacy_revision: 7,
+                            member: "44".into(),
+                        },
+                        true,
+                        &db,
+                        &events,
+                        &session,
+                        &client,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none());
+                let result = tokio::time::timeout(Duration::from_secs(5), groups.next())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    result,
+                    LiveEvent::GroupActionFinished { request_id:actual, outcome, .. }
+                        if actual == request_id && outcome == expected
+                ));
+                assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 1);
+            }
+            if !lose_invite {
+                assert!(groups
+                    .command(
+                        LiveCommand::GroupLeave {
+                            request_id: 4,
+                            thread: "g:22".into(),
+                            privacy_revision: 7
+                        },
+                        true,
+                        &db,
+                        &events,
+                        &session,
+                        &client,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none());
+                let result = tokio::time::timeout(Duration::from_secs(5), groups.next())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    result,
+                    LiveEvent::GroupActionFinished {
+                        request_id: 4,
+                        outcome: GroupActionOutcome::Left,
+                        ..
+                    }
+                ));
+                assert!(db
+                    .call(|store| store.group_has_left("11", "g:22"))
+                    .await
+                    .unwrap());
+                assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn actual_read_receipt_waits_for_explicit_painted_ids_and_never_fabricates_client_id() {
+    let fixture = Fixture::new(Reply::ReadStates);
+    let session = fixture.session();
+    let (commands, requests) = mpsc::channel(16);
+    let (events, mut incoming) = mpsc::channel(64);
+    let (stop, cancel) = watch::channel(false);
+    let actor = tokio::spawn(run_with_transports(
+        fixture.profile.clone(),
+        session,
+        requests,
+        events,
+        Arc::new(|| {}),
+        cancel,
+        fixture.transports(),
+    ));
+    let thread = "d:22".to_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(incoming.recv().await.unwrap(), LiveEvent::Received { message, .. } if message.id == "912") {
+                break;
+            }
+        }
+        commands.send(LiveCommand::Load { generation: 1, thread: thread.clone(), before: None }).await.unwrap();
+        loop {
+            if matches!(incoming.recv().await.unwrap(), LiveEvent::Page { generation: 1, .. }) { break; }
+        }
+        let read_state = |generation| LiveCommand::ReadState {
+            generation, threads: vec![thread.clone()], thread: None, message_ids: Vec::new(),
+        };
+        commands.send(read_state(2)).await.unwrap();
+        loop {
+            if let LiveEvent::ReadState { generation: 2, unread, .. } = incoming.recv().await.unwrap() {
+                assert_eq!(unread[0].unread, 2);
+                break;
+            }
+        }
+        assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 0);
+        commands.send(LiveCommand::ReadVisible { generation: 1, thread: thread.clone(), message_ids: vec!["910".into(), "911".into()] }).await.unwrap();
+        commands.send(read_state(3)).await.unwrap();
+        loop {
+            if let LiveEvent::ReadState { generation: 3, unread, .. } = incoming.recv().await.unwrap() {
+                assert_eq!(unread[0].unread, 0);
+                break;
+            }
+        }
+        while fixture.state.http_sends.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    stop.send(true).unwrap();
+    actor.await.unwrap();
+    assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 1);
 }

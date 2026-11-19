@@ -259,6 +259,10 @@ mod tests {
         let content = media_content(kind, 1);
         (
             Message {
+                reply_blocked: false,
+                recalled: false,
+                source_client_id: None,
+                quote: None,
                 account_id: "11".into(),
                 thread_id: "d:22".into(),
                 id: id.into(),
@@ -288,6 +292,10 @@ mod tests {
         }))
         .unwrap();
         let m = Message {
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: None,
+            quote: None,
             account_id: "11".into(),
             thread_id: "d:22".into(),
             id: "call".into(),
@@ -564,6 +572,7 @@ mod tests {
                 messages: vec![m.clone()],
                 message_info: vec![],
                 message_media: vec![binding(&m, content.clone())],
+                message_quotes: vec![],
                 observed_at_ms: 1000,
             };
             if directory_first {
@@ -669,7 +678,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            9
+            16
         );
     }
 
@@ -722,7 +731,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            9
+            16
         );
         for m in originals {
             assert_eq!(
@@ -863,6 +872,7 @@ mod tests {
                 content: info,
             }],
             message_media: vec![binding(&photo, media)],
+            message_quotes: vec![],
             observed_at_ms: 1000,
         };
         assert!(store.apply_directory_batch(&batch).is_err());

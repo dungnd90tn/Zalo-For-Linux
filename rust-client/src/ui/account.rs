@@ -179,6 +179,8 @@ impl NativeApp {
         };
         let mut appearance = false;
         let mut logout = false;
+        #[cfg(feature = "messaging")]
+        let mut notifications = false;
         let popup_id = egui::Id::new(match popup.kind {
             PopupKind::Settings => "account_settings_popup",
             PopupKind::Status => "account_status_popup",
@@ -209,6 +211,12 @@ impl NativeApp {
                                     menu_entry(ui, "Thiết lập giao diện", colors.text_primary)
                                         .clicked();
                                 if self.is_signed_in() {
+                                    #[cfg(feature = "messaging")]
+                                    {
+                                        notifications =
+                                            menu_entry(ui, "Thông báo", colors.text_primary)
+                                                .clicked();
+                                    }
                                     ui.separator();
                                     logout = menu_entry(ui, "Đăng xuất", colors.error).clicked();
                                 }
@@ -232,7 +240,33 @@ impl NativeApp {
                                         #[cfg(feature = "messaging")]
                                         self.live_recovery(ui);
                                         #[cfg(feature = "messaging")]
+                                        if let Some(label) = self
+                                            .live
+                                            .as_ref()
+                                            .and_then(|state| state.forwarding.status_label())
+                                        {
+                                            ui.label(label);
+                                        }
+                                        #[cfg(feature = "messaging")]
+                                        if let Some(label) = self
+                                            .live
+                                            .as_ref()
+                                            .and_then(|state| state.recall.status_label())
+                                        {
+                                            ui.label(label);
+                                        }
+                                        #[cfg(feature = "messaging")]
                                         self.privacy_status_controls(ui);
+                                        #[cfg(feature = "messaging")]
+                                        if let Some(label) = self
+                                            .live
+                                            .as_ref()
+                                            .and_then(|state| state.groups.status_label())
+                                        {
+                                            ui.label(label);
+                                        }
+                                        #[cfg(feature = "messaging")]
+                                        self.file_upload_controls(ui);
                                         if self.demo {
                                             ui.add(
                                                 egui::Label::new(
@@ -258,6 +292,14 @@ impl NativeApp {
                     state.logout_dialog = true;
                 }
             }
+        }
+        #[cfg(feature = "messaging")]
+        if notifications {
+            if let Some(state) = &mut self.live {
+                state.attention.settings_open = true;
+            }
+            self.account_popup = None;
+            return;
         }
         if dismiss || appearance || logout {
             self.account_popup = None;

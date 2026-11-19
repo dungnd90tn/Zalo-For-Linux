@@ -419,6 +419,10 @@ pub struct PreviewPage {
     pub messages: Vec<crate::domain::Message>,
     pub message_info: Vec<crate::domain::MessageInfoBinding>,
     pub message_media: Vec<crate::domain::MessageMediaBinding>,
+    pub message_quotes: Vec<crate::domain::MessageQuoteBinding>,
+    pub(crate) receipts: Vec<crate::domain::read_state::ReceiptBinding>,
+    pub(crate) forwards: Vec<crate::store::ForwardBinding>,
+    pub(crate) recalls: Vec<super::recall::RecallNotice>,
     pub unsupported_encrypted: usize,
 }
 /// Closed HTTP/parser locations only; never stores account IDs or payloads.
@@ -512,6 +516,12 @@ fn parse_previews_inner(
     let mut messages: Vec<crate::domain::Message> = Vec::new();
     let mut message_info: Vec<crate::domain::MessageInfoBinding> = Vec::new();
     let mut message_media: Vec<crate::domain::MessageMediaBinding> = Vec::new();
+    let mut message_quotes: Vec<crate::domain::MessageQuoteBinding> = Vec::new();
+    let mut receipts = Vec::new();
+    let mut forwards = Vec::<crate::store::ForwardBinding>::new();
+    let mut recalls = Vec::new();
+    let mut forward_indices = std::collections::HashMap::new();
+    let mut quote_indices = std::collections::HashMap::new();
     let mut media_indices = std::collections::HashMap::new();
     let mut info_indices = std::collections::HashMap::new();
     let mut info_bytes = 0usize;
@@ -561,7 +571,12 @@ fn parse_previews_inner(
             let payload = json!({"error_code":0,"data":batch});
             let decoded = match session {
                 Some(session) => super::messaging::incoming_verified_preview(session, &payload),
-                None => super::messaging::incoming_messages_detailed(account, &payload),
+                None => super::messaging::incoming_messages_detailed(account, &payload).map(
+                    |messages| super::messaging::IncomingBatch {
+                        messages,
+                        recalls: Vec::new(),
+                    },
+                ),
             }
             .map_err(|failure| PreviewFailure {
                 error: if failure.error == super::messaging::WireError::Oversize {
@@ -571,7 +586,8 @@ fn parse_previews_inner(
                 },
                 diagnostic: PreviewDiagnostic::from_frame(failure, diagnostic.field),
             })?;
-            for incoming in decoded {
+            recalls.extend(decoded.recalls);
+            for incoming in decoded.messages {
                 diagnostic.reason = FrameReason::MessageValidation;
                 diagnostic.message_kind = Some(if incoming.info.is_some() {
                     super::messaging::FrameMessageKind::WebchatInfo
@@ -610,6 +626,14 @@ fn parse_previews_inner(
                     if messages[*previous] != incoming.message
                         || previous_info != incoming.info.as_ref()
                         || previous_media != incoming.media.as_ref()
+                        || quote_indices
+                            .get(&key)
+                            .map(|index: &usize| &message_quotes[*index].content)
+                            != incoming.quote_content.as_ref()
+                        || forward_indices
+                            .get(&key)
+                            .map(|index: &usize| &forwards[*index].marker)
+                            != incoming.forward.as_ref()
                     {
                         return Err(diagnostic.failure(DirectoryError::Invalid));
                     }
@@ -659,6 +683,31 @@ fn parse_previews_inner(
                         content,
                     });
                 }
+                if let Some(content) = incoming.quote_content {
+                    info_bytes = info_bytes.saturating_add(content.as_json().len());
+                    if info_bytes > crate::domain::MAX_INFO_BATCH_BYTES {
+                        return Err(diagnostic.failure(DirectoryError::Resource));
+                    }
+                    quote_indices.insert(key.clone(), message_quotes.len());
+                    message_quotes.push(crate::domain::MessageQuoteBinding {
+                        account_id: incoming.message.account_id.clone(),
+                        thread_id: incoming.message.thread_id.clone(),
+                        message_id: incoming.message.id.clone(),
+                        content,
+                    });
+                }
+                if let Some(mut receipt) = incoming.receipt {
+                    receipt.counts_unread = false;
+                    receipts.push(receipt);
+                }
+                if let Some(marker) = incoming.forward {
+                    forward_indices.insert(key.clone(), forwards.len());
+                    forwards.push(crate::store::ForwardBinding {
+                        thread_id: incoming.message.thread_id.clone(),
+                        message_id: incoming.message.id.clone(),
+                        marker,
+                    });
+                }
                 seen.insert(key, messages.len());
                 messages.push(incoming.message);
                 if messages.len() > MAX_FRIENDS {
@@ -692,6 +741,10 @@ fn parse_previews_inner(
         messages,
         message_info,
         message_media,
+        message_quotes,
+        receipts,
+        forwards,
+        recalls,
         unsupported_encrypted,
     })
 }
@@ -793,6 +846,26 @@ mod preview_tests {
             strict.diagnostic.message_kind,
             Some(crate::protocol::messaging::FrameMessageKind::Photo)
         );
+        let structured = serde_json::json!({"msgs":[
+            {"uidFrom":"22","idTo":"11","msgId":"770","ts":"1","msgType":"webchat",
+             "cliMsgId":"776","content":{"action":"rtf","title":"Chữ định dạng","params":"ignored-style"}},
+            {"uidFrom":"22","idTo":"11","msgId":"771","ts":"2","msgType":"webchat",
+             "content":{"action":"unknown","title":"ignored-unknown"}}
+        ]});
+        let page = super::parse_verified_previews(&session, &structured).unwrap();
+        assert_eq!(page.messages[0].text, "Chữ định dạng");
+        assert_eq!(page.messages[1].text, "[Tin nhắn webchat chưa được hỗ trợ]");
+        assert!(page
+            .messages
+            .iter()
+            .all(|message| message.reply_blocked && message.source_client_id.is_none()));
+        assert!(page.receipts.is_empty());
+        assert_eq!(page.forwards.len(), 2);
+        assert!(page.forwards.iter().all(|binding| matches!(
+            binding.marker,
+            crate::protocol::forward::ForwardMarker::StructuredWebchat
+        )));
+        assert!(super::parse_previews("11", &structured).is_err());
         drop(session);
         drop(profile);
         std::fs::remove_dir_all(scratch).unwrap();
