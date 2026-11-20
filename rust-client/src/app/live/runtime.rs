@@ -37,6 +37,7 @@ mod e2ee_threads;
 mod echo_recovery;
 mod forward;
 mod group_actions;
+mod group_pins;
 mod group_roster;
 #[cfg(test)]
 mod integration_tests;
@@ -2062,6 +2063,8 @@ async fn handle_command(
         LiveCommand::React { .. }
         | LiveCommand::ReactionState { .. }
         | LiveCommand::GroupMembers { .. }
+        | LiveCommand::GroupPins { .. }
+        | LiveCommand::SetGroupPin { .. }
         | LiveCommand::CancelGroupMembers { .. }
         | LiveCommand::GroupInviteTargets { .. }
         | LiveCommand::GroupInvite { .. }
@@ -2659,6 +2662,7 @@ async fn run_inner(
     let mut recalls = recall::Recalls::default();
     let mut reactions = reactions::Reactions::default();
     let mut groups = group_actions::Groups::default();
+    let mut pins = group_pins::Pins::default();
     let mut uploads = upload::Uploads::default();
     let mut photos = photo::Photos::default();
     let mut sticker_search = sticker_catalog::Search::default();
@@ -2751,9 +2755,13 @@ async fn run_inner(
             completed = groups.next() => {
                 events.emit(completed).await?;
             },
+            completed = pins.next() => {
+                events.emit(completed).await?;
+            },
             command = commands.recv() => {
                 let Some(command) = command else { return Ok(()) };
                 let online = connection.as_ref().is_some_and(|socket| socket.decoder.authenticated());
+                let Some(command) = pins.command(command, online, &db, events, &session, &client).await? else { continue; };
                 let Some(command) = groups.command(command, online, &db, events, &session, &client).await? else { continue; };
                 let Some(command) = attention.command(command, &db, events).await? else { continue; };
                 let Some(command) = forwards.command(command, connection.as_ref(), &db, events, &session, &client).await? else { continue; };
@@ -2910,8 +2918,12 @@ async fn run_inner(
                         completed = groups.next() => {
                             events.emit(completed).await?;
                         },
+                        completed = pins.next() => {
+                            events.emit(completed).await?;
+                        },
                         command = commands.recv() => {
                             let Some(command) = command else { return Ok(()) };
+                            let Some(command) = pins.command(command, false, &db, events, &session, &client).await? else { continue; };
                             let Some(command) = groups.command(command, false, &db, events, &session, &client).await? else { continue; };
                             let Some(command) = attention.command(command, &db, events).await? else { continue; };
                             let Some(command) = forwards.command(command, None, &db, events, &session, &client).await? else { continue; };

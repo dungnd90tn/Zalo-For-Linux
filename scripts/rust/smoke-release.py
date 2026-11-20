@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import tempfile
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 def require(condition, message):
     if not condition:
@@ -59,21 +59,20 @@ def main():
             originals = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()
         require((count, accounts, threads) == (19, 1, 6), "repeated demo startup changed seeded message identity/count")
         require(len(originals) == 3, "legacy demo messages disappeared")
-        # Recreate schema 18 without the new mention tables and retain a local
+        # Recreate schema 19 without the new pin ledger and retain a local
         # message to detect data loss during the upgrade.
         with sqlite3.connect(data / "messages.sqlite3") as conn:
-            conn.execute("DROP TABLE message_mention")
-            conn.execute("DROP TABLE outgoing_mention")
-            conn.execute("PRAGMA user_version=18")
+            conn.execute("DROP TABLE group_pin_intent")
+            conn.execute("PRAGMA user_version=19")
             conn.execute("DELETE FROM messages WHERE thread_id NOT IN ('welcome','architecture')")
             conn.execute("DELETE FROM conversations WHERE thread_id NOT IN ('welcome','architecture')")
             conn.execute("INSERT INTO messages(account_id,thread_id,message_id,sender,body,sent_at_ms) VALUES ('0','welcome','qa-legacy-preserved','Local smoke','Existing local history',1700000000002)")
         for _ in range(2):
             require(json.loads(run("--demo", "--headless").stdout)["messages_loaded"] == 3, "legacy local history was not loaded after upgrade")
         with sqlite3.connect(f"file:{data / 'messages.sqlite3'}?mode=ro", uri=True) as conn:
-            require(conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION, "profile did not upgrade from schema 18")
-            mention_tables = conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('message_mention','outgoing_mention')").fetchone()[0]
-            require(mention_tables == 2, "upgrade did not create the mention tables")
+            require(conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION, "profile did not upgrade from schema 19")
+            pin_ledger = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='group_pin_intent'").fetchone()
+            require(pin_ledger == ("group_pin_intent",), "upgrade did not create the pin ledger")
             upgraded_count = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
             upgraded_threads = conn.execute("SELECT count(*) FROM conversations").fetchone()[0]
             upgraded_originals = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()

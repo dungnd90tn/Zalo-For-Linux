@@ -397,7 +397,9 @@ impl Privacy {
                 }
             }
             LiveEvent::ReactionState { thread, .. }
-            | LiveEvent::ReactionsChanged { thread, .. } => {
+            | LiveEvent::ReactionsChanged { thread, .. }
+            | LiveEvent::GroupPins { thread, .. }
+            | LiveEvent::GroupPinFinished { thread, .. } => {
                 if !self.list_visible(thread) {
                     return None;
                 }
@@ -494,6 +496,7 @@ impl NativeApp {
             state.forwarding.clear_picker();
             state.recall.clear_confirmation();
             state.groups.clear_projection();
+            state.group_pins.set_scope(None);
             state.mention_picker.set_scope(None);
         }
     }

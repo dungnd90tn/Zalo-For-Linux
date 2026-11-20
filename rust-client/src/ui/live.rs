@@ -55,6 +55,8 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub groups: super::group_members::Groups,
     #[cfg(feature = "messaging")]
+    pub group_pins: super::group_pins::Pins,
+    #[cfg(feature = "messaging")]
     pub mention_picker: super::mentions::Picker,
     #[cfg(feature = "messaging")]
     pub uploads: super::file_uploads::Uploads,
@@ -134,6 +136,8 @@ impl LiveState {
             #[cfg(feature = "messaging")]
             groups: Default::default(),
             #[cfg(feature = "messaging")]
+            group_pins: Default::default(),
+            #[cfg(feature = "messaging")]
             mention_picker: Default::default(),
             #[cfg(feature = "messaging")]
             uploads: Default::default(),
@@ -193,6 +197,13 @@ impl LiveState {
     }
 
     #[cfg(feature = "messaging")]
+    pub(super) fn group_pins_available(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.config().group_board_v2)
+    }
+
+    #[cfg(feature = "messaging")]
     pub(super) fn ensure_worker(&mut self, profile: Arc<Profile>) -> bool {
         if self.worker.is_some() {
             return true;
@@ -209,6 +220,7 @@ impl LiveState {
         self.avatars = Default::default();
         self.stickers = Default::default();
         self.reactions.worker_closed();
+        self.group_pins.set_scope(None);
         self.directory.privacy_reset(&self.context, false);
         match LiveWorker::start(
             profile,
@@ -583,6 +595,7 @@ impl NativeApp {
                         state.forwarding = Default::default();
                         state.recall = Default::default();
                         state.groups = Default::default();
+                        state.group_pins = Default::default();
                         state.mention_picker = Default::default();
                         state.uploads = Default::default();
                         state.photo_preview.clear();
@@ -813,6 +826,14 @@ impl NativeApp {
             .reactions
             .observe_snapshot(&event, reaction_scope.as_ref());
         state.groups.observe(&event);
+        if matches!(
+            &event,
+            LiveEvent::GroupPins { .. } | LiveEvent::GroupPinFinished { .. }
+        ) {
+            let pin_scope = self.group_pin_scope(state);
+            state.group_pins.set_scope(pin_scope);
+            state.group_pins.observe(&event);
+        }
         state.mention_picker.observe(&event);
         state.privacy.observe_conversation(&event);
         self.quarantine_privacy(state, ctx, false);
@@ -823,6 +844,7 @@ impl NativeApp {
             state
                 .media
                 .close_recalled_viewer(&account_id, thread, message_id);
+            state.group_pins.remove_preview(thread, message_id);
             if self.model.selected.as_deref() == Some(thread) {
                 self.model.overview = Default::default();
                 state.hydration.invalidate(&account_id, &self.model, ctx);
@@ -946,6 +968,7 @@ impl NativeApp {
                             state.forwarding = Default::default();
                             state.recall = Default::default();
                             state.groups = Default::default();
+                            state.group_pins = Default::default();
                             state.mention_picker = Default::default();
                             state.uploads = Default::default();
                             state.photo_preview.clear();
@@ -1268,6 +1291,7 @@ pub(in crate::ui) mod tests {
                 photo_upload_route: None,
                 photo_limits: Default::default(),
                 seen_v2: true,
+                group_board_v2: false,
                 recall_max_age_ms: Some(300_000),
                 chat_poll: vec![],
                 control_poll: vec![],
@@ -2329,10 +2353,12 @@ pub(in crate::ui) mod tests {
                         }
                     }
                 }
-                let reaction_menu = std::env::var("ZALO_UI_FIXTURE_INTERACTIONS")
-                    .is_ok_and(|scene| scene == "reaction-menu");
+                let anchored_menu =
+                    std::env::var("ZALO_UI_FIXTURE_INTERACTIONS").is_ok_and(|scene| {
+                        matches!(scene.as_str(), "reaction-menu" | "group-pin-menu")
+                    });
                 if !self.menu_opened
-                    && (reaction_menu || std::env::var_os("ZALO_UI_FIXTURE_MESSAGE_MENU").is_some())
+                    && (anchored_menu || std::env::var_os("ZALO_UI_FIXTURE_MESSAGE_MENU").is_some())
                 {
                     if let (Some(scope), Some(message)) = (
                         self.app.message_menu_scope(),
@@ -2341,7 +2367,7 @@ pub(in crate::ui) mod tests {
                         self.app.message_menu = Some(super::super::message_actions::Popup::new(
                             scope,
                             message.id.clone(),
-                            if reaction_menu {
+                            if anchored_menu {
                                 egui::pos2(screen.right() - 320.0, 80.0)
                             } else {
                                 screen.center()
@@ -2579,6 +2605,50 @@ pub(in crate::ui) mod tests {
                                 generation: app.model.generation,
                                 privacy_revision: state.privacy.revision,
                             });
+                    }
+                    Some("group-pins" | "group-pin-menu") => {
+                        use crate::app::live::{GroupPinEntry, GroupPinSnapshot};
+                        let group = "g:44";
+                        app.model.conversations[0].id = group.into();
+                        app.model.conversations[0].title = "Nhóm lên kế hoạch".into();
+                        let message = &mut app.model.messages[0];
+                        message.thread_id = group.into();
+                        message.id = "901".into();
+                        message.source_client_id = Some("1901".into());
+                        message.text = "Lịch họp nhóm vào 14 giờ thứ Sáu.".into();
+                        let hit = crate::domain::MessageHit {
+                            message_id: message.id.clone(),
+                            sender: message.sender.clone(),
+                            sent_at_ms: message.sent_at_ms,
+                            snippet: message.text.clone(),
+                            highlight: (0, 0),
+                            jump: None,
+                        };
+                        app.model.selected = Some(group.into());
+                        app.drafts.select(group).unwrap();
+                        app.drafts.active.text = "Nhớ gửi lịch cho mọi người".into();
+                        if interactions_scene.as_deref() == Some("group-pins") {
+                            app.conversation_details = Some(("11".into(), group.into()));
+                        }
+                        let state = app.live.as_ref().unwrap();
+                        let scope = app.group_pin_scope(state).unwrap();
+                        app.live.as_mut().unwrap().group_pins.fixture(
+                            scope,
+                            GroupPinSnapshot {
+                                can_mutate: true,
+                                entries: vec![
+                                    GroupPinEntry {
+                                        message_id: hit.message_id.clone(),
+                                        hit: Some(hit),
+                                    },
+                                    GroupPinEntry {
+                                        message_id: "902".into(),
+                                        hit: None,
+                                    },
+                                ],
+                                unresolved: Vec::new(),
+                            },
+                        );
                     }
                     _ => {}
                 }

@@ -43,6 +43,7 @@ pub(crate) struct VerifiedGroup {
     owner: String,
     admins: BTreeSet<String>,
     restricted: bool,
+    pub(crate) can_pin: bool,
     pub permissions: GroupPermissions,
 }
 
@@ -228,6 +229,13 @@ pub(crate) fn verify_group(
     };
     let privileged = account == owner || admins.contains(account);
     let restricted = !disabled("lockViewMember") && !privileged;
+    // The board uses a strict numeric zero for the ordinary member allowance.
+    let can_pin = row
+        .get("setting")
+        .and_then(Value::as_object)
+        .is_some_and(|settings| {
+            privileged || settings.get("setTopicOnly").and_then(Value::as_u64) == Some(0)
+        });
     let permissions = GroupPermissions {
         invite: total < MAX_MEMBERS as u64
             && (privileged || (disabled("addMemberOnly") && disabled("joinAppr"))),
@@ -238,6 +246,7 @@ pub(crate) fn verify_group(
         owner,
         admins,
         restricted,
+        can_pin,
         permissions,
     })
 }

@@ -21,6 +21,7 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 - **Thông báo Linux:** mặc định chỉ báo **Bạn có tin nhắn mới**. Bật xem trước nội dung ở **bánh răng → Thông báo**. Hội thoại ẩn hoặc đang tắt thông báo không phát cảnh báo.
 - **Thành viên nhóm:** mở **Thông tin hội thoại → Thành viên** để xem danh sách theo quyền của bạn, tối đa 50 người mỗi trang. Với nhóm thường tối đa 100 thành viên, bạn có thể mời một người bạn hoặc rời nhóm nếu quyền hiện tại cho phép. Hội thoại đã rời vẫn mở được để đọc lịch sử đã lưu.
 - **Nhắc tên trong nhóm** (bản đang phát triển). Gõ `@` rồi chọn thành viên bằng chuột hoặc phím ↑/↓ và Enter. Ứng dụng hỗ trợ nhóm thường tối đa 100 thành viên khi đã xác minh được danh sách theo quyền hiện tại.
+- **Ghim tin nhắn nhóm** (bản đang phát triển). Bấm chuột phải vào tin văn bản để ghim hoặc bỏ ghim nếu có quyền. Mở **Thông tin hội thoại → Tin nhắn đã ghim** để cập nhật danh sách và đi đến tin đã lưu trên máy. Tính năng cần dịch vụ bảng nhóm v2 của Zalo.
 - **Thông tin hội thoại:** số tin và khoảng thời gian đã lưu, cùng danh sách ảnh, tệp và liên kết từng xuất hiện trong lịch sử; bấm một mục để mở trong trình duyệt.
 - **Thích ứng với kích thước cửa sổ:** bố cục rộng và gọn giữ lại hội thoại đang chọn cùng bản nháp. Cỡ chữ và giới hạn khung ảnh được giữ nhất quán khi thay đổi kích thước.
 - **Giao diện thiết kế lại, sáng và tối:** có chế độ sáng, tối, theo hệ thống và tùy chỉnh; nút **Sáng/Tối** ở thanh bên đổi nhanh, lựa chọn được lưu theo từng hồ sơ. Phông chữ và biểu tượng vẫn là bộ Zalo có sẵn.
@@ -174,7 +175,7 @@ Sau mỗi lần biên dịch bản mới, chạy lại trình cài đặt để 
 | Nhắn tin | Xác nhận đầy đủ gửi–nhận cá nhân/nhóm với tài khoản thực, kết nối lại và vận hành lâu dài |
 | Đồng bộ | Toàn bộ lịch sử từ máy chủ, thành viên nhóm lớn và cộng đồng, xác nhận tải ảnh đại diện trên tài khoản thực |
 | Nội dung | Gửi ảnh gốc, gửi nhiều ảnh/tệp, ghi âm, tiếp tục lượt tải dở và các mẫu thẻ OA còn lại |
-| Thao tác tin nhắn | Ghim tin, chuyển tiếp nhiều người hoặc nhóm, nhắc cả nhóm, thu hồi nhóm hoặc xóa cục bộ, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
+| Thao tác tin nhắn | Ghim trong chat cá nhân, cập nhật tin ghim từ thiết bị khác theo thời gian thực, chuyển tiếp nhiều người hoặc nhóm, nhắc cả nhóm, thu hồi nhóm hoặc xóa cục bộ, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
 | Quản lý nhóm | Tạo nhóm, xóa thành viên, chuyển quyền trưởng nhóm, mời nhiều người và tham gia lại nhóm đã rời |
 | Bình chọn và tìm kiếm | Chi tiết/kết quả/bỏ phiếu và tìm kiếm toàn bộ tin nhắn |
 | Tích hợp Linux | Khay hệ thống, thông báo sau khi thoát hẳn, chụp màn hình và kiểm tra trên nhiều môi trường desktop |

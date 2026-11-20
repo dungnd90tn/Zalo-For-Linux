@@ -388,6 +388,10 @@ impl NativeApp {
         #[cfg(feature = "messaging")]
         let mut recall_selected = false;
         #[cfg(feature = "messaging")]
+        let pin_action = self.pin_menu_action(message);
+        #[cfg(feature = "messaging")]
+        let mut pin_selected = None;
+        #[cfg(feature = "messaging")]
         let own = self.account_id() == Some(message.sender.as_str());
         let reply = message.reply_reference();
         #[cfg(feature = "messaging")]
@@ -490,6 +494,18 @@ impl NativeApp {
                             "Chỉ hỗ trợ tin văn bản cá nhân đủ dữ liệu gốc khi đang kết nối.",
                         );
                     }
+                    #[cfg(feature = "messaging")]
+                    if let Some(action) = &pin_action {
+                        let button =
+                            action_row(ui, action.label, "fa-outline-pin", action.enabled, false);
+                        if action.enabled {
+                            buttons.push(button.id);
+                        }
+                        if button.clicked() {
+                            pin_selected = Some(action.pinned);
+                        }
+                        button.on_disabled_hover_text(action.reason);
+                    }
                     if can_select_many {
                         let button = action_row(
                             ui,
@@ -548,6 +564,12 @@ impl NativeApp {
         if recall_selected {
             self.message_menu = None;
             self.open_recall(&popup.message);
+            return;
+        }
+        #[cfg(feature = "messaging")]
+        if let Some(pinned) = pin_selected {
+            self.message_menu = None;
+            self.change_group_pin(&popup.message, pinned);
             return;
         }
         if copied

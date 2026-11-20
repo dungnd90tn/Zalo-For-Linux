@@ -680,7 +680,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            19
+            20
         );
     }
 
@@ -733,7 +733,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            19
+            20
         );
         for m in originals {
             assert_eq!(

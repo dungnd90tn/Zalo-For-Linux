@@ -61,6 +61,24 @@ impl Projection {
                         .retain(|target| !self.hidden.contains(&format!("d:{}", target.contact)));
                 }
             }
+            LiveEvent::GroupPins {
+                thread,
+                privacy_revision,
+                snapshot,
+                ..
+            }
+            | LiveEvent::GroupPinFinished {
+                thread,
+                privacy_revision,
+                snapshot,
+                ..
+            } if !self.confirmed
+                || self.status != LivePrivacyStatus::Ready
+                || *privacy_revision != self.revision
+                || self.hidden.contains(thread) =>
+            {
+                *snapshot = None;
+            }
             LiveEvent::ForwardTargets {
                 source_thread,
                 entries,

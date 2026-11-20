@@ -147,7 +147,7 @@ impl MessageStore {
 
     /// Cursor whose page shows the message with [`JUMP_CONTEXT`] newer ones after it, or `None`
     /// when there are not that many newer ones and the newest page already contains it.
-    fn jump_cursor(
+    pub(super) fn jump_cursor(
         &self,
         account: &str,
         thread: &str,

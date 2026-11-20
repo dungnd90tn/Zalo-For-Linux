@@ -22,6 +22,8 @@ mod group_actions;
 #[cfg(feature = "messaging")]
 mod group_members;
 #[cfg(feature = "messaging")]
+mod group_pins;
+#[cfg(feature = "messaging")]
 mod hydration;
 mod information;
 #[cfg(all(test, feature = "messaging"))]
@@ -1633,11 +1635,15 @@ impl NativeApp {
         );
         #[cfg(feature = "messaging")]
         let status = status.or_else(|| {
-            [self.sticker_status(), self.reaction_status()]
-                .into_iter()
-                .flatten()
-                .max_by_key(|(_, updated_at)| *updated_at)
-                .map(|(status, _)| status)
+            [
+                self.sticker_status(),
+                self.reaction_status(),
+                self.group_pin_status(),
+            ]
+            .into_iter()
+            .flatten()
+            .max_by_key(|(_, updated_at)| *updated_at)
+            .map(|(status, _)| status)
         });
         let status = status.map(str::to_owned);
         let status_height = if status.is_some() { 29.0 } else { 0.0 };
@@ -2183,7 +2189,7 @@ impl NativeApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Frame::none().inner_margin(16.0).show(ui, |ui| {
-                    self.information_body(ui, &thread);
+                    self.information_body(ui, &thread, compact);
                 });
             });
     }
@@ -2233,6 +2239,7 @@ impl eframe::App for NativeApp {
             self.sync_forward();
             self.sync_recall();
             self.sync_groups(ctx);
+            self.sync_group_pins();
         }
         self.update_modal_input(ctx);
         #[cfg(feature = "messaging")]

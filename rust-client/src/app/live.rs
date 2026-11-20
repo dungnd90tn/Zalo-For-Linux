@@ -175,6 +175,27 @@ pub enum StickerOutcome {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupPinOutcome {
+    Accepted,
+    Rejected,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupPinEntry {
+    pub message_id: String,
+    pub hit: Option<crate::domain::search::MessageHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupPinSnapshot {
+    pub can_mutate: bool,
+    pub entries: Vec<GroupPinEntry>,
+    pub unresolved: Vec<String>,
+}
+
 pub use crate::protocol::reactions::{
     ReactionAction, ReactionKind, ReactionOutcome, ReactionSummary,
 };
@@ -197,6 +218,18 @@ pub enum LiveCommand {
         thread: String,
         privacy_revision: u64,
         after: Option<String>,
+    },
+    GroupPins {
+        request_id: u64,
+        thread: String,
+        privacy_revision: u64,
+    },
+    SetGroupPin {
+        request_id: u64,
+        thread: String,
+        privacy_revision: u64,
+        message_id: String,
+        pinned: bool,
     },
     CancelGroupMembers {
         request_id: u64,
@@ -387,6 +420,22 @@ pub enum FileTransferPhase {
 }
 #[derive(Debug)]
 pub enum LiveEvent {
+    GroupPins {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        privacy_revision: u64,
+        snapshot: Option<GroupPinSnapshot>,
+    },
+    GroupPinFinished {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        privacy_revision: u64,
+        message_id: String,
+        outcome: GroupPinOutcome,
+        snapshot: Option<GroupPinSnapshot>,
+    },
     ReactionCapability {
         account_id: String,
         available: bool,
@@ -691,6 +740,8 @@ impl LiveEvent {
             | Self::GroupMembers { account_id, .. }
             | Self::GroupInviteTargets { account_id, .. }
             | Self::GroupActionFinished { account_id, .. }
+            | Self::GroupPins { account_id, .. }
+            | Self::GroupPinFinished { account_id, .. }
             | Self::RecallFinished { account_id, .. }
             | Self::Recalled { account_id, .. }
             | Self::ForwardFinished { account_id, .. }
@@ -879,6 +930,24 @@ impl LiveWorker {
                     && after.as_ref().is_none_or(|value| value.len() == 67)
             }
             LiveCommand::CancelGroupMembers { request_id } => *request_id > 0,
+            LiveCommand::GroupPins {
+                request_id, thread, ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+            }
+            LiveCommand::SetGroupPin {
+                request_id,
+                thread,
+                message_id,
+                ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+                    && crate::protocol::messaging::numeric_id(message_id).is_ok()
+            }
             LiveCommand::GroupInviteTargets {
                 request_id,
                 thread,
@@ -1775,6 +1844,8 @@ impl super::Model {
             | LiveEvent::GroupMembers { .. }
             | LiveEvent::GroupInviteTargets { .. }
             | LiveEvent::GroupActionFinished { .. }
+            | LiveEvent::GroupPins { .. }
+            | LiveEvent::GroupPinFinished { .. }
             | LiveEvent::RecallFinished { .. }
             | LiveEvent::ForwardFinished { .. }
             | LiveEvent::ForwardTargets { .. }

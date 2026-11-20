@@ -256,7 +256,12 @@ impl NativeApp {
         }
     }
 
-    pub(super) fn information_body(&mut self, ui: &mut egui::Ui, thread: &Conversation) {
+    pub(super) fn information_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        thread: &Conversation,
+        _compact: bool,
+    ) {
         let colors = crate::theme::palette(ui.ctx());
         self.refresh_overview(&ui.ctx().clone(), &thread.id);
         let title = display_title(thread);
@@ -304,7 +309,7 @@ impl NativeApp {
                 ui,
                 width,
                 "fa-outline-pin",
-                "Ghim",
+                "Ghim hội thoại",
                 false,
                 "Chưa hỗ trợ: ghim hội thoại nằm trên máy chủ Zalo và đồng bộ giữa các thiết bị",
             );
@@ -322,6 +327,8 @@ impl NativeApp {
             }
         });
 
+        #[cfg(feature = "messaging")]
+        self.group_pins_section(ui, thread, _compact);
         #[cfg(feature = "messaging")]
         self.group_section(ui, thread);
         self.message_search_section(ui, thread);
@@ -617,7 +624,7 @@ mod tests {
             "Ảnh",
             "Sao chép tên",
             "Tắt thông báo",
-            "Ghim",
+            "Ghim hội thoại",
         ] {
             assert!(
                 all.iter().any(|t| t == expected),
@@ -678,7 +685,7 @@ mod tests {
         let output = panel.settle();
         let output = panel.tap(center_of(&output, "Tắt thông báo"));
         assert!(output.platform_output.copied_text.is_empty());
-        let output = panel.tap(center_of(&output, "Ghim"));
+        let output = panel.tap(center_of(&output, "Ghim hội thoại"));
         assert!(output.platform_output.copied_text.is_empty());
         let output = panel.settle();
         let output = panel.tap(center_of(&output, "Sao chép tên"));

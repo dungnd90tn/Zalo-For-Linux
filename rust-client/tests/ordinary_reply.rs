@@ -399,7 +399,7 @@ fn schema_nine_upgrade_preserves_all_old_bytes_and_does_not_invent_reply_identit
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            19
+            20
         );
         for (table, expected) in OLD_TABLES.iter().zip(&before) {
             assert_eq!(&rows(&conn, table), expected, "Changed {table}");
@@ -431,7 +431,7 @@ fn failed_schema_nine_upgrade_rolls_back_both_sidecars_and_refuses_future_schema
     for (table, expected) in OLD_TABLES.iter().zip(&before) {
         assert_eq!(&rows(&conn, table), expected);
     }
-    conn.execute_batch("DROP TRIGGER reject_reply_upgrade; PRAGMA user_version=20;")
+    conn.execute_batch("DROP TRIGGER reject_reply_upgrade; PRAGMA user_version=21;")
         .unwrap();
     assert!(MessageStore::open(&db.0).is_err());
 }

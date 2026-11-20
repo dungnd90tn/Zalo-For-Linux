@@ -53,6 +53,7 @@ enum Reply {
     Reactions,
     ReactionReplay,
     GroupActions(bool),
+    GroupPins(bool),
     UpgradeForbidden,
     DesktopHeaders,
     UpgradeStall,
@@ -89,6 +90,7 @@ struct State {
     recall_source_at: OnceLock<i64>,
     reaction_first_client: OnceLock<u64>,
     release_reaction_removal: AtomicBool,
+    pin_fixture_board: AtomicUsize,
 }
 struct Fixture {
     addr: SocketAddr,
@@ -1387,6 +1389,11 @@ fn serve(
         && mention_tests::respond(&mut stream, &state, &cipher, &path, &headers, &body)
     {
         return;
+    }
+    if let Reply::GroupPins(lost) = reply {
+        if group_pin_tests::respond(&mut stream, &state, &cipher, lost, &path, &headers, &body) {
+            return;
+        }
     }
     if matches!(reply, Reply::Reactions) {
         assert!(headers.starts_with("POST "));
@@ -6029,6 +6036,7 @@ async fn opening_a_conversation_refreshes_names_and_avatars_at_most_every_two_mi
 mod file_fixture;
 mod file_upload_tests;
 
+mod group_pin_tests;
 mod mention_tests;
 mod photo_upload_tests;
 mod reaction_replay_tests;

@@ -1604,3 +1604,32 @@ passed 840 tests with five opt-in tests ignored. Strict all-feature,
 all-target Clippy passed. The optimized `live` build passed
 `scripts/rust/smoke-release.py --expect-live`, including upgrade from schema 18
 to 19, preservation of saved messages and idempotent restart.
+
+## Ordinary group text pins (2.0.6 development branch)
+
+The authenticated `group_board` v2 service uses `/api/board/pin/list`,
+`/api/board/topic/createv2` and `/api/board/unpinv2` (PC bundle N398353 and
+N401244–401353). The session must advertise an enabled production v2 board.
+The worker checks visible ordinary groups of up to 100 members. A write
+requires an eligible saved message, verified group permission and zero
+auto-delete TTL. The list opens only locally saved messages with matching
+server, sender and client IDs. Changes from other clients are fetched on
+demand using **Cập nhật tin ghim**.
+
+Local TLS/WSS fixtures exercise the encrypted request fields, stale privacy
+and missing-source rejection, pin and unpin confirmation, and a lost reply
+across a restart. Only unresolved intents are stored in schema 20. The worker
+releases one such intent when a newer authoritative board proves its requested
+state. It leaves other messages available for independent actions.
+
+Four native UI tests exercise scope, permissions, late list arrival while a
+menu is open and navigation to a saved message without losing the draft.
+Eight isolated X11 captures covered `group-pins` and `group-pin-menu` in
+both themes at 640×480 and 1200×780 using `ZALO_UI_FIXTURE_READY=1` and
+`ZALO_UI_FIXTURE_INTERACTIONS`. The traces had no IPv4 or IPv6 connections.
+
+The default checks passed with 308 Rust and 19 Python tests. The all-feature
+suite passed 850 Rust tests with five opt-in tests ignored. Strict all-feature,
+all-target Clippy passed. The optimized live binary preserved history and
+restarted cleanly after upgrading schema 19 to 20 in the release smoke test.
+Acceptance on the Zalo service remains pending.

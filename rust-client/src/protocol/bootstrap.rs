@@ -370,6 +370,7 @@ pub struct ServerConfig {
     pub photo_upload_route: Option<PhotoUploadRoute>,
     pub photo_limits: PhotoLimits,
     pub seen_v2: bool,
+    pub group_board_v2: bool,
     pub recall_max_age_ms: Option<i64>,
     pub chat_poll: Vec<Url>,
     pub control_poll: Vec<Url>,
@@ -472,6 +473,7 @@ impl ServerConfig {
             "file",
             "sticker",
             "reaction",
+            "group_board",
             "up_file",
         ] {
             let mut endpoints =
@@ -498,6 +500,24 @@ impl ServerConfig {
         };
         if !reactions_enabled {
             services.remove("reaction");
+        }
+        // PC bundle N225405–225415 and N323752–323770. Board actions
+        // require an explicitly enabled production v2 configuration.
+        let group_board_v2 = services.contains_key("group_board")
+            && feature_config(value, "group_topics")
+                .ok()
+                .flatten()
+                .is_some_and(|config| {
+                    let enabled =
+                        |value: &Value| value.as_bool() == Some(true) || value.as_u64() == Some(1);
+                    let disabled =
+                        |value: &Value| value.as_bool() == Some(false) || value.as_u64() == Some(0);
+                    config.get("enable").is_some_and(enabled)
+                        && config.get("using_new_api").is_none_or(enabled)
+                        && config.get("using_dev_api").is_none_or(disabled)
+                });
+        if !group_board_v2 {
+            services.remove("group_board");
         }
         // Native implements the source's raw async-file handler only. An advertised
         // multi-site/cloud handler is a separate protocol and cannot fall back silently.
@@ -635,6 +655,7 @@ impl ServerConfig {
             photo_upload_route,
             photo_limits,
             seen_v2,
+            group_board_v2,
             recall_max_age_ms,
             file_chunk_size,
             // The native runtime uses WebSockets, not legacy chat/control LP.
@@ -1072,6 +1093,47 @@ mod tests {
             value["zpw_service_map_v3"]["chat"] = serde_json::json!([bad]);
             assert!(ServerConfig::parse(&value).is_err());
         }
+    }
+    #[test]
+    fn group_board_is_optional_and_uses_advertised_validated_origins() {
+        let mut value = json!({"zpw_service_map_v3":{
+            "group":["https://group-wpa.zaloapp.com/"],
+            "group_board":["https://groupboard-wpa.api.zalo.me/"]
+        }});
+        let config = ServerConfig::parse(&value).unwrap();
+        assert!(!config.group_board_v2);
+        assert!(!config.services.contains_key("group_board"));
+        value["settings"] = json!({"features":{"group_topics":{"enable":1}}});
+        let config = ServerConfig::parse(&value).unwrap();
+        assert!(config.group_board_v2);
+        assert_eq!(
+            config.services["group_board"][0].as_str(),
+            "https://groupboard-wpa.api.zalo.me/"
+        );
+
+        for invalid in [
+            json!({"enable":1,"using_new_api":0}),
+            json!({"enable":1,"using_dev_api":1}),
+            json!({"enable":"1"}),
+            json!({"enable":1,"using_new_api":null}),
+        ] {
+            value["settings"]["features"]["group_topics"] = invalid;
+            assert!(!ServerConfig::parse(&value).unwrap().group_board_v2);
+        }
+        value["settings"]["features"]["group_topics"] = json!({"enable":1});
+        value["zpw_service_map_v3"]["group_board"] = json!(["https://untrusted.invalid/"]);
+        let config = ServerConfig::parse(&value).unwrap();
+        assert!(config.services.contains_key("group"));
+        assert!(!config.services.contains_key("group_board"));
+        assert!(!config.group_board_v2);
+
+        value["zpw_service_map_new"] = json!({"group_board":"https://groupboard-wpa.zaloapp.com/"});
+        let config = ServerConfig::parse(&value).unwrap();
+        assert!(config.group_board_v2);
+        assert_eq!(
+            config.services["group_board"][0].as_str(),
+            "https://groupboard-wpa.zaloapp.com/"
+        );
     }
     #[test]
     fn optional_directory_routes_fail_locally_without_rejecting_verified_bootstrap_identity() {

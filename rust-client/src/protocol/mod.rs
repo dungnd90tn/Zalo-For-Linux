@@ -10,6 +10,8 @@ pub(crate) mod forward;
 #[cfg(feature = "messaging")]
 pub(crate) mod group_actions;
 #[cfg(feature = "messaging")]
+pub(crate) mod group_pins;
+#[cfg(feature = "messaging")]
 pub(crate) mod group_roster;
 #[cfg(feature = "messaging")]
 pub(crate) mod hidden;

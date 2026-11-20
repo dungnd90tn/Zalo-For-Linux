@@ -17,6 +17,9 @@ pub(crate) use group_actions::GroupActionFailure;
 #[cfg(feature = "messaging")]
 pub use group_actions::{GroupActionOutcome, GroupInviteTarget};
 mod group_actions;
+mod group_pins;
+#[cfg(feature = "messaging")]
+pub(crate) use group_pins::PinSource;
 mod mention;
 pub mod message_content;
 mod message_info;
@@ -398,7 +401,7 @@ impl MessageStore {
     fn initialize(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 19 {
+        if version > 20 {
             bail!("Database was created by a newer client");
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
@@ -444,11 +447,12 @@ impl MessageStore {
         forward::initialize(&conn)?;
         recall::initialize(&conn)?;
         group_actions::initialize(&conn)?;
+        group_pins::initialize(&conn)?;
         sticker_send::initialize(&conn)?;
         reactions::initialize(&conn)?;
         message_media::reproject(&conn)?;
         silence_legacy(&conn)?;
-        conn.execute_batch("PRAGMA user_version=19; COMMIT;")?;
+        conn.execute_batch("PRAGMA user_version=20; COMMIT;")?;
         privacy::initialize(&conn)?;
         Ok(Self { conn })
     }
