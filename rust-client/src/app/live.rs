@@ -167,8 +167,31 @@ pub enum RecallOutcome {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StickerOutcome {
+    Accepted,
+    Rejected,
+    Unavailable,
+    Unknown,
+}
+
+pub use crate::protocol::reactions::{
+    ReactionAction, ReactionKind, ReactionOutcome, ReactionSummary,
+};
+
 #[derive(Debug)]
 pub enum LiveCommand {
+    React {
+        request_id: u64,
+        thread: String,
+        message_id: String,
+        action: ReactionAction,
+    },
+    ReactionState {
+        generation: u64,
+        thread: String,
+        message_ids: Vec<String>,
+    },
     GroupMembers {
         request_id: u64,
         thread: String,
@@ -211,6 +234,22 @@ pub enum LiveCommand {
         source_thread: String,
         source_message_id: String,
         query: String,
+    },
+    SendSticker {
+        request_id: u64,
+        thread: String,
+        sticker: crate::domain::StickerDescriptor,
+    },
+    SearchStickers {
+        request_id: u64,
+        thread: String,
+        query: String,
+    },
+    SendCatalogSticker {
+        request_id: u64,
+        search_id: u64,
+        thread: String,
+        sticker: crate::domain::StickerDescriptor,
     },
     ReadVisible {
         generation: u64,
@@ -340,6 +379,27 @@ pub enum FileTransferPhase {
 }
 #[derive(Debug)]
 pub enum LiveEvent {
+    ReactionCapability {
+        account_id: String,
+        available: bool,
+    },
+    ReactionFinished {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        message_id: String,
+        outcome: ReactionOutcome,
+    },
+    ReactionState {
+        account_id: String,
+        generation: u64,
+        thread: String,
+        messages: Vec<(String, Vec<ReactionSummary>)>,
+    },
+    ReactionsChanged {
+        account_id: String,
+        thread: String,
+    },
     GroupMembers {
         account_id: String,
         request_id: u64,
@@ -393,6 +453,22 @@ pub enum LiveEvent {
         query: String,
         entries: Vec<ForwardTarget>,
         failed: bool,
+    },
+    StickerFinished {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        outcome: StickerOutcome,
+    },
+    StickerSearchCapability {
+        account_id: String,
+        available: bool,
+    },
+    StickersFound {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        stickers: Option<Vec<crate::domain::StickerDescriptor>>,
     },
     ReadState {
         account_id: String,
@@ -600,13 +676,20 @@ pub enum LiveEvent {
 impl LiveEvent {
     pub fn account_id(&self) -> &str {
         match self {
-            Self::GroupMembers { account_id, .. }
+            Self::ReactionCapability { account_id, .. }
+            | Self::ReactionFinished { account_id, .. }
+            | Self::ReactionState { account_id, .. }
+            | Self::ReactionsChanged { account_id, .. }
+            | Self::GroupMembers { account_id, .. }
             | Self::GroupInviteTargets { account_id, .. }
             | Self::GroupActionFinished { account_id, .. }
             | Self::RecallFinished { account_id, .. }
             | Self::Recalled { account_id, .. }
             | Self::ForwardFinished { account_id, .. }
             | Self::ForwardTargets { account_id, .. }
+            | Self::StickerFinished { account_id, .. }
+            | Self::StickerSearchCapability { account_id, .. }
+            | Self::StickersFound { account_id, .. }
             | Self::ReadState { account_id, .. }
             | Self::ReadStateChanged { account_id, .. }
             | Self::NotificationPreferences { account_id, .. }
@@ -714,6 +797,42 @@ impl LiveWorker {
     pub fn account_id(&self) -> &str {
         &self.account
     }
+    pub fn send_sticker(
+        &self,
+        request_id: u64,
+        thread: String,
+        sticker: crate::domain::StickerDescriptor,
+    ) -> bool {
+        self.submit(LiveCommand::SendSticker {
+            request_id,
+            thread,
+            sticker,
+        })
+        .is_ok()
+    }
+    pub fn search_stickers(&self, request_id: u64, thread: String, query: String) -> bool {
+        self.submit(LiveCommand::SearchStickers {
+            request_id,
+            thread,
+            query,
+        })
+        .is_ok()
+    }
+    pub fn send_catalog_sticker(
+        &self,
+        request_id: u64,
+        search_id: u64,
+        thread: String,
+        sticker: crate::domain::StickerDescriptor,
+    ) -> bool {
+        self.submit(LiveCommand::SendCatalogSticker {
+            request_id,
+            search_id,
+            thread,
+            sticker,
+        })
+        .is_ok()
+    }
     pub fn submit(&self, command: LiveCommand) -> std::result::Result<(), SubmitError> {
         use crate::protocol::messaging::Target;
         let valid_message_ids = |ids: &[String]| {
@@ -723,6 +842,23 @@ impl LiveWorker {
                     .all(|id| crate::protocol::messaging::numeric_id(id).is_ok())
         };
         let valid = match &command {
+            LiveCommand::React {
+                request_id,
+                thread,
+                message_id,
+                ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
+                    && crate::protocol::messaging::numeric_id(message_id).is_ok()
+            }
+            LiveCommand::ReactionState {
+                thread,
+                message_ids,
+                ..
+            } => Target::from_thread(thread).is_ok() && valid_message_ids(message_ids),
             LiveCommand::GroupMembers {
                 request_id,
                 thread,
@@ -910,6 +1046,41 @@ impl LiveWorker {
                         .is_none_or(crate::domain::reply::valid_source_id)
                     && !text.trim().is_empty()
                     && text.len() <= MAX_TEXT_BYTES
+            }
+            LiveCommand::SendSticker {
+                request_id,
+                thread,
+                sticker,
+            } => {
+                *request_id > 0
+                    && sticker.is_builtin()
+                    && Target::from_thread(thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
+            }
+            LiveCommand::SearchStickers {
+                request_id,
+                thread,
+                query,
+            } => {
+                *request_id > 0
+                    && crate::protocol::sticker_catalog::valid_query(query)
+                    && Target::from_thread(thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
+            }
+            LiveCommand::SendCatalogSticker {
+                request_id,
+                search_id,
+                thread,
+                sticker,
+            } => {
+                *request_id > 0
+                    && *search_id > 0
+                    && sticker.is_catalog()
+                    && Target::from_thread(thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
             }
             LiveCommand::SendFile {
                 thread,
@@ -1549,12 +1720,19 @@ impl super::Model {
                 }
                 true
             }
-            LiveEvent::GroupMembers { .. }
+            LiveEvent::ReactionCapability { .. }
+            | LiveEvent::ReactionFinished { .. }
+            | LiveEvent::ReactionState { .. }
+            | LiveEvent::ReactionsChanged { .. }
+            | LiveEvent::GroupMembers { .. }
             | LiveEvent::GroupInviteTargets { .. }
             | LiveEvent::GroupActionFinished { .. }
             | LiveEvent::RecallFinished { .. }
             | LiveEvent::ForwardFinished { .. }
             | LiveEvent::ForwardTargets { .. }
+            | LiveEvent::StickerFinished { .. }
+            | LiveEvent::StickerSearchCapability { .. }
+            | LiveEvent::StickersFound { .. }
             | LiveEvent::ReadState { .. }
             | LiveEvent::ReadStateChanged { .. }
             | LiveEvent::NotificationPreferences { .. }

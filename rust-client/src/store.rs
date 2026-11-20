@@ -24,9 +24,13 @@ mod message_reply;
 mod overview;
 pub mod photos;
 mod privacy;
+mod reactions;
 mod read_state;
 pub(crate) mod recall;
 mod search;
+mod sticker_send;
+#[cfg(feature = "messaging")]
+pub(crate) use sticker_send::Reservation as StickerReservation;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
 
@@ -65,6 +69,8 @@ pub struct ForwardBinding {
 }
 
 #[cfg(feature = "messaging")]
+use crate::protocol::reactions::ReactionNotice;
+#[cfg(feature = "messaging")]
 use crate::protocol::recall::RecallNotice;
 #[cfg(not(feature = "messaging"))]
 enum RecallNotice {}
@@ -74,6 +80,17 @@ struct ReceiveExtras<'a> {
     attention: Option<(&'a [ReceiptBinding], ReceiveContext)>,
     #[cfg(feature = "messaging")]
     notices: &'a [RecallNotice],
+    #[cfg(feature = "messaging")]
+    reactions: Option<(
+        &'a [ReactionNotice],
+        &'a mut std::collections::BTreeSet<String>,
+    )>,
+}
+
+#[cfg(feature = "messaging")]
+pub(crate) struct ReceiveNotices<'a> {
+    pub recalls: &'a [RecallNotice],
+    pub reactions: &'a [ReactionNotice],
 }
 
 type ReceivedWithRecalls = (
@@ -81,6 +98,18 @@ type ReceivedWithRecalls = (
     Vec<(String, String)>,
     Vec<recall::RecallChange>,
 );
+
+fn advance_receive_cursor(conn: &Connection, account: &str, queue: &str, id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO receive_cursors(account_id,queue,last_id) VALUES(?1,?2,?3)
+         ON CONFLICT(account_id,queue) DO UPDATE SET last_id=CASE
+           WHEN length(excluded.last_id)>length(last_id)
+             OR (length(excluded.last_id)=length(last_id) AND excluded.last_id>last_id)
+           THEN excluded.last_id ELSE last_id END",
+        params![account, queue, id],
+    )?;
+    Ok(())
+}
 
 /// Closed, payload-free storage diagnostics. Never log an arbitrary error chain:
 /// database driver messages can include SQL or data from a failing trigger.
@@ -365,7 +394,7 @@ impl MessageStore {
     fn initialize(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 16 {
+        if version > 18 {
             bail!("Database was created by a newer client");
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
@@ -410,9 +439,11 @@ impl MessageStore {
         forward::initialize(&conn)?;
         recall::initialize(&conn)?;
         group_actions::initialize(&conn)?;
+        sticker_send::initialize(&conn)?;
+        reactions::initialize(&conn)?;
         message_media::reproject(&conn)?;
         silence_legacy(&conn)?;
-        conn.execute_batch("PRAGMA user_version=16; COMMIT;")?;
+        conn.execute_batch("PRAGMA user_version=18; COMMIT;")?;
         privacy::initialize(&conn)?;
         Ok(Self { conn })
     }
@@ -774,7 +805,10 @@ impl MessageStore {
             cursor,
             ReceiveExtras {
                 attention: Some((receipts, context)),
-                ..ReceiveExtras::default()
+                #[cfg(feature = "messaging")]
+                notices: &[],
+                #[cfg(feature = "messaging")]
+                reactions: None,
             },
         )
         .map(|(messages, unread, _)| (messages, unread))
@@ -793,7 +827,7 @@ impl MessageStore {
             .map(|(messages, unread, _)| (messages, unread))
     }
 
-    #[cfg(feature = "messaging")]
+    #[cfg(all(test, feature = "messaging"))]
     pub(crate) fn receive_batch_with_recalls(
         &mut self,
         account: &str,
@@ -803,7 +837,32 @@ impl MessageStore {
         context: ReceiveContext,
         notices: &[RecallNotice],
     ) -> Result<ReceivedWithRecalls> {
-        self.receive_batch_inner(
+        self.receive_batch_with_notices(
+            account,
+            messages,
+            cursor,
+            receipts,
+            context,
+            ReceiveNotices {
+                recalls: notices,
+                reactions: &[],
+            },
+        )
+        .map(|(batch, _)| batch)
+    }
+
+    #[cfg(feature = "messaging")]
+    pub(crate) fn receive_batch_with_notices(
+        &mut self,
+        account: &str,
+        messages: &[(ReceivedReply, Option<ForwardMarker>)],
+        cursor: Option<(&str, &str)>,
+        receipts: &[ReceiptBinding],
+        context: ReceiveContext,
+        notices: ReceiveNotices<'_>,
+    ) -> Result<(ReceivedWithRecalls, std::collections::BTreeSet<String>)> {
+        let mut changed = std::collections::BTreeSet::new();
+        let batch = self.receive_batch_inner(
             account,
             messages
                 .iter()
@@ -821,9 +880,11 @@ impl MessageStore {
             cursor,
             ReceiveExtras {
                 attention: Some((receipts, context)),
-                notices,
+                notices: notices.recalls,
+                reactions: Some((notices.reactions, &mut changed)),
             },
-        )
+        )?;
+        Ok((batch, changed))
     }
 
     fn receive_batch_inner<'a>(
@@ -883,6 +944,15 @@ impl MessageStore {
             .attention
             .is_some_and(|(_, context)| context == ReceiveContext::LiveFresh);
         let tx = self.conn.transaction()?;
+        #[cfg(feature = "messaging")]
+        let has_pending_reactions = message_count > 0
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_reaction_events WHERE account_id=?1)",
+                [account],
+                |row| row.get::<_, bool>(0),
+            )?;
+        #[cfg(feature = "messaging")]
+        let mut changed_reactions = std::collections::BTreeSet::new();
         #[cfg(feature = "messaging")]
         let changes = {
             if extras.notices.len() > MAX_PAGE_SIZE {
@@ -1000,6 +1070,18 @@ impl MessageStore {
                     adjusted += 1;
                 }
             }
+            #[cfg(feature = "messaging")]
+            if !recalled
+                && !is_forwarded
+                && info.is_none()
+                && media.is_none()
+                && quote.is_none()
+                && m.quote.is_none()
+                && m.sticker.is_some()
+                && sticker_send::reconcile(&tx, m, client_id.as_deref())?
+            {
+                adjusted += 1;
+            }
             // System/info events can carry source cliMsgId values but are not
             // acknowledgements of the user's plain-text send intent.
             if !recalled
@@ -1116,6 +1198,15 @@ impl MessageStore {
             #[cfg(not(feature = "messaging"))]
             let forward_enriched = false;
             let quote_enriched = message_reply::persist(&tx, m, quote)?;
+            #[cfg(feature = "messaging")]
+            if has_pending_reactions
+                && (m.source_client_id.is_some()
+                    || previous_reply.source_client_id.is_some()
+                    || m.reply_blocked)
+                && reactions::reconcile_pending(&tx, account, &m.thread_id, &m.id)?
+            {
+                changed_reactions.insert(m.thread_id.clone());
+            }
             let reply_enriched = quote_enriched
                 || (m.source_client_id.is_some()
                     && m.source_client_id != previous_reply.source_client_id)
@@ -1142,8 +1233,13 @@ impl MessageStore {
                 result.push((hydrated, c));
             }
         }
+        #[cfg(feature = "messaging")]
+        if let Some((notices, changed)) = extras.reactions {
+            changed_reactions.extend(reactions::apply(&tx, account, notices)?);
+            *changed = changed_reactions;
+        }
         if let Some((queue, id)) = cursor {
-            tx.execute("INSERT INTO receive_cursors(account_id,queue,last_id) VALUES(?1,?2,?3) ON CONFLICT(account_id,queue) DO UPDATE SET last_id=CASE WHEN length(excluded.last_id)>length(last_id) OR (length(excluded.last_id)=length(last_id) AND excluded.last_id>last_id) THEN excluded.last_id ELSE last_id END",params![account,queue,id])?;
+            advance_receive_cursor(&tx, account, queue, id)?;
         }
         tx.commit()?;
         Ok((result, unread, changes))

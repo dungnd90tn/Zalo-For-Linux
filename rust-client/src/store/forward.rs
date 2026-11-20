@@ -918,7 +918,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            16
+            18
         );
         assert_eq!(migrated.receive_cursor("11", "510_0").unwrap(), "99");
         migrated.replace_live_privacy("11", &[], None).unwrap();

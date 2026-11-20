@@ -2,9 +2,9 @@ name: Rust client preview
 
 on:
   push:
-    paths: ['rust-client/**', 'scripts/rust/**', 'pc-dist/*.css', 'pc-dist/fonts/**', 'pc-dist/favicon-*.png', 'pc-dist/compact-app-pc.*.js', '.github/workflows/rust-client.yml']
+    paths: ['rust-client/**', 'scripts/rust/**', 'pc-dist/*.css', 'pc-dist/fonts/**', 'pc-dist/emoji/emoji-32/**', 'pc-dist/favicon-*.png', 'pc-dist/compact-app-pc.*.js', '.github/workflows/rust-client.yml']
   pull_request:
-    paths: ['rust-client/**', 'scripts/rust/**', 'pc-dist/*.css', 'pc-dist/fonts/**', 'pc-dist/favicon-*.png', 'pc-dist/compact-app-pc.*.js', '.github/workflows/rust-client.yml']
+    paths: ['rust-client/**', 'scripts/rust/**', 'pc-dist/*.css', 'pc-dist/fonts/**', 'pc-dist/emoji/emoji-32/**', 'pc-dist/favicon-*.png', 'pc-dist/compact-app-pc.*.js', '.github/workflows/rust-client.yml']
 
 permissions:
   contents: read

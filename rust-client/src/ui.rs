@@ -34,6 +34,7 @@ mod login;
 mod media;
 mod message_actions;
 mod message_search;
+mod message_selection;
 #[cfg(all(test, feature = "messaging"))]
 mod modal_tests;
 #[cfg(feature = "messaging")]
@@ -45,12 +46,16 @@ mod privacy_native_fixture;
 #[cfg(all(test, feature = "messaging"))]
 mod privacy_tests;
 #[cfg(feature = "messaging")]
+mod reactions;
+#[cfg(feature = "messaging")]
 mod recall;
 mod replies;
 mod senders;
 mod settings;
 #[cfg(test)]
 mod shot_fixture;
+#[cfg(feature = "messaging")]
+mod sticker_picker;
 #[cfg(feature = "messaging")]
 mod stickers;
 mod visuals;
@@ -84,6 +89,28 @@ struct ModalFocus {
     auth_generation: Option<u64>,
 }
 
+#[cfg(feature = "messaging")]
+struct InteractionNotice {
+    thread: String,
+    label: &'static str,
+    updated_at: std::time::Instant,
+}
+
+#[cfg(feature = "messaging")]
+impl InteractionNotice {
+    fn new(thread: String, label: &'static str) -> Self {
+        Self {
+            thread,
+            label,
+            updated_at: std::time::Instant::now(),
+        }
+    }
+
+    fn for_thread(&self, thread: &str) -> Option<(&'static str, std::time::Instant)> {
+        (self.thread == thread).then_some((self.label, self.updated_at))
+    }
+}
+
 pub struct NativeApp {
     worker: Option<Worker>,
     model: Model,
@@ -99,6 +126,7 @@ pub struct NativeApp {
     settings_open: bool,
     account_popup: Option<account::Popup>,
     message_menu: Option<message_actions::Popup>,
+    message_selection: Option<message_selection::Selection>,
     account_trigger_focus: Option<ModalFocus>,
     theme: crate::theme::ThemeController,
     settings: settings::Settings,
@@ -159,6 +187,7 @@ impl NativeApp {
             settings_open: false,
             account_popup: None,
             message_menu: None,
+            message_selection: None,
             account_trigger_focus: None,
             theme,
             settings: settings::Settings::default(),
@@ -210,6 +239,7 @@ impl NativeApp {
             if state.open_dialog
                 || state.review_dialog
                 || state.attention.settings_open
+                || state.sticker_send.is_open()
                 || state.forwarding.is_open()
                 || state.recall.is_open()
                 || state.groups.is_open()
@@ -222,7 +252,7 @@ impl NativeApp {
 
     fn latch_modal_input(&mut self, ctx: &egui::Context) {
         if self.modal_open() && !self.modal_blocked {
-            self.modal_focus = self
+            let focus = self
                 .account_popup
                 .as_mut()
                 .and_then(|popup| popup.focus.take())
@@ -230,8 +260,10 @@ impl NativeApp {
                     self.message_menu
                         .as_mut()
                         .and_then(|popup| popup.focus.take())
-                })
-                .or_else(|| self.modal_focus_snapshot(ctx));
+                });
+            #[cfg(feature = "messaging")]
+            let focus = focus.or_else(|| self.live.as_mut()?.sticker_send.take_focus());
+            self.modal_focus = focus.or_else(|| self.modal_focus_snapshot(ctx));
             if let Some(focus) = &self.modal_focus {
                 ctx.memory_mut(|memory| memory.surrender_focus(focus.id));
             }
@@ -1255,12 +1287,10 @@ impl NativeApp {
             ),
             |ui| {
                 ui.horizontal(|ui| {
-                    icon_button(
-                        ui,
-                        Icon::Smile,
-                        "Biểu cảm · chưa hỗ trợ trong bản xem trước",
-                        false,
-                    );
+                    #[cfg(feature = "messaging")]
+                    self.sticker_button(ui, enabled);
+                    #[cfg(not(feature = "messaging"))]
+                    icon_button(ui, Icon::Sticker, "Gửi nhãn dán · chưa khả dụng", false);
                     if icon_button(
                         ui,
                         Icon::Image,
@@ -1534,6 +1564,7 @@ impl NativeApp {
         if self.modal_blocked || self.modal_open() {
             ui.disable();
         }
+        self.selection_toolbar(ui);
         let composer_height =
             composer_height(ui.available_height(), &self.drafts.active.text, compact)
                 + self.attachment_tray_height()
@@ -1544,13 +1575,28 @@ impl NativeApp {
             self.model.pending,
             self.demo,
             self.connection_label(),
-        )
-        .map(str::to_owned);
+        );
+        #[cfg(feature = "messaging")]
+        let status = status.or_else(|| {
+            [self.sticker_status(), self.reaction_status()]
+                .into_iter()
+                .flatten()
+                .max_by_key(|(_, updated_at)| *updated_at)
+                .map(|(status, _)| status)
+        });
+        let status = status.map(str::to_owned);
         let status_height = if status.is_some() { 29.0 } else { 0.0 };
         let timeline_height = (ui.available_height() - composer_height - status_height).max(60.0);
         let timeline_rect =
             egui::Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), timeline_height));
 
+        let timeline_margin = if compact { 18.0 } else { 30.0 };
+        let selecting = self.message_selection.is_some();
+        let selection_gutter = if selecting {
+            message_selection::GUTTER
+        } else {
+            0.0
+        };
         ui.allocate_ui_with_layout(
             vec2(ui.available_width(), timeline_height),
             Layout::top_down(Align::Min),
@@ -1565,19 +1611,22 @@ impl NativeApp {
                         self.model.generation,
                     ))
                     .auto_shrink([false, false])
-                    // Sticking to the newest message would override scrolling to a search hit.
-                    .stick_to_bottom(self.model.focus().is_none())
+                    // Keep the view where the user is reading during search or selection.
+                    .stick_to_bottom(self.model.focus().is_none() && !selecting)
+                    .animated(!selecting)
                     .max_height(timeline_height)
                     .show(ui, |ui| {
                         egui::Frame::none()
-                            .inner_margin(egui::Margin::symmetric(
-                                if compact { 18.0 } else { 30.0 },
-                                18.0,
-                            ))
+                            .inner_margin(egui::Margin {
+                                left: timeline_margin + selection_gutter,
+                                right: timeline_margin,
+                                top: 18.0,
+                                bottom: 18.0,
+                            })
                             .show(ui, |ui| {
                                 ui.set_min_width(
-                                    (timeline_rect.width() - if compact { 38.0 } else { 62.0 })
-                                        .max(100.0),
+                                    (timeline_rect.width() - timeline_margin * 2.0 - 2.0
+                                        - selection_gutter).max(100.0),
                                 );
                                 if !self.demo && !self.is_signed_in() {
                                     self.welcome(ui);
@@ -1620,6 +1669,9 @@ impl NativeApp {
                                 #[cfg(feature="messaging")]
                                 if let (Some(state),Some(account),Some(thread))=(&mut self.live,own_account.as_deref(),self.model.selected.as_deref()) {state.media.scope(account,thread,self.model.generation);}
                                 let menu_scope = self.message_menu_scope();
+                                let selection_scope = self.message_selection_scope();
+                                #[cfg(feature = "messaging")]
+                                let reaction_scope = self.reaction_scope();
                                 let menu_focus = self.modal_focus_snapshot(ctx);
                                 let mut previous_day = None;
                                 let focus = self
@@ -1677,17 +1729,31 @@ impl NativeApp {
                                         state.attention.paint(message, bubble.inner, ui.clip_rect(),
                                             self.model.messages.last().is_some_and(|tail| tail.id == message.id));
                                     }
-                                    if let Some(position) = message_actions::requested(ui, bubble.inner, message) {
+                                    let menu_position = if let Some(selection) = &mut self.message_selection {
+                                        selection.checkbox(ui, message, bubble.inner);
+                                        None
+                                    } else {
+                                        message_actions::requested(ui, bubble.inner, message).or_else(|| {
+                                            selection_scope.as_ref()?;
+                                            message_selection::text(message)?;
+                                            message_actions::keyboard_menu(ui, message, bubble.inner)
+                                        })
+                                    };
+                                    if let Some(position) = menu_position {
                                         if let Some(scope) = &menu_scope {
                                             self.message_menu = Some(message_actions::Popup::new(
                                                 scope.clone(), message.id.clone(), position, menu_focus.clone(),
                                             ));
                                         }
                                     }
+                                    #[cfg(feature = "messaging")]
+                                    if let (Some(state), Some(scope)) = (&self.live, &reaction_scope) {
+                                        reactions::paint_badge(ui, state, scope, message, bubble.inner);
+                                    }
                                     let bubble = bubble.response;
                                     if let Some((_, shown_at)) = focused {
                                         focus_drawn = true;
-                                        if shown_at.is_none() {
+                                        if shown_at.is_none() && !selecting {
                                             bubble.scroll_to_me(Some(Align::Center));
                                         }
                                         let alpha = message_search::focus_alpha(*shown_at, now);
@@ -1785,6 +1851,9 @@ impl NativeApp {
         let show_directory = self.directory_visible();
         #[cfg(not(feature = "messaging"))]
         let show_directory = false;
+        if privacy_pending || (compact && (show_directory || self.compact_list)) {
+            self.message_selection = None;
+        }
         if show_directory || (compact && self.compact_list) || self.bound_conversation().is_none() {
             self.conversation_details = None;
         }
@@ -1863,6 +1932,7 @@ impl NativeApp {
                         return;
                     }
                     if !dock_details && self.bound_conversation().is_some() {
+                        self.message_selection = None;
                         self.conversation_information(ui, true);
                     } else {
                         self.chat(ui, ctx, compact);
@@ -1886,6 +1956,8 @@ impl NativeApp {
         }
         self.show_account_popup(ctx);
         self.show_message_menu(ctx);
+        #[cfg(feature = "messaging")]
+        self.show_sticker_picker(ctx);
         #[cfg(feature = "messaging")]
         if !self.settings_open && !application_information {
             self.hidden_pin_dialog(ctx);
@@ -2055,6 +2127,10 @@ impl NativeApp {
 }
 
 impl eframe::App for NativeApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        self.message_menu_input(input);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(test)]
         if let Some(theme) = self.fixture_system_theme {
@@ -2090,6 +2166,7 @@ impl eframe::App for NativeApp {
         self.sync_message_menu();
         #[cfg(feature = "messaging")]
         {
+            self.sync_sticker_picker(ctx);
             self.sync_forward();
             self.sync_recall();
             self.sync_groups(ctx);
@@ -2101,6 +2178,7 @@ impl eframe::App for NativeApp {
         {
             if self.show_login(ctx) {
                 self.conversation_details = None;
+                self.message_selection = None;
                 self.latch_modal_input(ctx);
                 self.show_account_popup(ctx);
                 if self.settings_open {
@@ -2123,6 +2201,7 @@ impl eframe::App for NativeApp {
             self.show_forward_picker(ctx);
             self.show_recall_confirmation(ctx);
             self.show_group_dialogs(ctx);
+            self.sync_reactions(ctx);
             self.finish_attention_frame(ctx);
         }
     }
@@ -2651,7 +2730,7 @@ fn sticker_placeholder(ui: &mut egui::Ui, label: &str) -> egui::Response {
             ui.vertical_centered(|ui| {
                 ui.add_space(25.0);
                 let (rect, _) = ui.allocate_exact_size(vec2(25.0, 25.0), Sense::hover());
-                icon(ui, rect, Icon::Smile, colors.text_secondary);
+                icon(ui, rect, Icon::Sticker, colors.text_secondary);
                 ui.add(
                     egui::Label::new(
                         RichText::new(label)

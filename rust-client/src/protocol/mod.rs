@@ -21,6 +21,8 @@ pub mod messaging;
 pub mod photo;
 pub mod qr;
 #[cfg(feature = "messaging")]
+pub(crate) mod reactions;
+#[cfg(feature = "messaging")]
 pub(crate) mod read_state;
 #[cfg(feature = "messaging")]
 pub(crate) mod recall;
@@ -28,6 +30,10 @@ pub(crate) mod recall;
 pub mod session;
 #[cfg(feature = "messaging")]
 pub mod signal;
+#[cfg(feature = "messaging")]
+pub(crate) mod sticker_catalog;
+#[cfg(feature = "messaging")]
+pub(crate) mod sticker_send;
 #[cfg(feature = "trust-wasm")]
 pub mod trust;
 #[cfg(feature = "messaging")]

@@ -2,7 +2,52 @@
 
 Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-client/`). Định dạng theo
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
-Ghi chú phát hành mới nhất nằm trong [changelogs/](../changelogs/RELEASE-v2.0.4.md).
+Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) để đối chiếu khi nâng cấp.
+
+## 2.0.5 — gói thử 2.0.5-2
+
+Xem [ghi chú 2.0.5](../changelogs/RELEASE-v2.0.5.md) và các mục kiểm thử còn mở trong [kế hoạch 2.0.5](PLAN_2.0.5.md).
+
+### Giao diện
+
+- Thu gọn menu chuột phải của tin nhắn. Các mục căn trái, có biểu tượng, hàng cảm xúc nằm ở trên và mục **Thu hồi** tách riêng ở cuối. Dùng Tab hoặc phím mũi tên để di chuyển và Enter để thực hiện.
+
+### Thêm mới
+
+- Gửi 30 nhãn dán mặc định từ nút nhãn dán cạnh ô soạn trong chat cá nhân và nhóm thường đủ điều kiện. Bấm vào một nhãn dán để gửi ngay. Bản nháp đang soạn được giữ lại.
+- Tìm sticker theo từ khóa trong bảng nhãn dán khi phiên Zalo có dịch vụ danh mục tương thích. Có thể gửi sticker thường đã được dịch vụ xác nhận.
+- Bấm chuột phải vào tin văn bản đủ điều kiện để thả tim, thích, cười, bất ngờ, buồn hoặc giận. Có thể gỡ tất cả cảm xúc của mình trên tin đó. Tổng hiển thị dựa trên các lượt mà ứng dụng đã ghi nhận.
+- Lấy bù cảm xúc sau khi kết nối lại nếu máy chủ công bố hàng đợi cảm xúc tương thích. Cảm xúc đến trước tin nhắn sẽ xuất hiện sau khi thông tin tin gốc được xác minh.
+- Chọn nhiều tin nhắn văn bản trên trang hiện tại và sao chép theo thứ tự thời gian. Nhấn Esc để thoát chế độ chọn.
+
+### Thay đổi
+
+- Hồ sơ nâng lên **schema 18** và giữ lịch sử cùng các lượt gửi đang chờ xác nhận. Các bản dựng dùng schema cũ hơn không mở được hồ sơ đã nâng cấp.
+
+### Ưu tiên kiểm chứng
+
+- Gửi nhãn dán và thêm/gỡ cảm xúc giữa điện thoại và Linux đã được người dùng xác nhận hoạt động. Tiếp tục ghi kết quả riêng cho tìm sticker, chat nhóm và lấy bù khi Linux ngoại tuyến.
+- Xác nhận phiên đã lưu giữ Online sau đồng bộ. Thử gửi bằng **Enter** và nút **Gửi** khi bật/tắt x-unikey, trên X11 và Wayland.
+- Kiểm chứng trên tài khoản thử các luồng trả lời, gửi tệp và ảnh, thông báo, chuyển tiếp, thu hồi và thao tác nhóm. Ghi kết quả theo từng luồng trong [VALIDATION.md](VALIDATION.md).
+
+## Gói 2.0.4-3 - 2026-11-19
+
+### Sửa lỗi
+
+- Tin `webchat` dạng đối tượng không còn làm rớt kết nối và vô hiệu hóa nút **Gửi** trong lúc đồng bộ. Hiển thị phần chữ khi nhận dạng được, hoặc dòng thay thế cho dạng chưa hỗ trợ.
+- Tooltip của nút **Gửi** ghi rõ khi ngoại tuyến, đang kết nối hoặc phiên đã hết hạn.
+
+## Gói 2.0.4-2 - 2026-11-19
+
+### Thêm mới
+
+- Trả lời tin văn bản kèm trích dẫn. Gửi một tệp tối đa 100 MiB hoặc một ảnh HD tĩnh với xem trước và chú thích.
+- Số tin chưa đọc trên máy này, trạng thái chuyển/đã xem có xác nhận và thông báo Linux với xem trước nội dung mặc định tắt.
+- Chuyển tiếp văn bản cá nhân đến một bạn bè, thu hồi tin văn bản của mình trong hội thoại cá nhân, xem thành viên, mời và rời nhóm thường theo quyền.
+
+### Thay đổi
+
+- Hồ sơ nâng lên **schema 16**, giữ lịch sử đã lưu. Các bản dựng dùng schema cũ hơn không mở được hồ sơ đã nâng cấp.
 
 ## [2.0.4] - 2026-11-11
 

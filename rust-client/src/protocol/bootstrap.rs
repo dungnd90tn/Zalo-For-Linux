@@ -470,6 +470,8 @@ impl ServerConfig {
             "chat_e2e",
             "group_e2e",
             "file",
+            "sticker",
+            "reaction",
             "up_file",
         ] {
             let mut endpoints =
@@ -483,6 +485,19 @@ impl ServerConfig {
             if !endpoints.is_empty() {
                 services.insert(name.into(), endpoints);
             }
+        }
+        let reactions_enabled = match feature_config(value, "reaction_setting") {
+            Ok(None) => true,
+            Ok(Some(settings)) if settings.is_object() => {
+                match settings.get("off_message_reaction") {
+                    None | Some(Value::Null | Value::Bool(false)) => true,
+                    Some(flag) => flag.as_u64() == Some(0),
+                }
+            }
+            _ => false,
+        };
+        if !reactions_enabled {
+            services.remove("reaction");
         }
         // Native implements the source's raw async-file handler only. An advertised
         // multi-site/cloud handler is a separate protocol and cannot fall back silently.

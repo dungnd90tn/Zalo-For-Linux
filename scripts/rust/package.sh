@@ -12,8 +12,13 @@ RUSTUP_VERSION="1.29.3"
 RUSTUP_SHA256="b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55"
 
 PKG_VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$REPO_ROOT/rust-client/Cargo.toml" | head -1)"
-# Bump the release for every package you hand over, even a rebuild of the same code.
-PKG_RELEASE="${ZALO_PKG_RELEASE:-1}"
+# Use the tested package revision by default. Bump it for each new package of the same version.
+DEFAULT_RELEASE="$(sed -n 's/^package-release *= *\([1-9][0-9]*\)$/\1/p' "$REPO_ROOT/rust-client/Cargo.toml")"
+PKG_RELEASE="${ZALO_PKG_RELEASE:-$DEFAULT_RELEASE}"
+if [[ ! "$PKG_RELEASE" =~ ^[1-9][0-9]*$ ]]; then
+    echo 'Set a positive package-release in Cargo.toml or ZALO_PKG_RELEASE.' >&2
+    exit 1
+fi
 # Cargo features of the shipped binary. Releases use `live`; set `live,signal-crypto` for a build that can try E2EE.
 PKG_FEATURES="${ZALO_PKG_FEATURES:-live}"
 OUT="$REPO_ROOT/dist/rust"

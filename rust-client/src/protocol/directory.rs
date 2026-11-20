@@ -575,6 +575,7 @@ fn parse_previews_inner(
                     |messages| super::messaging::IncomingBatch {
                         messages,
                         recalls: Vec::new(),
+                        reactions: Vec::new(),
                     },
                 ),
             }

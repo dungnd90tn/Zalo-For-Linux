@@ -419,10 +419,10 @@ fn schema_ten_upgrade_and_failed_migration_preserve_quote_history_and_crypto_int
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            16
+            18
         );
     }
-    conn.execute_batch("PRAGMA user_version=17;").unwrap();
+    conn.execute_batch("PRAGMA user_version=19;").unwrap();
     assert!(MessageStore::open(&db.0).is_err());
     assert_eq!(rows(&db.0), before);
 }

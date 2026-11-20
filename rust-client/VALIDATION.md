@@ -1471,3 +1471,104 @@ ASCII. With the Telex word still composing, the first Enter committed the word
 and enabled Send, and the second Enter submitted exactly one synthetic row.
 After a space committed the composition, one Enter submitted. Extra Enter
 presses produced no duplicate rows.
+
+## Built-in sticker sending and message reactions (2.0.5 preview)
+
+The all-feature suite passed 817 Rust tests with five opt-in tests ignored.
+Strict all-feature Clippy, default all-target compilation, formatting, the
+original sticker oracle, 19 Python tooling tests and five IME adapter tests
+also passed. Loopback TLS/WSS covers sticker requests for direct chats and
+groups, ACK and echo correlation, persistence of ambiguous attempts after
+restart, and reaction acceptance, replay, and removal. The schema 16 to 17
+regression checks saved history, the cursor, and unresolved text sends.
+
+The private X11 fixture `ui::live::tests::signed_in_offline_native_window_fixture`
+shows the picker, reaction badge, or reaction menu with
+`ZALO_UI_FIXTURE_INTERACTIONS=stickers|reactions|reaction-menu`. Review covered
+Light and Dark at 640×480 and 1200×780 with synthetic content. Connection traces
+showed zero Internet connections for every capture. Keyboard regressions verify
+that a single selection dispatches to the current conversation and preserves
+the composer draft. The screenshots use synthetic sticker thumbnails.
+
+An optimized standard `live` build passed the schema 17 release smoke with
+19 synthetic messages across six conversations, restart preservation, profile
+locking and private diagnostic files. The workspace preview still reports
+version 2.0.4 until the 2.0.5 release is finalized.
+
+Real-account acceptance is pending for both workflows. Reaction totals cover
+confirmed local sends and authenticated notices the worker has processed.
+Receiving updates through the separate control stream and historical reaction
+replay require further work.
+
+## Catalog search, reaction catch-up and message selection (2.0.5 preview)
+
+The full offline all-feature suite passed 828 Rust tests with five opt-in tests
+ignored. Strict Clippy, formatting, the sticker source oracle and 19 Python
+tooling tests passed. Local TLS checks verify the authorized sticker search,
+matching detail response and typed send. Local WSS checks both advertised
+reaction queues, retry from the last committed cursor and later reconciliation
+when the referenced message arrives. The 17 to 18 upgrade covers preserved
+built-in sticker intents and atomic reaction cursor rollback on write failure.
+
+Private X11 captures cover `stickers`, `stickers-search` and `message-selection`
+in Light and Dark at 640×480 and 1200×780. Connection traces confirm zero
+Internet requests. Selection reveals the entry message once, then allows normal
+scrolling. Keyboard tests cover ordered plaintext copy, draft preservation,
+Escape and page changes.
+
+The optimized standard `live` preview passed the schema 18 release smoke with
+19 synthetic messages across six conversations, restart preservation, profile
+locking and private diagnostic files.
+
+Real-account checks remain in [PLAN_2.0.5.md](PLAN_2.0.5.md). Reaction catch-up
+requires advertised queues and retained ordinary history. The legacy control
+poll, queue resets and evictions are outside this implementation.
+
+The 2.0.5-1 packages in `dist/rust/` use the same optimized `live` executable
+and require at most the `GLIBC_2.30` symbol set. The Debian package upgraded
+2.0.4-3 on Ubuntu 20.04 and retained a synthetic history row across schema
+16 to 18. Installation, payload integrity and removal of the RPM passed on
+AlmaLinux 9. The extracted binary reports 2.0.5 and passed schema 18 release
+smoke. SHA-256 sums were verified for both packages.
+
+## Compact message context menu (2.0.5-2)
+
+Private X11 captures cover the menu with and without reactions in Light and
+Dark at 640×480 and 1200×780. The full menu measures about 230×255 pixels at
+native scale one. The capture connection traces contain no Internet connections.
+Keyboard tests cover Tab, both arrows, wrapping between enabled actions, narrow
+viewport placement and preservation of the composer draft. The all-feature
+suite passed 828 Rust tests with five opt-in tests ignored. Strict all-feature
+Clippy and formatting passed.
+
+The 2.0.5-2 Debian package upgraded 2.0.5-1 in Ubuntu 20.04 and preserved a
+synthetic history row at schema 18. The RPM installed, verified and removed
+cleanly on AlmaLinux 9. Both packages carried the same executable, and both
+SHA-256 checks and the schema 18 release smoke passed.
+
+## Packaged build pilot (2.0.5-2)
+
+The same checked packages passed clean installation, CLI diagnostics, desktop
+launcher and icon checks, and removal on Ubuntu 22.04, Ubuntu 24.04, Debian 12
+and Fedora 42. Ubuntu 20.04 upgrade and AlmaLinux 9 results are recorded above.
+Packaging now reads the tested revision from Cargo metadata. A disposable script
+fixture checked the default revision 2, explicit override 3, and rejection of
+invalid revisions before writing package outputs.
+
+The extracted 2.0.5-2 binary ran with the installed x-unikey IBus engine on
+isolated X11 in offline demo mode. Enter committed and saved `chào` once in two
+trials, and subsequent presses added no rows. Enter and mouse Send worked with
+x-unikey off and after committing Telex text with a space. Switching between two
+conversations preserved both Unicode drafts and saved each only on explicit
+submission. The profile, X server and IBus bus were private to the test.
+
+The same extracted binary ran on a headless GNOME Wayland compositor with
+`DISPLAY` unset, a private IBus x-unikey engine and negotiated text input v3.
+With active Telex preedit, the first Enter committed the word and a second
+Enter saved it once. Extra Enter presses added no rows. A space-committed
+draft and ASCII with the engine off each saved on a single Enter. A native
+pointer click on the demo composer button saved exactly one committed draft.
+
+The user confirmed sticker sending and adding/removing reactions between Linux
+and phone on 2.0.5-2. Detailed direct/group, catalog search and offline reaction
+catch-up acceptance remain tracked in the [release plan](PLAN_2.0.5.md).

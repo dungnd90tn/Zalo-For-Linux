@@ -426,6 +426,9 @@ fn unknown_policy_clears_cached_content_before_late_event_consumers() {
             message_id: "photo".into(),
             url: "https://photo-talk.zadn.vn/synthetic.jpg".into(),
         };
+        // Drain the window's public icon uploads so the assertion below tracks
+        // exactly the private texture introduced by this fixture.
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
         let seeded = ctx.run(egui::RawInput::default(), |ctx| {
             app.live
                 .as_mut()
@@ -440,7 +443,7 @@ fn unknown_policy_clears_cached_content_before_late_event_consumers() {
             .map(|(id, _)| *id)
             .filter(|id| *id != egui::TextureId::Managed(0))
             .collect();
-        assert!(!texture_ids.is_empty());
+        assert_eq!(texture_ids.len(), 1, "one private image was seeded");
         policy(&mut app, &ctx, 2, status, None);
         assert!(app.model.selected.is_none());
         assert!(app.model.messages.is_empty() && app.model.conversations.is_empty());

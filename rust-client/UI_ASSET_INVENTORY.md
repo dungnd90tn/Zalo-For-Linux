@@ -59,13 +59,15 @@ Native hiện khai báo **15** biến thể `Icon` trong `src/ui/visuals.rs`, đ
 | Cloud / Settings | `.fa-cloud` / `.fa-tab-icon-setting` | `U+EAA5` / `U+ED88` |
 | Search / Plus | `.fa-outline-search` / `.fa-outline-plus` | `U+ECA1` / `U+EC97` |
 | Phone / Video | `.fa-outline-call` / `.fa-outline-video` | `U+EC83` / `U+ECAC` |
-| Smile / Image / Paperclip | `.fa-chatbar-emoji` / `.fa-chatbar-photo` / `.fa-chatbar-attach` | `U+EA5C` / `U+EA6A` / `U+EA5A` |
+| Sticker / Image / Paperclip | `.fa-chatbar-sticker` / `.fa-chatbar-photo` / `.fa-chatbar-attach` | `U+EA71` / `U+EA6A` / `U+EA5A` |
 | Back / Info | `.fa-back` / `.fa-outline-info` | `U+EA25` / `U+EC8D` |
 | Check / Shield | `.fa-check` / `.fa-icon-outline-lock` | `U+EA7E` / `U+EBC5` |
 
 Font được catalog theo đường dẫn, loại tệp, kích thước, SHA-256 và khai báo `@font-face`. Các tệp cũ như EOT vẫn thuộc kiểm kê; điều đó không yêu cầu nạp chúng vào native. Native nhúng 5 tài sản cần dùng: Segoe regular/Semibold/Bold, icon Zalo và Screencap; các weight/font trang trí chưa có thành phần sử dụng vẫn ở catalog, không nạp sẵn.
 
-Một codepoint có binding không có nghĩa control tương ứng đã hoạt động. Gọi thoại/video, upload ảnh, tệp và gửi sticker vẫn là khoảng trống tính năng. Giữ đúng disabled/tooltip cho tới khi có luồng thực. Không thay glyph bằng icon pack khác hoặc nhân bản asset từ client bên ngoài.
+Các hàng trong menu tin nhắn dùng trực tiếp `.fa-outline-reply`, `.fa-icon-outline-copy`, `.fa-icon-outline-link`, `.fa-csc-menu-icon-forward`, `.fa-multiselect-stroke-checkbox`, `.fa-outline-recall` và `.fa-close_24` cho thao tác gỡ cảm xúc. Sáu ảnh cảm xúc gốc 32 px trong `pc-dist/emoji/emoji-32/` lần lượt là `row-30-column-43.png`, `row-34-column-43.png`, `row-4-column-42.png`, `row-9-column-43.png`, `row-2-column-43.png` và `row-3-column-43.png`. Ánh xạ lấy từ bí danh trong `pc-dist/emoji/emoji-rc.json`. Ảnh nhãn dán lấy theo danh mục từ worker.
+
+Gọi thoại và video vẫn dùng nút tắt có giải thích. Các nút hoạt động theo khả năng đã xác minh của phiên hiện tại.
 
 ## Ma trận trạng thái thành phần
 

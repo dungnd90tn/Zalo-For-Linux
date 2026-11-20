@@ -15,6 +15,7 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 - **Tôn trọng hội thoại đã ẩn trên Zalo:** loại khỏi danh sách thông thường; tìm tên và nhập PIN Zalo hiện có để mở riêng hội thoại được chọn.
 - **Hiển thị nội dung nhận được:** văn bản, thông báo hệ thống, sticker (tĩnh và động, hiển thị không nền), ảnh và một số thẻ OA/nội dung được chia sẻ. Hỗ trợ PNG/JPEG/WebP và một phần JPEG XL tĩnh; ảnh đã tải có thể mở trong khung xem của ứng dụng.
 - **Trả lời và gửi tệp:** trả lời tin văn bản thường, gửi một tệp tối đa 100 MiB hoặc một ảnh HD tĩnh, có tiến độ và nút hủy. Ảnh HD có bản xem trước và chú thích.
+- **Sticker và cảm xúc.** Gửi sticker mặc định hoặc tìm theo từ khóa khi phiên Zalo hỗ trợ danh mục. Menu chuột phải có sáu cảm xúc và thao tác sao chép nhiều tin văn bản trên trang hiện tại.
 - **Chuyển tiếp và thu hồi:** chuyển tiếp một tin văn bản cá nhân thông thường đến một bạn bè. Thu hồi tin văn bản do bạn gửi trong hội thoại cá nhân khi còn trong thời hạn cho phép.
 - **Theo dõi tin mới:** lọc hội thoại **Chưa đọc** theo các tin mới nhận trên máy này. Tin gửi hiện trạng thái chuyển/đã xem khi có dữ liệu xác nhận.
 - **Thông báo Linux:** mặc định chỉ báo **Bạn có tin nhắn mới**. Bật xem trước nội dung ở **bánh răng → Thông báo**. Hội thoại ẩn hoặc đang tắt thông báo không phát cảnh báo.
@@ -45,14 +46,14 @@ Các ảnh dưới đây là **ảnh giả lập**: chụp từ chế độ `--d
 
 ## Cài đặt nhanh bằng gói `.deb` / `.rpm`
 
-Tải gói của [bản phát hành](changelogs/RELEASE-v2.0.0.md) rồi cài bằng trình quản lý gói của bản phân phối. Gói dành cho **x86_64**, cần glibc 2.31 trở lên. Đã cài, chạy `--doctor` và gỡ thử bằng `apt`/`dnf` trong container sạch trên Ubuntu 20.04/22.04/24.04, Debian 12, Fedora 42 và AlmaLinux 9; các bản khác cùng họ nhiều khả năng chạy được nhưng chưa được kiểm:
+Gói thử **2.0.5-2** dành cho x86_64, cần glibc 2.31 trở lên. Đã thử nâng cấp trên Ubuntu 20.04 và cài/gỡ trên Ubuntu 22.04/24.04, Debian 12, Fedora 42 và AlmaLinux 9. [Ghi chú 2.0.5](changelogs/RELEASE-v2.0.5.md)
 
 ```bash
 # Ubuntu / Debian
-sudo apt install ./zalo-native_2.0.0-3_amd64.deb
+sudo apt install ./zalo-native_2.0.5-2_amd64.deb
 
 # Fedora / RHEL / AlmaLinux / Rocky (yum dùng cùng lệnh)
-sudo dnf install ./zalo-native-2.0.0-3.x86_64.rpm
+sudo dnf install ./zalo-native-2.0.5-2.x86_64.rpm
 ```
 
 Mở **Zalo Native** từ menu ứng dụng hoặc chạy `zalo-native --live`; `zalo-native --demo` mở bản dùng thử. Gỡ cài đặt bằng `sudo apt remove zalo-native` hoặc `sudo dnf remove zalo-native`. Gói độc lập với gói Electron `zalo` và có thể cài cùng lúc. Hiện chưa có kho `apt`/`dnf` để tự cập nhật: muốn nâng cấp, cài gói mới hơn theo cùng lệnh.
@@ -172,7 +173,7 @@ Sau mỗi lần biên dịch bản mới, chạy lại trình cài đặt để 
 | Nhắn tin | Xác nhận đầy đủ gửi–nhận cá nhân/nhóm với tài khoản thực, kết nối lại và vận hành lâu dài |
 | Đồng bộ | Toàn bộ lịch sử từ máy chủ, thành viên nhóm lớn và cộng đồng, xác nhận tải ảnh đại diện trên tài khoản thực |
 | Nội dung | Gửi ảnh gốc, gửi nhiều ảnh/tệp, ghi âm, tiếp tục lượt tải dở và các mẫu thẻ OA còn lại |
-| Thao tác tin nhắn | Chuyển tiếp nhiều người hoặc nhóm, nhắc tên, thả cảm xúc, thu hồi nhóm hoặc xóa cục bộ, nhập số chưa đọc từ lịch sử và xác nhận tương thích trạng thái trên tài khoản thực |
+| Thao tác tin nhắn | Chuyển tiếp nhiều người hoặc nhóm, nhắc tên, thu hồi nhóm hoặc xóa cục bộ, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
 | Quản lý nhóm | Tạo nhóm, xóa thành viên, chuyển quyền trưởng nhóm, mời nhiều người và tham gia lại nhóm đã rời |
 | Bình chọn và tìm kiếm | Chi tiết/kết quả/bỏ phiếu và tìm kiếm toàn bộ tin nhắn |
 | Tích hợp Linux | Khay hệ thống, thông báo sau khi thoát hẳn, chụp màn hình và kiểm tra trên nhiều môi trường desktop |
@@ -265,7 +266,7 @@ Xử lý mạng, truy cập dữ liệu và giải mã ảnh phải chạy ngoà
 - [Quy ước nội dung đa phương tiện](rust-client/PROTOCOL_MEDIA.md): định dạng hỗ trợ, giải mã và giới hạn tài nguyên.
 - [Kiểm chứng](rust-client/VALIDATION.md): lệnh kiểm thử và bằng chứng kiểm tra trên desktop.
 - [Tiến độ phát triển](rust-client/MIGRATION_STATUS.md): các mốc triển khai và lịch sử kiểm chứng.
-- [Nhật ký thay đổi](rust-client/CHANGELOG.md) và [ghi chú phát hành 2.0.0](changelogs/RELEASE-v2.0.0.md).
+- [Nhật ký thay đổi](rust-client/CHANGELOG.md) và [ghi chú 2.0.5](changelogs/RELEASE-v2.0.5.md).
 - [Hướng dẫn áp dụng thiết kế mới](rust-client/UI_REDESIGN_GUIDE.md): màu, kích thước và các điểm lệch có chủ ý so với bản thiết kế.
 
 Thương hiệu Zalo và tài nguyên đi kèm thuộc về chủ sở hữu tương ứng. Việc tích hợp không thể hiện sự liên kết hay bảo chứng; mã bên thứ ba giữ nguyên các thông báo bản quyền/giấy phép của mình.

@@ -63,6 +63,16 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub stickers: super::stickers::StickerCache,
     #[cfg(feature = "messaging")]
+    pub sticker_send: super::sticker_picker::StickerSend,
+    #[cfg(feature = "messaging")]
+    pub reactions: super::reactions::Reactions,
+    #[cfg(feature = "messaging")]
+    pub reaction_icons: super::reactions::Icons,
+    #[cfg(all(test, feature = "messaging"))]
+    pub sticker_fixture: bool,
+    #[cfg(all(test, feature = "messaging"))]
+    pub sticker_fixture_open: bool,
+    #[cfg(feature = "messaging")]
     pub media: super::media::MediaCache,
     #[cfg(feature = "messaging")]
     pub avatars: super::avatars::Avatars,
@@ -130,6 +140,16 @@ impl LiveState {
             #[cfg(feature = "messaging")]
             stickers: Default::default(),
             #[cfg(feature = "messaging")]
+            sticker_send: Default::default(),
+            #[cfg(feature = "messaging")]
+            reactions: Default::default(),
+            #[cfg(feature = "messaging")]
+            reaction_icons: super::reactions::Icons::new(_ctx),
+            #[cfg(all(test, feature = "messaging"))]
+            sticker_fixture: false,
+            #[cfg(all(test, feature = "messaging"))]
+            sticker_fixture_open: false,
+            #[cfg(feature = "messaging")]
             media: Default::default(),
             #[cfg(feature = "messaging")]
             avatars: Default::default(),
@@ -184,6 +204,7 @@ impl LiveState {
         self.media = Default::default();
         self.avatars = Default::default();
         self.stickers = Default::default();
+        self.reactions.worker_closed();
         self.directory.privacy_reset(&self.context, false);
         match LiveWorker::start(
             profile,
@@ -225,6 +246,8 @@ impl LiveState {
                 self.reason.get_or_insert_with(|| error.clone());
                 self.delivery.interrupted();
                 self.uploads.worker_closed();
+                self.sticker_send.worker_closed();
+                self.reactions.worker_closed();
                 self.forwarding.worker_closed();
                 self.recall.worker_closed();
                 self.groups.worker_closed();
@@ -252,6 +275,8 @@ impl LiveState {
         }
         self.delivery.interrupted();
         self.uploads.worker_closed();
+        self.sticker_send.worker_closed();
+        self.reactions.worker_closed();
         self.forwarding.worker_closed();
         self.recall.worker_closed();
         self.groups.worker_closed();
@@ -525,6 +550,8 @@ impl NativeApp {
                         state.uploads = Default::default();
                         state.photo_preview.clear();
                         state.stickers = Default::default();
+                        state.sticker_send = Default::default();
+                        state.reactions = Default::default();
                         state.media = Default::default();
                         state.avatars = Default::default();
                         state.sender_names = Default::default();
@@ -554,6 +581,8 @@ impl NativeApp {
                         state.photo_preview.clear();
                         state.directory = Default::default();
                         state.stickers = Default::default();
+                        state.sticker_send = Default::default();
+                        state.reactions = Default::default();
                         state.media = Default::default();
                         state.avatars = Default::default();
                         state.sender_names = Default::default();
@@ -650,6 +679,8 @@ impl NativeApp {
         }
         // Durable settlement is independent of whether its conversation is still visible.
         state.uploads.observe(&event);
+        state.sticker_send.observe(&event);
+        state.reactions.observe_outcome(&event);
         state
             .attention
             .scope(Some((account_id.clone(), Some(state.login.generation()))));
@@ -712,6 +743,8 @@ impl NativeApp {
             }
         ) {
             state.worker = None;
+            state.sticker_send.worker_closed();
+            state.reactions.worker_closed();
             state.forwarding.worker_closed();
             state.recall.worker_closed();
             state.groups.worker_closed();
@@ -757,6 +790,20 @@ impl NativeApp {
         let Some(event) = state.privacy.project(event) else {
             return;
         };
+        let reaction_scope = self
+            .model
+            .selected
+            .as_ref()
+            .filter(|thread| state.privacy.list_visible(thread))
+            .map(|thread| super::message_actions::Scope {
+                account: account_id.clone(),
+                thread: thread.clone(),
+                generation: self.model.generation,
+                auth_generation: Some(state.login.generation()),
+            });
+        state
+            .reactions
+            .observe_snapshot(&event, reaction_scope.as_ref());
         state.groups.observe(&event);
         state.privacy.observe_conversation(&event);
         self.quarantine_privacy(state, ctx, false);
@@ -894,6 +941,8 @@ impl NativeApp {
                             state.photo_preview.clear();
                             state.directory = Default::default();
                             state.stickers = Default::default();
+                            state.sticker_send = Default::default();
+                            state.reactions = Default::default();
                             state.media = Default::default();
                             state.avatars = Default::default();
                             state.sender_names = Default::default();
@@ -1238,6 +1287,7 @@ pub(in crate::ui) mod tests {
                 settings_open: false,
                 account_popup: None,
                 message_menu: None,
+                message_selection: None,
                 account_trigger_focus: None,
                 theme: crate::theme::ThemeController::new(
                     profile.paths.config_dir.clone(),
@@ -2231,6 +2281,10 @@ pub(in crate::ui) mod tests {
             menu_opened: bool,
         }
         impl eframe::App for MeasuredFixture {
+            fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+                self.app.raw_input_hook(ctx, input);
+            }
+
             fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
                 let screen = ctx.screen_rect();
                 let geometry = [
@@ -2254,7 +2308,11 @@ pub(in crate::ui) mod tests {
                         }
                     }
                 }
-                if !self.menu_opened && std::env::var_os("ZALO_UI_FIXTURE_MESSAGE_MENU").is_some() {
+                let reaction_menu = std::env::var("ZALO_UI_FIXTURE_INTERACTIONS")
+                    .is_ok_and(|scene| scene == "reaction-menu");
+                if !self.menu_opened
+                    && (reaction_menu || std::env::var_os("ZALO_UI_FIXTURE_MESSAGE_MENU").is_some())
+                {
                     if let (Some(scope), Some(message)) = (
                         self.app.message_menu_scope(),
                         self.app.model.messages.last(),
@@ -2262,7 +2320,11 @@ pub(in crate::ui) mod tests {
                         self.app.message_menu = Some(super::super::message_actions::Popup::new(
                             scope,
                             message.id.clone(),
-                            screen.center(),
+                            if reaction_menu {
+                                egui::pos2(screen.right() - 320.0, 80.0)
+                            } else {
+                                screen.center()
+                            },
                             self.app.modal_focus_snapshot(ctx),
                         ));
                         self.menu_opened = true;
@@ -2278,6 +2340,7 @@ pub(in crate::ui) mod tests {
             .filter(|v| (640.0..=1600.0).contains(v))
             .unwrap_or(1200.0);
         let sticker = std::env::var_os("ZALO_UI_FIXTURE_STICKER").is_some();
+        let interactions_scene = std::env::var("ZALO_UI_FIXTURE_INTERACTIONS").ok();
         let online = std::env::var_os("ZALO_UI_FIXTURE_ONLINE").is_some();
         let directory = std::env::var_os("ZALO_UI_FIXTURE_DIRECTORY").is_some();
         let sender_mode = std::env::var("ZALO_UI_FIXTURE_SENDERS").ok();
@@ -2292,6 +2355,7 @@ pub(in crate::ui) mod tests {
             || recall_scene.is_some()
             || group_scene.is_some()
             || attention_scene.is_some()
+            || interactions_scene.is_some()
             || sticker
             || directory
             || sender_mode.is_some()
@@ -2342,6 +2406,7 @@ pub(in crate::ui) mod tests {
                     || forward_scene.is_some()
                     || recall_scene.is_some()
                     || group_scene.is_some()
+                    || interactions_scene.is_some()
                 {
                     app.live.as_mut().unwrap().connection = LiveConnection::Online;
                     // Synthetic visual state only; no production authentication claim.
@@ -2389,6 +2454,52 @@ pub(in crate::ui) mod tests {
                     app.model.messages = vec![messages[0].clone()];
                     app.drafts.select("d:22").unwrap();
                     app.drafts.active.text = "Bản nháp ngoại tuyến".into();
+                }
+                match interactions_scene.as_deref() {
+                    Some("stickers" | "stickers-search") => {
+                        let state = app.live.as_mut().unwrap();
+                        state.sticker_fixture = true;
+                        state.sticker_fixture_open = true;
+                        if interactions_scene.as_deref() == Some("stickers-search") {
+                            state.sticker_send.fixture_catalog();
+                        }
+                        super::super::sticker_picker::fixture_thumbnails(
+                            &mut state.stickers,
+                            &cc.egui_ctx,
+                        );
+                    }
+                    Some("reaction-menu" | "reactions") => {
+                        let message = &mut app.model.messages[0];
+                        message.id = "901".into();
+                        message.source_client_id = Some("1901".into());
+                        message.text = "Mình đã xem bản thiết kế mới.".into();
+                        let mut outgoing = message.clone();
+                        outgoing.id = "902".into();
+                        outgoing.source_client_id = Some("1902".into());
+                        outgoing.sender = "11".into();
+                        outgoing.text = "Cảm ơn bạn, mình cập nhật ngay.".into();
+                        outgoing.sent_at_ms += 3000;
+                        app.model.messages.push(outgoing);
+                        let scope = app.reaction_scope().unwrap();
+                        app.live.as_mut().unwrap().reactions.seed(scope, "902");
+                    }
+                    Some("message-selection") => {
+                        let first = &mut app.model.messages[0];
+                        first.text = "Mình đã cập nhật lịch họp.".into();
+                        let mut next = first.clone();
+                        next.id = "fixture-selection-2".into();
+                        next.sender = "11".into();
+                        next.text = "Cảm ơn bạn, mình kiểm tra ngay.".into();
+                        next.sent_at_ms += 1000;
+                        app.model.messages.push(next);
+                        let mut last = app.model.messages[0].clone();
+                        last.id = "fixture-selection-3".into();
+                        last.text = "Hẹn gặp bạn chiều nay.".into();
+                        last.sent_at_ms += 2000;
+                        app.model.messages.push(last);
+                        app.start_message_selection("fixture-1");
+                    }
+                    _ => {}
                 }
                 if let Some(scene) = attention_scene.as_deref() {
                     let mut outgoing = app.model.messages[0].clone();
