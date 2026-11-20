@@ -1633,3 +1633,33 @@ suite passed 850 Rust tests with five opt-in tests ignored. Strict all-feature,
 all-target Clippy passed. The optimized live binary preserved history and
 restarted cleanly after upgrading schema 19 to 20 in the release smoke test.
 Acceptance on the Zalo service remains pending.
+
+## Direct text forwarding to several friends (2.0.6 development branch)
+
+One eligible saved direct text message can be forwarded to up to ten verified
+friends. The worker sends serial single-recipient requests to
+`/api/message/mforward`, using one durable client ID per recipient. A fresh
+account-wide auto-delete snapshot can serve multiple recipients within 20
+seconds. Each send still checks its recipient's WSS eligibility, original
+authenticated socket, privacy revision and canonical source. The existing
+forward outbox remains at schema 20.
+
+TLS/WSS fixtures cover mixed acceptance, rejection, unknown delivery and a
+target with auto-delete enabled. They verify that the same-batch retry sends
+only eligible failures, uses unique IDs and never replays an unresolved
+send after restart. A cancellation fixture stops the actor after the first
+ACK and while the second request is pending. The third request never reaches
+the fixture. The runtime also yields to queued actor work between recipients
+when reusing a TTL snapshot.
+
+UI tests verify retained selections across searches, stale-response rejection,
+and reopening the same message to consult a batch result in the current
+conversation. The results panel is session-local. An explicit new batch can
+forward the same message again, subject to the durable unresolved-send guard.
+Isolated X11 captures of `ZALO_UI_FIXTURE_FORWARD=batch` and `mixed` covered
+both themes at 640×480 and 1200×780, with no IPv4 or IPv6 connections.
+
+The all-feature suite passed 854 Rust tests with five opt-in tests ignored.
+The default checks passed 308 Rust and 19 Python tests. Strict all-feature,
+all-target Clippy and the optimized live release smoke passed. Real-account
+acceptance remains pending.

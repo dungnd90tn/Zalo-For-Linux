@@ -22,4 +22,4 @@ Ba hạng mục đầu đã có trong bản thử `2.0.5-2` và qua kiểm thử
 
 ## Sau 2.0.5
 
-Nhánh `v2.0.6` đã có nhắc tên từng thành viên và ghim/bỏ ghim tin văn bản trong nhóm thường. Cần xác nhận các luồng này giữa Linux và điện thoại trên tài khoản thử. Tiếp theo là chuyển tiếp nhiều người và thu hồi trong nhóm. Sau đó đánh giá duyệt theo gói sticker, đồng bộ lịch sử từ xa, ảnh gốc, album và ghi âm.
+Nhánh `v2.0.6` đã có nhắc tên và ghim tin văn bản trong nhóm thường, cùng chuyển tiếp tin văn bản cá nhân đến tối đa 10 bạn bè. Cần xác nhận các luồng này giữa Linux và điện thoại trên tài khoản thử. Tiếp theo là thu hồi trong nhóm. Sau đó đánh giá duyệt theo gói sticker, đồng bộ lịch sử từ xa, ảnh gốc, album và ghi âm.

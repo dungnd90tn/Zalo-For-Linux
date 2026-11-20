@@ -79,6 +79,8 @@ struct State {
     observed_commands: Mutex<Vec<u16>>,
     pings: AtomicUsize,
     http_sends: AtomicUsize,
+    forward_ttl_reads: AtomicUsize,
+    forward_hold: AtomicBool,
     echoed: AtomicBool,
     privacy_requests: AtomicUsize,
     privacy_responses: AtomicUsize,
@@ -1488,8 +1490,11 @@ fn serve(
         let data = if get {
             assert!(headers.starts_with("GET "));
             assert_eq!(parameters, json!({}));
+            state.forward_ttl_reads.fetch_add(1, Ordering::SeqCst);
             if mode == 1 {
                 json!({"convers":[{"destId":"22","isGroup":false,"ttl":60000}]})
+            } else if mode == 3 {
+                json!({"convers":[{"destId":"66","isGroup":false,"ttl":60000}]})
             } else {
                 json!({"convers":[]})
             }
@@ -1497,7 +1502,14 @@ fn serve(
             assert_eq!(route, "/api/message/mforward");
             assert!(headers.starts_with("POST "));
             assert_eq!(parameters["imei"], "native-fixture");
-            assert_eq!(parameters["toIds"][0]["toUid"], "22");
+            assert_eq!(parameters["toIds"].as_array().unwrap().len(), 1);
+            assert_eq!(parameters["totalIds"], 1);
+            let target = parameters["toIds"][0]["toUid"].as_str().unwrap();
+            assert!(match mode {
+                3 => matches!(target, "22" | "44" | "55"),
+                4 => matches!(target, "22" | "44"),
+                _ => target == "22",
+            });
             assert_eq!(parameters["toIds"][0]["ttl"], 0);
             assert_eq!(parameters["msgType"], "1");
             let id = parameters["toIds"][0]["clientId"].as_str().unwrap();
@@ -1511,11 +1523,25 @@ fn serve(
                 crate::protocol::forward::ForwardMarker::parse(&reference),
                 Some(crate::protocol::forward::ForwardMarker::Parsed(_))
             ));
-            state.http_sends.fetch_add(1, Ordering::SeqCst);
-            if mode == 2 {
+            let attempt = state.http_sends.fetch_add(1, Ordering::SeqCst);
+            if mode == 4 && target == "44" {
+                let started = std::time::Instant::now();
+                while state.forward_hold.load(Ordering::SeqCst)
+                    && started.elapsed() < Duration::from_secs(12)
+                {
+                    std::thread::park_timeout(Duration::from_millis(2));
+                }
+                return;
+            }
+            if mode == 2 || target == "55" {
                 return; // HTTP failed after receiving the exact request.
             }
-            json!({"success":[{"clientId":id,"msgId":"991","ts":1760000000099_i64}],"failed":[]})
+            if mode == 3 && target == "44" && attempt == 1 {
+                json!({"success":[],"failed":[{"clientId":id,"toUid":target,"error":{"code":211}}]})
+            } else {
+                let server_id = if target == "44" { "992" } else { "991" };
+                json!({"success":[{"clientId":id,"toUid":target,"msgId":server_id,"ts":1760000000099_i64}],"failed":[]})
+            }
         };
         let inner = json!({"error_code":0,"data":data});
         let response=serde_json::to_vec(&json!({"error_code":0,"data":cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()})).unwrap();
@@ -6035,6 +6061,7 @@ async fn opening_a_conversation_refreshes_names_and_avatars_at_most_every_two_mi
 
 mod file_fixture;
 mod file_upload_tests;
+mod forward_batch_tests;
 
 mod group_pin_tests;
 mod mention_tests;

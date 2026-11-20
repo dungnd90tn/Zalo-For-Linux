@@ -159,6 +159,28 @@ pub enum ForwardOutcome {
     Unknown,
 }
 
+pub const MAX_FORWARD_BATCH: usize = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardBatchResult {
+    pub target_thread: String,
+    pub outcome: ForwardOutcome,
+}
+
+fn valid_forward_targets(targets: &[String], account: &str) -> bool {
+    use crate::protocol::messaging::Target;
+    if !(1..=MAX_FORWARD_BATCH).contains(&targets.len()) {
+        return false;
+    }
+    let mut unique = std::collections::HashSet::new();
+    targets.iter().all(|thread| {
+        unique.insert(thread)
+            && Target::from_thread(thread).is_ok_and(|target| {
+                target.kind == ThreadKind::Direct && target.remote_id != account
+            })
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecallOutcome {
     Accepted,
@@ -261,6 +283,12 @@ pub enum LiveCommand {
         source_thread: String,
         source_message_id: String,
         target_thread: String,
+    },
+    ForwardBatch {
+        request_id: u64,
+        source_thread: String,
+        source_message_id: String,
+        target_threads: Vec<String>,
     },
     ForwardTargets {
         generation: u64,
@@ -501,6 +529,13 @@ pub enum LiveEvent {
         source_message_id: String,
         target_thread: String,
         outcome: ForwardOutcome,
+    },
+    ForwardBatchFinished {
+        account_id: String,
+        request_id: u64,
+        source_thread: String,
+        source_message_id: String,
+        results: Vec<ForwardBatchResult>,
     },
     ForwardTargets {
         account_id: String,
@@ -745,6 +780,7 @@ impl LiveEvent {
             | Self::RecallFinished { account_id, .. }
             | Self::Recalled { account_id, .. }
             | Self::ForwardFinished { account_id, .. }
+            | Self::ForwardBatchFinished { account_id, .. }
             | Self::ForwardTargets { account_id, .. }
             | Self::StickerFinished { account_id, .. }
             | Self::StickerSearchCapability { account_id, .. }
@@ -1002,6 +1038,19 @@ impl LiveWorker {
                     && Target::from_thread(target_thread)
                         .is_ok_and(|t| t.kind == ThreadKind::Direct)
                     && crate::protocol::messaging::numeric_id(source_message_id).is_ok()
+            }
+            LiveCommand::ForwardBatch {
+                request_id,
+                source_thread,
+                source_message_id,
+                target_threads,
+            } => {
+                *request_id > 0
+                    && Target::from_thread(source_thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Direct && target.remote_id != self.account
+                    })
+                    && crate::protocol::messaging::numeric_id(source_message_id).is_ok()
+                    && valid_forward_targets(target_threads, &self.account)
             }
             LiveCommand::ForwardTargets {
                 generation,
@@ -1848,6 +1897,7 @@ impl super::Model {
             | LiveEvent::GroupPinFinished { .. }
             | LiveEvent::RecallFinished { .. }
             | LiveEvent::ForwardFinished { .. }
+            | LiveEvent::ForwardBatchFinished { .. }
             | LiveEvent::ForwardTargets { .. }
             | LiveEvent::StickerFinished { .. }
             | LiveEvent::StickerSearchCapability { .. }

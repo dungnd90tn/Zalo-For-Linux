@@ -2071,6 +2071,7 @@ async fn handle_command(
         | LiveCommand::GroupLeave { .. }
         | LiveCommand::Recall { .. }
         | LiveCommand::Forward { .. }
+        | LiveCommand::ForwardBatch { .. }
         | LiveCommand::ForwardTargets { .. } => {
             return Ok(CommandOutcome::Continue);
         }
