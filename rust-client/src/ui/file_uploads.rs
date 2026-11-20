@@ -323,6 +323,7 @@ impl NativeApp {
     }
     pub(super) fn file_can_choose(&self) -> bool {
         self.drafts.active.reply().is_none()
+            && !self.has_draft_mentions()
             && !self.photo_selected()
             && (self.demo
                 || self
@@ -623,6 +624,7 @@ mod tests {
                 sender: "11".into(),
                 text: "A.pdf".into(),
                 source_client_id: Some("9002".into()),
+                mentions: Vec::new(),
                 reply_blocked: true,
                 recalled: false,
                 quote: None,

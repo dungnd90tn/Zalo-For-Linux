@@ -32,6 +32,8 @@ mod live;
 mod login;
 #[cfg(feature = "messaging")]
 mod media;
+#[cfg(feature = "messaging")]
+mod mentions;
 mod message_actions;
 mod message_search;
 mod message_selection;
@@ -508,6 +510,13 @@ impl NativeApp {
         false
     }
 
+    fn has_draft_mentions(&self) -> bool {
+        #[cfg(feature = "messaging")]
+        return self.drafts.active.has_mentions();
+        #[cfg(not(feature = "messaging"))]
+        false
+    }
+
     fn send_local(&mut self) {
         if self.modal_blocked || self.modal_open() || self.selected_group_left() {
             return;
@@ -532,6 +541,10 @@ impl NativeApp {
             return;
         }
         #[cfg(feature = "messaging")]
+        if self.has_draft_mentions() && self.mention_scope().is_none() {
+            return;
+        }
+        #[cfg(feature = "messaging")]
         if self.photo_selected() && !self.demo {
             self.send_live_photo();
             return;
@@ -551,12 +564,14 @@ impl NativeApp {
                     return;
                 }
                 let mut submitted = None;
-                let result = self.drafts.active.send_live(
+                let result = self.drafts.active.send_live_in_scope(
                     self.model.generation,
                     thread.clone(),
+                    Some(state.privacy.revision),
                     |command| {
                         let request = match &command {
-                            crate::app::live::LiveCommand::Send { request_id, .. } => {
+                            crate::app::live::LiveCommand::Send { request_id, .. }
+                            | crate::app::live::LiveCommand::SendMentions { request_id, .. } => {
                                 Some(*request_id)
                             }
                             _ => None,
@@ -1246,7 +1261,9 @@ impl NativeApp {
         ui.painter()
             .rect_stroke(rect, 16.0, Stroke::new(1.0_f32, colors.border_strong));
         let attach_here = enabled && self.file_can_choose();
-        let attach_reason = if self.drafts.active.reply().is_some() {
+        let attach_reason = if self.has_draft_mentions() {
+            "Xóa phần nhắc thành viên để đính kèm tệp."
+        } else if self.drafts.active.reply().is_some() {
             "Chưa hỗ trợ gửi tệp kèm trích dẫn. Hủy trả lời trước khi chọn tệp."
         } else if self.file_upload_visible() {
             "Một lượt gửi tệp đang được xử lý hoặc cần kiểm tra kết quả."
@@ -1294,7 +1311,11 @@ impl NativeApp {
                     if icon_button(
                         ui,
                         Icon::Image,
-                        "Ảnh HD · JPEG/PNG/WebP tĩnh, tối đa 20 MiB · nén JPEG, không gửi bản gốc",
+                        if self.has_draft_mentions() {
+                            "Xóa phần nhắc thành viên để gửi ảnh HD."
+                        } else {
+                            "Ảnh HD · JPEG/PNG/WebP tĩnh, tối đa 20 MiB · nén JPEG, không gửi bản gốc"
+                        },
                         enabled && self.photo_can_choose() && !self.attachments.busy(),
                     )
                     .clicked()
@@ -1363,6 +1384,12 @@ impl NativeApp {
                         self.account_id(),
                         self.model.selected.as_deref(),
                     ));
+                    #[cfg(feature = "messaging")]
+                    let mention_choice = self.mention_keys(ctx, composer_id, enabled, ime_active);
+                    #[cfg(feature = "messaging")]
+                    let previous_text = self
+                        .has_draft_mentions()
+                        .then(|| self.drafts.active.text.clone());
                     // Enter sends; Ctrl+Enter and Shift+Enter insert a line break. Handle both before
                     // TextEdit sees them: a plain Enter is swallowed here (it never becomes a
                     // newline) and a modified Enter is handed on as the plain key TextEdit turns
@@ -1400,15 +1427,14 @@ impl NativeApp {
                         });
                     }
                     ui.set_clip_rect(ui.clip_rect().intersect(editor_rect));
-                    let response = egui::ScrollArea::vertical()
+                    let edit = egui::ScrollArea::vertical()
                         .id_salt("composer_scroll")
                         .auto_shrink([false, false])
                         .min_scrolled_height(editor_rect.height())
                         .max_height(editor_rect.height())
                         .show(ui, |ui| {
                             let size = vec2(ui.available_width(), editor_rect.height());
-                            ui.add_enabled(
-                                enabled,
+                            ui.add_enabled_ui(enabled, |ui| {
                                 egui::TextEdit::multiline(&mut self.drafts.active.text)
                                     .id(composer_id)
                                     .hint_text(if group_left {
@@ -1421,16 +1447,25 @@ impl NativeApp {
                                     .desired_width(size.x)
                                     .frame(false)
                                     .char_limit(crate::domain::MAX_TEXT_BYTES)
-                                    .margin(egui::Margin::ZERO),
-                            )
+                                    .margin(egui::Margin::ZERO)
+                                    .show(ui)
+                            })
+                            .inner
                         })
                         .inner;
-                    let response = response.on_hover_text(if group_left {
+                    let response = edit.response.on_hover_text(if group_left {
                         "Bản nháp được giữ trên máy"
                     } else {
                         "Enter để gửi · Ctrl+Enter để xuống dòng"
                     });
                     if response.changed() {
+                        #[cfg(feature = "messaging")]
+                        if let Some(previous_text) = previous_text {
+                            self.drafts.active.edit_with_mentions(&previous_text);
+                        } else {
+                            self.drafts.active.edited();
+                        }
+                        #[cfg(not(feature = "messaging"))]
                         self.drafts.active.edited();
                         #[cfg(feature = "messaging")]
                         if let (Some(state), Some(thread)) =
@@ -1443,9 +1478,27 @@ impl NativeApp {
                         response.request_focus();
                         self.focus_composer = false;
                     }
+                    #[cfg(feature = "messaging")]
+                    self.show_mentions(
+                        ctx,
+                        mentions::Editor {
+                            id: composer_id,
+                            rect: editor_rect,
+                            caret: edit.state.cursor.char_range(),
+                            focused: response.has_focus(),
+                        },
+                        mention_choice,
+                        ime_active,
+                    );
                 });
+                #[cfg(feature = "messaging")]
+                let mention_send_ready =
+                    !self.has_draft_mentions() || self.mention_scope().is_some();
+                #[cfg(not(feature = "messaging"))]
+                let mention_send_ready = true;
                 let can_send = enabled
                     && !ime_active
+                    && mention_send_ready
                     && (self.demo
                         || if self.photo_selected() {
                             self.photo_can_send()
@@ -1526,6 +1579,8 @@ impl NativeApp {
                     "Hoàn tất phần nhập đang soạn trước khi gửi."
                 } else if self.drafts.active.in_flight() {
                     "Đang chờ kết quả lượt gửi trước; bản nháp được giữ nguyên."
+                } else if !mention_send_ready {
+                    "Cần kết nối và kiểm tra quyền nhóm để gửi phần nhắc thành viên."
                 } else if self.drafts.active.reply().is_some()
                     && self.drafts.active.attachment().is_some()
                 {
@@ -1853,6 +1908,10 @@ impl NativeApp {
         let show_directory = false;
         if privacy_pending || (compact && (show_directory || self.compact_list)) {
             self.message_selection = None;
+            #[cfg(feature = "messaging")]
+            if let Some(state) = &mut self.live {
+                state.mention_picker.set_scope(None);
+            }
         }
         if show_directory || (compact && self.compact_list) || self.bound_conversation().is_none() {
             self.conversation_details = None;
@@ -1933,6 +1992,10 @@ impl NativeApp {
                     }
                     if !dock_details && self.bound_conversation().is_some() {
                         self.message_selection = None;
+                        #[cfg(feature = "messaging")]
+                        if let Some(state) = &mut self.live {
+                            state.mention_picker.set_scope(None);
+                        }
                         self.conversation_information(ui, true);
                     } else {
                         self.chat(ui, ctx, compact);
@@ -2421,6 +2484,39 @@ fn is_own_sender(sender: &str, account: Option<&str>) -> bool {
     account.map_or_else(|| sender == "You (local demo)", |account| sender == account)
 }
 
+fn message_body(
+    ui: &egui::Ui,
+    message: &Message,
+    width: f32,
+    ink: egui::Color32,
+    mention_ink: egui::Color32,
+) -> Arc<egui::Galley> {
+    let font = FontId::proportional(visuals::TEXT_MESSAGE);
+    if !message.mentions.is_empty() && !message.is_recalled() {
+        if let Ok(spans) = crate::domain::mention::byte_ranges(&message.text, &message.mentions) {
+            let normal = egui::TextFormat::simple(font.clone(), ink);
+            let emphasis = egui::TextFormat::simple(
+                FontId::new(
+                    visuals::TEXT_MESSAGE,
+                    egui::FontFamily::Name("Zalo Semibold".into()),
+                ),
+                mention_ink,
+            );
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = width;
+            let mut previous = 0;
+            for span in spans {
+                job.append(&message.text[previous..span.start], 0.0, normal.clone());
+                previous = span.end;
+                job.append(&message.text[span], 0.0, emphasis.clone());
+            }
+            job.append(&message.text[previous..], 0.0, normal);
+            return ui.painter().layout_job(job);
+        }
+    }
+    ui.painter().layout(message.text.clone(), font, ink, width)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn message_bubble(
     ui: &mut egui::Ui,
@@ -2463,11 +2559,16 @@ fn message_bubble(
         .min(490.0)
         .min((available - outside).max(1.0));
     let body = (message.media.is_none() && message.sticker.is_none()).then(|| {
-        ui.painter().layout(
-            message.text.clone(),
-            FontId::proportional(visuals::TEXT_MESSAGE),
-            ink,
+        message_body(
+            ui,
+            message,
             max_bubble,
+            ink,
+            if accent {
+                colors.on_color
+            } else {
+                colors.accent_ink
+            },
         )
     });
     let mut content_width = body

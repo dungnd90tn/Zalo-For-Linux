@@ -4,6 +4,12 @@ Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-clie
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
 Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) để đối chiếu khi nâng cấp.
 
+## Chưa phát hành — nhánh 2.0.6
+
+- Gõ `@` để chọn và nhắc từng thành viên trong nhóm thường có tối đa 100 người. Chọn bằng chuột hoặc phím ↑/↓ và Enter. Ứng dụng giữ bản nháp khi lượt gửi bị từ chối hoặc chưa xác định được kết quả.
+- Làm nổi bật phần nhắc tên đã xác minh trong tin nhắn nhóm, kể cả khi mở lại lịch sử.
+- Hồ sơ nâng lên **schema 19** để lưu lượt gửi và thông tin nhắc tên trong lịch sử, đồng thời giữ dữ liệu của schema 18. Bản 2.0.5 dùng schema 18 sẽ từ chối mở hồ sơ đã nâng cấp.
+
 ## 2.0.5 — gói thử 2.0.5-2
 
 Xem [ghi chú 2.0.5](../changelogs/RELEASE-v2.0.5.md) và các mục kiểm thử còn mở trong [kế hoạch 2.0.5](PLAN_2.0.5.md).

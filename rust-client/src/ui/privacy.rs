@@ -494,6 +494,7 @@ impl NativeApp {
             state.forwarding.clear_picker();
             state.recall.clear_confirmation();
             state.groups.clear_projection();
+            state.mention_picker.set_scope(None);
         }
     }
     pub(super) fn relock_hidden(&mut self) {

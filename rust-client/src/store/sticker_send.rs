@@ -139,6 +139,7 @@ mod live {
                     .unwrap_or(row.created_at_ms),
                 sticker: Some(row.sticker),
                 source_client_id: None,
+                mentions: Vec::new(),
                 reply_blocked: true,
                 recalled: false,
                 media: None,
@@ -329,6 +330,7 @@ mod tests {
             sticker: Some(sticker),
             sent_at_ms: stamp,
             source_client_id: None,
+            mentions: Vec::new(),
             reply_blocked: true,
             recalled: false,
             media: None,
@@ -440,7 +442,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            18
+            19
         );
         assert_eq!(upgraded.receive_cursor("11", "510_0").unwrap(), "123");
         assert_eq!(upgraded.page("11", "d:22", None, 2).unwrap(), [historical]);
@@ -500,6 +502,6 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
     }
 }

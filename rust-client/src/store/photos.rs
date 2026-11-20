@@ -572,6 +572,7 @@ impl MessageStore {
             sender: account.into(),
             text: MediaKind::Photo.legacy_placeholder().into(),
             source_client_id: Some(client.to_string()),
+            mentions: Vec::new(),
             reply_blocked: true,
             recalled: false,
             quote: None,

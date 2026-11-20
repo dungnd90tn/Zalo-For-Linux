@@ -21,7 +21,7 @@ impl Drop for Scratch {
 }
 
 fn sample(index: usize) -> Message {
-    Message {reply_blocked: false, recalled: false,
+    Message {mentions: Vec::new(), reply_blocked: false, recalled: false,
             source_client_id: None,
             quote: None,
         account_id: ACCOUNT.into(), thread_id: THREAD.into(), id: format!("{index:010}"),

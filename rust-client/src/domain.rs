@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub mod attachment;
 pub(crate) mod info;
 pub mod media;
+pub mod mention;
 pub mod overview;
 pub mod reply;
 pub mod search;
@@ -212,6 +213,8 @@ pub struct Message {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<mention::Mention>,
     #[serde(default)]
     pub reply_blocked: bool,
     #[serde(default)]
@@ -246,6 +249,7 @@ impl Message {
             && (self.text != RECALLED_TEXT
                 || !self.reply_blocked
                 || self.source_client_id.is_some()
+                || !self.mentions.is_empty()
                 || self.quote.is_some()
                 || self.sticker.is_some()
                 || self.media.is_some())
@@ -269,6 +273,19 @@ impl Message {
         }
         if self.sender.len() > 256 || self.text.len() > MAX_TEXT_BYTES || self.sent_at_ms < 0 {
             bail!("Invalid message size or timestamp");
+        }
+        if !self.mentions.is_empty() {
+            if !self.reply_blocked
+                || !self
+                    .thread_id
+                    .strip_prefix("g:")
+                    .is_some_and(reply::valid_source_id)
+                || self.sticker.is_some()
+                || self.media.is_some()
+            {
+                bail!("Invalid mention message scope");
+            }
+            mention::validate(&self.text, &self.mentions)?;
         }
         Ok(())
     }
@@ -380,6 +397,7 @@ mod tests {
     #[test]
     fn rejects_oversized_text_and_invalid_ids() {
         let mut m = Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

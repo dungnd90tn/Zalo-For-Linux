@@ -64,6 +64,7 @@ fn own(server: &str, content: &MediaMessageContent, ts: i64) -> Message {
         sender: "11".into(),
         text: content.kind().legacy_placeholder().into(),
         source_client_id: None,
+        mentions: Vec::new(),
         reply_blocked: true,
         recalled: false,
         quote: None,
@@ -383,10 +384,10 @@ fn schema_eleven_migration_preserves_file_quote_and_crypto_bytes_and_rolls_back(
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            18
+            19
         );
     }
-    conn.execute_batch("PRAGMA user_version=19;").unwrap();
+    conn.execute_batch("PRAGMA user_version=20;").unwrap();
     assert!(MessageStore::open(&db.0).is_err());
     assert_eq!(rows(&db.0), before);
 }

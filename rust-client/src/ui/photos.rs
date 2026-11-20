@@ -73,6 +73,7 @@ impl NativeApp {
     pub(super) fn photo_can_choose(&self) -> bool {
         !self.demo
             && self.drafts.active.reply().is_none()
+            && !self.has_draft_mentions()
             && self.drafts.active.attachment().is_none()
             && !self.drafts.active.photo_preparing()
             && self

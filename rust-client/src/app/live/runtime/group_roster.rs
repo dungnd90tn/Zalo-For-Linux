@@ -1,14 +1,37 @@
 //! Authenticated read-only group member pages. Run on a background worker task.
 use super::*;
 use crate::protocol::group_roster as roster;
+use tokio::time::Instant;
 
 const DEADLINE: Duration = Duration::from_secs(10);
+const MENTION_PROOF_AGE: Duration = Duration::from_secs(20);
 const CURSOR_BYTES: usize = 67;
 
 pub(super) struct Request {
     pub thread: String,
     pub privacy_revision: u64,
     pub after: Option<String>,
+}
+
+pub(super) struct Proof {
+    account: String,
+    thread: String,
+    revision: u64,
+    checked_at: Instant,
+    roster: roster::VerifiedGroup,
+}
+
+impl Proof {
+    pub(super) fn applies(&self, request: &Request, account: &str) -> bool {
+        self.account == account
+            && self.thread == request.thread
+            && self.revision == request.privacy_revision
+            && self.checked_at.elapsed() <= MENTION_PROOF_AGE
+    }
+
+    pub(super) fn member_visible(&self, uid: &str) -> bool {
+        uid != self.account && self.roster.contains(uid) && self.roster.can_view(&self.account, uid)
+    }
 }
 
 impl Request {
@@ -67,21 +90,11 @@ pub(super) async fn load_page(
     session: &VerifiedSession,
     policy: &std::sync::RwLock<privacy::Projection>,
     request: &Request,
-) -> Result<roster::Page> {
+) -> Result<(roster::Page, Proof)> {
+    let proof = verify_members(client, session, policy, request).await?;
     let target = request.target()?;
-    if !request.permits(policy) {
-        return Err(WireError::Unsupported.into());
-    }
-    let payload = post(
-        client,
-        session,
-        "group",
-        roster::ROSTER_PATH,
-        roster::roster_parameters(&target)?,
-    )
-    .await?;
-    let mut page = roster::roster_page(
-        &payload,
+    let mut page = roster::project_page(
+        &proof.roster,
         session.account_id(),
         &target,
         request.after.as_deref(),
@@ -101,7 +114,39 @@ pub(super) async fn load_page(
     if !request.permits(policy) {
         return Err(WireError::Unsupported.into());
     }
-    Ok(page)
+    Ok((page, proof))
+}
+
+pub(super) async fn verify_members(
+    client: &reqwest::Client,
+    session: &VerifiedSession,
+    policy: &std::sync::RwLock<privacy::Projection>,
+    request: &Request,
+) -> Result<Proof> {
+    let target = request.target()?;
+    if !request.permits(policy) {
+        return Err(WireError::Unsupported.into());
+    }
+    let checked_at = Instant::now();
+    let payload = post(
+        client,
+        session,
+        "group",
+        roster::ROSTER_PATH,
+        roster::roster_parameters(&target)?,
+    )
+    .await?;
+    let roster = roster::verify_group(&payload, session.account_id(), &target)?;
+    if !request.permits(policy) {
+        return Err(WireError::Unsupported.into());
+    }
+    Ok(Proof {
+        account: session.account_id().into(),
+        thread: request.thread.clone(),
+        revision: request.privacy_revision,
+        checked_at,
+        roster,
+    })
 }
 
 #[cfg(test)]

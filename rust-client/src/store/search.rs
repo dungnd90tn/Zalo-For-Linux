@@ -178,6 +178,7 @@ mod tests {
 
     fn message(id: &str, text: &str, at: i64) -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

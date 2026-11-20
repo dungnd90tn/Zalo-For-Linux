@@ -258,6 +258,7 @@ mod tests {
                 quote: None,
                 media: None,
                 sticker: None,
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
             };

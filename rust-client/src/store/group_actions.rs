@@ -484,6 +484,7 @@ mod tests {
             sender: "55".into(),
             text: "Lịch sử tổng hợp trước khi rời nhóm".into(),
             source_client_id: None,
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             quote: None,

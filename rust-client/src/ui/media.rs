@@ -902,6 +902,7 @@ mod tests {
 
     fn message(media: MediaDescriptor) -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -991,6 +992,7 @@ mod tests {
             ],
         };
         let message = Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

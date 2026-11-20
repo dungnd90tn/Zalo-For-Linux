@@ -40,6 +40,7 @@ mod group_actions;
 mod group_roster;
 #[cfg(test)]
 mod integration_tests;
+mod mentions;
 pub(crate) mod photo;
 mod privacy;
 mod reactions;
@@ -57,6 +58,7 @@ fn outgoing_mismatch_diagnostics_report_only_closed_field_flags() {
     store.record_outgoing_ack("11", id, "900").unwrap();
     store.accept_outgoing("11", id, "900", Some(1000)).unwrap();
     let message = crate::domain::Message {
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         source_client_id: None,
@@ -2396,6 +2398,25 @@ async fn handle_command(
             .finish(events, StickerOutcome::Unavailable)
             .await?;
         }
+        LiveCommand::SendMentions {
+            generation,
+            thread,
+            text,
+            mentions,
+            privacy_revision,
+            request_id,
+        } => {
+            return mentions::Request {
+                generation,
+                thread,
+                text,
+                mentions,
+                privacy_revision,
+                request_id,
+            }
+            .unavailable(events)
+            .await;
+        }
         LiveCommand::Send {
             generation,
             thread,
@@ -2737,6 +2758,20 @@ async fn run_inner(
                 let Some(command) = attention.command(command, &db, events).await? else { continue; };
                 let Some(command) = forwards.command(command, connection.as_ref(), &db, events, &session, &client).await? else { continue; };
                 let command = match command {
+                    LiveCommand::SendMentions { generation, thread, text, mentions, privacy_revision, request_id } => {
+                        let request = mentions::Request { generation, thread, text, mentions, privacy_revision, request_id };
+                        let outcome = mentions::handle(
+                            request, online && !uploads.active(), &mut groups.member_proof,
+                            &db, events, &session, &client,
+                        ).await?;
+                        if matches!(outcome, CommandOutcome::PauseTransport) {
+                            uploads.invalidate();
+                            attention.reset_transport();
+                            connection = None;
+                            network_paused = true;
+                        }
+                        continue;
+                    }
                     LiveCommand::SearchStickers { request_id, thread, query } => {
                         sticker_search.start(
                             sticker_catalog::Request { id: request_id, thread, query },
@@ -2805,6 +2840,7 @@ async fn run_inner(
                     trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
                     uploads.invalidate();
                     attention.reset_transport();
+                    groups.member_proof = None;
                     connection = None;
                     network_paused = false;
                     retries = 0;

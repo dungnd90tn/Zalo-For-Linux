@@ -333,6 +333,14 @@ pub enum LiveCommand {
         reply_to: Option<String>,
         request_id: u64,
     },
+    SendMentions {
+        generation: u64,
+        thread: String,
+        text: String,
+        mentions: Vec<crate::domain::mention::Mention>,
+        privacy_revision: u64,
+        request_id: u64,
+    },
     SendFile {
         generation: u64,
         thread: String,
@@ -1047,6 +1055,19 @@ impl LiveWorker {
                     && !text.trim().is_empty()
                     && text.len() <= MAX_TEXT_BYTES
             }
+            LiveCommand::SendMentions {
+                request_id,
+                thread,
+                text,
+                mentions,
+                ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+                    && crate::domain::mention::validate_outgoing(text, mentions).is_ok()
+                    && mentions.iter().all(|mention| mention.uid != self.account)
+            }
             LiveCommand::SendSticker {
                 request_id,
                 thread,
@@ -1165,6 +1186,7 @@ impl super::Composer {
             }
             if clear_caption {
                 self.text.clear();
+                self.clear_mentions();
                 self.edited();
             }
             self.pending_file = None;
@@ -1281,6 +1303,16 @@ impl super::Composer {
         thread: String,
         enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
     ) -> std::result::Result<(), SubmitError> {
+        self.send_live_in_scope(generation, thread, None, enqueue)
+    }
+
+    pub fn send_live_in_scope(
+        &mut self,
+        generation: u64,
+        thread: String,
+        privacy_revision: Option<u64>,
+        enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
+    ) -> std::result::Result<(), SubmitError> {
         if self.attachment().is_some()
             || self.has_photo_intent()
             || self.reply().is_some_and(|reply| reply.thread_id != thread)
@@ -1292,13 +1324,28 @@ impl super::Composer {
         }
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let request_id = self.next_request_id;
-        enqueue(LiveCommand::Send {
-            generation,
-            thread,
-            text: self.text.clone(),
-            reply_to: self.reply().map(|reply| reply.message_id.clone()),
-            request_id,
-        })?;
+        if self.has_mentions() {
+            if self.reply().is_some() || !thread.starts_with("g:") {
+                return Err(SubmitError::Invalid);
+            }
+            let privacy_revision = privacy_revision.ok_or(SubmitError::Invalid)?;
+            enqueue(LiveCommand::SendMentions {
+                generation,
+                thread,
+                text: crate::domain::canonical_plain_text(&self.text).to_owned(),
+                mentions: self.wire_mentions().map_err(|_| SubmitError::Invalid)?,
+                privacy_revision,
+                request_id,
+            })?;
+        } else {
+            enqueue(LiveCommand::Send {
+                generation,
+                thread,
+                text: self.text.clone(),
+                reply_to: self.reply().map(|reply| reply.message_id.clone()),
+                request_id,
+            })?;
+        }
         self.pending = Some((request_id, self.revision));
         Ok(())
     }
@@ -1393,6 +1440,7 @@ impl super::Composer {
                     if pending == *request_id {
                         if self.revision == revision {
                             self.text.clear();
+                            self.clear_mentions();
                             self.reply = None;
                             self.edited();
                         }
@@ -1814,6 +1862,7 @@ mod tests {
     use crate::app::{DraftBook, Model};
     fn message() -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -1917,6 +1966,7 @@ mod tests {
         let bad = LiveEvent::Received {
             account_id: "11".into(),
             message: Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 source_client_id: None,

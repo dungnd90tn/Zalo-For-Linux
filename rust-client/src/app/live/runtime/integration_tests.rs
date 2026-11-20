@@ -36,6 +36,7 @@ enum Reply {
     ConflictingReceive,
     Stickers,
     StickerSend(u8),
+    Mentions,
     RuntimeStall,
     ControlHeartbeats,
     OfflinePages,
@@ -1381,6 +1382,11 @@ fn serve(
         if sticker_send_tests::respond(&mut stream, &state, &cipher, mode, &path, &headers, &body) {
             return;
         }
+    }
+    if matches!(reply, Reply::Mentions)
+        && mention_tests::respond(&mut stream, &state, &cipher, &path, &headers, &body)
+    {
+        return;
     }
     if matches!(reply, Reply::Reactions) {
         assert!(headers.starts_with("POST "));
@@ -3935,6 +3941,7 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
     ] {
         let f = Fixture::new(reply.unwrap_or(Reply::Normal));
         let cached = crate::domain::Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -4462,6 +4469,7 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
     .unwrap();
     directory.changed();
     let message = crate::domain::Message {
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         source_client_id: None,
@@ -5258,6 +5266,7 @@ async fn hidden_policy_real_tls_search_pin_cancel_scope_and_remote_revoke() {
     db.call(|s| {
         for (thread, id) in [("d:22", "1"), ("g:22", "2"), ("d:44", "3")] {
             s.insert_batch(&[crate::domain::Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 source_client_id: None,
@@ -5798,6 +5807,7 @@ async fn ordinary_reply_actual_tls_uses_canonical_scoped_target_and_retains_quot
         .into_iter()
         .map(
             |(thread, id, sender, client, text)| crate::domain::Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 account_id: "11".into(),
@@ -6019,6 +6029,7 @@ async fn opening_a_conversation_refreshes_names_and_avatars_at_most_every_two_mi
 mod file_fixture;
 mod file_upload_tests;
 
+mod mention_tests;
 mod photo_upload_tests;
 mod reaction_replay_tests;
 mod sticker_send_tests;

@@ -165,6 +165,7 @@ mod tests {
     fn unknown_hidden_scope_and_unlock_filter_reads_without_changing_history() {
         let mut s = MessageStore::in_memory().unwrap();
         let make = |account: &str, thread: &str, id: &str| crate::domain::Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -212,7 +213,7 @@ mod tests {
             s.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
                 .unwrap(),
-            18
+            19
         );
     }
 }
@@ -223,6 +224,7 @@ mod provisional_tests {
     #[test]
     fn last_confirmed_hidden_set_applies_at_once_on_the_next_start() {
         let make = |thread: &str, id: &str| crate::domain::Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

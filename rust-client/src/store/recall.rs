@@ -51,6 +51,7 @@ pub(super) fn materialized(conn: &Connection, message: &Message) -> Result<bool>
 pub(super) fn redact(message: &mut Message) {
     crate::domain::RECALLED_TEXT.clone_into(&mut message.text);
     message.source_client_id = None;
+    message.mentions.clear();
     message.reply_blocked = true;
     message.recalled = true;
     message.quote = None;
@@ -146,7 +147,7 @@ mod live {
             params![account,thread,id],
             |row| Ok(Message {
                 account_id:account.into(),thread_id:thread.into(),id:id.into(),sender:row.get(0)?,
-                text:row.get(1)?,sent_at_ms:row.get(2)?,source_client_id:None,reply_blocked:false,recalled:false,
+                text:row.get(1)?,sent_at_ms:row.get(2)?,source_client_id:None,mentions: Vec::new(), reply_blocked:false,recalled:false,
                 quote:None,sticker:None,media:None,
             }),
         ).optional()?;
@@ -680,6 +681,7 @@ mod tests {
             text: body.into(),
             sent_at_ms: 100,
             source_client_id: Some("101".into()),
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             quote: None,

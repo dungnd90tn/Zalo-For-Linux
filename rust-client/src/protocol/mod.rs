@@ -16,6 +16,8 @@ pub(crate) mod hidden;
 #[cfg(feature = "network")]
 pub mod http;
 #[cfg(feature = "messaging")]
+pub(crate) mod mention;
+#[cfg(feature = "messaging")]
 pub mod messaging;
 #[cfg(feature = "messaging")]
 pub mod photo;

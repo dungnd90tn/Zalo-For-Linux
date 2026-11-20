@@ -118,6 +118,10 @@ Tra tên dùng snapshot có scope tài khoản/trang/thread và epoch riêng. Ch
 
 Toàn vùng nhập của composer nhận focus; nội dung nhiều dòng cuộn bên trong. Enter gửi khi đủ điều kiện; Ctrl+Enter (hoặc Shift+Enter) xuống dòng. Enter không bao giờ chèn dòng mới, và không gửi khi IME đang soạn, trong cùng khung với commit hay khi giữ phím lặp. Bản nháp, cursor/undo và IME gắn với tài khoản/hội thoại, không bị xóa khi đổi theme.
 
+Trong nhóm thường đang kết nối, gõ `@` ở đầu từ để mở danh sách thành viên theo quyền xem. Gõ tên để lọc, rồi bấm tên hoặc dùng ↑/↓ và Enter để chọn. Enter khi đang chốt chữ vẫn dành cho bộ gõ. Tên nhập tay là văn bản thường. Chọn từ danh sách giữ phần chữ xung quanh và gắn đúng thành viên vào bản nháp. Danh sách hỗ trợ nhóm tối đa 100 thành viên và mỗi tin văn bản tối đa 32 lượt nhắc tên. Escape đóng gợi ý. Đổi hội thoại, tài khoản hoặc quyền xem sẽ làm mới phạm vi.
+
+Lịch sử nhấn đậm đúng phần nhắc tên đã xác minh. Tin đến dùng màu nhấn của theme, tin gửi dùng màu chữ hiện có của bong bóng xanh. Toàn bộ văn bản vẫn xuống dòng, chọn và sao chép như tin thường.
+
 Bản vá [egui-winit](vendor/egui-winit/LINUX_IME_PATCH.md) nhận preedit/commit Linux, không để context Enabled khóa Backspace/phím mũi tên; đổi editor tạo lại context. Không gửi trong composition, frame commit hoặc do phím giữ lặp sau commit.
 
 Yêu cầu: kiểm thử bằng x-unikey thật, không chỉ chèn Unicode. Kiểm tra Tab, focus sau đổi cửa sổ/hội thoại, Backspace, chuột và nội dung tiếng Việt. Duy trì chữ dễ đọc, trạng thái disabled phân biệt được; đo tương phản nếu đổi token. Chưa có chứng nhận WCAG hoặc kiểm thử screen reader đầy đủ.

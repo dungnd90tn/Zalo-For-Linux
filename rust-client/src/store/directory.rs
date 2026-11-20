@@ -735,6 +735,7 @@ mod tests {
     }
     fn message(account: &str, id: &str, text: &str) -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -1088,7 +1089,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            18
+            19
         );
         assert_eq!(
             store.page("11", "d:12", None, 10).unwrap()[0].text,

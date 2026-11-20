@@ -204,6 +204,7 @@ pub(super) fn hydrate(conn: &Connection, message: &mut Message) -> Result<()> {
         message.source_client_id = client;
         message.quote = quote.as_deref().map(decode).transpose()?;
         message.reply_blocked |= blocked;
+        super::mention::hydrate(conn, message)?;
     }
     Ok(())
 }
@@ -267,6 +268,7 @@ mod tests {
     use super::*;
     fn source() -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             account_id: "11".into(),

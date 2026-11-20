@@ -399,6 +399,7 @@ async fn authenticated_preview_source_shapes_and_rejections_preserve_local_state
             commits: 0,
         };
         let cached = crate::domain::Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

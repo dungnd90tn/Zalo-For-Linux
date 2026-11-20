@@ -139,7 +139,7 @@ mod live {
             |row| Ok(Message {
                 account_id: account.into(), thread_id: thread.into(), id: id.into(),
                 sender: row.get(0)?, text: row.get(1)?, sent_at_ms: row.get(2)?,
-                source_client_id: None, reply_blocked: false, recalled: false, quote: None, sticker: None, media: None,
+                source_client_id: None, mentions: Vec::new(), reply_blocked: false, recalled: false, quote: None, sticker: None, media: None,
             }),
         ).optional()?.ok_or(ForwardFailure::Source)?;
         message_reply::hydrate(conn, &mut source)?;
@@ -621,6 +621,7 @@ mod live {
                 sender: account.into(),
                 text: row.body,
                 source_client_id: Some(row.client),
+                mentions: Vec::new(),
                 reply_blocked: true,
                 recalled: false,
                 quote: None,
@@ -676,6 +677,7 @@ mod tests {
             quote: None,
             media: None,
             sticker: None,
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
         }
@@ -918,7 +920,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            18
+            19
         );
         assert_eq!(migrated.receive_cursor("11", "510_0").unwrap(), "99");
         migrated.replace_live_privacy("11", &[], None).unwrap();

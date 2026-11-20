@@ -1,7 +1,7 @@
 //! Explicit clipboard actions for the currently visible, scoped message. No I/O or raw sidecars.
 use super::{visuals, ModalFocus, NativeApp};
 use crate::domain::{MediaDescriptor, Message};
-use eframe::egui::{self, pos2, vec2, Align2, FontId, Rect, Sense, Stroke};
+use eframe::egui::{self, pos2, vec2, FontId, Rect, Sense, Stroke};
 
 const MENU_WIDTH: f32 = 216.0;
 const ROW_HEIGHT: f32 = 32.0;
@@ -118,9 +118,20 @@ pub(super) fn action_row(
     enabled: bool,
     destructive: bool,
 ) -> egui::Response {
+    action_row_height(ui, label, glyph, enabled, destructive, ROW_HEIGHT)
+}
+
+pub(super) fn action_row_height(
+    ui: &mut egui::Ui,
+    label: &str,
+    glyph: &str,
+    enabled: bool,
+    destructive: bool,
+    height: f32,
+) -> egui::Response {
     let (rect, response) = ui
         .add_enabled_ui(enabled, |ui| {
-            ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click())
+            ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click())
         })
         .inner;
     let colors = crate::theme::palette(ui.ctx());
@@ -144,11 +155,17 @@ pub(super) fn action_row(
         glyph,
         icon,
     );
-    ui.painter().text(
-        pos2(rect.left() + 39.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
+    let mut label_job = egui::text::LayoutJob::simple_singleline(
+        label.into(),
         FontId::proportional(visuals::TEXT_BODY),
+        ink,
+    );
+    label_job.wrap.max_width = (rect.width() - 50.0).max(1.0);
+    label_job.wrap.max_rows = 1;
+    let galley = ui.painter().layout_job(label_job);
+    ui.painter().galley(
+        pos2(rect.left() + 39.0, rect.center().y - galley.size().y / 2.0),
+        galley,
         ink,
     );
     visuals::focus_outline(ui, &response, row, 7.0);
@@ -383,12 +400,15 @@ impl NativeApp {
         let can_reply = !self.demo
             && !group_left
             && reply.is_some()
+            && !self.has_draft_mentions()
             && self.drafts.active.attachment().is_none()
             && !self.photo_selected();
         let reply_unavailable = if self.demo {
             "Bản demo chưa hỗ trợ trả lời tin nhắn Zalo."
         } else if group_left {
             "Bạn đã rời nhóm. Lịch sử vẫn có thể xem."
+        } else if self.has_draft_mentions() {
+            "Xóa phần nhắc thành viên để viết trả lời."
         } else if message.media.is_some() || message.sticker.is_some() {
             "Hiện chỉ hỗ trợ trả lời tin nhắn văn bản."
         } else if self.photo_selected() {
@@ -549,6 +569,7 @@ mod tests {
 
     fn message() -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

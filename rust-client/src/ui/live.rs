@@ -55,6 +55,8 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub groups: super::group_members::Groups,
     #[cfg(feature = "messaging")]
+    pub mention_picker: super::mentions::Picker,
+    #[cfg(feature = "messaging")]
     pub uploads: super::file_uploads::Uploads,
     #[cfg(feature = "messaging")]
     pub photo_preview: super::photos::Preview,
@@ -131,6 +133,8 @@ impl LiveState {
             recall: Default::default(),
             #[cfg(feature = "messaging")]
             groups: Default::default(),
+            #[cfg(feature = "messaging")]
+            mention_picker: Default::default(),
             #[cfg(feature = "messaging")]
             uploads: Default::default(),
             #[cfg(feature = "messaging")]
@@ -251,6 +255,7 @@ impl LiveState {
                 self.forwarding.worker_closed();
                 self.recall.worker_closed();
                 self.groups.worker_closed();
+                self.mention_picker.set_scope(None);
                 self.photo_preview.clear();
             }
             _ => {}
@@ -280,6 +285,7 @@ impl LiveState {
         self.forwarding.worker_closed();
         self.recall.worker_closed();
         self.groups.worker_closed();
+        self.mention_picker.set_scope(None);
         self.photo_preview.clear();
         self.directory.worker_closed();
         self.sender_names.worker_closed();
@@ -577,6 +583,7 @@ impl NativeApp {
                         state.forwarding = Default::default();
                         state.recall = Default::default();
                         state.groups = Default::default();
+                        state.mention_picker = Default::default();
                         state.uploads = Default::default();
                         state.photo_preview.clear();
                         state.directory = Default::default();
@@ -748,6 +755,7 @@ impl NativeApp {
             state.forwarding.worker_closed();
             state.recall.worker_closed();
             state.groups.worker_closed();
+            state.mention_picker.set_scope(None);
             state.privacy.reset_worker();
             state.privacy.status = crate::app::live::LivePrivacyStatus::Failed;
             self.quarantine_privacy(state, ctx, true);
@@ -805,6 +813,7 @@ impl NativeApp {
             .reactions
             .observe_snapshot(&event, reaction_scope.as_ref());
         state.groups.observe(&event);
+        state.mention_picker.observe(&event);
         state.privacy.observe_conversation(&event);
         self.quarantine_privacy(state, ctx, false);
         if let LiveEvent::Recalled {
@@ -937,6 +946,7 @@ impl NativeApp {
                             state.forwarding = Default::default();
                             state.recall = Default::default();
                             state.groups = Default::default();
+                            state.mention_picker = Default::default();
                             state.uploads = Default::default();
                             state.photo_preview.clear();
                             state.directory = Default::default();
@@ -1764,6 +1774,7 @@ pub(in crate::ui) mod tests {
         let (mut app, root) = fixture(&ctx);
         let thread = "d:22";
         let original = crate::domain::Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -1939,6 +1950,7 @@ pub(in crate::ui) mod tests {
                 let (mut app, root) = fixture(&ctx);
                 app.live.as_mut().unwrap().connection = connection;
                 let message = crate::domain::Message {
+                    mentions: Vec::new(),
                     reply_blocked: false,
                     recalled: false,
                     source_client_id: None,
@@ -2279,9 +2291,18 @@ pub(in crate::ui) mod tests {
             geometry: Option<[f32; 4]>,
             grab: crate::ui::shot_fixture::Grabber,
             menu_opened: bool,
+            mention_scene: bool,
+            mention_caret_seeded: bool,
         }
         impl eframe::App for MeasuredFixture {
             fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+                if self.mention_scene {
+                    // A bare X11 test display may have no window manager to give us focus.
+                    input.focused = true;
+                    if let Some(viewport) = input.viewports.get_mut(&input.viewport_id) {
+                        viewport.focused = Some(true);
+                    }
+                }
                 self.app.raw_input_hook(ctx, input);
             }
 
@@ -2331,7 +2352,36 @@ pub(in crate::ui) mod tests {
                     }
                 }
                 self.app.update(ctx, frame);
-                self.grab.tick(ctx);
+                if self.mention_scene && !self.mention_caret_seeded {
+                    if let Some((id, mut editor)) =
+                        ctx.memory(|memory| memory.focused()).and_then(|id| {
+                            egui::TextEdit::load_state(ctx, id).map(|editor| (id, editor))
+                        })
+                    {
+                        let end = self.app.drafts.active.text.chars().count();
+                        editor
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::one(
+                                egui::text::CCursor::new(end),
+                            )));
+                        editor.store(ctx, id);
+                        self.mention_caret_seeded = true;
+                        ctx.request_repaint();
+                    }
+                }
+                self.grab.tick(ctx, || {
+                    if self.mention_scene {
+                        assert!(
+                            self.app
+                                .live
+                                .as_ref()
+                                .unwrap()
+                                .mention_picker
+                                .fixture_shown(),
+                            "mention fixture must capture the two visible member suggestions"
+                        );
+                    }
+                });
             }
         }
         let width = std::env::var("ZALO_UI_FIXTURE_WIDTH")
@@ -2396,6 +2446,8 @@ pub(in crate::ui) mod tests {
                             geometry: None,
                             grab: Default::default(),
                             menu_opened: false,
+                            mention_scene: false,
+                            mention_caret_seeded: false,
                         }) as Box<dyn eframe::App>
                     })
                     .map_err(Into::into);
@@ -2420,6 +2472,7 @@ pub(in crate::ui) mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (thread, sender, text))| crate::domain::Message {
+                        mentions: Vec::new(),
                         reply_blocked: false,
                         recalled: false,
                         source_client_id: None,
@@ -2498,6 +2551,34 @@ pub(in crate::ui) mod tests {
                         last.sent_at_ms += 2000;
                         app.model.messages.push(last);
                         app.start_message_selection("fixture-1");
+                    }
+                    Some("mentions") => {
+                        let group = "g:44";
+                        app.model.conversations[0].id = group.into();
+                        app.model.conversations[0].title = "Nhóm kiểm thử nhắc tên".into();
+                        app.model.messages[0].thread_id = group.into();
+                        app.model.messages[0].text =
+                            "Chào @Tài khoản thử, nhóm mình xem bản thiết kế chiều nay nhé.".into();
+                        app.model.messages[0].mentions = vec![crate::domain::mention::Mention {
+                            uid: "11".into(),
+                            pos: 5,
+                            len: "@Tài khoản thử".encode_utf16().count() as u32,
+                        }];
+                        app.model.selected = Some(group.into());
+                        app.drafts.select(group).unwrap();
+                        app.drafts.active.text = "Chào @nguy".into();
+                        app.focus_composer = true;
+                        let auth = app.auth_generation();
+                        let state = app.live.as_mut().unwrap();
+                        state
+                            .mention_picker
+                            .fixture(super::super::group_members::Scope {
+                                account: "11".into(),
+                                auth,
+                                thread: group.into(),
+                                generation: app.model.generation,
+                                privacy_revision: state.privacy.revision,
+                            });
                     }
                     _ => {}
                 }
@@ -2611,6 +2692,7 @@ pub(in crate::ui) mod tests {
                         .into_iter()
                         .enumerate()
                         .map(|(i, sticker)| Message {
+                            mentions: Vec::new(),
                             reply_blocked: false,
                             recalled: false,
                             source_client_id: None,
@@ -2734,6 +2816,7 @@ pub(in crate::ui) mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (sender, text))| Message {
+                        mentions: Vec::new(),
                         reply_blocked: false,
                         recalled: false,
                         source_client_id: None,
@@ -2854,6 +2937,7 @@ pub(in crate::ui) mod tests {
                 if std::env::var_os("ZALO_UI_FIXTURE_REPLY").is_some() {
                     use crate::domain::{Message, MessageQuote};
                     let original = Message {
+                        mentions: Vec::new(),
                         reply_blocked: false,
                         recalled: false,
                         account_id: "11".into(),
@@ -2873,6 +2957,7 @@ pub(in crate::ui) mod tests {
                     let messages = vec![
                         original.clone(),
                         Message {
+                            mentions: Vec::new(),
                             reply_blocked: false,
                             recalled: false,
                             account_id: "11".into(),
@@ -2887,6 +2972,7 @@ pub(in crate::ui) mod tests {
                             sent_at_ms: 1_700_000_060_000,
                         },
                         Message {
+                            mentions: Vec::new(),
                             reply_blocked: false,
                             recalled: false,
                             account_id: "11".into(),
@@ -3018,6 +3104,7 @@ pub(in crate::ui) mod tests {
                         sender: "22".into(),
                         source_client_id: None,
                         quote: None,
+                        mentions: Vec::new(),
                         reply_blocked: true,
                         recalled: false,
                         sticker: None,
@@ -3114,6 +3201,8 @@ pub(in crate::ui) mod tests {
                     geometry: None,
                     grab: Default::default(),
                     menu_opened: false,
+                    mention_scene: interactions_scene.as_deref() == Some("mentions"),
+                    mention_caret_seeded: false,
                 }))
             }),
         )
@@ -3200,6 +3289,7 @@ pub(in crate::ui) mod tests {
             .map(|(i, (kind, source, failed))| {
                 let content = MediaMessageContent::new(kind, &source).unwrap();
                 let message = Message {
+                    mentions: Vec::new(),
                     reply_blocked: false,
                     recalled: false,
                     source_client_id: None,
@@ -3226,6 +3316,7 @@ pub(in crate::ui) mod tests {
         if mode == "files" {
             messages.push((
                 Message {
+                    mentions: Vec::new(),
                     reply_blocked: false,
                     recalled: false,
                     source_client_id: None,

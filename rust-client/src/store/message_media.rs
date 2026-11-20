@@ -259,6 +259,7 @@ mod tests {
         let content = media_content(kind, 1);
         (
             Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 source_client_id: None,
@@ -292,6 +293,7 @@ mod tests {
         }))
         .unwrap();
         let m = Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -678,7 +680,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            18
+            19
         );
     }
 
@@ -731,7 +733,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            18
+            19
         );
         for m in originals {
             assert_eq!(

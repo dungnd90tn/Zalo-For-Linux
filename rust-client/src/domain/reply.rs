@@ -153,6 +153,7 @@ impl Message {
         }
         if self.recalled
             || self.reply_blocked
+            || !self.mentions.is_empty()
             || self.sticker.is_some()
             || self.media.is_some()
             || !self

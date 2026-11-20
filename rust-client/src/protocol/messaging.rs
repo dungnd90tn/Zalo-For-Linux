@@ -959,18 +959,32 @@ fn incoming_with_reason(
             if info_bytes > MAX_INFO_BATCH_BYTES {
                 return Err(WireError::Oversize);
             }
-            let reply_blocked = !(message_type == "webchat"
+            let ordinary_text = message_type == "webchat"
                 && info.is_none()
                 && !structured_webchat
                 && legacy
-                && v.get("mentions").is_none_or(|value| {
-                    value.is_null() || value.as_array().is_some_and(|items| items.is_empty())
-                })
                 && v.get("textProperties")
                     .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
                 && v.get("ttl")
-                    .is_none_or(|value| value.is_null() || value.as_u64() == Some(0)));
-            let source_client_id = if !reply_blocked {
+                    .is_none_or(|value| value.is_null() || value.as_u64() == Some(0));
+            let has_mentions = v.get("mentions").is_some_and(|value| {
+                !value.is_null() && !value.as_array().is_some_and(|items| items.is_empty())
+            });
+            let mentions = if scope == IncomingScope::AuthenticatedQueue
+                && kind == ThreadKind::Group
+                && ordinary_text
+                && has_mentions
+            {
+                content
+                    .and_then(Value::as_str)
+                    .map_or_else(Vec::new, |text| {
+                        super::mention::incoming(text, v.get("mentions"))
+                    })
+            } else {
+                Vec::new()
+            };
+            let reply_blocked = !ordinary_text || has_mentions;
+            let source_client_id = if !reply_blocked || !mentions.is_empty() {
                 v.get("cliMsgId").and_then(|value| id_string(value).ok())
             } else {
                 None
@@ -979,6 +993,7 @@ fn incoming_with_reason(
                 reply_blocked,
                 recalled: false,
                 source_client_id,
+                mentions,
                 quote,
                 account_id: account.into(),
                 thread_id: thread,
@@ -1013,7 +1028,10 @@ fn incoming_with_reason(
             // it independently from server msgId. Zero/null carry no usable
             // client-generated correlation. Never treat these sentinels
             // as an outbox identity; durable server binding remains authoritative.
-            let client_id = match v.get("cliMsgId").filter(|_| !structured_webchat) {
+            let client_id = match v
+                .get("cliMsgId")
+                .filter(|_| !structured_webchat && (!has_mentions || !message.mentions.is_empty()))
+            {
                 None | Some(Value::Null) => None,
                 Some(Value::Number(n)) if n.as_u64() == Some(0) => None,
                 Some(Value::String(s)) if s == "0" => None,
@@ -1388,6 +1406,29 @@ mod tests {
             key: (0..32).collect(),
             authenticated: true,
         }
+    }
+
+    #[test]
+    fn authenticated_plain_group_mentions_keep_text_when_span_is_malformed() {
+        let group = |id, pos| {
+            json!({
+                "uidFrom":"44","idTo":"33","msgId":id,"cliMsgId":"992","ts":17,
+                "msgType":"webchat","content":"😀 @Ánh",
+                "mentions":[{"pos":pos,"len":4,"uid":"22","type":0}]
+            })
+        };
+        let wire = json!({"error_code":0,"data":{"groupMsgs":[group("910",3),group("911",1)]}});
+        let messages = authenticated().incoming_messages("11", &wire).unwrap();
+        assert_eq!(messages[0].message.mentions[0].uid, "22");
+        assert_eq!(messages[0].client_id.as_deref(), Some("992"));
+        assert!(messages[0].message.reply_reference().is_none());
+        assert_eq!(messages[1].message.text, "😀 @Ánh");
+        assert!(messages[1].message.mentions.is_empty());
+        assert!(messages[1].client_id.is_none());
+        assert!(incoming_messages("11", &wire).unwrap()[0]
+            .message
+            .mentions
+            .is_empty());
     }
 
     #[test]

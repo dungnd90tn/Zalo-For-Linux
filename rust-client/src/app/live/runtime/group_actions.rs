@@ -231,13 +231,17 @@ impl Ticket {
     }
 }
 
-type RosterTask = (Ticket, JoinHandle<Option<GroupMemberPage>>);
+type RosterTask = (
+    Ticket,
+    JoinHandle<Option<(GroupMemberPage, group_roster::Proof)>>,
+);
 type MutationTask = (Ticket, Option<String>, JoinHandle<GroupActionOutcome>);
 
 #[derive(Default)]
 pub(super) struct Groups {
     roster: Option<RosterTask>,
     mutation: Option<MutationTask>,
+    pub member_proof: Option<group_roster::Proof>,
 }
 
 impl Drop for Groups {
@@ -262,7 +266,11 @@ impl Groups {
         tokio::select! {
             result = async { (&mut self.roster.as_mut().expect("guarded roster").1).await }, if self.roster.is_some() => {
                 let (ticket, _) = self.roster.take().expect("completed roster");
-                ticket.roster(result.ok().flatten())
+                let page = result.ok().flatten().map(|(page, proof)| {
+                    self.member_proof = Some(proof);
+                    page
+                });
+                ticket.roster(page)
             },
             result = async { (&mut self.mutation.as_mut().expect("guarded mutation").2).await }, if self.mutation.is_some() => {
                 let (ticket, member, _) = self.mutation.take().expect("completed mutation");
@@ -291,6 +299,7 @@ impl Groups {
                 let ticket = Ticket::new(events, request_id, thread, privacy_revision);
                 let request = ticket.roster_request(after);
                 self.cancel_roster();
+                self.member_proof = None;
                 if !online || request_id == 0 || !request.permits(&events.privacy) {
                     events.emit(ticket.roster(None)).await?;
                     return Ok(None);
@@ -400,6 +409,7 @@ impl Groups {
                 .emit(ticket.finished(member, GroupActionOutcome::NotSent))
                 .await;
         }
+        self.member_proof = None;
         let (client, session, policy, db) = (
             client.clone(),
             session.clone(),
@@ -421,12 +431,12 @@ async fn fetch_roster(
     policy: &std::sync::RwLock<privacy::Projection>,
     db: &DatabaseHandle,
     request: &group_roster::Request,
-) -> Result<GroupMemberPage> {
+) -> Result<(GroupMemberPage, group_roster::Proof)> {
     let (account, thread) = (session.account_id().to_owned(), request.thread.clone());
     let (guard_account, guard_thread) = (account.clone(), thread.clone());
     db.call(move |store| store.validate_group_scope(&guard_account, &guard_thread))
         .await?;
-    let page = group_roster::load_page(client, session, policy, request).await?;
+    let (page, proof) = group_roster::load_page(client, session, policy, request).await?;
     let confirmed_members: Vec<_> = page
         .members
         .iter()
@@ -444,7 +454,7 @@ async fn fetch_roster(
     if !request.permits(policy) {
         return Err(WireError::Unsupported.into());
     }
-    Ok(page)
+    Ok((page, proof))
 }
 
 async fn run_mutation(

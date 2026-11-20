@@ -500,6 +500,7 @@ mod tests {
             text: "Tin nhắn tổng hợp".into(),
             sent_at_ms: 20,
             source_client_id: None,
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             quote: None,
@@ -548,7 +549,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            18
+            19
         );
         assert_eq!(store.receive_cursor("11", "510_0").unwrap(), "99");
         let column: String = store

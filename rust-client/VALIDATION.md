@@ -1572,3 +1572,35 @@ pointer click on the demo composer button saved exactly one committed draft.
 The user confirmed sticker sending and adding/removing reactions between Linux
 and phone on 2.0.5-2. Detailed direct/group, catalog search and offline reaction
 catch-up acceptance remain tracked in the [release plan](PLAN_2.0.5.md).
+
+## Ordinary group mentions (2.0.6 development branch)
+
+Individual mentions use the `/api/group/mention` payload in the PC bundle at
+N399977–399996. The composer filters the verified, visible membership of an
+ordinary group with up to 100 members. Its scoped picker lists up to five
+matches and accepts a click or arrow keys followed by Enter. Each message can
+carry up to 32 annotations. The initial implementation covers plain text in
+visible groups with a verified ordinary route and zero auto-delete TTL.
+
+Local TLS/WSS exercises the encrypted request path, the exact offsets for
+Vietnamese names after emoji, and rejection of stale privacy revisions and IDs
+outside the current roster. The worker can reuse an authenticated roster proof
+for up to 20 seconds. Storage tests cover the schema 18 upgrade, typed own-echo
+matching after an uncertain send and ACK recovery across restart. An unsupported
+or malformed inbound annotation leaves the message text readable.
+
+Four isolated X11 captures at 640×480 and 1200×780 verified the picker and
+mention highlighting in both themes. The fixture requires
+`ZALO_UI_FIXTURE_READY=1 ZALO_UI_FIXTURE_INTERACTIONS=mentions` and the ignored
+`ui::live::tests::signed_in_offline_native_window_fixture` test. Connection
+traces showed no IPv4 or IPv6 connections. UI tests cover the Enter guard while
+IME is composing and preservation of existing whitespace when choosing a name
+in the middle of a draft. Zalo service acceptance and a real x-unikey pass for
+this new picker remain pending.
+
+The default `scripts/rust/check.sh` checks passed, including 307 Rust tests
+and 19 Python tooling tests. `cargo test --locked --offline --all-features`
+passed 840 tests with five opt-in tests ignored. Strict all-feature,
+all-target Clippy passed. The optimized `live` build passed
+`scripts/rust/smoke-release.py --expect-live`, including upgrade from schema 18
+to 19, preservation of saved messages and idempotent restart.

@@ -242,44 +242,53 @@ pub(crate) fn verify_group(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn roster_page(
     payload: &Value,
     account: &str,
     target: &Target,
     after: Option<&str>,
 ) -> Result<Page, WireError> {
-    let VerifiedGroup {
-        versions,
-        owner,
-        admins,
-        restricted,
-        permissions,
-    } = verify_group(payload, account, target)?;
-    let total = versions.len() as u32;
-    let mut selected: Vec<_> = versions
-        .into_iter()
+    project_page(
+        &verify_group(payload, account, target)?,
+        account,
+        target,
+        after,
+    )
+}
+
+pub(crate) fn project_page(
+    group: &VerifiedGroup,
+    account: &str,
+    target: &Target,
+    after: Option<&str>,
+) -> Result<Page, WireError> {
+    let total = group.versions.len() as u32;
+    let mut selected: Vec<_> = group
+        .versions
+        .iter()
         .filter_map(|(id, version)| {
-            let role = if id == owner {
+            let role = if *id == group.owner {
                 Role::Owner
-            } else if admins.contains(&id) {
+            } else if group.admins.contains(id) {
                 Role::Deputy
             } else {
                 Role::Member
             };
-            if restricted && role == Role::Member && id != account {
+            if group.restricted && role == Role::Member && id != account {
                 None
             } else {
                 Some((id, version, role))
             }
         })
         .collect();
-    selected.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    selected.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(b.0)));
     let mut fingerprint = Sha256::new();
     fingerprint.update(account.as_bytes());
     fingerprint.update(b":");
     fingerprint.update(target.remote_id.as_bytes());
     fingerprint.update(total.to_le_bytes());
-    fingerprint.update([u8::from(restricted)]);
+    fingerprint.update([u8::from(group.restricted)]);
     for (id, version, role) in &selected {
         fingerprint.update(id.as_bytes());
         fingerprint.update(b":");
@@ -300,7 +309,7 @@ pub(crate) fn roster_page(
         .skip(start)
         .take(PAGE_SIZE)
         .map(|(id, _, role)| Member {
-            id,
+            id: id.clone(),
             name: None,
             role: Some(role),
         })
@@ -308,9 +317,9 @@ pub(crate) fn roster_page(
     Ok(Page {
         members,
         total: Some(total),
-        restricted,
+        restricted: group.restricted,
         next,
-        permissions,
+        permissions: group.permissions,
     })
 }
 

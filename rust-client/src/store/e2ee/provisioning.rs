@@ -1171,6 +1171,7 @@ mod tests {
             .unwrap();
         store
             .insert_batch(&[Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 source_client_id: None,
