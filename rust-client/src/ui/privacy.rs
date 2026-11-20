@@ -491,6 +491,7 @@ impl NativeApp {
             state.photo_preview.clear();
             state.avatars = Default::default();
             state.stickers = Default::default();
+            state.sticker_send.clear_picker();
             state.reactions.reset_view();
             state.directory.privacy_reset(ctx, state.privacy.ready());
             state.forwarding.clear_picker();

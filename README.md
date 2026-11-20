@@ -15,7 +15,7 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 - **Tôn trọng hội thoại đã ẩn trên Zalo:** loại khỏi danh sách thông thường; tìm tên và nhập PIN Zalo hiện có để mở riêng hội thoại được chọn.
 - **Hiển thị nội dung nhận được:** văn bản, thông báo hệ thống, sticker (tĩnh và động, hiển thị không nền), ảnh và một số thẻ OA/nội dung được chia sẻ. Hỗ trợ PNG/JPEG/WebP và một phần JPEG XL tĩnh; ảnh đã tải có thể mở trong khung xem của ứng dụng.
 - **Trả lời và gửi tệp:** trả lời tin văn bản thường, gửi một tệp tối đa 100 MiB hoặc một ảnh HD tĩnh, có tiến độ và nút hủy. Ảnh HD có bản xem trước và chú thích.
-- **Sticker và cảm xúc.** Gửi sticker mặc định hoặc tìm theo từ khóa khi phiên Zalo hỗ trợ danh mục. Menu chuột phải có sáu cảm xúc và thao tác sao chép nhiều tin văn bản trên trang hiện tại.
+- **Sticker và cảm xúc.** Gửi sticker mặc định, tìm theo từ khóa hoặc mở **Bộ nhãn dán** để duyệt và gửi từ các bộ công khai mà phiên Zalo trả trực tiếp trong danh mục. Menu chuột phải có sáu cảm xúc và thao tác sao chép nhiều tin văn bản trên trang hiện tại.
 - **Chuyển tiếp và thu hồi:** chuyển tiếp một tin văn bản cá nhân thông thường đến tối đa 10 bạn bè và xem kết quả cho từng người. Bấm chuột phải và chọn **Thu hồi** cho tin văn bản thông thường do bạn gửi còn trong thời hạn cho phép. Tính năng áp dụng trong chat cá nhân và nhóm thường tối đa 100 thành viên mà bạn vẫn tham gia.
 - **Theo dõi tin mới:** lọc hội thoại **Chưa đọc** theo các tin mới nhận trên máy này. Tin gửi hiện trạng thái chuyển/đã xem khi có dữ liệu xác nhận.
 - **Thông báo Linux:** mặc định chỉ báo **Bạn có tin nhắn mới**. Bật xem trước nội dung ở **bánh răng → Thông báo**. Hội thoại ẩn hoặc đang tắt thông báo không phát cảnh báo.

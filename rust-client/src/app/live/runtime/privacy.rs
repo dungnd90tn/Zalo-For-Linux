@@ -115,11 +115,21 @@ impl Projection {
             }
             LiveEvent::StickersFound {
                 thread, stickers, ..
+            }
+            | LiveEvent::StickerPackFound {
+                thread, stickers, ..
             } if !self.confirmed
                 || self.status != LivePrivacyStatus::Ready
                 || self.hidden.contains(thread) =>
             {
                 *stickers = None;
+            }
+            LiveEvent::StickerPacksFound { thread, packs, .. }
+                if !self.confirmed
+                    || self.status != LivePrivacyStatus::Ready
+                    || self.hidden.contains(thread) =>
+            {
+                *packs = None;
             }
             LiveEvent::Avatars { avatars, .. } => {
                 avatars.retain(|entry| self.permits(&entry.thread_id))

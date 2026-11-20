@@ -17,7 +17,9 @@ use std::{
 };
 
 #[cfg(feature = "messaging")]
-use crate::app::live::{LiveCommand, LiveConnection, LiveEvent, LiveWorker, ThreadKind};
+use crate::app::live::{
+    LiveCommand, LiveConnection, LiveEvent, LivePrivacyStatus, LiveWorker, ThreadKind,
+};
 
 pub(super) struct Account {
     pub id: String,
@@ -711,7 +713,19 @@ impl NativeApp {
         }
         // Durable settlement is independent of whether its conversation is still visible.
         state.uploads.observe(&event);
-        state.sticker_send.observe(&event);
+        let sticker_catalog_thread = match &event {
+            LiveEvent::StickersFound { thread, .. }
+            | LiveEvent::StickerPacksFound { thread, .. }
+            | LiveEvent::StickerPackFound { thread, .. } => Some(thread.as_str()),
+            _ => None,
+        };
+        if sticker_catalog_thread.is_none_or(|thread| {
+            self.model.selected.as_deref() == Some(thread)
+                && state.privacy.status == LivePrivacyStatus::Ready
+                && state.privacy.list_visible(thread)
+        }) {
+            state.sticker_send.observe(&event);
+        }
         state.reactions.observe_outcome(&event);
         state
             .attention
@@ -2551,12 +2565,17 @@ pub(in crate::ui) mod tests {
                     app.drafts.active.text = "Bản nháp ngoại tuyến".into();
                 }
                 match interactions_scene.as_deref() {
-                    Some("stickers" | "stickers-search") => {
+                    Some(
+                        "stickers" | "stickers-search" | "sticker-packs" | "sticker-pack-detail",
+                    ) => {
                         let state = app.live.as_mut().unwrap();
                         state.sticker_fixture = true;
                         state.sticker_fixture_open = true;
-                        if interactions_scene.as_deref() == Some("stickers-search") {
-                            state.sticker_send.fixture_catalog();
+                        match interactions_scene.as_deref() {
+                            Some("stickers-search") => state.sticker_send.fixture_catalog(),
+                            Some("sticker-packs") => state.sticker_send.fixture_packs(false),
+                            Some("sticker-pack-detail") => state.sticker_send.fixture_packs(true),
+                            _ => {}
                         }
                         super::super::sticker_picker::fixture_thumbnails(
                             &mut state.stickers,

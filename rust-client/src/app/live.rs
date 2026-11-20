@@ -149,6 +149,7 @@ impl Drop for HiddenPin {
 }
 
 use crate::domain::read_state::{MessageDelivery, NotificationPreferences, ThreadReadState};
+pub use crate::protocol::sticker_catalog::StickerPack;
 pub use crate::store::forward::ForwardTarget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +306,16 @@ pub enum LiveCommand {
         request_id: u64,
         thread: String,
         query: String,
+    },
+    ListStickerPacks {
+        request_id: u64,
+        thread: String,
+    },
+    BrowseStickerPack {
+        request_id: u64,
+        thread: String,
+        pack_list_id: u64,
+        category_id: u64,
     },
     SendCatalogSticker {
         request_id: u64,
@@ -562,6 +573,19 @@ pub enum LiveEvent {
         thread: String,
         stickers: Option<Vec<crate::domain::StickerDescriptor>>,
     },
+    StickerPacksFound {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        packs: Option<Vec<StickerPack>>,
+    },
+    StickerPackFound {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        category_id: u64,
+        stickers: Option<Vec<crate::domain::StickerDescriptor>>,
+    },
     ReadState {
         account_id: String,
         generation: u64,
@@ -785,6 +809,8 @@ impl LiveEvent {
             | Self::StickerFinished { account_id, .. }
             | Self::StickerSearchCapability { account_id, .. }
             | Self::StickersFound { account_id, .. }
+            | Self::StickerPacksFound { account_id, .. }
+            | Self::StickerPackFound { account_id, .. }
             | Self::ReadState { account_id, .. }
             | Self::ReadStateChanged { account_id, .. }
             | Self::NotificationPreferences { account_id, .. }
@@ -910,6 +936,25 @@ impl LiveWorker {
             request_id,
             thread,
             query,
+        })
+        .is_ok()
+    }
+    pub fn sticker_packs(&self, request_id: u64, thread: String) -> bool {
+        self.submit(LiveCommand::ListStickerPacks { request_id, thread })
+            .is_ok()
+    }
+    pub fn browse_sticker_pack(
+        &self,
+        request_id: u64,
+        thread: String,
+        pack_list_id: u64,
+        category_id: u64,
+    ) -> bool {
+        self.submit(LiveCommand::BrowseStickerPack {
+            request_id,
+            thread,
+            pack_list_id,
+            category_id,
         })
         .is_ok()
     }
@@ -1204,6 +1249,25 @@ impl LiveWorker {
             } => {
                 *request_id > 0
                     && crate::protocol::sticker_catalog::valid_query(query)
+                    && Target::from_thread(thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
+            }
+            LiveCommand::ListStickerPacks { request_id, thread } => {
+                *request_id > 0
+                    && Target::from_thread(thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
+            }
+            LiveCommand::BrowseStickerPack {
+                request_id,
+                thread,
+                pack_list_id,
+                category_id,
+            } => {
+                *request_id > 0
+                    && *pack_list_id > 0
+                    && crate::protocol::sticker_catalog::valid_pack_id(*category_id)
                     && Target::from_thread(thread).is_ok_and(|target| {
                         target.kind == ThreadKind::Group || target.remote_id != self.account
                     })
@@ -1902,6 +1966,8 @@ impl super::Model {
             | LiveEvent::StickerFinished { .. }
             | LiveEvent::StickerSearchCapability { .. }
             | LiveEvent::StickersFound { .. }
+            | LiveEvent::StickerPacksFound { .. }
+            | LiveEvent::StickerPackFound { .. }
             | LiveEvent::ReadState { .. }
             | LiveEvent::ReadStateChanged { .. }
             | LiveEvent::NotificationPreferences { .. }

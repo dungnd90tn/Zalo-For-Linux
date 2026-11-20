@@ -1693,3 +1693,28 @@ Real-account verification remains pending. Use a disposable profile and a
 group with a second test account. Confirm both clients show the same recall,
 then reopen the thread and check that the original text stays hidden in local
 history, search, quotes and pinned-message previews.
+
+## Public sticker pack browsing (2.0.6 development branch)
+
+The native composer has a **Bộ nhãn dán** tab alongside the default set and
+keyword search. It uses the authenticated sticker service's category list v2
+and category sticker detail (PC bundle N398920–398946 and N519921–519993).
+The list accepts public packs from the authenticated inline array. A response
+with only an external manifest is shown as unavailable. The picker filters
+hidden packs and sends ordinary type-3 stickers through the existing outbox.
+It uses the same profile schema and loads thumbnails only for visible tiles.
+
+The parser and loopback fixtures exercise the encrypted category requests,
+scope and proof invalidation on a newer request, excluded packs, foreign or
+unsupported stickers, and sends to both a direct chat and a group. The
+fixture supplies an untrusted catalog URL and expects zero requests to it.
+Isolated X11 captures of `ZALO_UI_FIXTURE_INTERACTIONS=sticker-packs` and
+`sticker-pack-detail` covered both themes at 640×480 and 1200×780. Connection
+traces contained no IPv4 or IPv6 connections.
+
+The all-feature suite passed 869 Rust tests with five opt-in tests ignored.
+Default checks passed 308 Rust and 19 Python tests. Strict all-feature,
+all-target Clippy and the offline source oracle passed. The optimized live
+binary passed the schema 20 profile upgrade and restart smoke test.
+
+Real-account catalog availability and cross-device sending remain pending.

@@ -2383,10 +2383,12 @@ async fn handle_command(
             )
             .await;
         }
-        LiveCommand::SearchStickers {
-            request_id, thread, ..
-        } => {
-            sticker_catalog::publish(events, request_id, thread, None).await?;
+        command @ (LiveCommand::SearchStickers { .. }
+        | LiveCommand::ListStickerPacks { .. }
+        | LiveCommand::BrowseStickerPack { .. }) => {
+            if let Some(request) = sticker_catalog::Request::from_command(&command) {
+                request.unavailable(events).await?;
+            }
         }
         LiveCommand::SendCatalogSticker {
             request_id,
@@ -2748,7 +2750,7 @@ async fn run_inner(
                 recall::complete(&db, events, completed).await?;
             },
             found = sticker_search.next() => {
-                sticker_search.complete(found, events).await?;
+                sticker_search.complete(found, sticker_catalog::authenticated_at(connection.as_ref()), events).await?;
             },
             completed = reactions.next() => {
                 reactions::complete(&db, events, completed).await?;
@@ -2766,6 +2768,11 @@ async fn run_inner(
                 let Some(command) = groups.command(command, online, &db, events, &session, &client).await? else { continue; };
                 let Some(command) = attention.command(command, &db, events).await? else { continue; };
                 let Some(command) = forwards.command(command, connection.as_ref(), &db, events, &session, &client).await? else { continue; };
+                let sticker_session = sticker_catalog::authenticated_at(connection.as_ref());
+                if let Some(request) = sticker_catalog::Request::from_command(&command) {
+                    sticker_search.start(request, sticker_session, events, &session, &client).await?;
+                    continue;
+                }
                 let command = match command {
                     LiveCommand::SendMentions { generation, thread, text, mentions, privacy_revision, request_id } => {
                         let request = mentions::Request { generation, thread, text, mentions, privacy_revision, request_id };
@@ -2781,15 +2788,8 @@ async fn run_inner(
                         }
                         continue;
                     }
-                    LiveCommand::SearchStickers { request_id, thread, query } => {
-                        sticker_search.start(
-                            sticker_catalog::Request { id: request_id, thread, query },
-                            online, events, &session, &client,
-                        ).await?;
-                        continue;
-                    }
                     LiveCommand::SendCatalogSticker { request_id, search_id, thread, sticker } => {
-                        let authorized = sticker_search.permits(search_id, &thread, sticker, events);
+                        let authorized = sticker_search.permits(search_id, &thread, sticker, sticker_session, events);
                         let socket = connection.as_mut().filter(|_| online && !uploads.active());
                         let outcome = sticker_send::handle(
                             sticker_send::Request { request_id, thread, sticker },
@@ -2911,7 +2911,7 @@ async fn run_inner(
                             recall::complete(&db, events, completed).await?;
                         },
                         found = sticker_search.next() => {
-                            sticker_search.complete(found, events).await?;
+                            sticker_search.complete(found, None, events).await?;
                         },
                         completed = reactions.next() => {
                             reactions::complete(&db, events, completed).await?;
@@ -2928,6 +2928,10 @@ async fn run_inner(
                             let Some(command) = groups.command(command, false, &db, events, &session, &client).await? else { continue; };
                             let Some(command) = attention.command(command, &db, events).await? else { continue; };
                             let Some(command) = forwards.command(command, None, &db, events, &session, &client).await? else { continue; };
+                            if let Some(request) = sticker_catalog::Request::from_command(&command) {
+                                sticker_search.start(request, None, events, &session, &client).await?;
+                                continue;
+                            }
                             let command = match reactions.command(command, None, &db, events, &session, &client).await? {
                                 recall::Command::Continue(command) => command,
                                 recall::Command::Handled => continue,
