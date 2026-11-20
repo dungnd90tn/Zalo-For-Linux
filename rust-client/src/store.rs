@@ -99,6 +99,18 @@ type ReceivedWithRecalls = (
     Vec<recall::RecallChange>,
 );
 
+fn advance_receive_cursor(conn: &Connection, account: &str, queue: &str, id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO receive_cursors(account_id,queue,last_id) VALUES(?1,?2,?3)
+         ON CONFLICT(account_id,queue) DO UPDATE SET last_id=CASE
+           WHEN length(excluded.last_id)>length(last_id)
+             OR (length(excluded.last_id)=length(last_id) AND excluded.last_id>last_id)
+           THEN excluded.last_id ELSE last_id END",
+        params![account, queue, id],
+    )?;
+    Ok(())
+}
+
 /// Closed, payload-free storage diagnostics. Never log an arbitrary error chain:
 /// database driver messages can include SQL or data from a failing trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,7 +394,7 @@ impl MessageStore {
     fn initialize(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 17 {
+        if version > 18 {
             bail!("Database was created by a newer client");
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
@@ -431,7 +443,7 @@ impl MessageStore {
         reactions::initialize(&conn)?;
         message_media::reproject(&conn)?;
         silence_legacy(&conn)?;
-        conn.execute_batch("PRAGMA user_version=17; COMMIT;")?;
+        conn.execute_batch("PRAGMA user_version=18; COMMIT;")?;
         privacy::initialize(&conn)?;
         Ok(Self { conn })
     }
@@ -930,6 +942,15 @@ impl MessageStore {
             .is_some_and(|(_, context)| context == ReceiveContext::LiveFresh);
         let tx = self.conn.transaction()?;
         #[cfg(feature = "messaging")]
+        let has_pending_reactions = message_count > 0
+            && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_reaction_events WHERE account_id=?1)",
+                [account],
+                |row| row.get::<_, bool>(0),
+            )?;
+        #[cfg(feature = "messaging")]
+        let mut changed_reactions = std::collections::BTreeSet::new();
+        #[cfg(feature = "messaging")]
         let changes = {
             if extras.notices.len() > MAX_PAGE_SIZE {
                 bail!(FailureReason::Validation);
@@ -1174,6 +1195,15 @@ impl MessageStore {
             #[cfg(not(feature = "messaging"))]
             let forward_enriched = false;
             let quote_enriched = message_reply::persist(&tx, m, quote)?;
+            #[cfg(feature = "messaging")]
+            if has_pending_reactions
+                && (m.source_client_id.is_some()
+                    || previous_reply.source_client_id.is_some()
+                    || m.reply_blocked)
+                && reactions::reconcile_pending(&tx, account, &m.thread_id, &m.id)?
+            {
+                changed_reactions.insert(m.thread_id.clone());
+            }
             let reply_enriched = quote_enriched
                 || (m.source_client_id.is_some()
                     && m.source_client_id != previous_reply.source_client_id)
@@ -1202,10 +1232,11 @@ impl MessageStore {
         }
         #[cfg(feature = "messaging")]
         if let Some((notices, changed)) = extras.reactions {
-            *changed = reactions::apply(&tx, account, notices)?;
+            changed_reactions.extend(reactions::apply(&tx, account, notices)?);
+            *changed = changed_reactions;
         }
         if let Some((queue, id)) = cursor {
-            tx.execute("INSERT INTO receive_cursors(account_id,queue,last_id) VALUES(?1,?2,?3) ON CONFLICT(account_id,queue) DO UPDATE SET last_id=CASE WHEN length(excluded.last_id)>length(last_id) OR (length(excluded.last_id)=length(last_id) AND excluded.last_id>last_id) THEN excluded.last_id ELSE last_id END",params![account,queue,id])?;
+            advance_receive_cursor(&tx, account, queue, id)?;
         }
         tx.commit()?;
         Ok((result, unread, changes))

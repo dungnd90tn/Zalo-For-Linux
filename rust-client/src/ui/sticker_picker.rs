@@ -1,11 +1,15 @@
-//! Built-in sticker picker. The worker validates and sends each explicit selection.
+//! Native sticker picker for built-in and authenticated catalog results.
 use super::{
     message_actions::Scope, stickers::Presentation, visuals, InteractionNotice, ModalFocus,
     NativeApp,
 };
-use crate::app::{
-    live::{LiveConnection, LiveEvent, StickerOutcome},
-    stickers::builtin_stickers,
+use crate::{
+    app::{
+        live::{LiveConnection, LiveEvent, StickerOutcome},
+        stickers::builtin_stickers,
+    },
+    domain::StickerDescriptor,
+    protocol::sticker_catalog::valid_query,
 };
 use eframe::egui::{self, pos2, vec2, Align2, Rect, RichText, Sense};
 
@@ -14,13 +18,37 @@ const TILE: f32 = 44.0;
 const GAP: f32 = 4.0;
 const PADDING: f32 = 10.0;
 const PICKER_WIDTH: f32 = COLUMNS as f32 * TILE + (COLUMNS - 1) as f32 * GAP;
+#[cfg(test)]
+const CATALOG_FIXTURE: [StickerDescriptor; 2] = [
+    StickerDescriptor {
+        sticker_id: 20695,
+        category_id: 10047,
+        sticker_type: 3,
+    },
+    StickerDescriptor {
+        sticker_id: 20696,
+        category_id: 10047,
+        sticker_type: 3,
+    },
+];
 
 struct Picker {
     scope: Scope,
+    open_id: u64,
     anchor: Rect,
     just_opened: bool,
     action_focus: Option<egui::Id>,
     focus: Option<ModalFocus>,
+    query: String,
+    searching: bool,
+    lookup: Lookup,
+}
+
+enum Lookup {
+    Idle,
+    Pending(u64),
+    Found(u64, Vec<StickerDescriptor>),
+    Unavailable,
 }
 
 #[derive(Default)]
@@ -29,9 +57,18 @@ pub(super) struct StickerSend {
     request: u64,
     pending: Option<(String, u64)>,
     status: Option<InteractionNotice>,
+    search_available: bool,
+    #[cfg(test)]
+    catalog_fixture: bool,
 }
 
 impl StickerSend {
+    #[cfg(test)]
+    pub(super) fn fixture_catalog(&mut self) {
+        self.search_available = true;
+        self.catalog_fixture = true;
+    }
+
     pub(super) fn is_open(&self) -> bool {
         self.picker.is_some()
     }
@@ -41,6 +78,30 @@ impl StickerSend {
     }
 
     pub(super) fn observe(&mut self, event: &LiveEvent) {
+        match event {
+            LiveEvent::StickerSearchCapability { available, .. } => {
+                self.search_available = *available;
+                return;
+            }
+            LiveEvent::StickersFound {
+                request_id,
+                thread,
+                stickers,
+                ..
+            } => {
+                if let Some(picker) = self.picker.as_mut().filter(|picker| {
+                    picker.scope.thread == *thread
+                        && matches!(picker.lookup, Lookup::Pending(id) if id == *request_id)
+                }) {
+                    picker.lookup = match stickers {
+                        Some(stickers) => Lookup::Found(*request_id, stickers.clone()),
+                        None => Lookup::Unavailable,
+                    };
+                }
+                return;
+            }
+            _ => {}
+        }
         let LiveEvent::StickerFinished {
             request_id,
             thread,
@@ -72,6 +133,8 @@ impl StickerSend {
     }
 
     pub(super) fn worker_closed(&mut self) {
+        self.search_available = false;
+        self.picker = None;
         if let Some((thread, _)) = self.pending.take() {
             self.status = Some(InteractionNotice::new(
                 thread,
@@ -177,12 +240,30 @@ impl NativeApp {
                 #[cfg(not(test))]
                 let fixture_open = false;
                 if let Some(scope) = scope.filter(|_| button.clicked() || fixture_open) {
+                    state.sticker_send.request = state.sticker_send.request.wrapping_add(1).max(1);
+                    #[cfg(test)]
+                    let (searching, query, lookup) =
+                        if std::mem::take(&mut state.sticker_send.catalog_fixture) {
+                            (
+                                true,
+                                "chào".into(),
+                                Lookup::Found(1, CATALOG_FIXTURE.to_vec()),
+                            )
+                        } else {
+                            (false, String::new(), Lookup::Idle)
+                        };
+                    #[cfg(not(test))]
+                    let (searching, query, lookup) = (false, String::new(), Lookup::Idle);
                     state.sticker_send.picker = Some(Picker {
                         scope,
+                        open_id: state.sticker_send.request,
                         anchor: button.rect,
                         just_opened: true,
                         action_focus: None,
                         focus,
+                        query,
+                        searching,
+                        lookup,
                     });
                     ui.ctx().request_repaint();
                 }
@@ -201,7 +282,15 @@ impl NativeApp {
         }
         self.latch_modal_input(ctx);
         let can_pick = self.can_pick_sticker();
+        let ime_active = self.ime_composing
+            || ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Ime(_)))
+            });
         let Some(state) = &mut self.live else { return };
+        let search_available = state.sticker_send.search_available;
         let Some(picker) = &mut state.sticker_send.picker else {
             return;
         };
@@ -211,8 +300,8 @@ impl NativeApp {
             .left()
             .min(bounds.right() - PICKER_WIDTH - PADDING * 2.0);
         let y = picker.anchor.top() - 8.0;
-        let grid_height = (y - bounds.top() - 58.0).clamp(TILE, 240.0);
         let mut selection = None;
+        let mut search = false;
         let mut buttons = Vec::new();
         let tab = super::message_actions::popup_tab(ctx, picker.action_focus);
         let response = egui::Area::new(egui::Id::new("sticker_picker"))
@@ -230,24 +319,101 @@ impl NativeApp {
                     .fill(colors.surface)
                     .show(ui, |ui| {
                         ui.set_width(PICKER_WIDTH);
-                        ui.label(RichText::new("Nhãn dán mặc định").strong());
-                        ui.label(
-                            RichText::new(if can_pick {
+                        ui.horizontal(|ui| {
+                            for (searching, label) in [(false, "Mặc định"), (true, "Tìm nhãn dán")] {
+                                let tab = ui.add_sized(
+                                    vec2(68.0, 36.0),
+                                    egui::SelectableLabel::new(picker.searching == searching, label),
+                                );
+                                buttons.push(tab.id);
+                                if tab.clicked() {
+                                    picker.searching = searching;
+                                }
+                                visuals::focus_outline(ui, &tab, tab.rect, 4.0);
+                            }
+                        });
+                        let mut search_id = None;
+                        let mut entries = Vec::new();
+                        let label = if picker.searching {
+                            ui.horizontal(|ui| {
+                                let edit = ui.add_enabled(
+                                    can_pick && search_available,
+                                    egui::TextEdit::singleline(&mut picker.query)
+                                        .id(egui::Id::new((
+                                            "sticker_catalog_query", &picker.scope.account, &picker.scope.thread,
+                                            picker.scope.generation, picker.scope.auth_generation, picker.open_id,
+                                        )))
+                                        .hint_text("Nhập từ khóa")
+                                        .char_limit(64)
+                                        .return_key(None)
+                                        .min_size(vec2(0.0, 36.0))
+                                        .desired_width(PICKER_WIDTH - 58.0),
+                                );
+                                if edit.changed() {
+                                    picker.lookup = Lookup::Idle;
+                                }
+                                if edit.enabled() {
+                                    buttons.push(edit.id);
+                                }
+                                let ready =
+                                    can_pick && search_available && valid_query(picker.query.trim())
+                                        && !matches!(picker.lookup, Lookup::Pending(_)) && !ime_active;
+                                let submit = ui.add_enabled(
+                                    ready, egui::Button::new("Tìm").min_size(vec2(44.0, 36.0)),
+                                );
+                                if submit.enabled() {
+                                    buttons.push(submit.id);
+                                }
+                                visuals::focus_outline(ui, &submit, submit.rect, 4.0);
+                                let enter = ready && edit.has_focus()
+                                    && ctx.input(|input| input.events.iter().any(|event| matches!(
+                                        event, egui::Event::Key {
+                                            key: egui::Key::Enter, pressed: true, repeat: false, modifiers, ..
+                                        } if *modifiers == egui::Modifiers::NONE
+                                    )))
+                                    && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                                search = submit.clicked() || enter;
+                            });
+                            if !search_available {
+                                Some("Danh mục nhãn dán hiện không khả dụng.")
+                            } else {
+                                match &picker.lookup {
+                                    Lookup::Idle => Some("Tìm theo từ khóa tiếng Việt."),
+                                    Lookup::Pending(_) => Some("Đang tìm nhãn dán…"),
+                                    Lookup::Unavailable => Some("Chưa tải được nhãn dán. Vui lòng thử lại."),
+                                    Lookup::Found(_, stickers) if stickers.is_empty() => {
+                                        Some("Không có nhãn dán phù hợp.")
+                                    }
+                                    Lookup::Found(id, stickers) => {
+                                        search_id = Some(*id);
+                                        entries.extend(stickers.iter().copied());
+                                        None
+                                    }
+                                }
+                            }
+                        } else {
+                            entries.extend(builtin_stickers());
+                            Some(if can_pick {
                                 "Chọn nhãn dán để gửi ngay."
                             } else {
                                 "Chưa thể gửi nhãn dán trong hội thoại này."
                             })
-                            .size(visuals::TEXT_SMALL)
-                            .color(colors.text_secondary),
-                        );
+                        };
+                        if let Some(label) = label {
+                            ui.label(RichText::new(label)
+                                .size(visuals::TEXT_SMALL)
+                                .color(colors.text_secondary));
+                        }
+                        let header = if picker.searching { 118.0 } else { 75.0 };
+                        let grid_height = (y - bounds.top() - header).clamp(TILE, 240.0);
                         egui::ScrollArea::vertical()
+                            .id_salt(picker.searching)
                             .max_height(grid_height)
                             .show(ui, |ui| {
-                                let mut catalog = builtin_stickers().peekable();
                                 ui.spacing_mut().item_spacing = vec2(GAP, GAP);
-                                while catalog.peek().is_some() {
+                                for row in entries.chunks(COLUMNS) {
                                     ui.horizontal(|ui| {
-                                        for sticker in catalog.by_ref().take(COLUMNS) {
+                                        for &sticker in row {
                                             let (rect, _) = ui.allocate_exact_size(
                                                 vec2(TILE, TILE),
                                                 Sense::hover(),
@@ -258,7 +424,7 @@ impl NativeApp {
                                             let preview = state.stickers.thumbnail(ctx, sticker);
                                             let enabled = can_pick
                                                 && matches!(&preview, Presentation::Image { .. });
-                                            let id = ui.id().with(sticker.sticker_id);
+                                            let id = ui.id().with(sticker);
                                             let button = ui
                                                 .add_enabled_ui(enabled, |ui| {
                                                     ui.interact(rect, id, Sense::click())
@@ -284,7 +450,7 @@ impl NativeApp {
                                                 buttons.push(button.id);
                                             }
                                             if button.clicked() {
-                                                selection = Some(sticker);
+                                                selection = Some((sticker, search_id));
                                             }
                                             if button.is_pointer_button_down_on()
                                                 || button.hovered()
@@ -311,16 +477,37 @@ impl NativeApp {
                     });
             });
         super::message_actions::focus_popup_actions(ctx, tab, &buttons, &mut picker.action_focus);
-        let escape =
-            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        if let Some(sticker) = selection {
+        if let Some(focused) = ctx
+            .memory(|memory| memory.focused())
+            .filter(|id| buttons.contains(id))
+        {
+            picker.action_focus = Some(focused);
+        }
+        let escape = !ime_active
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if search {
+            state.sticker_send.request = state.sticker_send.request.wrapping_add(1).max(1);
+            let id = state.sticker_send.request;
+            let queued = state.worker.as_ref().is_some_and(|worker| {
+                worker.search_stickers(id, picker.scope.thread.clone(), picker.query.trim().into())
+            });
+            picker.lookup = if queued {
+                Lookup::Pending(id)
+            } else {
+                Lookup::Unavailable
+            };
+            picker.just_opened = false;
+        } else if let Some((sticker, search_id)) = selection {
             let thread = picker.scope.thread.clone();
             let send = &mut state.sticker_send;
             send.request = send.request.wrapping_add(1).max(1);
-            let accepted = state
-                .worker
-                .as_ref()
-                .is_some_and(|worker| worker.send_sticker(send.request, thread.clone(), sticker));
+            let accepted = state.worker.as_ref().is_some_and(|worker| {
+                if let Some(search_id) = search_id {
+                    worker.send_catalog_sticker(send.request, search_id, thread.clone(), sticker)
+                } else {
+                    worker.send_sticker(send.request, thread.clone(), sticker)
+                }
+            });
             send.status = Some(InteractionNotice::new(
                 thread.clone(),
                 if accepted {
@@ -373,7 +560,7 @@ pub(super) fn fixture_thumbnails(cache: &mut super::stickers::StickerCache, ctx:
         [251, 166, 115, 255],
     ];
     const INK: [u8; 4] = [42, 53, 69, 255];
-    for (index, sticker) in builtin_stickers().enumerate() {
+    for (index, sticker) in builtin_stickers().chain(CATALOG_FIXTURE).enumerate() {
         let mut bytes = Vec::new();
         for y in -32i32..32 {
             for x in -32i32..32 {

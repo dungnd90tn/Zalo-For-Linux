@@ -95,6 +95,14 @@ impl Projection {
             LiveEvent::PhotoPrepared { result, thread, .. } if !self.permits(thread) => {
                 *result = Err(PhotoPreparationFailure::Cancelled);
             }
+            LiveEvent::StickersFound {
+                thread, stickers, ..
+            } if !self.confirmed
+                || self.status != LivePrivacyStatus::Ready
+                || self.hidden.contains(thread) =>
+            {
+                *stickers = None;
+            }
             LiveEvent::Avatars { avatars, .. } => {
                 avatars.retain(|entry| self.permits(&entry.thread_id))
             }

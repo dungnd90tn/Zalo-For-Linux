@@ -65,7 +65,7 @@ Native hiện khai báo **15** biến thể `Icon` trong `src/ui/visuals.rs`, đ
 
 Font được catalog theo đường dẫn, loại tệp, kích thước, SHA-256 và khai báo `@font-face`. Các tệp cũ như EOT vẫn thuộc kiểm kê; điều đó không yêu cầu nạp chúng vào native. Native nhúng 5 tài sản cần dùng: Segoe regular/Semibold/Bold, icon Zalo và Screencap; các weight/font trang trí chưa có thành phần sử dụng vẫn ở catalog, không nạp sẵn.
 
-Menu cảm xúc dùng trực tiếp glyph `.fa-csc-menu-icon-reaction` (`U+EACA`). Sáu ảnh gốc 32 px trong `pc-dist/emoji/emoji-32/` lần lượt là `row-30-column-43.png`, `row-34-column-43.png`, `row-4-column-42.png`, `row-9-column-43.png`, `row-2-column-43.png` và `row-3-column-43.png`. Ánh xạ lấy từ bí danh trong `pc-dist/emoji/emoji-rc.json`. Ảnh nhãn dán lấy theo danh mục từ worker.
+Các hàng trong menu tin nhắn dùng trực tiếp `.fa-outline-reply`, `.fa-icon-outline-copy`, `.fa-icon-outline-link`, `.fa-csc-menu-icon-forward`, `.fa-multiselect-stroke-checkbox`, `.fa-outline-recall` và `.fa-close_24` cho thao tác gỡ cảm xúc. Sáu ảnh cảm xúc gốc 32 px trong `pc-dist/emoji/emoji-32/` lần lượt là `row-30-column-43.png`, `row-34-column-43.png`, `row-4-column-42.png`, `row-9-column-43.png`, `row-2-column-43.png` và `row-3-column-43.png`. Ánh xạ lấy từ bí danh trong `pc-dist/emoji/emoji-rc.json`. Ảnh nhãn dán lấy theo danh mục từ worker.
 
 Gọi thoại và video vẫn dùng nút tắt có giải thích. Các nút hoạt động theo khả năng đã xác minh của phiên hiện tại.
 

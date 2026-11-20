@@ -1088,7 +1088,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            17
+            18
         );
         assert_eq!(
             store.page("11", "d:12", None, 10).unwrap()[0].text,

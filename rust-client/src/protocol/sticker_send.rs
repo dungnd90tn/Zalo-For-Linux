@@ -1,4 +1,4 @@
-//! Ordinary built-in sticker submit from the shipped client's `sendSticker`.
+//! Ordinary sticker submit from the shipped client's `sendSticker`.
 use super::{
     client::ClientType,
     messaging::{self as wire, SendAck, Target, ThreadKind, WireError},
@@ -30,7 +30,7 @@ pub(crate) fn parameters(
     imei: &str,
 ) -> Result<Value, WireError> {
     wire::numeric_id(&target.remote_id)?;
-    if !sticker.is_builtin()
+    if !sticker.can_send()
         || !(1..=MAX_STICKER_ID).contains(&client_id)
         || imei.is_empty()
         || imei.len() > 256

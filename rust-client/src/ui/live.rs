@@ -1287,6 +1287,7 @@ pub(in crate::ui) mod tests {
                 settings_open: false,
                 account_popup: None,
                 message_menu: None,
+                message_selection: None,
                 account_trigger_focus: None,
                 theme: crate::theme::ThemeController::new(
                     profile.paths.config_dir.clone(),
@@ -2280,6 +2281,10 @@ pub(in crate::ui) mod tests {
             menu_opened: bool,
         }
         impl eframe::App for MeasuredFixture {
+            fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+                self.app.raw_input_hook(ctx, input);
+            }
+
             fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
                 let screen = ctx.screen_rect();
                 let geometry = [
@@ -2451,10 +2456,13 @@ pub(in crate::ui) mod tests {
                     app.drafts.active.text = "Bản nháp ngoại tuyến".into();
                 }
                 match interactions_scene.as_deref() {
-                    Some("stickers") => {
+                    Some("stickers" | "stickers-search") => {
                         let state = app.live.as_mut().unwrap();
                         state.sticker_fixture = true;
                         state.sticker_fixture_open = true;
+                        if interactions_scene.as_deref() == Some("stickers-search") {
+                            state.sticker_send.fixture_catalog();
+                        }
                         super::super::sticker_picker::fixture_thumbnails(
                             &mut state.stickers,
                             &cc.egui_ctx,
@@ -2474,6 +2482,22 @@ pub(in crate::ui) mod tests {
                         app.model.messages.push(outgoing);
                         let scope = app.reaction_scope().unwrap();
                         app.live.as_mut().unwrap().reactions.seed(scope, "902");
+                    }
+                    Some("message-selection") => {
+                        let first = &mut app.model.messages[0];
+                        first.text = "Mình đã cập nhật lịch họp.".into();
+                        let mut next = first.clone();
+                        next.id = "fixture-selection-2".into();
+                        next.sender = "11".into();
+                        next.text = "Cảm ơn bạn, mình kiểm tra ngay.".into();
+                        next.sent_at_ms += 1000;
+                        app.model.messages.push(next);
+                        let mut last = app.model.messages[0].clone();
+                        last.id = "fixture-selection-3".into();
+                        last.text = "Hẹn gặp bạn chiều nay.".into();
+                        last.sent_at_ms += 2000;
+                        app.model.messages.push(last);
+                        app.start_message_selection("fixture-1");
                     }
                     _ => {}
                 }

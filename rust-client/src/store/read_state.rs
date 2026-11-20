@@ -548,7 +548,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            17
+            18
         );
         assert_eq!(store.receive_cursor("11", "510_0").unwrap(), "99");
         let column: String = store

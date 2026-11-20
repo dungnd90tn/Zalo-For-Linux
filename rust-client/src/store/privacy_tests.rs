@@ -34,14 +34,18 @@ fn persistent_rows(store: &MessageStore) -> Vec<(String, Vec<Vec<SqlValue>>)> {
     tables
         .into_iter()
         .map(|table| {
+            let query = format!("SELECT * FROM main.\"{}\"", table.replace('"', "\"\""));
+            let columns = store.conn.prepare(&query).unwrap().column_count();
+            // Order by the complete row so tables with composite keys or no
+            // rowid are compared as multisets, including duplicate rows.
+            let ordering = (1..=columns)
+                .map(|column| column.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             let mut statement = store
                 .conn
-                .prepare(&format!(
-                    "SELECT * FROM main.\"{}\" ORDER BY rowid",
-                    table.replace('"', "\"\"")
-                ))
+                .prepare(&format!("{query} ORDER BY {ordering}"))
                 .unwrap();
-            let columns = statement.column_count();
             let rows = statement
                 .query_map([], |row| {
                     (0..columns).map(|column| row.get(column)).collect()
@@ -230,7 +234,7 @@ fn locked_receives_and_ack_keep_raw_history_cursors_and_outbox_without_projectio
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        17
+        18
     );
     assert_eq!(
         store

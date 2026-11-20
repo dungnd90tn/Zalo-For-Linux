@@ -48,10 +48,12 @@ Quy tắc đi kèm:
 | Tìm kiếm | cao 44, bo 12 | 32 |
 | Chip lọc "Tất cả / Chưa đọc" | cao 44, bo tròn | chưa có trong tài liệu |
 | Composer | khối bo 16, hàng công cụ trên, ô nhập + nút gửi dưới | theo `UI_DESIGN.md` |
+| Menu ngữ cảnh tin nhắn | thân rộng 216, đệm 6, góc bo 12, hàng 32, ô cảm xúc 36×36 | dành cho chuột và bàn phím |
 | Vùng chạm | tối thiểu 44 | — |
 
 - Rail, danh sách, chat giữ thứ tự hiện tại. Cửa sổ hẹp: danh sách thu lại sau nút quay lại, **giữ người nhận đã chọn và bản nháp** (đã là yêu cầu hiện hữu, không bỏ).
 - Vùng vẽ phải khớp vùng tương tác (`Sense` rect). Nút 44 trong thiết kế có nghĩa là rect click 44, không chỉ icon 20.
+- Riêng menu ngữ cảnh tin nhắn dùng hàng 32 và ô cảm xúc 36 cho thao tác desktop. Tab hoặc phím mũi tên di chuyển giữa các mục có thể dùng. Các nút khác giữ kích thước theo thành phần.
 - Thông tin phụ trong thiết kế cỡ 11–13. `UI_THEME.md` cấm chữ phụ 9–11,5 để tiết kiệm chỗ: **giữ sàn 12**, không theo cỡ 11 của giờ tin nhắn.
 
 ## Phông và icon

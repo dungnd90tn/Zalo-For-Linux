@@ -160,7 +160,8 @@ pub(crate) fn parse_notice(
     embedded: bool,
 ) -> Result<Vec<ReactionNotice>, WireError> {
     numeric_id(account)?;
-    if raw["msgType"].as_str() != Some("chat.reaction")
+    let message_type = raw["msgType"].as_str().ok_or(WireError::Invalid)?;
+    if message_type != "chat.reaction"
         || raw.get("e2eeExt").is_some()
         || ["isE2EE", "isE2ee", "e2ee"].iter().any(|key| {
             raw.get(key)
@@ -247,14 +248,20 @@ pub(crate) fn parse_notice(
         .ok_or(WireError::Oversize)?;
     let mut notices = Vec::<ReactionNotice>::new();
     for target in targets {
-        if target["msgType"].as_i64() != Some(TEXT) {
+        if target["msgType"].as_i64().ok_or(WireError::Invalid)? != TEXT {
             continue;
         }
-        let (Ok(message_id), Ok(source_client_id)) =
-            (id_string(&target["gMsgID"]), id_string(&target["cMsgID"]))
-        else {
+        let target_ids = [&target["gMsgID"], &target["cMsgID"]];
+        if target_ids
+            .iter()
+            .any(|id| id.is_null() || zero(id) || id.as_str() == Some(""))
+        {
+            // The original can queue client-only references. A native
+            // projection requires both exact identifiers.
             continue;
-        };
+        }
+        let message_id = id_string(target_ids[0])?;
+        let source_client_id = id_string(target_ids[1])?;
         if message_id == event_id || notices.iter().any(|notice| notice.message_id == message_id) {
             continue;
         }
@@ -272,34 +279,152 @@ pub(crate) fn parse_notice(
     Ok(notices)
 }
 
-pub(crate) fn control_notices(account: &str, frame: &Value) -> Vec<ReactionNotice> {
-    if super::messaging::service_code(frame).is_err() {
+pub(crate) const DIRECT_PULL: u16 = 610;
+pub(crate) const GROUP_PULL: u16 = 611;
+
+pub(crate) fn advertised_pulls(frame: &Value) -> Vec<u16> {
+    let Some(commands) = frame
+        .pointer("/data/ctrl_qCmds")
+        .and_then(Value::as_array)
+        .filter(|commands| commands.len() <= 64)
+    else {
         return Vec::new();
+    };
+    [DIRECT_PULL, GROUP_PULL]
+        .into_iter()
+        .filter(|command| {
+            commands.iter().any(|entry| {
+                entry["cmd"].as_u64() == Some(u64::from(*command))
+                    && entry["subCmd"].as_u64() == Some(0)
+            })
+        })
+        .collect()
+}
+
+/// Control pull cursors belong to their exact command/subcommand. A control
+/// push can contain newer IDs while a historical page is in flight, so only a
+/// validated pull response may advance our independent bookmark.
+pub(crate) struct PullPage {
+    pub cursor: Option<u64>,
+    pub continuation: Option<u64>,
+    pub notices: Vec<ReactionNotice>,
+}
+
+fn optional_cursor(value: &Value) -> Result<Option<u64>, WireError> {
+    if value.is_null() || zero(value) {
+        return Ok(None);
     }
+    safe_id(&id_string(value)?).map(Some)
+}
+
+pub(crate) fn pull_page(account: &str, frame: &Value, command: u16) -> Result<PullPage, WireError> {
+    let notices = control_notices(account, frame)?;
+    let data = &frame["data"];
+    let key = format!("{command}_0");
+    let status = &data["queueStatus"];
+    let status = match status {
+        Value::Null => &Value::Null,
+        Value::Object(queues) if queues.len() <= 64 => &status[&key],
+        _ => return Err(WireError::Invalid),
+    };
+    if !status.is_null() && !status.is_object() {
+        return Err(WireError::Invalid);
+    }
+    if !status["evict"].is_null()
+        && !zero(&status["evict"])
+        && status["evict"].as_bool() != Some(false)
+    {
+        return Err(WireError::Unsupported);
+    }
+    if !data["resetLastActionId"].is_null() && !zero(&data["resetLastActionId"]) {
+        return Err(WireError::Unsupported);
+    }
+    let more = match &data["more"] {
+        Value::Null | Value::Bool(false) => false,
+        Value::Bool(true) => true,
+        value if value.as_u64() == Some(0) => false,
+        value if value.as_u64() == Some(1) => true,
+        _ => return Err(WireError::Invalid),
+    };
+    let action = optional_cursor(&data["lastActionId"])?;
+    let queue = optional_cursor(&status["lastId"])?;
+    let (cursor, continuation) = if more {
+        let next = action.ok_or(WireError::Invalid)?;
+        // lastActionId is the source's next-page parameter. A later watermark
+        // cannot skip a following page if the connection drops at this point.
+        (Some(queue.map_or(next, |id| id.min(next))), Some(next))
+    } else {
+        (queue.or(action), None)
+    };
+    Ok(PullPage {
+        cursor,
+        continuation,
+        notices,
+    })
+}
+
+pub(crate) fn control_notices(
+    account: &str,
+    frame: &Value,
+) -> Result<Vec<ReactionNotice>, WireError> {
+    super::messaging::service_code(frame)?;
+    if frame["data"].as_str() == Some("") {
+        return Ok(Vec::new());
+    }
+    let data = frame["data"].as_object().ok_or(WireError::Invalid)?;
     let mut notices = Vec::new();
     for (field, kind) in [
         ("reacts", ThreadKind::Direct),
         ("reactGroups", ThreadKind::Group),
     ] {
-        let Some(rows) = frame["data"][field]
-            .as_array()
-            .filter(|rows| rows.len() <= MAX_NOTICES)
-        else {
+        let Some(rows) = data.get(field).filter(|rows| !rows.is_null()) else {
             continue;
         };
+        let rows = rows.as_array().ok_or(WireError::Invalid)?;
+        if rows.len() > MAX_NOTICES {
+            return Err(WireError::Oversize);
+        }
         for row in rows {
-            if let Ok(parsed) = parse_notice(account, kind, row, false) {
-                notices.extend(parsed.into_iter().take(MAX_NOTICES - notices.len()));
+            match parse_notice(account, kind, row, false) {
+                Ok(parsed) if parsed.len() + notices.len() <= MAX_NOTICES => notices.extend(parsed),
+                Ok(_) => return Err(WireError::Oversize),
+                Err(WireError::Unsupported) => {}
+                Err(error) => return Err(error),
             }
         }
     }
-    notices
+    Ok(notices)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::bootstrap::ServerConfig;
+
+    #[test]
+    fn advertised_control_pages_require_exact_command_and_conservative_cursor() {
+        let auth = json!({"data":{"qCmds":[{"cmd":610,"subCmd":0}],"ctrl_qCmds":[
+            {"cmd":610,"subCmd":0},{"cmd":610,"subCmd":0},{"cmd":611,"subCmd":1},{"cmd":603,"subCmd":0}
+        ]}});
+        assert_eq!(advertised_pulls(&auth), [610]);
+        assert!(advertised_pulls(&json!({"data":{"qCmds":[{"cmd":610,"subCmd":0}]}})).is_empty());
+        let mut envelope = json!({"error_code":0,"data":{
+            "more":true,"lastActionId":"50","queueStatus":{"610_0":{"lastId":70},"611_0":{"lastId":100}}
+        }});
+        let page = pull_page("11", &envelope, 610).unwrap();
+        assert_eq!((page.cursor, page.continuation), (Some(50), Some(50)));
+        envelope["data"]["queueStatus"]["610_0"]["evict"] = json!(1);
+        assert!(matches!(
+            pull_page("11", &envelope, 610),
+            Err(WireError::Unsupported)
+        ));
+        envelope["data"]["queueStatus"]["610_0"]["evict"] = json!(0);
+        envelope["data"]["lastActionId"] = json!(0);
+        assert!(matches!(
+            pull_page("11", &envelope, 610),
+            Err(WireError::Invalid)
+        ));
+    }
 
     #[test]
     fn reaction_route_is_optional_and_an_authenticated_disable_removes_it() {

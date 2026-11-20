@@ -470,6 +470,7 @@ impl ServerConfig {
             "chat_e2e",
             "group_e2e",
             "file",
+            "sticker",
             "reaction",
             "up_file",
         ] {

@@ -1,7 +1,10 @@
 //! Explicit clipboard actions for the currently visible, scoped message. No I/O or raw sidecars.
-use super::{ModalFocus, NativeApp};
+use super::{visuals, ModalFocus, NativeApp};
 use crate::domain::{MediaDescriptor, Message};
-use eframe::egui::{self, vec2};
+use eframe::egui::{self, pos2, vec2, Align2, FontId, Rect, Sense, Stroke};
+
+const MENU_WIDTH: f32 = 216.0;
+const ROW_HEIGHT: f32 = 32.0;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Scope {
@@ -41,6 +44,7 @@ impl Popup {
 
 struct Action {
     label: &'static str,
+    glyph: &'static str,
     text: String,
 }
 
@@ -91,15 +95,77 @@ fn actions(message: &Message) -> Vec<Action> {
         .collect::<Vec<_>>()
         .join("\n");
     if !text.is_empty() && text.len() <= crate::domain::MAX_TEXT_BYTES {
-        result.push(Action { label, text });
+        result.push(Action {
+            label,
+            glyph: "fa-icon-outline-copy",
+            text,
+        });
     }
     if let Some(text) = link.and_then(external_url) {
         result.push(Action {
             label: "Sao chép liên kết",
+            glyph: "fa-icon-outline-link",
             text,
         });
     }
     result
+}
+
+pub(super) fn action_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    glyph: &str,
+    enabled: bool,
+    destructive: bool,
+) -> egui::Response {
+    let (rect, response) = ui
+        .add_enabled_ui(enabled, |ui| {
+            ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click())
+        })
+        .inner;
+    let colors = crate::theme::palette(ui.ctx());
+    let row = rect.shrink2(vec2(0.0, 1.0));
+    if response.is_pointer_button_down_on() {
+        ui.painter().rect_filled(row, 7.0, colors.pressed);
+    } else if response.hovered() {
+        ui.painter().rect_filled(row, 7.0, colors.hover);
+    }
+    let (ink, icon) = if !response.enabled() {
+        (colors.text_disabled, colors.text_disabled)
+    } else if destructive {
+        (colors.error, colors.error)
+    } else {
+        (colors.text_primary, colors.text_tertiary)
+    };
+    let icon_center = pos2(rect.left() + 20.0, rect.center().y);
+    visuals::source_icon(
+        ui,
+        Rect::from_center_size(icon_center, vec2(17.0, 17.0)),
+        glyph,
+        icon,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 39.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(visuals::TEXT_BODY),
+        ink,
+    );
+    visuals::focus_outline(ui, &response, row, 7.0);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label)
+    });
+    response
+}
+
+#[cfg(feature = "messaging")]
+pub(super) fn menu_separator(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 7.0), Sense::hover());
+    let y = rect.center().y;
+    ui.painter().line_segment(
+        [pos2(rect.left() + 9.0, y), pos2(rect.right() - 9.0, y)],
+        Stroke::new(1.0_f32, crate::theme::palette(ui.ctx()).divider),
+    );
 }
 
 pub(super) fn requested(ui: &egui::Ui, rect: egui::Rect, message: &Message) -> Option<egui::Pos2> {
@@ -114,6 +180,36 @@ pub(super) fn requested(ui: &egui::Ui, rect: egui::Rect, message: &Message) -> O
             .flatten()
     })?;
     (ui.rect_contains_pointer(rect) && !actions(message).is_empty()).then_some(position)
+}
+
+pub(super) fn keyboard_menu(
+    ui: &egui::Ui,
+    message: &Message,
+    rect: egui::Rect,
+) -> Option<egui::Pos2> {
+    if !ui.is_enabled() || !ui.is_rect_visible(rect) {
+        return None;
+    }
+    let row = ui.interact(
+        rect,
+        ui.id().with((
+            "message_options",
+            &message.account_id,
+            &message.thread_id,
+            &message.id,
+        )),
+        egui::Sense::focusable_noninteractive(),
+    );
+    row.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Tùy chọn tin nhắn")
+    });
+    super::visuals::focus_outline(ui, &row, rect, 12.0);
+    (row.has_focus()
+        && ui.input_mut(|input| {
+            input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                || input.consume_key(egui::Modifiers::SHIFT, egui::Key::F10)
+        }))
+    .then_some(rect.center())
 }
 
 pub(super) fn external_url(raw: &str) -> Option<String> {
@@ -164,9 +260,32 @@ pub(super) fn focus_popup_actions(
     };
     ctx.memory_mut(|memory| memory.request_focus(buttons[next]));
     *action_focus = Some(buttons[next]);
+    ctx.request_repaint();
 }
 
 impl NativeApp {
+    pub(super) fn message_menu_input(&self, input: &mut egui::RawInput) {
+        if self.message_menu.is_none() {
+            return;
+        }
+        // Use the same scoped focus order as Tab. egui records directional focus before
+        // widgets consume their events, so this translation has to happen on raw input.
+        for event in &mut input.events {
+            if let egui::Event::Key { key, modifiers, .. } = event {
+                if modifiers.is_none() {
+                    match key {
+                        egui::Key::ArrowDown => *key = egui::Key::Tab,
+                        egui::Key::ArrowUp => {
+                            *key = egui::Key::Tab;
+                            *modifiers = egui::Modifiers::SHIFT;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn message_menu_scope(&self) -> Option<Scope> {
         let thread = self.model.selected.clone()?;
         #[cfg(feature = "messaging")]
@@ -241,6 +360,8 @@ impl NativeApp {
             return;
         };
         let actions = actions(message);
+        let can_select_many = self.message_selection_scope().is_some()
+            && super::message_selection::text(message).is_some();
         #[cfg(feature = "messaging")]
         let can_forward = self.can_forward(message);
         #[cfg(feature = "messaging")]
@@ -283,15 +404,9 @@ impl NativeApp {
             self.message_menu = None;
             return;
         }
-        let width = 244.0_f32.min(ctx.screen_rect().width() - 32.0);
-        #[cfg(feature = "messaging")]
-        let width = if reaction_scope.is_some() {
-            super::reactions::POPUP_WIDTH
-        } else {
-            width
-        };
         let mut copied = false;
         let mut reply_selected = false;
+        let mut select_many = false;
         let tab = popup_tab(ctx, popup.action_focus);
         let mut buttons = Vec::with_capacity(actions.len());
         let response = egui::Area::new(egui::Id::new((
@@ -310,68 +425,87 @@ impl NativeApp {
         .fixed_pos(popup.position)
         .constrain_to(ctx.screen_rect().shrink(8.0))
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_width(width);
-                #[cfg(feature = "messaging")]
-                if let Some(scope) = &reaction_scope {
-                    reaction_selected =
-                        super::reactions::show_menu(ui, self, scope, message, &mut buttons);
-                }
-                for action in actions {
-                    let button = ui.add_sized(vec2(width, 44.0), egui::Button::new(action.label));
-                    buttons.push(button.id);
-                    if button.clicked() {
-                        ctx.copy_text(action.text);
-                        copied = true;
+            let colors = crate::theme::palette(ctx);
+            egui::Frame::popup(ui.style())
+                .fill(colors.surface)
+                .stroke(Stroke::new(1.0_f32, colors.border))
+                .inner_margin(6.0)
+                .rounding(12.0)
+                .show(ui, |ui| {
+                    ui.set_width(MENU_WIDTH);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    #[cfg(feature = "messaging")]
+                    if let Some(scope) = &reaction_scope {
+                        reaction_selected =
+                            super::reactions::show_menu(ui, self, scope, message, &mut buttons);
                     }
-                }
-                let button = ui
-                    .add_enabled_ui(can_reply, |ui| {
-                        ui.add_sized(vec2(width, 44.0), egui::Button::new("Trả lời"))
-                    })
-                    .inner;
-                if can_reply {
-                    buttons.push(button.id);
-                }
-                reply_selected = button.clicked();
-                button.on_disabled_hover_text(reply_unavailable);
-                #[cfg(feature = "messaging")]
-                if !self.demo {
-                    let button = ui
-                        .add_enabled_ui(can_forward, |ui| {
-                            ui.add_sized(vec2(width, 44.0), egui::Button::new("Chuyển tiếp"))
-                        })
-                        .inner;
-                    if can_forward {
+                    let button = action_row(ui, "Trả lời", "fa-outline-reply", can_reply, false);
+                    if can_reply {
                         buttons.push(button.id);
                     }
-                    forward_selected = button.clicked();
-                    button.on_disabled_hover_text(
-                        "Chỉ hỗ trợ tin văn bản cá nhân đủ dữ liệu gốc khi đang kết nối.",
-                    );
-                }
-                #[cfg(feature = "messaging")]
-                if !self.demo && own {
-                    let button = ui
-                        .add_enabled_ui(can_recall, |ui| {
-                            ui.add_sized(vec2(width, 44.0), egui::Button::new("Thu hồi"))
-                        })
-                        .inner;
-                    if can_recall {
+                    reply_selected = button.clicked();
+                    button.on_disabled_hover_text(reply_unavailable);
+                    for action in actions {
+                        let button = action_row(ui, action.label, action.glyph, true, false);
                         buttons.push(button.id);
+                        if button.clicked() {
+                            ctx.copy_text(action.text);
+                            copied = true;
+                        }
                     }
-                    recall_selected = button.clicked();
-                    button.on_disabled_hover_text(
-                        "Chỉ hỗ trợ tin văn bản cá nhân đã gửi khi đang kết nối.",
-                    );
-                }
-            });
+                    #[cfg(feature = "messaging")]
+                    if !self.demo {
+                        let button = action_row(
+                            ui,
+                            "Chuyển tiếp",
+                            "fa-csc-menu-icon-forward",
+                            can_forward,
+                            false,
+                        );
+                        if can_forward {
+                            buttons.push(button.id);
+                        }
+                        forward_selected = button.clicked();
+                        button.on_disabled_hover_text(
+                            "Chỉ hỗ trợ tin văn bản cá nhân đủ dữ liệu gốc khi đang kết nối.",
+                        );
+                    }
+                    if can_select_many {
+                        let button = action_row(
+                            ui,
+                            "Chọn nhiều tin nhắn",
+                            "fa-multiselect-stroke-checkbox",
+                            true,
+                            false,
+                        );
+                        buttons.push(button.id);
+                        select_many = button.clicked();
+                    }
+                    #[cfg(feature = "messaging")]
+                    if !self.demo && own {
+                        menu_separator(ui);
+                        let button =
+                            action_row(ui, "Thu hồi", "fa-outline-recall", can_recall, true);
+                        if can_recall {
+                            buttons.push(button.id);
+                        }
+                        recall_selected = button.clicked();
+                        button.on_disabled_hover_text(
+                            "Chỉ hỗ trợ tin văn bản cá nhân đã gửi khi đang kết nối.",
+                        );
+                    }
+                });
         });
         if let Some(popup) = &mut self.message_menu {
             focus_popup_actions(ctx, tab, &buttons, &mut popup.action_focus);
         }
         let escape =
             ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if select_many {
+            self.message_menu = None;
+            self.start_message_selection(&popup.message);
+            return;
+        }
         #[cfg(feature = "messaging")]
         if let (Some(action), Some(scope)) = (reaction_selected, reaction_scope) {
             self.message_menu = None;
@@ -552,18 +686,17 @@ mod tests {
             size: egui::Vec2,
             events: Vec<egui::Event>,
         ) -> egui::FullOutput {
-            ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| {
-                    app.sync_message_menu();
-                    app.update_modal_input(ctx);
-                    app.workspace(ctx);
-                },
-            )
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            };
+            app.message_menu_input(&mut input);
+            ctx.run(input, |ctx| {
+                app.sync_message_menu();
+                app.update_modal_input(ctx);
+                app.workspace(ctx);
+            })
         }
 
         fn text_rect(out: &egui::FullOutput, text: &str) -> egui::Rect {
@@ -609,6 +742,152 @@ mod tests {
         }
 
         #[test]
+        fn keyboard_multiselect_copies_in_time_order_and_preserves_the_draft() {
+            let ctx = egui::Context::default();
+            let size = vec2(640.0, 480.0);
+            let (mut app, root) = fixture(&ctx);
+            let draft = app.drafts.active.text.clone();
+            let current = app.model.messages[0].clone();
+            let mut older = current.clone();
+            older.id = "copy-older".into();
+            older.text = "Tin nhắn trước".into();
+            older.sent_at_ms -= 1000;
+            app.model.messages.insert(0, older.clone());
+            let _ = frame(&mut app, &ctx, size, vec![]);
+            app.message_menu = Some(Popup::new(
+                app.message_menu_scope().unwrap(),
+                current.id,
+                egui::pos2(220.0, 100.0),
+                None,
+            ));
+            for _ in 0..2 {
+                let _ = frame(&mut app, &ctx, size, vec![]);
+            }
+            let _ = frame(&mut app, &ctx, size, key(egui::Key::Tab));
+            let menu = frame(&mut app, &ctx, size, key(egui::Key::Tab));
+            let focused = ctx.memory(|memory| memory.focused()).unwrap();
+            assert!(ctx
+                .read_response(focused)
+                .unwrap()
+                .rect
+                .contains(text_rect(&menu, "Chọn nhiều tin nhắn").center()));
+            let _ = frame(&mut app, &ctx, size, key(egui::Key::Enter));
+            let _ = frame(&mut app, &ctx, size, vec![]);
+            let selected = frame(&mut app, &ctx, size, vec![]);
+            assert!(text_rect(&selected, "Đã chọn 1 tin").is_positive());
+            let focus = ctx.memory(|memory| memory.focused()).unwrap();
+            let checked = ctx.read_response(focus).unwrap().rect;
+            assert_eq!(checked.size(), vec2(44.0, 44.0));
+            let older_y = text_rect(&selected, &older.text).center().y;
+            let checkbox_at = egui::pos2(checked.center().x, older_y);
+            for pressed in [true, false] {
+                let _ = frame(
+                    &mut app,
+                    &ctx,
+                    size,
+                    pointer(checkbox_at, egui::PointerButton::Primary, pressed),
+                );
+            }
+            let selected = frame(&mut app, &ctx, size, vec![]);
+            assert!(text_rect(&selected, "Đã chọn 2 tin").is_positive());
+            let copy_at = text_rect(&selected, "Sao chép").center();
+            let _ = frame(
+                &mut app,
+                &ctx,
+                size,
+                pointer(copy_at, egui::PointerButton::Primary, true),
+            );
+            let copied = frame(
+                &mut app,
+                &ctx,
+                size,
+                pointer(copy_at, egui::PointerButton::Primary, false),
+            );
+            assert_eq!(
+                copied.platform_output.copied_text,
+                format!("{}\n\n{}", older.text, current.text)
+            );
+            assert!(app.message_selection.is_none());
+            assert_eq!(app.drafts.active.text, draft);
+            assert!(!app.drafts.active.in_flight());
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn multiselect_escape_respects_ime_and_a_new_page_invalidates_selection() {
+            let ctx = egui::Context::default();
+            let size = vec2(640.0, 480.0);
+            let (mut app, root) = fixture(&ctx);
+            app.start_message_selection("copy-1");
+            let _ = frame(&mut app, &ctx, size, vec![]);
+            app.ime_composing = true;
+            let _ = frame(&mut app, &ctx, size, key(egui::Key::Escape));
+            assert!(app.message_selection.is_some());
+            app.ime_composing = false;
+            let _ = frame(&mut app, &ctx, size, key(egui::Key::Escape));
+            assert!(app.message_selection.is_none());
+            app.start_message_selection("copy-1");
+            app.model.generation += 1;
+            let _ = frame(&mut app, &ctx, size, vec![]);
+            assert!(app.message_selection.is_none());
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn multiselect_reveals_the_entry_row_once_and_leaves_scrolling_free() {
+            let ctx = egui::Context::default();
+            let size = vec2(640.0, 480.0);
+            let (mut app, root) = fixture(&ctx);
+            let first = app.model.messages[0].clone();
+            for i in 1..=10 {
+                let mut next = first.clone();
+                next.id = format!("selection-overflow-{i}");
+                next.text = format!("Tin tổng hợp thứ {i}");
+                next.sent_at_ms += i * 1000;
+                app.model.messages.push(next);
+            }
+            for _ in 0..3 {
+                let _ = frame(&mut app, &ctx, size, vec![]);
+            }
+            app.start_message_selection(&first.id);
+            for _ in 0..2 {
+                let _ = frame(&mut app, &ctx, size, vec![]);
+            }
+            let out = frame(&mut app, &ctx, size, vec![]);
+            assert!(text_rect(&out, "Đã chọn 1 tin").is_positive());
+            assert!(text_rect(&out, &first.text).is_positive());
+            let checked = ctx
+                .memory(|memory| memory.focused())
+                .and_then(|id| ctx.read_response(id))
+                .unwrap();
+            assert_eq!(checked.rect.size(), vec2(44.0, 44.0));
+
+            let _ = frame(
+                &mut app,
+                &ctx,
+                size,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(320.0, 230.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Page,
+                        delta: vec2(0.0, -6.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            for _ in 0..10 {
+                let _ = frame(&mut app, &ctx, size, vec![]);
+            }
+            let out = frame(&mut app, &ctx, size, vec![]);
+            assert!(text_rect(&out, "Đã chọn 1 tin").is_positive());
+            assert!(text_rect(&out, "Tin tổng hợp thứ 10").is_positive());
+            drop(app);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[test]
         fn compact_sticker_picker_keyboard_dispatches_one_scoped_sticker_and_keeps_draft() {
             use crate::app::live::{LiveCommand, LiveConnection, LiveWorker};
             let ctx = egui::Context::default();
@@ -626,8 +905,11 @@ mod tests {
             for _ in 0..3 {
                 let _ = frame(&mut app, &ctx, size, vec![]);
             }
+            for _ in 0..2 {
+                let _ = frame(&mut app, &ctx, size, key(egui::Key::Tab));
+            }
             let out = frame(&mut app, &ctx, size, key(egui::Key::Tab));
-            assert!(text_rect(&out, "Nhãn dán mặc định").top() >= 8.0);
+            assert!(text_rect(&out, "Mặc định").top() >= 8.0);
             let focus = ctx.memory(|memory| memory.focused()).unwrap();
             let rect = ctx.read_response(focus).unwrap().rect;
             assert_eq!(rect.width(), 44.0);
@@ -638,7 +920,7 @@ mod tests {
                 .collect();
             assert!(matches!(
                 sends.as_slice(),
-                [LiveCommand::SendSticker { request_id: 1, thread, sticker }]
+                [LiveCommand::SendSticker { thread, sticker, .. }]
                     if thread == "d:22" && *sticker == crate::domain::StickerDescriptor::builtin(1)
             ));
             assert_eq!(app.drafts.active.text, draft);
@@ -1062,16 +1344,20 @@ mod tests {
                 app.message_menu = Some(Popup::new(
                     app.message_menu_scope().unwrap(),
                     "copy-1".into(),
-                    egui::pos2(300.0, 150.0),
+                    egui::pos2(620.0, 460.0),
                     app.modal_focus_snapshot(&ctx),
                 ));
                 let _ = frame(&mut app, &ctx, size, vec![]);
-                let _ = frame(&mut app, &ctx, size, vec![]);
-                for (backward, label) in [
-                    (false, "Sao chép tên tệp"),
-                    (false, "Sao chép liên kết"),
-                    (true, "Sao chép tên tệp"),
-                    (true, "Sao chép liên kết"),
+                let out = frame(&mut app, &ctx, size, vec![]);
+                let name = text_rect(&out, "Sao chép tên tệp");
+                let link = text_rect(&out, "Sao chép liên kết");
+                assert!((name.left() - link.left()).abs() <= 1.0);
+                assert!((link.center().y - name.center().y - ROW_HEIGHT).abs() <= 1.0);
+                for (key, backward, label) in [
+                    (egui::Key::Tab, false, "Sao chép tên tệp"),
+                    (egui::Key::ArrowDown, false, "Sao chép liên kết"),
+                    (egui::Key::ArrowUp, false, "Sao chép tên tệp"),
+                    (egui::Key::Tab, true, "Sao chép liên kết"),
                 ] {
                     let modifiers = if backward {
                         egui::Modifiers::SHIFT
@@ -1084,14 +1370,14 @@ mod tests {
                         size,
                         vec![
                             egui::Event::Key {
-                                key: egui::Key::Tab,
+                                key,
                                 physical_key: None,
                                 pressed: true,
                                 repeat: false,
                                 modifiers,
                             },
                             egui::Event::Key {
-                                key: egui::Key::Tab,
+                                key,
                                 physical_key: None,
                                 pressed: false,
                                 repeat: false,
@@ -1100,11 +1386,12 @@ mod tests {
                         ],
                     );
                     let focused = ctx.memory(|memory| memory.focused()).unwrap();
-                    assert!(ctx
-                        .read_response(focused)
-                        .unwrap()
-                        .rect
-                        .contains(text_rect(&out, label).center()));
+                    let row = ctx.read_response(focused).unwrap().rect;
+                    assert!(row.contains(text_rect(&out, label).center()));
+                    assert!((row.height() - ROW_HEIGHT).abs() <= 1.0);
+                    assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size)
+                        .shrink(8.0)
+                        .contains_rect(row));
                     assert!(out.platform_output.copied_text.is_empty());
                 }
                 let draft = app.drafts.active.text.clone();

@@ -28,7 +28,19 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
             WHERE state IN ('sending','unknown');
         CREATE INDEX IF NOT EXISTS reaction_removals
             ON reaction_events(account_id,thread_id,message_id,actor_id,occurred_at_ms)
-            WHERE kind=-1;",
+            WHERE kind=-1;
+        CREATE TABLE IF NOT EXISTS pending_reaction_events (
+            account_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            source_client_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            client_id TEXT,
+            event_id TEXT NOT NULL,
+            occurred_at_ms INTEGER NOT NULL,
+            kind INTEGER NOT NULL CHECK(kind BETWEEN -1 AND 4096),
+            PRIMARY KEY(account_id,thread_id,message_id,event_id)
+        ) WITHOUT ROWID;",
     )?;
     Ok(())
 }
@@ -45,6 +57,7 @@ mod live {
 
     const MAX_JS_INTEGER: i64 = 9_007_199_254_740_991;
     const MAX_UNRESOLVED: i64 = 100;
+    const MAX_PENDING_NOTICES: i64 = 4096;
 
     // reply_blocked/source_client_id encode the previously verified ordinary text
     // proof. Match both server IDs and reject recall, encryption and rich rows.
@@ -124,23 +137,66 @@ mod live {
         account: &str,
         notices: &[ReactionNotice],
     ) -> Result<BTreeSet<String>> {
+        apply_batch(conn, account, notices, false)
+    }
+
+    fn apply_batch(
+        conn: &Connection,
+        account: &str,
+        notices: &[ReactionNotice],
+        stage_missing: bool,
+    ) -> Result<BTreeSet<String>> {
         ensure!(
             notices.len() <= wire::MAX_NOTICES,
             FailureReason::Validation
         );
         let mut changed = BTreeSet::new();
+        let mut staged = false;
         for notice in notices {
-            if source_client(conn, account, &notice.thread, &notice.message_id)?.as_deref()
-                != Some(notice.source_client_id.as_str())
-            {
+            if notice.actor == account && notice.client_id.is_none() {
+                // Without the client ID, the same action might already have
+                // been counted from this device's HTTP acknowledgement.
                 continue;
             }
-            if notice.actor == account {
-                let Some(client) = &notice.client_id else {
-                    // Without the client ID, the same action might already
-                    // have been counted from this device's HTTP acknowledgement.
-                    continue;
-                };
+            match source_client(conn, account, &notice.thread, &notice.message_id)? {
+                Some(source) if source == notice.source_client_id => {
+                    if record_observed(conn, account, notice)? {
+                        changed.insert(notice.thread.clone());
+                    }
+                }
+                None if stage_missing => staged |= stage_if_missing(conn, account, notice)?,
+                _ => {}
+            }
+        }
+        if staged {
+            let pending: i64 = conn.query_row(
+                "SELECT count(*) FROM pending_reaction_events WHERE account_id=?1",
+                [account],
+                |row| row.get(0),
+            )?;
+            // A replay can retry this page when ordinary history has released
+            // pending slots. Never evict a committed notice to fit a new page.
+            ensure!(pending <= MAX_PENDING_NOTICES, FailureReason::Validation);
+        }
+        Ok(changed)
+    }
+
+    fn stage_if_missing(conn: &Connection, account: &str, notice: &ReactionNotice) -> Result<bool> {
+        Ok(conn.execute(
+            "INSERT INTO pending_reaction_events
+               (account_id,thread_id,message_id,source_client_id,actor_id,client_id,event_id,occurred_at_ms,kind)
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9
+             WHERE NOT EXISTS(SELECT 1 FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)
+               AND NOT EXISTS(SELECT 1 FROM e2ee_threads WHERE account_id=?1 AND thread_id=?2)
+             ON CONFLICT(account_id,thread_id,message_id,event_id) DO NOTHING",
+            params![account,notice.thread,notice.message_id,notice.source_client_id,notice.actor,
+                notice.client_id,notice.event_id,notice.timestamp,notice.code],
+        )? != 0)
+    }
+
+    fn record_observed(conn: &Connection, account: &str, notice: &ReactionNotice) -> Result<bool> {
+        if notice.actor == account {
+            if let Some(client) = &notice.client_id {
                 let reserved: bool = conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM reaction_events WHERE account_id=?1 AND client_id=?2)",
                     params![account, client],
@@ -149,7 +205,7 @@ mod live {
                 if reserved {
                     // Exact action and source only. A conflicting echo must not
                     // consume the local reservation or increment the total.
-                    if conn.execute(
+                    return Ok(conn.execute(
                         "UPDATE OR IGNORE reaction_events
                          SET state='observed',event_id=?7,occurred_at_ms=?8
                          WHERE account_id=?1 AND client_id=?2 AND actor_id=?1
@@ -165,40 +221,101 @@ mod live {
                             notice.event_id,
                             notice.timestamp
                         ],
-                    )? != 0
-                    {
-                        changed.insert(notice.thread.clone());
-                    }
-                    continue;
+                    )? != 0);
                 }
             }
-            if conn.execute(
+        }
+        Ok(conn.execute(
                 "INSERT INTO reaction_events(account_id,thread_id,message_id,source_client_id,actor_id,event_id,occurred_at_ms,kind,state)
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'observed')
                  ON CONFLICT(account_id,thread_id,message_id,event_id) DO NOTHING",
                 params![account, notice.thread, notice.message_id, notice.source_client_id,
                     notice.actor, notice.event_id, notice.timestamp, notice.code],
-            )? != 0 {
-                changed.insert(notice.thread.clone());
+            )? != 0)
+    }
+
+    pub(in super::super) fn reconcile_pending(
+        conn: &Connection,
+        account: &str,
+        thread: &str,
+        message: &str,
+    ) -> Result<bool> {
+        let mut statement = conn.prepare_cached(
+            "SELECT source_client_id,actor_id,client_id,event_id,occurred_at_ms,kind
+             FROM pending_reaction_events WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
+        )?;
+        let mut rows = statement.query(params![account, thread, message])?;
+        let Some(mut row) = rows.next()? else {
+            return Ok(false);
+        };
+        let source = source_client(conn, account, thread, message)?;
+        let mut changed = false;
+        loop {
+            let source_client_id: String = row.get(0)?;
+            if source.as_deref() == Some(&source_client_id) {
+                changed |= record_observed(
+                    conn,
+                    account,
+                    &ReactionNotice {
+                        thread: thread.into(),
+                        message_id: message.into(),
+                        source_client_id,
+                        actor: row.get(1)?,
+                        client_id: row.get(2)?,
+                        event_id: row.get(3)?,
+                        timestamp: row.get(4)?,
+                        code: row.get(5)?,
+                    },
+                )?;
             }
+            let Some(next) = rows.next()? else { break };
+            row = next;
         }
+        drop(rows);
+        conn.execute(
+            "DELETE FROM pending_reaction_events WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
+            params![account, thread, message],
+        )?;
         Ok(changed)
     }
 
     impl MessageStore {
+        #[cfg(test)]
         pub(crate) fn apply_reaction_notices(
             &mut self,
             account: &str,
             notices: &[ReactionNotice],
         ) -> Result<BTreeSet<String>> {
+            self.commit_reaction_page(account, notices, None)
+        }
+
+        pub(crate) fn commit_reaction_page(
+            &mut self,
+            account: &str,
+            notices: &[ReactionNotice],
+            cursor: Option<(u16, u64)>,
+        ) -> Result<BTreeSet<String>> {
             let tx = self.conn.transaction()?;
-            let changed = apply(&tx, account, notices)?;
+            let changed = apply_batch(&tx, account, notices, true)?;
+            if let Some((command, last_id)) = cursor {
+                ensure!(
+                    matches!(command, wire::DIRECT_PULL | wire::GROUP_PULL)
+                        && (1..=MAX_JS_INTEGER as u64).contains(&last_id),
+                    FailureReason::Validation
+                );
+                advance_receive_cursor(
+                    &tx,
+                    account,
+                    &format!("{command}_0"),
+                    &last_id.to_string(),
+                )?;
+            }
             tx.commit()?;
             Ok(changed)
         }
 
         pub(crate) fn reaction_summaries(
-            &self,
+            &mut self,
             account: &str,
             thread: &str,
             ids: &[String],
@@ -207,12 +324,15 @@ mod live {
             if !self.live_thread_visible(account, thread)? {
                 return Ok(Vec::new());
             }
+            let tx = self.conn.transaction()?;
             let mut summaries = Vec::new();
             for id in ids {
-                if source_client(&self.conn, account, thread, id)?.is_some() {
-                    summaries.push((id.clone(), summary(&self.conn, account, thread, id)?));
+                if source_client(&tx, account, thread, id)?.is_some() {
+                    reconcile_pending(&tx, account, thread, id)?;
+                    summaries.push((id.clone(), summary(&tx, account, thread, id)?));
                 }
             }
+            tx.commit()?;
             Ok(summaries)
         }
 
@@ -242,6 +362,7 @@ mod live {
             if closed {
                 return Ok(Err(Unavailable));
             }
+            reconcile_pending(&tx, account, thread, message)?;
             let (pending, same): (i64, bool) = tx.query_row(
                 "SELECT count(*), COALESCE(MAX(thread_id=?2 AND message_id=?3),0)
                  FROM reaction_events WHERE account_id=?1 AND state IN ('sending','unknown')",
@@ -310,7 +431,7 @@ mod live {
 }
 
 #[cfg(feature = "messaging")]
-pub(super) use live::apply;
+pub(super) use live::{apply, reconcile_pending};
 
 #[cfg(all(test, feature = "messaging"))]
 mod tests {
@@ -454,5 +575,112 @@ mod tests {
                 .unwrap(),
             Err(Unavailable)
         );
+    }
+
+    #[test]
+    fn schema_seventeen_upgrade_and_reaction_cursor_failure_preserve_history_atomically() {
+        let mut original = MessageStore::in_memory().unwrap();
+        let mut cached = source();
+        cached.id = "912".into();
+        original
+            .receive_batch("11", &[(cached.clone(), None)], Some(("510_0", "73")))
+            .unwrap();
+        original
+            .apply_reaction_notices(
+                "11",
+                &[ReactionNotice {
+                    message_id: "912".into(),
+                    ..notice("90", 5, 2)
+                }],
+            )
+            .unwrap();
+        original
+            .conn
+            .execute_batch("DROP TABLE pending_reaction_events; PRAGMA user_version=17;")
+            .unwrap();
+        let mut upgraded = MessageStore::initialize(original.conn).unwrap();
+        assert_eq!(
+            upgraded
+                .conn
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            18
+        );
+        assert_eq!(upgraded.receive_cursor("11", "510_0").unwrap(), "73");
+        assert_eq!(upgraded.page("11", "d:22", None, 10).unwrap(), [cached]);
+        assert_eq!(
+            upgraded
+                .reaction_summaries("11", "d:22", &["912".into()])
+                .unwrap()[0]
+                .1[0]
+                .count,
+            1
+        );
+        upgraded.conn.execute_batch(
+            "CREATE TRIGGER prohibit_test_cursor BEFORE INSERT ON receive_cursors
+             WHEN NEW.queue='610_0' BEGIN SELECT RAISE(ABORT, 'synthetic cursor write failure'); END;",
+        ).unwrap();
+        let actions = [notice("91", 3, 4)];
+        assert!(upgraded
+            .commit_reaction_page("11", &actions, Some((610, 100)))
+            .is_err());
+        let count_pending = |store: &MessageStore| {
+            store
+                .conn
+                .query_row("SELECT count(*) FROM pending_reaction_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count_pending(&upgraded), 0);
+        assert_eq!(upgraded.receive_cursor("11", "610_0").unwrap(), "1");
+        upgraded
+            .conn
+            .execute_batch("DROP TRIGGER prohibit_test_cursor;")
+            .unwrap();
+        assert!(upgraded
+            .commit_reaction_page("11", &actions, Some((610, 100)))
+            .unwrap()
+            .is_empty());
+        assert_eq!(count_pending(&upgraded), 1);
+        assert_eq!(upgraded.receive_cursor("11", "610_0").unwrap(), "100");
+        upgraded
+            .receive_batch("11", &[(source(), None)], None)
+            .unwrap();
+        assert_eq!(count_pending(&upgraded), 0);
+        assert_eq!(
+            upgraded
+                .reaction_summaries("11", "d:22", &["910".into()])
+                .unwrap()[0]
+                .1[0]
+                .kind,
+            ReactionKind::Like
+        );
+    }
+
+    #[test]
+    fn deferred_capacity_stops_the_page_without_evicting_old_actions() {
+        let mut store = MessageStore::in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<4096)
+             INSERT INTO pending_reaction_events
+             SELECT '11','d:22','911','990','22',NULL,CAST(n AS TEXT),n,3 FROM seq;",
+            )
+            .unwrap();
+        assert!(store
+            .commit_reaction_page("11", &[notice("93", 5, 12)], Some((610, 100)))
+            .is_err());
+        assert_eq!(store.receive_cursor("11", "610_0").unwrap(), "1");
+        let counts: (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT count(*),sum(message_id='911') FROM pending_reaction_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (4096, 4096));
     }
 }

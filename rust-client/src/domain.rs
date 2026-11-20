@@ -180,6 +180,18 @@ impl StickerDescriptor {
             && self.sticker_type == 7
     }
 
+    #[cfg(feature = "messaging")]
+    pub(crate) fn is_catalog(self) -> bool {
+        (1..=MAX_STICKER_ID).contains(&self.sticker_id)
+            && (1..=MAX_STICKER_ID).contains(&self.category_id)
+            && self.sticker_type == 3
+    }
+
+    #[cfg(feature = "messaging")]
+    pub(crate) fn can_send(self) -> bool {
+        self.is_builtin() || self.is_catalog()
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.sticker_id > MAX_STICKER_ID
             || self.category_id > MAX_STICKER_ID

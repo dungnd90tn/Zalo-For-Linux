@@ -44,6 +44,7 @@ pub(crate) mod photo;
 mod privacy;
 mod reactions;
 mod recall;
+mod sticker_catalog;
 mod sticker_send;
 mod upload;
 
@@ -1153,6 +1154,7 @@ struct Connection {
     decoder: FrameDecoder,
     queues: std::collections::HashSet<(u16, u8)>,
     offline_progress: std::collections::HashMap<(u16, u8), OfflineProgress>,
+    reaction_catchup: reactions::Catchup,
     request_id: u64,
     last_pong: tokio::time::Instant,
     last_ping: Option<i64>,
@@ -1183,7 +1185,17 @@ impl Connection {
     async fn next(&mut self) -> Result<Option<DecodedFrame>> {
         match self.socket.next().await {
             Some(Ok(tungstenite::Message::Binary(bytes))) => {
-                Ok(Some(self.decoder.decode_detailed(&bytes)?))
+                match self.decoder.decode_detailed(&bytes) {
+                    Ok(frame) => Ok(Some(frame)),
+                    Err(failure)
+                        if self.decoder.authenticated()
+                            && self.reaction_catchup.discard_optional_frame(&failure) =>
+                    {
+                        let _ = diagnostic(&failure.into(), LiveStage::Synchronization);
+                        Ok(None)
+                    }
+                    Err(failure) => Err(failure.into()),
+                }
             }
             Some(Ok(tungstenite::Message::Ping(bytes))) => {
                 tokio::time::timeout(
@@ -1278,6 +1290,7 @@ impl Connection {
             decoder: FrameDecoder::default(),
             queues: Default::default(),
             offline_progress: Default::default(),
+            reaction_catchup: Default::default(),
             request_id: 0,
             last_pong: tokio::time::Instant::now(),
             last_ping: None,
@@ -1453,6 +1466,7 @@ impl Connection {
                     self.offline(db, &events.account, cmd, sub, true, None)
                         .await?;
                 }
+                reactions::start_catchup(self, db, &frame.payload).await?;
             }
             2 => {
                 if frame
@@ -1482,10 +1496,11 @@ impl Connection {
             502 | 522 | 504 | 524 if self.decoder.authenticated() => {
                 attention::apply_status(db, events, &frame.payload).await?;
             }
-            610..=612 if self.decoder.authenticated() => {
-                let notices =
-                    crate::protocol::reactions::control_notices(&self.account, &frame.payload);
-                reactions::receive(db, events, notices).await?;
+            610 | 611 if self.decoder.authenticated() && frame.sub_cmd == 0 => {
+                reactions::catchup_page(self, db, events, frame.cmd, &frame.payload).await?;
+            }
+            601 | 612 if self.decoder.authenticated() => {
+                reactions::receive(db, events, &frame.payload, frame.cmd, frame.sub_cmd).await?;
             }
             501 | 521 | 510 | 511 | 534 | 570 => {
                 let wire::IncomingBatch {
@@ -2351,6 +2366,7 @@ async fn handle_command(
                     thread,
                     sticker,
                 },
+                false,
                 connection
                     .as_mut()
                     .filter(|link| link.decoder.authenticated()),
@@ -2360,6 +2376,25 @@ async fn handle_command(
                 client,
             )
             .await;
+        }
+        LiveCommand::SearchStickers {
+            request_id, thread, ..
+        } => {
+            sticker_catalog::publish(events, request_id, thread, None).await?;
+        }
+        LiveCommand::SendCatalogSticker {
+            request_id,
+            thread,
+            sticker,
+            ..
+        } => {
+            sticker_send::Request {
+                request_id,
+                thread,
+                sticker,
+            }
+            .finish(events, StickerOutcome::Unavailable)
+            .await?;
         }
         LiveCommand::Send {
             generation,
@@ -2605,6 +2640,7 @@ async fn run_inner(
     let mut groups = group_actions::Groups::default();
     let mut uploads = upload::Uploads::default();
     let mut photos = photo::Photos::default();
+    let mut sticker_search = sticker_catalog::Search::default();
     let mut upload_tick = tokio::time::interval(Duration::from_millis(100));
     upload_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     events
@@ -2623,6 +2659,12 @@ async fn run_inner(
         .emit(LiveEvent::PhotoCapability {
             account_id: events.account.clone(),
             available: session.config().photo_upload_route.is_some() && uploads.lease() != 0,
+        })
+        .await?;
+    events
+        .emit(LiveEvent::StickerSearchCapability {
+            account_id: events.account.clone(),
+            available: root_for(&session, "sticker").is_ok(),
         })
         .await?;
     let mut directory = DirectorySync::new();
@@ -2679,6 +2721,9 @@ async fn run_inner(
             completed = recalls.next() => {
                 recall::complete(&db, events, completed).await?;
             },
+            found = sticker_search.next() => {
+                sticker_search.complete(found, events).await?;
+            },
             completed = reactions.next() => {
                 reactions::complete(&db, events, completed).await?;
             },
@@ -2692,6 +2737,28 @@ async fn run_inner(
                 let Some(command) = attention.command(command, &db, events).await? else { continue; };
                 let Some(command) = forwards.command(command, connection.as_ref(), &db, events, &session, &client).await? else { continue; };
                 let command = match command {
+                    LiveCommand::SearchStickers { request_id, thread, query } => {
+                        sticker_search.start(
+                            sticker_catalog::Request { id: request_id, thread, query },
+                            online, events, &session, &client,
+                        ).await?;
+                        continue;
+                    }
+                    LiveCommand::SendCatalogSticker { request_id, search_id, thread, sticker } => {
+                        let authorized = sticker_search.permits(search_id, &thread, sticker, events);
+                        let socket = connection.as_mut().filter(|_| online && !uploads.active());
+                        let outcome = sticker_send::handle(
+                            sticker_send::Request { request_id, thread, sticker },
+                            authorized, socket, &db, events, &session, &client,
+                        ).await?;
+                        if matches!(outcome, CommandOutcome::PauseTransport) {
+                            uploads.invalidate();
+                            attention.reset_transport();
+                            connection = None;
+                            network_paused = true;
+                        }
+                        continue;
+                    }
                     LiveCommand::SendSticker { request_id, thread, sticker } if uploads.active() => {
                         sticker_send::Request { request_id, thread, sticker }
                             .finish(events, StickerOutcome::Unavailable)
@@ -2797,6 +2864,9 @@ async fn run_inner(
                         },
                         completed = recalls.next() => {
                             recall::complete(&db, events, completed).await?;
+                        },
+                        found = sticker_search.next() => {
+                            sticker_search.complete(found, events).await?;
                         },
                         completed = reactions.next() => {
                             reactions::complete(&db, events, completed).await?;

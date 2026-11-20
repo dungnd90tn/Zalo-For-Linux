@@ -240,6 +240,17 @@ pub enum LiveCommand {
         thread: String,
         sticker: crate::domain::StickerDescriptor,
     },
+    SearchStickers {
+        request_id: u64,
+        thread: String,
+        query: String,
+    },
+    SendCatalogSticker {
+        request_id: u64,
+        search_id: u64,
+        thread: String,
+        sticker: crate::domain::StickerDescriptor,
+    },
     ReadVisible {
         generation: u64,
         thread: String,
@@ -448,6 +459,16 @@ pub enum LiveEvent {
         request_id: u64,
         thread: String,
         outcome: StickerOutcome,
+    },
+    StickerSearchCapability {
+        account_id: String,
+        available: bool,
+    },
+    StickersFound {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        stickers: Option<Vec<crate::domain::StickerDescriptor>>,
     },
     ReadState {
         account_id: String,
@@ -667,6 +688,8 @@ impl LiveEvent {
             | Self::ForwardFinished { account_id, .. }
             | Self::ForwardTargets { account_id, .. }
             | Self::StickerFinished { account_id, .. }
+            | Self::StickerSearchCapability { account_id, .. }
+            | Self::StickersFound { account_id, .. }
             | Self::ReadState { account_id, .. }
             | Self::ReadStateChanged { account_id, .. }
             | Self::NotificationPreferences { account_id, .. }
@@ -782,6 +805,29 @@ impl LiveWorker {
     ) -> bool {
         self.submit(LiveCommand::SendSticker {
             request_id,
+            thread,
+            sticker,
+        })
+        .is_ok()
+    }
+    pub fn search_stickers(&self, request_id: u64, thread: String, query: String) -> bool {
+        self.submit(LiveCommand::SearchStickers {
+            request_id,
+            thread,
+            query,
+        })
+        .is_ok()
+    }
+    pub fn send_catalog_sticker(
+        &self,
+        request_id: u64,
+        search_id: u64,
+        thread: String,
+        sticker: crate::domain::StickerDescriptor,
+    ) -> bool {
+        self.submit(LiveCommand::SendCatalogSticker {
+            request_id,
+            search_id,
             thread,
             sticker,
         })
@@ -1008,6 +1054,30 @@ impl LiveWorker {
             } => {
                 *request_id > 0
                     && sticker.is_builtin()
+                    && Target::from_thread(thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
+            }
+            LiveCommand::SearchStickers {
+                request_id,
+                thread,
+                query,
+            } => {
+                *request_id > 0
+                    && crate::protocol::sticker_catalog::valid_query(query)
+                    && Target::from_thread(thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
+            }
+            LiveCommand::SendCatalogSticker {
+                request_id,
+                search_id,
+                thread,
+                sticker,
+            } => {
+                *request_id > 0
+                    && *search_id > 0
+                    && sticker.is_catalog()
                     && Target::from_thread(thread).is_ok_and(|target| {
                         target.kind == ThreadKind::Group || target.remote_id != self.account
                     })
@@ -1661,6 +1731,8 @@ impl super::Model {
             | LiveEvent::ForwardFinished { .. }
             | LiveEvent::ForwardTargets { .. }
             | LiveEvent::StickerFinished { .. }
+            | LiveEvent::StickerSearchCapability { .. }
+            | LiveEvent::StickersFound { .. }
             | LiveEvent::ReadState { .. }
             | LiveEvent::ReadStateChanged { .. }
             | LiveEvent::NotificationPreferences { .. }

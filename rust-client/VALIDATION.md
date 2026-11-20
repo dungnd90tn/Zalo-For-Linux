@@ -1499,3 +1499,49 @@ Real-account acceptance is pending for both workflows. Reaction totals cover
 confirmed local sends and authenticated notices the worker has processed.
 Receiving updates through the separate control stream and historical reaction
 replay require further work.
+
+## Catalog search, reaction catch-up and message selection (2.0.5 preview)
+
+The full offline all-feature suite passed 828 Rust tests with five opt-in tests
+ignored. Strict Clippy, formatting, the sticker source oracle and 19 Python
+tooling tests passed. Local TLS checks verify the authorized sticker search,
+matching detail response and typed send. Local WSS checks both advertised
+reaction queues, retry from the last committed cursor and later reconciliation
+when the referenced message arrives. The 17 to 18 upgrade covers preserved
+built-in sticker intents and atomic reaction cursor rollback on write failure.
+
+Private X11 captures cover `stickers`, `stickers-search` and `message-selection`
+in Light and Dark at 640×480 and 1200×780. Connection traces confirm zero
+Internet requests. Selection reveals the entry message once, then allows normal
+scrolling. Keyboard tests cover ordered plaintext copy, draft preservation,
+Escape and page changes.
+
+The optimized standard `live` preview passed the schema 18 release smoke with
+19 synthetic messages across six conversations, restart preservation, profile
+locking and private diagnostic files.
+
+Real-account checks remain in [PLAN_2.0.5.md](PLAN_2.0.5.md). Reaction catch-up
+requires advertised queues and retained ordinary history. The legacy control
+poll, queue resets and evictions are outside this implementation.
+
+The 2.0.5-1 packages in `dist/rust/` use the same optimized `live` executable
+and require at most the `GLIBC_2.30` symbol set. The Debian package upgraded
+2.0.4-3 on Ubuntu 20.04 and retained a synthetic history row across schema
+16 to 18. Installation, payload integrity and removal of the RPM passed on
+AlmaLinux 9. The extracted binary reports 2.0.5 and passed schema 18 release
+smoke. SHA-256 sums were verified for both packages.
+
+## Compact message context menu (2.0.5-2)
+
+Private X11 captures cover the menu with and without reactions in Light and
+Dark at 640×480 and 1200×780. The full menu measures about 230×255 pixels at
+native scale one. The capture connection traces contain no Internet connections.
+Keyboard tests cover Tab, both arrows, wrapping between enabled actions, narrow
+viewport placement and preservation of the composer draft. The all-feature
+suite passed 828 Rust tests with five opt-in tests ignored. Strict all-feature
+Clippy and formatting passed.
+
+The 2.0.5-2 Debian package upgraded 2.0.5-1 in Ubuntu 20.04 and preserved a
+synthetic history row at schema 18. The RPM installed, verified and removed
+cleanly on AlmaLinux 9. Both packages carried the same executable, and both
+SHA-256 checks and the schema 18 release smoke passed.

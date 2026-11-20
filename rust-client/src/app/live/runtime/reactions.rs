@@ -1,9 +1,151 @@
 //! One explicit reaction request at a time, with bounded authenticated input.
 use super::*;
-use crate::protocol::reactions::{self as reaction_wire, ReactionNotice};
-use std::collections::BTreeSet;
+use crate::protocol::reactions::{self as reaction_wire, ReactionNotice, DIRECT_PULL, GROUP_PULL};
+use std::collections::{BTreeMap, BTreeSet};
 
 const SEND_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_CATCHUP_PAGES: u16 = 100;
+
+#[derive(Default)]
+pub(super) struct Catchup(BTreeMap<u16, PullRequest>);
+
+struct PullRequest {
+    last_id: u64,
+    pages: u16,
+    request_id: String,
+}
+
+impl Catchup {
+    pub fn discard_optional_frame(&mut self, failure: &wire::FrameFailure) -> bool {
+        if matches!(failure.error, WireError::Authentication | WireError::Crypto) {
+            return false;
+        }
+        match failure.context.command {
+            Some(command @ (DIRECT_PULL | GROUP_PULL)) => {
+                if failure.context.subcommand == Some(0) {
+                    self.0.remove(&command);
+                }
+                true
+            }
+            Some(601 | 612) => true,
+            _ => false,
+        }
+    }
+}
+
+async fn request_page(
+    connection: &mut Connection,
+    command: u16,
+    last_id: u64,
+    pages: u16,
+) -> Result<()> {
+    let request_id = connection.request();
+    connection
+        .send(
+            command,
+            0,
+            json!({
+                "first": pages == 1,
+                "reqId": request_id,
+                "lastId": last_id,
+                "preIds": [],
+            }),
+        )
+        .await?;
+    connection.reaction_catchup.0.insert(
+        command,
+        PullRequest {
+            last_id,
+            pages,
+            request_id,
+        },
+    );
+    Ok(())
+}
+
+pub(super) async fn start_catchup(
+    connection: &mut Connection,
+    db: &Database,
+    auth: &Value,
+) -> Result<()> {
+    connection.reaction_catchup.0.clear();
+    for command in reaction_wire::advertised_pulls(auth) {
+        let account = connection.account.clone();
+        let last_id = db
+            .call_with(StorageOperation::ReceiveCursor, move |store| {
+                store.receive_cursor(&account, &format!("{command}_0"))
+            })
+            .await;
+        match last_id.and_then(|id| safe_cursor(&id)) {
+            Ok(last_id) => request_page(connection, command, last_id, 1).await?,
+            Err(error) => {
+                let _ = diagnostic(&error, LiveStage::Synchronization);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn catchup_page(
+    connection: &mut Connection,
+    db: &Database,
+    events: &Events,
+    command: u16,
+    payload: &Value,
+) -> Result<()> {
+    let Some(progress) = connection.reaction_catchup.0.get(&command) else {
+        return Ok(());
+    };
+    // Some server versions omit reqId. A reply naming another request cannot
+    // advance this queue, even if its contents otherwise look valid.
+    if payload
+        .pointer("/data/reqId")
+        .is_some_and(|req| !req.is_null() && req.as_str() != Some(progress.request_id.as_str()))
+    {
+        return Ok(());
+    }
+    let progress = connection
+        .reaction_catchup
+        .0
+        .remove(&command)
+        .expect("active pull");
+    let page = match reaction_wire::pull_page(&events.account, payload, command) {
+        Ok(page) if page.continuation.is_none_or(|next| next > progress.last_id) => page,
+        Ok(_) => {
+            record_pull_error(command, 0, WireError::Invalid);
+            return Ok(());
+        }
+        Err(error) => {
+            record_pull_error(command, 0, error);
+            return Ok(());
+        }
+    };
+    let cursor = page.cursor.map(|last| (command, last));
+    if !commit_notices(db, events, page.notices, cursor).await? {
+        return Ok(());
+    }
+    if let Some(next) = page.continuation {
+        if progress.pages < MAX_CATCHUP_PAGES {
+            request_page(connection, command, next, progress.pages + 1).await?;
+        } else {
+            record_pull_error(command, 0, WireError::Oversize);
+        }
+    }
+    Ok(())
+}
+
+fn record_pull_error(command: u16, subcommand: u8, error: WireError) {
+    let failure = wire::FrameFailure {
+        error,
+        reason: wire::FrameReason::BatchEnvelope,
+        context: wire::FrameContext {
+            command: Some(command),
+            subcommand: Some(subcommand),
+            ..Default::default()
+        },
+    };
+    let _ = diagnostic(&failure.into(), LiveStage::Synchronization);
+}
 
 #[derive(Clone)]
 pub(super) struct Request {
@@ -246,18 +388,44 @@ pub(super) async fn emit_changed(events: &Events, threads: BTreeSet<String>) -> 
 pub(super) async fn receive(
     db: &Database,
     events: &Events,
-    notices: Vec<ReactionNotice>,
+    payload: &Value,
+    command: u16,
+    subcommand: u8,
 ) -> Result<()> {
-    if !notices.is_empty() {
-        let account = events.account.clone();
-        let changed = db
-            .call_with(StorageOperation::ReceiveBatch, move |store| {
-                store.apply_reaction_notices(&account, &notices)
-            })
-            .await?;
-        emit_changed(events, changed).await?;
+    match reaction_wire::control_notices(&events.account, payload) {
+        Ok(notices) => {
+            commit_notices(db, events, notices, None).await?;
+        }
+        Err(error) => record_pull_error(command, subcommand, error),
     }
     Ok(())
+}
+
+async fn commit_notices(
+    db: &Database,
+    events: &Events,
+    notices: Vec<ReactionNotice>,
+    cursor: Option<(u16, u64)>,
+) -> Result<bool> {
+    if notices.is_empty() && cursor.is_none() {
+        return Ok(true);
+    }
+    let account = events.account.clone();
+    match db
+        .call_with(StorageOperation::ReceiveBatch, move |store| {
+            store.commit_reaction_page(&account, &notices, cursor)
+        })
+        .await
+    {
+        Ok(changed) => {
+            emit_changed(events, changed).await?;
+            Ok(true)
+        }
+        Err(error) => {
+            record_storage_failure(&error, StorageOperation::ReceiveBatch);
+            Ok(false)
+        }
+    }
 }
 
 pub(super) async fn complete(

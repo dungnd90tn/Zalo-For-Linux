@@ -31,6 +31,8 @@ pub mod session;
 #[cfg(feature = "messaging")]
 pub mod signal;
 #[cfg(feature = "messaging")]
+pub(crate) mod sticker_catalog;
+#[cfg(feature = "messaging")]
 pub(crate) mod sticker_send;
 #[cfg(feature = "trust-wasm")]
 pub mod trust;

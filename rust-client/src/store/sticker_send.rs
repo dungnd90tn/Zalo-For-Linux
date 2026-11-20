@@ -2,15 +2,36 @@
 use super::*;
 
 pub(super) fn initialize(conn: &Connection) -> Result<()> {
+    let old_layout: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sticker_outbox') WHERE name='sticker_id')
+          AND NOT EXISTS(SELECT 1 FROM pragma_table_info('sticker_outbox') WHERE name='category_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    if old_layout {
+        conn.execute_batch("ALTER TABLE sticker_outbox RENAME TO sticker_outbox_v17;")?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sticker_outbox(
             account_id TEXT NOT NULL, client_id TEXT NOT NULL, thread_id TEXT NOT NULL,
-            sticker_id INTEGER NOT NULL CHECK(sticker_id BETWEEN 1 AND 30),
+            sticker_id INTEGER NOT NULL, category_id INTEGER NOT NULL, sticker_type INTEGER NOT NULL,
             created_at_ms INTEGER NOT NULL, server_id TEXT,
             echoed INTEGER NOT NULL DEFAULT 0 CHECK(echoed IN (0,1)),
-            PRIMARY KEY(account_id,client_id));
-         CREATE UNIQUE INDEX IF NOT EXISTS sticker_unconfirmed ON
-            sticker_outbox(account_id,thread_id,sticker_id) WHERE server_id IS NULL;
+            CHECK((sticker_id BETWEEN 1 AND 30 AND category_id=0 AND sticker_type=7)
+                OR (sticker_id BETWEEN 1 AND 9007199254740991
+                    AND category_id BETWEEN 1 AND 9007199254740991 AND sticker_type=3)),
+            PRIMARY KEY(account_id,client_id));",
+    )?;
+    if old_layout {
+        conn.execute_batch(
+            "INSERT INTO sticker_outbox(account_id,client_id,thread_id,sticker_id,category_id,sticker_type,created_at_ms,server_id,echoed)
+             SELECT account_id,client_id,thread_id,sticker_id,0,7,created_at_ms,server_id,echoed FROM sticker_outbox_v17;
+             DROP TABLE sticker_outbox_v17;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS sticker_unconfirmed ON
+            sticker_outbox(account_id,thread_id,sticker_id,category_id,sticker_type) WHERE server_id IS NULL;
          CREATE UNIQUE INDEX IF NOT EXISTS sticker_server_id ON
             sticker_outbox(account_id,thread_id,server_id) WHERE server_id IS NOT NULL;",
     )?;
@@ -42,7 +63,7 @@ mod live {
             let target = Target::from_thread(thread)?;
             numeric_id(account)?;
             ensure!(
-                sticker.is_builtin()
+                sticker.can_send()
                     && (1..=MAX_STICKER_ID as i64).contains(&now_ms)
                     && !(target.kind == ThreadKind::Direct && target.remote_id == account),
                 FailureReason::Validation
@@ -51,9 +72,9 @@ mod live {
             let tx = self.conn.transaction()?;
             let unconfirmed: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sticker_outbox WHERE account_id=?1 AND thread_id=?2
-                   AND sticker_id=?3 AND server_id IS NULL)
+                   AND sticker_id=?3 AND category_id=?4 AND sticker_type=?5 AND server_id IS NULL)
                  OR (SELECT COUNT(*) FROM sticker_outbox WHERE account_id=?1 AND server_id IS NULL)>=100",
-                params![account, thread, sticker.sticker_id],
+                params![account, thread, sticker.sticker_id, sticker.category_id, sticker.sticker_type],
                 |row| row.get(0),
             )?;
             if unconfirmed {
@@ -74,9 +95,9 @@ mod live {
                 params![account, next],
             )?;
             tx.execute(
-                "INSERT INTO sticker_outbox(account_id,client_id,thread_id,sticker_id,created_at_ms)
-                 VALUES(?1,?2,?3,?4,?5)",
-                params![account, next.to_string(), thread, sticker.sticker_id, now_ms],
+                "INSERT INTO sticker_outbox(account_id,client_id,thread_id,sticker_id,category_id,sticker_type,created_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![account, next.to_string(), thread, sticker.sticker_id, sticker.category_id, sticker.sticker_type, now_ms],
             )?;
             tx.commit()?;
             Ok(Reservation::Ready(next as u64))
@@ -116,7 +137,7 @@ mod live {
                     .timestamp_ms
                     .filter(|&stamp| stamp > 0)
                     .unwrap_or(row.created_at_ms),
-                sticker: Some(StickerDescriptor::builtin(row.sticker_id)),
+                sticker: Some(row.sticker),
                 source_client_id: None,
                 reply_blocked: true,
                 recalled: false,
@@ -147,7 +168,7 @@ mod live {
     struct Binding {
         client: String,
         thread: String,
-        sticker_id: u64,
+        sticker: StickerDescriptor,
         created_at_ms: i64,
         server_id: Option<String>,
         echoed: bool,
@@ -157,17 +178,21 @@ mod live {
         Ok(Binding {
             client: row.get(0)?,
             thread: row.get(1)?,
-            sticker_id: row.get(2)?,
-            created_at_ms: row.get(3)?,
-            server_id: row.get(4)?,
-            echoed: row.get(5)?,
+            sticker: StickerDescriptor {
+                sticker_id: row.get(2)?,
+                category_id: row.get(3)?,
+                sticker_type: row.get(4)?,
+            },
+            created_at_ms: row.get(5)?,
+            server_id: row.get(6)?,
+            echoed: row.get(7)?,
         })
     }
 
     fn by_client(conn: &Connection, account: &str, client: &str) -> Result<Option<Binding>> {
         Ok(conn
             .query_row(
-                "SELECT client_id,thread_id,sticker_id,created_at_ms,server_id,echoed
+                "SELECT client_id,thread_id,sticker_id,category_id,sticker_type,created_at_ms,server_id,echoed
                  FROM sticker_outbox WHERE account_id=?1 AND client_id=?2",
                 params![account, client],
                 binding,
@@ -217,7 +242,7 @@ mod live {
         message: &Message,
         client: Option<&str>,
     ) -> Result<bool> {
-        let Some(sticker) = message.sticker.filter(|sticker| sticker.is_builtin()) else {
+        let Some(sticker) = message.sticker.filter(|sticker| sticker.can_send()) else {
             return Ok(false);
         };
         if message.sender != message.account_id {
@@ -229,7 +254,7 @@ mod live {
             .flatten();
         let bound = conn
             .query_row(
-                "SELECT client_id,thread_id,sticker_id,created_at_ms,server_id,echoed
+                "SELECT client_id,thread_id,sticker_id,category_id,sticker_type,created_at_ms,server_id,echoed
                  FROM sticker_outbox WHERE account_id=?1 AND thread_id=?2 AND server_id=?3",
                 params![message.account_id, message.thread_id, message.id],
                 binding,
@@ -246,7 +271,7 @@ mod live {
             return Ok(false);
         };
         if row.thread != message.thread_id
-            || row.sticker_id != sticker.sticker_id
+            || row.sticker != sticker
             || row
                 .server_id
                 .as_ref()
@@ -404,7 +429,8 @@ mod tests {
         original
             .conn
             .execute_batch(
-                "DROP TABLE sticker_outbox; DROP TABLE reaction_events; PRAGMA user_version=16;",
+                "DROP TABLE sticker_outbox; DROP TABLE reaction_events;
+                 DROP TABLE pending_reaction_events; PRAGMA user_version=16;",
             )
             .unwrap();
 
@@ -414,7 +440,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            17
+            18
         );
         assert_eq!(upgraded.receive_cursor("11", "510_0").unwrap(), "123");
         assert_eq!(upgraded.page("11", "d:22", None, 2).unwrap(), [historical]);
@@ -428,5 +454,52 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(new_tables, 2);
+    }
+
+    #[test]
+    fn schema_seventeen_migration_preserves_the_existing_builtin_attempt_bindings() {
+        let original = MessageStore::in_memory().unwrap();
+        original.conn.execute_batch(
+            "DROP TABLE sticker_outbox;
+             CREATE TABLE sticker_outbox(
+               account_id TEXT NOT NULL, client_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+               sticker_id INTEGER NOT NULL CHECK(sticker_id BETWEEN 1 AND 30),
+               created_at_ms INTEGER NOT NULL, server_id TEXT,
+               echoed INTEGER NOT NULL DEFAULT 0 CHECK(echoed IN (0,1)),
+               PRIMARY KEY(account_id,client_id));
+             CREATE UNIQUE INDEX sticker_unconfirmed ON sticker_outbox(account_id,thread_id,sticker_id)
+               WHERE server_id IS NULL;
+             CREATE UNIQUE INDEX sticker_server_id ON sticker_outbox(account_id,thread_id,server_id)
+               WHERE server_id IS NOT NULL;
+             INSERT INTO sticker_outbox VALUES('11','5001','d:22',3,5001,NULL,0);
+             INSERT INTO outgoing_counters VALUES('11',5001);
+             PRAGMA user_version=17;",
+        ).unwrap();
+        let mut upgraded = MessageStore::initialize(original.conn).unwrap();
+        let builtin = StickerDescriptor::builtin(3);
+        assert!(matches!(
+            upgraded
+                .prepare_sticker("11", "d:22", builtin, 5002)
+                .unwrap(),
+            Reservation::Unconfirmed
+        ));
+        let catalog = StickerDescriptor {
+            sticker_id: 3,
+            category_id: 10047,
+            sticker_type: 3,
+        };
+        assert!(reserve(&mut upgraded, catalog) > 5001);
+        let ack = SendAck {
+            server_id: "903".into(),
+            timestamp_ms: None,
+        };
+        let (message, _) = upgraded.accept_sticker("11", 5001, &ack).unwrap();
+        assert_eq!(message.sticker, Some(builtin));
+        assert_eq!(message.sent_at_ms, 5001);
+        let version: i64 = upgraded
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 18);
     }
 }

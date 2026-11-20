@@ -10,7 +10,7 @@ use crate::{
     },
     domain::Message,
 };
-use eframe::egui::{self, pos2, vec2, FontId, Rect, RichText, Sense, Stroke};
+use eframe::egui::{self, pos2, vec2, FontId, Rect, Sense, Stroke};
 use std::{collections::BTreeMap, time::Duration};
 
 const PRESETS: [(ReactionKind, &str, &[u8]); 6] = [
@@ -45,8 +45,6 @@ const PRESETS: [(ReactionKind, &str, &[u8]); 6] = [
         include_bytes!("../../../pc-dist/emoji/emoji-32/row-3-column-43.png"),
     ),
 ];
-
-pub(super) const POPUP_WIDTH: f32 = 6.0 * visuals::ICON_BUTTON + 5.0 * 4.0;
 
 pub(super) struct Icons([egui::TextureHandle; PRESETS.len()]);
 
@@ -387,24 +385,17 @@ pub(super) fn show_menu(
     };
     let summary = state.reactions.at(scope, &message.id);
     let colors = crate::theme::palette(ui.ctx());
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-        visuals::source_icon(ui, rect, "fa-csc-menu-icon-reaction", colors.text_secondary);
-        ui.label(RichText::new("Cảm xúc").strong());
-    });
     let mut action = None;
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let cell = ui.available_width() / PRESETS.len() as f32;
         for (index, (kind, label, _)) in PRESETS.iter().enumerate() {
             let selected = summary
                 .iter()
                 .any(|entry| entry.kind == *kind && entry.mine);
             let (rect, button) = ui
                 .add_enabled_ui(active, |ui| {
-                    ui.allocate_exact_size(
-                        vec2(visuals::ICON_BUTTON, visuals::ICON_BUTTON),
-                        Sense::click(),
-                    )
+                    ui.allocate_exact_size(vec2(cell, 36.0), Sense::click())
                 })
                 .inner;
             let fill = if button.is_pointer_button_down_on() {
@@ -417,7 +408,7 @@ pub(super) fn show_menu(
                 None
             };
             if let Some(fill) = fill {
-                ui.painter().rect_filled(rect, 12.0, fill);
+                ui.painter().rect_filled(rect.shrink(2.0), 10.0, fill);
             }
             let tint = if active {
                 egui::Color32::WHITE
@@ -426,11 +417,11 @@ pub(super) fn show_menu(
             };
             ui.painter().image(
                 state.reaction_icons.0[index].id(),
-                Rect::from_center_size(rect.center(), vec2(24.0, 24.0)),
+                Rect::from_center_size(rect.center(), vec2(22.0, 22.0)),
                 Rect::from_min_max(egui::Pos2::ZERO, pos2(1.0, 1.0)),
                 tint,
             );
-            visuals::focus_outline(ui, &button, rect, 12.0);
+            visuals::focus_outline(ui, &button, rect.shrink(2.0), 10.0);
             button.widget_info(|| {
                 egui::WidgetInfo::selected(egui::WidgetType::Button, active, selected, *label)
             });
@@ -446,14 +437,13 @@ pub(super) fn show_menu(
         }
     });
     if summary.iter().any(|entry| entry.mine) {
-        let remove = ui
-            .add_enabled_ui(active, |ui| {
-                ui.add_sized(
-                    vec2(POPUP_WIDTH, 44.0),
-                    egui::Button::new("Gỡ cảm xúc của tôi"),
-                )
-            })
-            .inner;
+        let remove = super::message_actions::action_row(
+            ui,
+            "Gỡ cảm xúc của tôi",
+            "fa-close_24",
+            active,
+            false,
+        );
         if active {
             buttons.push(remove.id);
         }
@@ -462,7 +452,7 @@ pub(super) fn show_menu(
         }
         remove.on_disabled_hover_text(unavailable);
     }
-    ui.separator();
+    super::message_actions::menu_separator(ui);
     action
 }
 
@@ -571,30 +561,4 @@ pub(super) fn paint_badge(
     let label = details.join("\n");
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &label));
     response.on_hover_text(label);
-}
-
-pub(super) fn keyboard_menu(ui: &egui::Ui, message: &Message, bubble: Rect) -> Option<egui::Pos2> {
-    if !ui.is_enabled() || !ui.is_rect_visible(bubble) || !supports(message) {
-        return None;
-    }
-    let row = ui.interact(
-        bubble,
-        ui.id().with((
-            "message_options",
-            &message.account_id,
-            &message.thread_id,
-            &message.id,
-        )),
-        Sense::focusable_noninteractive(),
-    );
-    row.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Tùy chọn tin nhắn")
-    });
-    visuals::focus_outline(ui, &row, bubble, 12.0);
-    (row.has_focus()
-        && ui.input_mut(|input| {
-            input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                || input.consume_key(egui::Modifiers::SHIFT, egui::Key::F10)
-        }))
-    .then_some(bubble.center())
 }

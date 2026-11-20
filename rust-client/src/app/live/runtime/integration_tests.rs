@@ -50,6 +50,7 @@ enum Reply {
     Forward(u8),
     Recall(u8),
     Reactions,
+    ReactionReplay,
     GroupActions(bool),
     UpgradeForbidden,
     DesktopHeaders,
@@ -86,6 +87,7 @@ struct State {
     ordinary_quotes: Mutex<Vec<Value>>,
     recall_source_at: OnceLock<i64>,
     reaction_first_client: OnceLock<u64>,
+    release_reaction_removal: AtomicBool,
 }
 struct Fixture {
     addr: SocketAddr,
@@ -225,24 +227,7 @@ impl Fixture {
         )
         .await
         .unwrap();
-        Connection {
-            account: "11".into(),
-            socket,
-            decoder: FrameDecoder::default(),
-            queues: Default::default(),
-            offline_progress: Default::default(),
-            request_id: 0,
-            last_pong: tokio::time::Instant::now(),
-            last_ping: None,
-            authenticated_at: None,
-            list_encrypted: false,
-            #[cfg(feature = "signal-crypto")]
-            e2ee_receive_report: None,
-            #[cfg(feature = "signal-crypto")]
-            e2ee_receive: None,
-            #[cfg(feature = "signal-crypto")]
-            e2ee_http: None,
-        }
+        Connection::connected(socket, "11")
     }
 }
 impl Drop for Fixture {
@@ -687,7 +672,13 @@ fn serve(
             let _ = ws.read();
             return;
         }
-        let auth = json!({"error_code":0,"data":{"qCmds":if matches!(reply,Reply::InfoPages(_)|Reply::MediaPages(_)|Reply::RichCards){json!([{"cmd":511,"subCmd":1}])}else if matches!(reply,Reply::PeerRouting(_) | Reply::StructuredWebchat){json!([{"cmd":510,"subCmd":1}])}else if matches!(reply,Reply::Runtime|Reply::Stickers|Reply::RuntimeStall|Reply::DirectoryStall|Reply::ControlHeartbeats){json!([{"cmd":510,"subCmd":0},{"cmd":511,"subCmd":0}])}else{json!([{"cmd":510,"subCmd":0}])}}});
+        let mut auth = json!({"error_code":0,"data":{"qCmds":if matches!(reply,Reply::InfoPages(_)|Reply::MediaPages(_)|Reply::RichCards){json!([{"cmd":511,"subCmd":1}])}else if matches!(reply,Reply::PeerRouting(_) | Reply::StructuredWebchat){json!([{"cmd":510,"subCmd":1}])}else if matches!(reply,Reply::Runtime|Reply::Stickers|Reply::RuntimeStall|Reply::DirectoryStall|Reply::ControlHeartbeats){json!([{"cmd":510,"subCmd":0},{"cmd":511,"subCmd":0}])}else{json!([{"cmd":510,"subCmd":0}])}}});
+        if matches!(reply, Reply::ReactionReplay) {
+            auth["data"]["ctrl_qCmds"] = json!([
+                {"cmd":610,"subCmd":0},{"cmd":611,"subCmd":0},
+                {"cmd":603,"subCmd":0},{"cmd":611,"subCmd":1}
+            ]);
+        }
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         z.write_all(&serde_json::to_vec(&auth).unwrap()).unwrap();
         let auth_frame = if matches!(reply, Reply::ControlHeartbeats) {
@@ -723,6 +714,10 @@ fn serve(
                 return;
             }
             panic!("Synthetic WebSocket authentication failed: {error}");
+        }
+        if matches!(reply, Reply::ReactionReplay) {
+            reaction_replay_tests::socket(ws, state);
+            return;
         }
         if matches!(reply, Reply::ReadStates) {
             let live = json!({"error_code":0,"data":{"msgs":[
@@ -6025,6 +6020,7 @@ mod file_fixture;
 mod file_upload_tests;
 
 mod photo_upload_tests;
+mod reaction_replay_tests;
 mod sticker_send_tests;
 
 #[tokio::test]
@@ -6386,7 +6382,7 @@ async fn actual_tls_reaction_acceptance_echo_replay_and_remove_preserve_peer_and
     stop.send(true).unwrap();
     actor.await.unwrap();
     assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 2);
-    let store =
+    let mut store =
         MessageStore::open(&fixture.profile.paths.data_dir.join("messages.sqlite")).unwrap();
     assert_eq!(store.page("11", "d:22", None, 10).unwrap().len(), 1);
     assert_eq!(

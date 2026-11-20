@@ -1045,7 +1045,7 @@ fn incoming_with_reason(
                     && !structured_webchat
                     && ((media.is_none() && message_type == "webchat")
                         || matches!(message_type, "share.file" | "chat.photo")
-                        || (sticker.is_some_and(StickerDescriptor::is_builtin)
+                        || (sticker.is_some_and(StickerDescriptor::can_send)
                             && legacy
                             && v.get("ttl")
                                 .is_none_or(|value| value.is_null() || value.as_u64() == Some(0))))

@@ -74,13 +74,24 @@ remains a truthful local placeholder and does not change messaging connection st
 The picker lists the 30 built-in descriptors. N400154–400182 sends an encrypted
 form to `/api/message/sticker` or `/api/group/sticker` on the configured chat or
 group service. The worker requires a verified ordinary visible conversation,
-standard group visibility and a fresh auto-delete check. Search, downloaded
-sticker packs and encrypted sticker sending are outside this scope.
+standard group visibility and a fresh auto-delete check.
 
-Schema 17 keeps sticker attempts in `sticker_outbox`. A matching ACK or exact own
+Schema 18 keeps sticker attempts in `sticker_outbox` with their category and type.
+The additive migration preserves schema 17 built-in reservations. A matching ACK or exact own
 echo can confirm an attempt. A timeout leaves the attempt unconfirmed across
 restart and blocks resubmission of that sticker in the same conversation. Sticker
 ACKs and echoes leave the text outbox and composer draft alone.
+
+## Catalog search
+
+The configured sticker service handles keyword search through
+`/api/message/sticker/search`. The authenticated sticker detail response from
+`/api/message/sticker/sticker_detail` must match both the selected result ID and
+category before the picker offers an ordinary type-3 sticker. Search resolves at
+most ten results and keeps selection authority scoped to the request and
+conversation. Thumbnail loading still uses the fixed public media endpoints.
+The built-in pack is available when the authenticated catalog service is absent.
+Effect stickers, personalized stickers and pack browsing remain outside this flow.
 
 Offline checks:
 

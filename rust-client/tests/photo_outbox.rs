@@ -383,10 +383,10 @@ fn schema_eleven_migration_preserves_file_quote_and_crypto_bytes_and_rolls_back(
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            17
+            18
         );
     }
-    conn.execute_batch("PRAGMA user_version=18;").unwrap();
+    conn.execute_batch("PRAGMA user_version=19;").unwrap();
     assert!(MessageStore::open(&db.0).is_err());
     assert_eq!(rows(&db.0), before);
 }

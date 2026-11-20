@@ -23,7 +23,7 @@ impl Request {
     }
 }
 
-fn normal_scope(events: &Events, thread: &str) -> Option<u64> {
+pub(super) fn normal_scope(events: &Events, thread: &str) -> Option<u64> {
     let state = events.privacy.read().ok()?;
     (state.confirmed && state.status == LivePrivacyStatus::Ready && !state.hidden.contains(thread))
         .then_some(state.revision)
@@ -31,6 +31,7 @@ fn normal_scope(events: &Events, thread: &str) -> Option<u64> {
 
 pub(super) async fn handle(
     request: Request,
+    catalog_authorized: bool,
     connection: Option<&mut Connection>,
     db: &Database,
     events: &Events,
@@ -40,7 +41,8 @@ pub(super) async fn handle(
     use StickerOutcome::*;
     let allowed = Target::from_thread(&request.thread).ok().filter(|target| {
         request.request_id > 0
-            && request.sticker.is_builtin()
+            && (request.sticker.is_builtin()
+                || (catalog_authorized && request.sticker.is_catalog()))
             && (target.kind == ThreadKind::Group || target.remote_id != events.account)
     });
     let (Some(connection), Some(revision), Some(target)) =

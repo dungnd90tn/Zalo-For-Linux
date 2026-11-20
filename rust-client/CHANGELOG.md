@@ -2,25 +2,33 @@
 
 Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-client/`). Định dạng theo
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
-Ghi chú đóng gói mới nhất nằm trong [bản 2.0.4-3](../changelogs/RELEASE-v2.0.4-3.md).
+Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) để đối chiếu khi nâng cấp.
 
-## Chưa phát hành (dự kiến 2.0.5)
+## 2.0.5 — gói thử 2.0.5-2
+
+Theo dõi thứ tự triển khai và tiêu chí phát hành trong [kế hoạch 2.0.5](PLAN_2.0.5.md).
+
+### Giao diện
+
+- Thu gọn menu chuột phải của tin nhắn. Các mục căn trái, có biểu tượng, hàng cảm xúc nằm ở trên và mục **Thu hồi** tách riêng ở cuối. Dùng Tab hoặc phím mũi tên để di chuyển và Enter để thực hiện.
 
 ### Thêm mới
 
 - Gửi 30 nhãn dán mặc định từ nút nhãn dán cạnh ô soạn trong chat cá nhân và nhóm thường đủ điều kiện. Bấm vào một nhãn dán để gửi ngay. Bản nháp đang soạn được giữ lại.
+- Tìm sticker theo từ khóa trong bảng nhãn dán khi phiên Zalo có dịch vụ danh mục tương thích. Có thể gửi sticker thường đã được dịch vụ xác nhận.
 - Bấm chuột phải vào tin văn bản đủ điều kiện để thả tim, thích, cười, bất ngờ, buồn hoặc giận. Có thể gỡ tất cả cảm xúc của mình trên tin đó. Tổng hiển thị dựa trên các lượt mà ứng dụng đã ghi nhận.
+- Lấy bù cảm xúc sau khi kết nối lại nếu máy chủ công bố hàng đợi cảm xúc tương thích. Cảm xúc đến trước tin nhắn sẽ xuất hiện sau khi thông tin tin gốc được xác minh.
+- Chọn nhiều tin nhắn văn bản trên trang hiện tại và sao chép theo thứ tự thời gian. Nhấn Esc để thoát chế độ chọn.
 
 ### Thay đổi
 
-- Hồ sơ nâng lên **schema 17** và giữ lịch sử đã lưu. Các bản dựng cũ hơn không mở được hồ sơ đã nâng cấp.
+- Hồ sơ nâng lên **schema 18** và giữ lịch sử cùng các lượt gửi đang chờ xác nhận. Các bản dựng dùng schema cũ hơn không mở được hồ sơ đã nâng cấp.
 
 ### Ưu tiên kiểm chứng
 
 - Thử gửi nhãn dán và thêm/gỡ cảm xúc qua điện thoại và Linux trong cả chat cá nhân và nhóm thường. Xác nhận cập nhật từ thiết bị khác và sau khi kết nối lại.
 - Xác nhận phiên đã lưu giữ Online sau đồng bộ. Thử gửi bằng **Enter** và nút **Gửi** khi bật/tắt x-unikey, trên X11 và Wayland.
 - Kiểm chứng trên tài khoản thử các luồng trả lời, gửi tệp và ảnh, thông báo, chuyển tiếp, thu hồi và thao tác nhóm. Ghi kết quả theo từng luồng trong [VALIDATION.md](VALIDATION.md).
-- Khi chốt mã, cập nhật phiên bản Native trong `Cargo.toml` và `Cargo.lock`, chốt ghi chú 2.0.5, build gói `.deb`/`.rpm` và kiểm tra nâng cấp từ `2.0.4-3`. Thẻ phát hành phải khớp phiên bản Native.
 
 ## Gói 2.0.4-3 - 2026-11-19
 
