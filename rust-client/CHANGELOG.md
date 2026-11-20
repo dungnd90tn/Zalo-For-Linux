@@ -10,6 +10,7 @@ Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) đ�
 - Làm nổi bật phần nhắc tên đã xác minh trong tin nhắn nhóm, kể cả khi mở lại lịch sử.
 - Ghim và bỏ ghim tin văn bản trong nhóm thường theo quyền Zalo. Xem danh sách trong **Thông tin hội thoại** và bấm để mở tin đã lưu. Nếu ghim trên thiết bị khác, dùng **Cập nhật tin ghim** để tải trạng thái mới.
 - Chuyển tiếp một tin văn bản cá nhân đến tối đa 10 bạn bè. Giữ lựa chọn khi tìm kiếm, hiển thị kết quả từng người và chỉ cho thử lại các lượt bị từ chối hoặc xác định chưa gửi.
+- Thu hồi tin văn bản do bạn gửi trong nhóm thường tối đa 100 thành viên khi còn trong thời hạn. Khi xác nhận thu hồi, ứng dụng cập nhật bong bóng và bỏ nội dung gốc khỏi trích dẫn, kết quả tìm kiếm và bản xem trước tin ghim trên máy.
 - Hồ sơ nâng lên **schema 20** để lưu thông tin nhắc tên và trạng thái ghim chưa xác nhận. Giữ lịch sử đã lưu khi nâng cấp. Bản cài 2.0.5 dùng schema 18 sẽ từ chối mở hồ sơ đã nâng cấp.
 
 ## 2.0.5 — gói thử 2.0.5-2

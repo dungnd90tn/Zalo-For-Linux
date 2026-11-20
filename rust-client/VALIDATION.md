@@ -1663,3 +1663,33 @@ The all-feature suite passed 854 Rust tests with five opt-in tests ignored.
 The default checks passed 308 Rust and 19 Python tests. Strict all-feature,
 all-target Clippy and the optimized live release smoke passed. Real-account
 acceptance remains pending.
+
+## Ordinary group text recall (2.0.6 development branch)
+
+The message menu offers **Thu hồi** for eligible saved text authored by the
+current account. The group confirmation states that recall applies to all
+members. The worker requires a visible ordinary group of up to 100 members,
+recent membership and visibility checks, and the session's recall window. The
+encrypted group request to `/api/group/undomsg` uses the message and client
+IDs from the saved source (PC bundle N401877–401897). Storage uses the existing
+recall ledger and schema 20.
+
+The TLS/WSS fixture covers accepted, rejected and missing replies, a restart
+with an unresolved recall, and recovery via an authenticated group notice.
+Storage tests check that an early notice waits for the exact ordinary source,
+that historical text and quotes stay redacted after replay, and that a group
+notice cannot affect another chat or settle a typed mention send. UI tests
+cover scope, draft preservation and a pin snapshot that arrives after recall.
+Isolated X11 captures of `ZALO_UI_FIXTURE_RECALL=group-confirm` and
+`group-unknown` covered both themes at 640×480 and 1200×780. The captures used
+synthetic conversations and made no IPv4 or IPv6 connections.
+
+The all-feature suite passed 864 Rust tests with five opt-in tests ignored.
+Default checks passed 308 Rust and 19 Python tests. Strict Clippy passed with
+all features and targets. The optimized live binary passed the profile upgrade
+and restart smoke tests with schema 20.
+
+Real-account verification remains pending. Use a disposable profile and a
+group with a second test account. Confirm both clients show the same recall,
+then reopen the thread and check that the original text stays hidden in local
+history, search, quotes and pinned-message previews.

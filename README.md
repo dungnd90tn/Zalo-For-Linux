@@ -16,7 +16,7 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 - **Hiển thị nội dung nhận được:** văn bản, thông báo hệ thống, sticker (tĩnh và động, hiển thị không nền), ảnh và một số thẻ OA/nội dung được chia sẻ. Hỗ trợ PNG/JPEG/WebP và một phần JPEG XL tĩnh; ảnh đã tải có thể mở trong khung xem của ứng dụng.
 - **Trả lời và gửi tệp:** trả lời tin văn bản thường, gửi một tệp tối đa 100 MiB hoặc một ảnh HD tĩnh, có tiến độ và nút hủy. Ảnh HD có bản xem trước và chú thích.
 - **Sticker và cảm xúc.** Gửi sticker mặc định hoặc tìm theo từ khóa khi phiên Zalo hỗ trợ danh mục. Menu chuột phải có sáu cảm xúc và thao tác sao chép nhiều tin văn bản trên trang hiện tại.
-- **Chuyển tiếp và thu hồi:** chuyển tiếp một tin văn bản cá nhân thông thường đến tối đa 10 bạn bè và xem kết quả cho từng người. Thu hồi tin văn bản do bạn gửi trong hội thoại cá nhân khi còn trong thời hạn cho phép.
+- **Chuyển tiếp và thu hồi:** chuyển tiếp một tin văn bản cá nhân thông thường đến tối đa 10 bạn bè và xem kết quả cho từng người. Bấm chuột phải và chọn **Thu hồi** cho tin văn bản thông thường do bạn gửi còn trong thời hạn cho phép. Tính năng áp dụng trong chat cá nhân và nhóm thường tối đa 100 thành viên mà bạn vẫn tham gia.
 - **Theo dõi tin mới:** lọc hội thoại **Chưa đọc** theo các tin mới nhận trên máy này. Tin gửi hiện trạng thái chuyển/đã xem khi có dữ liệu xác nhận.
 - **Thông báo Linux:** mặc định chỉ báo **Bạn có tin nhắn mới**. Bật xem trước nội dung ở **bánh răng → Thông báo**. Hội thoại ẩn hoặc đang tắt thông báo không phát cảnh báo.
 - **Thành viên nhóm:** mở **Thông tin hội thoại → Thành viên** để xem danh sách theo quyền của bạn, tối đa 50 người mỗi trang. Với nhóm thường tối đa 100 thành viên, bạn có thể mời một người bạn hoặc rời nhóm nếu quyền hiện tại cho phép. Hội thoại đã rời vẫn mở được để đọc lịch sử đã lưu.
@@ -175,7 +175,7 @@ Sau mỗi lần biên dịch bản mới, chạy lại trình cài đặt để 
 | Nhắn tin | Xác nhận đầy đủ gửi–nhận cá nhân/nhóm với tài khoản thực, kết nối lại và vận hành lâu dài |
 | Đồng bộ | Toàn bộ lịch sử từ máy chủ, thành viên nhóm lớn và cộng đồng, xác nhận tải ảnh đại diện trên tài khoản thực |
 | Nội dung | Gửi ảnh gốc, gửi nhiều ảnh/tệp, ghi âm, tiếp tục lượt tải dở và các mẫu thẻ OA còn lại |
-| Thao tác tin nhắn | Ghim trong chat cá nhân, cập nhật tin ghim theo thời gian thực, chuyển tiếp từ hoặc đến nhóm, nhắc cả nhóm, thu hồi nhóm hoặc xóa cục bộ, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
+| Thao tác tin nhắn | Ghim trong chat cá nhân, cập nhật tin ghim theo thời gian thực, chuyển tiếp từ hoặc đến nhóm, nhắc cả nhóm, thu hồi ảnh và tệp, xóa cục bộ, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
 | Quản lý nhóm | Tạo nhóm, xóa thành viên, chuyển quyền trưởng nhóm, mời nhiều người và tham gia lại nhóm đã rời |
 | Bình chọn và tìm kiếm | Chi tiết/kết quả/bỏ phiếu và tìm kiếm toàn bộ tin nhắn |
 | Tích hợp Linux | Khay hệ thống, thông báo sau khi thoát hẳn, chụp màn hình và kiểm tra trên nhiều môi trường desktop |

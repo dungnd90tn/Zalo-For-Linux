@@ -1,9 +1,11 @@
-//! Scoped online dispatch for one ordinary direct-message recall.
+//! Scoped online dispatch for ordinary direct and group text recalls.
 use super::*;
 use crate::protocol::recall::{self as wire_recall, RecallReference};
 use crate::store::recall::{RecallChange, RecallFailure, RecallOutcome as StoredOutcome};
+use tokio::time::Instant;
 
 const RECALL_DEADLINE: Duration = Duration::from_secs(10);
+const GROUP_PROOF_AGE: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 pub(super) struct RecallRequest {
@@ -17,11 +19,29 @@ impl RecallRequest {
         wire::numeric_id(account)?;
         wire::numeric_id(&self.message_id)?;
         let target = Target::from_thread(&self.thread)?;
-        if self.request_id == 0 || target.kind != ThreadKind::Direct || target.remote_id == account
+        if self.request_id == 0
+            || (target.kind == ThreadKind::Direct && target.remote_id == account)
         {
             return Err(WireError::Unsupported);
         }
         Ok(target)
+    }
+}
+
+enum Eligibility {
+    Direct,
+    Group {
+        visibility: u64,
+        checked_at: Instant,
+    },
+}
+
+impl Eligibility {
+    fn is_fresh(&self) -> bool {
+        match self {
+            Self::Direct => true,
+            Self::Group { checked_at, .. } => checked_at.elapsed() <= GROUP_PROOF_AGE,
+        }
     }
 }
 
@@ -43,23 +63,25 @@ pub(super) enum DispatchOutcome {
     Unknown,
 }
 
-pub(super) struct PreparedDispatch {
+struct PreparedDispatch {
     thread: String,
     url: Url,
     body: String,
     original: RecallReference,
     max_age_ms: i64,
+    eligibility: Eligibility,
 }
 
 impl PreparedDispatch {
     /// The caller reserves an exact scope-bound intent and verifies ordinary
-    /// sending eligibility on the current authenticated socket before dispatch.
-    pub fn new(
+    /// messaging eligibility on an authenticated session before dispatch.
+    fn new(
         session: &VerifiedSession,
         request: &RecallRequest,
         client_id: u64,
         original: RecallReference,
         max_age_ms: i64,
+        eligibility: Eligibility,
     ) -> Result<Self> {
         let target = request.target(session.account_id())?;
         if request.message_id != original.message_id
@@ -67,13 +89,31 @@ impl PreparedDispatch {
         {
             return Err(WireError::Unsupported.into());
         }
-        let mut url = root_for(session, "chat")?;
+        let (service, path, parameters) = match (&target.kind, &eligibility) {
+            (ThreadKind::Direct, Eligibility::Direct) => (
+                "chat",
+                wire_recall::DIRECT_PATH,
+                wire_recall::direct_parameters(&target, client_id, &original)?,
+            ),
+            (ThreadKind::Group, Eligibility::Group { visibility, .. }) => (
+                "group",
+                wire_recall::GROUP_PATH,
+                wire_recall::group_parameters(
+                    &target,
+                    client_id,
+                    &original,
+                    *visibility,
+                    session.imei(),
+                )?,
+            ),
+            _ => return Err(WireError::Unsupported.into()),
+        };
+        let mut url = root_for(session, service)?;
         wire::validate_origin(&url, "https")?;
-        url.set_path(wire_recall::DIRECT_PATH);
+        url.set_path(path);
         url.query_pairs_mut()
             .append_pair("zpw_ver", wire::API_VERSION)
             .append_pair("zpw_type", session.client_type().api_type());
-        let parameters = wire_recall::direct_parameters(&target, client_id, &original)?;
         let encrypted = session.encrypt_payload(&serde_json::to_vec(&parameters)?)?;
         let body = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("params", &encrypted)
@@ -84,12 +124,13 @@ impl PreparedDispatch {
             body,
             original,
             max_age_ms,
+            eligibility,
         })
     }
 
     /// Issue the authorized authenticated request once. Any interrupted,
     /// malformed or otherwise unproven response leaves the durable row unknown.
-    pub async fn send(
+    async fn send(
         self,
         client: &reqwest::Client,
         session: &VerifiedSession,
@@ -97,6 +138,7 @@ impl PreparedDispatch {
         revision: u64,
     ) -> DispatchOutcome {
         if normal_scope_revision(privacy, &self.thread) != Some(revision)
+            || !self.eligibility.is_fresh()
             || !self.original.within_window(now_ms(), self.max_age_ms)
         {
             return DispatchOutcome::NotSent;
@@ -214,21 +256,58 @@ impl Recalls {
         ) else {
             return finish(events, request, RecallOutcome::Unavailable).await;
         };
-        if self.running.is_some() || root_for(session, "chat").is_err() {
+        let service = match target.kind {
+            ThreadKind::Direct => "chat",
+            ThreadKind::Group => "group",
+        };
+        if self.running.is_some() || root_for(session, service).is_err() {
             return finish(events, request, RecallOutcome::Unavailable).await;
         }
-        // The actor is the sole WSS reader. This bounded eligibility check can
-        // receive and commit queue pushes before it reserves a recall intent.
-        if let Err(error) = socket.verify_direct(&target, db, events).await {
-            finish(events, request, RecallOutcome::Unavailable).await?;
-            if error.downcast_ref::<StorageContext>().is_some()
-                || wire_error(&error) == Some(&WireError::Authentication)
-            {
-                return Err(error);
+        let eligibility = match target.kind {
+            // The actor is the sole WSS reader. Direct preflight can receive
+            // and commit queue pushes before reserving a recall intent.
+            ThreadKind::Direct => socket
+                .verify_direct(&target, db, events)
+                .await
+                .map(|()| Eligibility::Direct),
+            ThreadKind::Group => {
+                let checked_at = Instant::now();
+                let roster_request = group_roster::Request {
+                    thread: request.thread.clone(),
+                    privacy_revision: revision,
+                    after: None,
+                };
+                tokio::try_join!(
+                    verify_group(client, session, &target),
+                    group_roster::verify_members(client, session, &events.privacy, &roster_request),
+                )
+                .and_then(|(visibility, roster)| {
+                    if visibility != 0 || !roster.applies(&roster_request, &events.account) {
+                        return Err(WireError::Unsupported.into());
+                    }
+                    Ok(Eligibility::Group {
+                        visibility,
+                        checked_at,
+                    })
+                })
             }
-            return Ok(());
-        }
-        if normal_scope_revision(&events.privacy, &request.thread) != Some(revision) {
+        };
+        let eligibility = match eligibility {
+            Ok(eligibility) => eligibility,
+            Err(error) => {
+                finish(events, request, RecallOutcome::Unavailable).await?;
+                if error.downcast_ref::<StorageContext>().is_some()
+                    || wire_error(&error) == Some(&WireError::Authentication)
+                {
+                    return Err(error);
+                }
+                return Ok(());
+            }
+        };
+        if !socket.decoder.authenticated()
+            || normal_scope_revision(&events.privacy, &request.thread) != Some(revision)
+            || !eligibility.is_fresh()
+        {
             return finish(events, request, RecallOutcome::Unavailable).await;
         }
         let (account, thread, message) = (
@@ -249,7 +328,8 @@ impl Recalls {
                 return finish(events, request, outcome).await;
             }
         };
-        let Ok(dispatch) = PreparedDispatch::new(session, &request, client_id, original, max_age)
+        let Ok(dispatch) =
+            PreparedDispatch::new(session, &request, client_id, original, max_age, eligibility)
         else {
             return complete(db, events, (request, client_id, DispatchOutcome::NotSent)).await;
         };
@@ -260,12 +340,11 @@ impl Recalls {
             request,
             client_id,
             task: tokio::spawn(async move {
-                // A preview or socket notice can settle the intent after it is
-                // reserved. Recheck on the storage actor before any HTTP write.
+                // Recheck the pending intent and group policy before any HTTP write.
                 if !db
-                    .call(move |store| store.recall_outcome(&account, client_id))
+                    .call(move |store| store.recall_dispatch_pending(&account, client_id))
                     .await
-                    .is_ok_and(|outcome| outcome == StoredOutcome::Pending)
+                    .unwrap_or(false)
                 {
                     return DispatchOutcome::NotSent;
                 }
@@ -340,7 +419,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_confirmed_visible_direct_chat_can_supply_recall_scope() {
+    fn only_confirmed_visible_chat_can_supply_recall_scope() {
         let mut request = RecallRequest {
             request_id: 2,
             thread: "d:22".into(),
@@ -361,6 +440,7 @@ mod tests {
         }
         assert_eq!(normal_scope_revision(&scope, &request.thread), None);
         request.thread = "g:22".into();
-        assert!(request.target("11").is_err());
+        assert!(request.target("11").is_ok());
+        assert_eq!(normal_scope_revision(&scope, &request.thread), Some(3));
     }
 }

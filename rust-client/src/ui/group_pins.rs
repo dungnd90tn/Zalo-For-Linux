@@ -8,7 +8,7 @@ use crate::{
     domain::{Conversation, Message, MessageHit},
 };
 use eframe::egui::{self, vec2, RichText};
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
 
 #[derive(Default)]
 pub(super) struct Pins {
@@ -18,6 +18,8 @@ pub(super) struct Pins {
     online: bool,
     pending: Option<(u64, Option<String>)>,
     snapshot: Option<GroupPinSnapshot>,
+    recalled_during_request: HashSet<String>,
+    preview_overflow: bool,
     notice: Option<(&'static str, Instant)>,
     #[cfg(test)]
     fixture: bool,
@@ -87,6 +89,8 @@ impl Pins {
         };
         self.attempted = true;
         if worker.submit(command).is_ok() {
+            self.recalled_during_request.clear();
+            self.preview_overflow = false;
             let mutation = change.is_some();
             self.pending = Some((request_id, change.map(|change| change.id)));
             self.notice = None;
@@ -155,6 +159,16 @@ impl Pins {
         }
         self.pending = None;
         self.snapshot.clone_from(snapshot);
+        if let Some(snapshot) = &mut self.snapshot {
+            for entry in &mut snapshot.entries {
+                if self.preview_overflow || self.recalled_during_request.contains(&entry.message_id)
+                {
+                    entry.hit = None;
+                }
+            }
+        }
+        self.recalled_during_request.clear();
+        self.preview_overflow = false;
         let notice = match outcome {
             Some(GroupPinOutcome::Accepted) if self.snapshot.is_some() => {
                 "Đã cập nhật tin nhắn ghim."
@@ -188,6 +202,14 @@ impl Pins {
             .as_ref()
             .is_some_and(|scope| scope.thread == thread)
         {
+            // An outstanding board snapshot may have read the original text before recall committed.
+            if self.pending.is_some() && !self.preview_overflow {
+                if self.recalled_during_request.len() < crate::domain::MAX_PAGE_SIZE {
+                    self.recalled_during_request.insert(message.into());
+                } else {
+                    self.preview_overflow = true;
+                }
+            }
             if let Some(snapshot) = &mut self.snapshot {
                 for entry in &mut snapshot.entries {
                     if entry.message_id == message {
@@ -493,6 +515,41 @@ mod tests {
                 vec![]
             },
         }
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_restore_a_pin_preview_recalled_during_the_read() {
+        let (worker, mut commands, _events) = LiveWorker::presentation_fixture("11");
+        let mut pins = Pins::default();
+        pins.set_scope(Some(scope(4)));
+        pins.set_online(true);
+        pins.start(Some(&worker), None);
+        let Ok(LiveCommand::GroupPins {
+            request_id,
+            thread,
+            privacy_revision,
+        }) = commands.try_recv()
+        else {
+            panic!("expected a scoped read");
+        };
+        pins.remove_preview(&thread, "901");
+        let mut stale = snapshot(true, true, false);
+        stale.entries[0].hit = Some(MessageHit {
+            message_id: "901".into(),
+            sender: "11".into(),
+            sent_at_ms: 1000,
+            snippet: "Nội dung đã thu hồi".into(),
+            highlight: (0, 0),
+            jump: None,
+        });
+        pins.observe(&LiveEvent::GroupPins {
+            account_id: "11".into(),
+            request_id,
+            thread,
+            privacy_revision,
+            snapshot: Some(stale),
+        });
+        assert_eq!(pins.snapshot, Some(snapshot(true, true, false)));
     }
 
     #[test]

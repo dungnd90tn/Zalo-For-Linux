@@ -120,10 +120,22 @@ mod live {
         pub reference: RecallReference,
     }
 
-    fn scope<'a>(account: &str, thread: &'a str) -> Option<&'a str> {
-        thread
-            .strip_prefix("d:")
-            .filter(|peer| valid_source_id(account) && valid_source_id(peer) && account != *peer)
+    #[derive(Clone, Copy)]
+    enum Scope<'a> {
+        Direct(&'a str),
+        Group,
+    }
+
+    fn scope<'a>(account: &str, thread: &'a str) -> Option<Scope<'a>> {
+        let (kind, remote) = thread.split_once(':')?;
+        if !valid_source_id(account) || !valid_source_id(remote) {
+            return None;
+        }
+        match kind {
+            "d" if account != remote => Some(Scope::Direct(remote)),
+            "g" => Some(Scope::Group),
+            _ => None,
+        }
     }
 
     fn private_or_encrypted(conn: &Connection, account: &str, thread: &str) -> Result<bool> {
@@ -212,22 +224,51 @@ mod live {
         message: &Message,
         ordinary_text: bool,
     ) -> Result<Option<Message>> {
-        if scope(&message.account_id, &message.thread_id).is_none() {
+        let Some(scope) = scope(&message.account_id, &message.thread_id) else {
             return Ok(None);
-        }
+        };
         let Some(prior) = tombstone(conn, &message.account_id, &message.thread_id, &message.id)?
         else {
             return Ok(None);
         };
+        let group = matches!(scope, Scope::Group);
+        let client = message.source_client_id.as_deref();
+        let matches_client = if group {
+            prior
+                .source_client
+                .as_deref()
+                .is_some_and(|id| client == Some(id))
+        } else {
+            same_cli(prior.source_client.as_deref(), client)
+        };
         if message.sender != prior.actor
-            || (!prior.materialized
-                && (!ordinary_text
-                    || !same_cli(
-                        prior.source_client.as_deref(),
-                        message.source_client_id.as_deref(),
-                    )))
+            || (!prior.materialized && (!ordinary_text || !matches_client))
         {
             return Ok(None);
+        }
+        if group && !prior.materialized {
+            if message.sender == message.account_id
+                && own_mention(conn, &message.account_id, &message.thread_id, client)?
+            {
+                return Ok(None);
+            }
+            // An early group notice has now matched the original ordinary row.
+            redact_copies(
+                conn,
+                &message.account_id,
+                &message.thread_id,
+                &message.id,
+                &prior.actor,
+            )?;
+            if message.sender == message.account_id {
+                settle_own_recall(
+                    conn,
+                    &message.account_id,
+                    &message.thread_id,
+                    &message.id,
+                    client,
+                )?;
+            }
         }
         conn.execute(
             "UPDATE recall_tombstones SET materialized=1,
@@ -281,6 +322,7 @@ mod live {
                AND (server_id IS NULL OR server_id=?3) AND body=?6
                AND state IN ('sending','unknown','acknowledged','accepted')
                AND NOT EXISTS(SELECT 1 FROM outgoing_reply r WHERE r.account_id=?1 AND r.client_id=?4)
+               AND NOT EXISTS(SELECT 1 FROM outgoing_mention n WHERE n.account_id=?1 AND n.client_id=?4)
                AND NOT EXISTS(SELECT 1 FROM outgoing other WHERE other.account_id=?1 AND other.thread_id=?2 AND other.server_id=?3 AND other.client_id<>?4)",
             params![message.account_id,message.thread_id,message.id,client,PLACEHOLDER,message.text],
         )?;
@@ -298,7 +340,8 @@ mod live {
         };
         if quote.owner_id != prior.actor
             || (!prior.materialized
-                && !same_cli(prior.source_client.as_deref(), quote.client_id.as_deref()))
+                && (thread.starts_with("g:")
+                    || !same_cli(prior.source_client.as_deref(), quote.client_id.as_deref())))
         {
             return Ok(false);
         }
@@ -351,6 +394,37 @@ mod live {
         Ok(())
     }
 
+    fn own_mention(
+        conn: &Connection,
+        account: &str,
+        thread: &str,
+        client: Option<&str>,
+    ) -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outgoing_mention n JOIN outgoing o
+                ON o.account_id=n.account_id AND o.client_id=n.client_id
+                WHERE n.account_id=?1 AND o.thread_id=?2 AND n.client_id=?3)",
+            params![account, thread, client],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn settle_own_recall(
+        conn: &Connection,
+        account: &str,
+        thread: &str,
+        id: &str,
+        client: Option<&str>,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE recall_outbox SET state='recalled'
+             WHERE account_id=?1 AND thread_id=?2 AND message_id=?3
+             AND state IN ('sending','unknown','acknowledged') AND (?4 IS NULL OR source_client_id=?4)",
+            params![account, thread, id, client],
+        )?;
+        Ok(())
+    }
+
     fn write(
         conn: &Connection,
         account: &str,
@@ -360,23 +434,45 @@ mod live {
         client: Option<&str>,
         time: i64,
     ) -> Result<Option<RecallChange>> {
-        let Some(peer) = scope(account, thread) else {
+        let Some(scope) = scope(account, thread) else {
             return Ok(None);
         };
+        let group = matches!(scope, Scope::Group);
         if !valid_source_id(id)
+            || !valid_source_id(actor)
             || time <= 0
-            || (actor != account && actor != peer)
+            || matches!(scope, Scope::Direct(peer) if actor != account && actor != peer)
             || client.is_some_and(|id| !valid_source_id(id))
         {
             return Ok(None);
         }
         let mut previous = tombstone(conn, account, thread, id)?;
         let mut original = original(conn, account, thread, id)?;
+        if group
+            && original.is_none()
+            && (client.is_none()
+                || (actor == account && own_mention(conn, account, thread, client)?))
+        {
+            return Ok(None);
+        }
         if let Some(message) = &original {
             if message.sender != actor || !same_cli(message.source_client_id.as_deref(), client) {
                 return Ok(None);
             }
+            if group
+                && previous.as_ref().is_none_or(|prior| !prior.materialized)
+                && !ordinary(conn, message)?
+            {
+                return Ok(None);
+            }
         }
+        // A group notice with no client ID can use a verified original. Compare
+        // that ID against any pending notice before materializing its tombstone.
+        let client = if group {
+            client.or_else(|| original.as_ref()?.source_client_id.as_deref())
+        } else {
+            client
+        };
         if previous.as_ref().is_some_and(|prior| {
             prior.actor != actor || !same_cli(prior.source_client.as_deref(), client)
         }) {
@@ -384,6 +480,7 @@ mod live {
             // with the eventual row, let a new notice bound to the actual row
             // replace it. Never change an already materialized tombstone.
             let bound_original = match &original {
+                Some(_) if group => previous.as_ref().is_some_and(|prior| !prior.materialized),
                 Some(message) => ordinary(conn, message)?,
                 None => false,
             };
@@ -397,7 +494,7 @@ mod live {
             previous = None;
         }
         if let Some(message) = &original {
-            if previous.is_none() && !ordinary(conn, message)? {
+            if !group && previous.is_none() && !ordinary(conn, message)? {
                 return Ok(None);
             }
         }
@@ -416,15 +513,12 @@ mod live {
         if original.is_none() {
             bound_pending(conn, account)?;
         }
-        if actor == account {
-            conn.execute(
-                "UPDATE recall_outbox SET state='recalled'
-                 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3
-                 AND state IN ('sending','unknown','acknowledged') AND (?4 IS NULL OR source_client_id=?4)",
-                params![account,thread,id,client],
-            )?;
+        if actor == account && (!group || original.is_some()) {
+            settle_own_recall(conn, account, thread, id, client)?;
         }
-        redact_copies(conn, account, thread, id, actor)?;
+        if !group || original.is_some() {
+            redact_copies(conn, account, thread, id, actor)?;
+        }
         if let Some(message) = &mut original {
             conn.execute(
                 "UPDATE messages SET body=?5 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND sender=?4",
@@ -477,10 +571,19 @@ mod live {
         account: &str,
         notice: &RecallNotice,
     ) -> Result<Option<RecallChange>> {
-        if !valid_source_id(&notice.event_id) {
+        if !valid_source_id(&notice.event_id) || notice.event_id == notice.message_id {
             return Ok(None);
         }
-        write(
+        if notice.thread_id.starts_with("g:")
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM e2ee_threads WHERE account_id=?1 AND thread_id=?2)",
+                params![account, notice.thread_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Ok(None);
+        }
+        let change = write(
             conn,
             account,
             &notice.thread_id,
@@ -488,7 +591,10 @@ mod live {
             &notice.actor_id,
             notice.client_id.as_deref(),
             notice.occurred_at_ms,
-        )
+        )?;
+        // An early group notice remains internal until an ordinary source is
+        // matched. There is no UI change to apply to menus or quotes yet.
+        Ok(change.filter(|change| !notice.thread_id.starts_with("g:") || change.message.is_some()))
     }
 
     fn allocate(conn: &Connection, account: &str, now: i64) -> Result<i64> {
@@ -534,7 +640,8 @@ mod live {
             );
             let tx = self.conn.transaction()?;
             ensure!(
-                !private_or_encrypted(&tx, account, thread)?,
+                !private_or_encrypted(&tx, account, thread)?
+                    && !crate::store::group_actions::write_blocked(&tx, account, thread)?,
                 RecallFailure::Unavailable
             );
             ensure!(
@@ -592,6 +699,23 @@ mod live {
             Ok(())
         }
 
+        pub(crate) fn recall_dispatch_pending(&self, account: &str, client: u64) -> Result<bool> {
+            ensure!(valid_source_id(account), FailureReason::Validation);
+            let thread: Option<String> = self.conn.query_row(
+                "SELECT thread_id FROM recall_outbox WHERE account_id=?1 AND client_id=?2 AND state='sending'",
+                params![account, client.to_string()],
+                |row| row.get(0),
+            ).optional()?;
+            let Some(thread) = thread else {
+                return Ok(false);
+            };
+            if !thread.starts_with("g:") {
+                return Ok(true);
+            }
+            Ok(!private_or_encrypted(&self.conn, account, &thread)?
+                && !crate::store::group_actions::write_blocked(&self.conn, account, &thread)?)
+        }
+
         pub(crate) fn accept_recall_ack(
             &mut self,
             account: &str,
@@ -607,6 +731,11 @@ mod live {
             )?;
             let change = write(&tx, account, &thread, &id, account, Some(&source), created)?
                 .ok_or(FailureReason::ConflictingEcho)?;
+            if thread.starts_with("g:") && change.message.is_none() {
+                // A matched HTTP ACK confirms the exact reserved operation
+                // even if the source row was cleared while awaiting it.
+                settle_own_recall(&tx, account, &thread, &id, Some(&source))?;
+            }
             tx.commit()?;
             Ok(change)
         }
@@ -728,6 +857,232 @@ mod tests {
         let loaded = store.refresh_messages("11", "d:22", &["7".into()]).unwrap();
         assert!(loaded[0].is_recalled());
         assert!(loaded[0].source_client_id.is_none());
+    }
+
+    #[test]
+    fn group_notice_awaits_the_exact_ordinary_source_and_leaves_other_threads_intact() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let original = message("g:77", "7", "22", "Tin trong nhóm");
+        let mut quote = message("g:77", "8", "33", "Trích dẫn");
+        quote.quote = Some(MessageQuote::from_message(&original).unwrap());
+        let other_group = message("g:78", "7", "22", "Tin ở nhóm khác");
+        store.insert_batch(&[quote, other_group.clone()]).unwrap();
+        let mut group_notice = RecallNotice {
+            thread_id: "g:77".into(),
+            ..notice("7", "22")
+        };
+        receive(&mut store, &[], &[group_notice.clone()], None).unwrap();
+        let mut wrong_client = original.clone();
+        wrong_client.source_client_id = Some("201".into());
+        assert!(redacted_copy(&store.conn, &wrong_client, true)
+            .unwrap()
+            .is_none());
+        assert!(redacted_copy(&store.conn, &original, true)
+            .unwrap()
+            .is_none());
+
+        group_notice.client_id = Some("101".into());
+        receive(&mut store, &[], &[group_notice], None).unwrap();
+        assert!(redacted_copy(&store.conn, &wrong_client, true)
+            .unwrap()
+            .is_none());
+        let loaded = store.refresh_messages("11", "g:77", &["8".into()]).unwrap();
+        assert_eq!(loaded[0].quote.as_ref().unwrap().text, "Tin trong nhóm");
+        receive(
+            &mut store,
+            &[((original.clone(), None, None, None, None), None)],
+            &[],
+            None,
+        )
+        .unwrap();
+        let loaded = store
+            .refresh_messages("11", "g:77", &["7".into(), "8".into()])
+            .unwrap();
+        assert!(loaded
+            .iter()
+            .find(|message| message.id == "7")
+            .unwrap()
+            .is_recalled());
+        assert_eq!(
+            loaded
+                .iter()
+                .find(|message| message.id == "8")
+                .unwrap()
+                .quote
+                .as_ref()
+                .unwrap()
+                .text,
+            RECALLED_TEXT
+        );
+        assert_eq!(
+            store.refresh_messages("11", "g:78", &["7".into()]).unwrap(),
+            [other_group]
+        );
+
+        let existing = message("g:77", "9", "22", "Tin đã lưu");
+        store.insert_batch(std::slice::from_ref(&existing)).unwrap();
+        let global_only = RecallNotice {
+            thread_id: "g:77".into(),
+            ..notice("9", "22")
+        };
+        receive(&mut store, &[], &[global_only], None).unwrap();
+        assert!(store.refresh_messages("11", "g:77", &["9".into()]).unwrap()[0].is_recalled());
+    }
+
+    #[test]
+    fn group_recall_cannot_settle_a_typed_mention_from_a_plain_echo() {
+        use crate::domain::mention::Mention;
+        let mut store = MessageStore::in_memory().unwrap();
+        let text = "Chào @An";
+        let client = store
+            .prepare_outgoing_mention(
+                "11",
+                "g:77",
+                text,
+                &[Mention {
+                    uid: "22".into(),
+                    pos: 5,
+                    len: 3,
+                }],
+                101,
+            )
+            .unwrap();
+        store.fail_outgoing("11", client, true).unwrap();
+        let group_notice = RecallNotice {
+            thread_id: "g:77".into(),
+            client_id: Some(client.to_string()),
+            ..notice("7", "11")
+        };
+        receive(&mut store, &[], &[group_notice], None).unwrap();
+        let mut echo = message("g:77", "7", "11", text);
+        echo.source_client_id = Some(client.to_string());
+        assert!(redacted_copy(&store.conn, &echo, true).unwrap().is_none());
+        settle_recalled_own_echo(&store.conn, &echo).unwrap();
+        let state: (String, String) = store
+            .conn
+            .query_row(
+                "SELECT state,body FROM outgoing WHERE account_id='11' AND client_id=?1",
+                [client.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("unknown".into(), text.into()));
+    }
+
+    #[test]
+    fn duplicate_group_notice_never_redacts_a_later_peer_mention() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let incoming = RecallNotice {
+            thread_id: "g:77".into(),
+            client_id: Some("101".into()),
+            ..notice("7", "22")
+        };
+        let (_, _, changes) =
+            receive(&mut store, &[], std::slice::from_ref(&incoming), None).unwrap();
+        assert!(changes.is_empty());
+
+        let mut original = message("g:77", "7", "22", "@An");
+        original.reply_blocked = true;
+        original.mentions.push(crate::domain::mention::Mention {
+            uid: "11".into(),
+            pos: 0,
+            len: 3,
+        });
+        receive(
+            &mut store,
+            &[((original.clone(), None, None, None, None), None)],
+            std::slice::from_ref(&incoming),
+            None,
+        )
+        .unwrap();
+        let (_, _, changes) = receive(&mut store, &[], &[incoming], None).unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(
+            store.refresh_messages("11", "g:77", &["7".into()]).unwrap(),
+            [original]
+        );
+    }
+
+    #[test]
+    fn group_notice_with_committed_source_replaces_a_mismatched_pending_client() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let mut incoming = RecallNotice {
+            thread_id: "g:77".into(),
+            client_id: Some("201".into()),
+            ..notice("7", "22")
+        };
+        receive(&mut store, &[], std::slice::from_ref(&incoming), None).unwrap();
+        let original = message("g:77", "7", "22", "Tin đã lưu");
+        receive(
+            &mut store,
+            &[((original.clone(), None, None, None, None), None)],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            store.refresh_messages("11", "g:77", &["7".into()]).unwrap(),
+            [original]
+        );
+        incoming.client_id = None;
+        let (_, _, changes) = receive(&mut store, &[], &[incoming], None).unwrap();
+        assert!(changes[0].message.as_ref().unwrap().is_recalled());
+        let stored: (String, bool) = store
+            .conn
+            .query_row(
+                "SELECT source_client_id,materialized FROM recall_tombstones
+             WHERE account_id='11' AND thread_id='g:77' AND message_id='7'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("101".into(), true));
+    }
+
+    #[test]
+    fn early_group_own_notice_waits_for_source_while_exact_ack_settles_intent() {
+        let mut store = MessageStore::in_memory().unwrap();
+        store.replace_live_privacy("11", &[], None).unwrap();
+        let original = message("g:77", "7", "11", "Tin của tôi");
+        store.insert_batch(std::slice::from_ref(&original)).unwrap();
+        let intent = store.prepare_recall("11", "g:77", "7", 120, 100).unwrap();
+        store.conn.execute(
+            "DELETE FROM messages WHERE account_id='11' AND thread_id='g:77' AND message_id='7'",
+            [],
+        ).unwrap();
+        let incoming = RecallNotice {
+            thread_id: "g:77".into(),
+            client_id: Some(intent.reference.client_id),
+            ..notice("7", "11")
+        };
+        let (_, _, changes) = receive(&mut store, &[], &[incoming], None).unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(
+            store.recall_outcome("11", intent.client_id).unwrap(),
+            RecallOutcome::Pending
+        );
+
+        store.record_recall_ack("11", intent.client_id).unwrap();
+        assert_eq!(
+            store
+                .accept_recall_ack("11", intent.client_id)
+                .unwrap()
+                .message_id,
+            "7"
+        );
+        assert_eq!(
+            store.recall_outcome("11", intent.client_id).unwrap(),
+            RecallOutcome::Recalled
+        );
+        let (messages, _, changes) = receive(
+            &mut store,
+            &[((original, None, None, None, None), None)],
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(changes.is_empty());
+        assert!(messages[0].0.is_recalled());
     }
 
     #[test]

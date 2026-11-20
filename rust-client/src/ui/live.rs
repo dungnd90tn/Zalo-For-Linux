@@ -204,6 +204,18 @@ impl LiveState {
     }
 
     #[cfg(feature = "messaging")]
+    pub(super) fn group_recall_available(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            let config = session.config();
+            config.recall_max_age_ms.is_some()
+                && config
+                    .services
+                    .get("group")
+                    .is_some_and(|routes| !routes.is_empty())
+        })
+    }
+
+    #[cfg(feature = "messaging")]
     pub(super) fn ensure_worker(&mut self, profile: Arc<Profile>) -> bool {
         if self.worker.is_some() {
             return true;
@@ -1286,7 +1298,11 @@ pub(in crate::ui) mod tests {
                 trusted_qr: false,
                 server_time_seconds: None,
                 parameter_encryption: None,
-                services: Default::default(),
+                services: [(
+                    "group".into(),
+                    vec!["https://group.example.invalid".parse().unwrap()],
+                )]
+                .into(),
                 file_chunk_size: 256_000,
                 photo_upload_route: None,
                 photo_limits: Default::default(),
@@ -2683,6 +2699,15 @@ pub(in crate::ui) mod tests {
                     message.id = "901".into();
                     message.sender = "11".into();
                     message.source_client_id = Some("900".into());
+                    if scene.starts_with("group-") {
+                        let group = "g:70";
+                        app.model.selected = Some(group.into());
+                        app.model.conversations[0].id = group.into();
+                        app.model.conversations[0].title = "Nhóm kiểm thử thu hồi".into();
+                        message.thread_id = group.into();
+                        app.drafts.select(group).unwrap();
+                        app.drafts.active.text = "Bản nháp cần giữ".into();
+                    }
                     if scene == "recalled" {
                         message.recalled = true;
                         message.text = crate::domain::RECALLED_TEXT.into();

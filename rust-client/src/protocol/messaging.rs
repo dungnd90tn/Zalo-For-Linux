@@ -751,14 +751,24 @@ fn incoming_with_reason(
                 return Err(WireError::Invalid);
             }
             if scope == IncomingScope::AuthenticatedQueue
-                && field == "msgs"
+                && matches!(field, "msgs" | "groupMsgs")
                 && message_type == "chat.undo"
             {
-                // A direct recall is a scoped action, never a second chat row.
-                // Unsupported or malformed actions cannot mutate history.
-                result
-                    .recalls
-                    .extend(super::recall::direct_notice(account, v).ok());
+                // Unsupported or malformed recalls never become timeline rows.
+                let notice = match kind {
+                    ThreadKind::Direct => super::recall::direct_notice(account, v).ok(),
+                    ThreadKind::Group
+                        if data.get("e2ee").is_none_or(|value| {
+                            value.is_null()
+                                || value.as_bool() == Some(false)
+                                || value.as_u64() == Some(0)
+                        }) =>
+                    {
+                        super::recall::group_notice(account, v).ok()
+                    }
+                    ThreadKind::Group => None,
+                };
+                result.recalls.extend(notice);
                 continue;
             }
             if scope == IncomingScope::AuthenticatedQueue && message_type == "chat.reaction" {

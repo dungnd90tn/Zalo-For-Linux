@@ -1,9 +1,10 @@
-//! Ordinary direct-message recall as used by the bundled PC client.
+//! Ordinary direct and group message recall as used by the bundled PC client.
 use super::messaging::{id_string, numeric_id, service_code, Target, ThreadKind, WireError};
 use crate::domain::Message;
 use serde_json::{json, Value};
 
 pub(crate) const DIRECT_PATH: &str = "/api/message/undo";
+pub(crate) const GROUP_PATH: &str = "/api/group/undomsg";
 const MAX_CLIENT_ID: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,8 +20,7 @@ impl RecallReference {
     pub(crate) fn from_source(account: &str, message: &Message) -> Result<Self, WireError> {
         numeric_id(account)?;
         let target = Target::from_thread(&message.thread_id)?;
-        if target.kind != ThreadKind::Direct
-            || target.remote_id == account
+        if (target.kind == ThreadKind::Direct && target.remote_id == account)
             || message.account_id != account
             || message.sender != account
             || message.quote.is_some()
@@ -52,21 +52,52 @@ pub(crate) fn direct_parameters(
     new_client_id: u64,
     original: &RecallReference,
 ) -> Result<Value, WireError> {
-    if target.kind != ThreadKind::Direct
-        || !(1..=MAX_CLIENT_ID).contains(&new_client_id)
-        || new_client_id.to_string() == original.client_id
-    {
+    if target.kind != ThreadKind::Direct {
         return Err(WireError::Invalid);
     }
-    numeric_id(&target.remote_id)?;
-    numeric_id(&original.message_id)?;
-    numeric_id(&original.client_id)?;
+    validate_parameters(target, new_client_id, original)?;
     Ok(json!({
         "msgId": original.message_id,
         "toid": target.remote_id,
         "clientId": new_client_id,
         "cliMsgIdUndo": original.client_id,
     }))
+}
+
+pub(crate) fn group_parameters(
+    target: &Target,
+    new_client_id: u64,
+    original: &RecallReference,
+    visibility: u64,
+    imei: &str,
+) -> Result<Value, WireError> {
+    if target.kind != ThreadKind::Group || visibility != 0 || imei.is_empty() {
+        return Err(WireError::Invalid);
+    }
+    validate_parameters(target, new_client_id, original)?;
+    Ok(json!({
+        "msgId": original.message_id,
+        "grid": target.remote_id,
+        "clientId": new_client_id,
+        "visibility": visibility,
+        "cliMsgIdUndo": original.client_id,
+        "imei": imei,
+    }))
+}
+
+fn validate_parameters(
+    target: &Target,
+    new_client_id: u64,
+    original: &RecallReference,
+) -> Result<(), WireError> {
+    if !(1..=MAX_CLIENT_ID).contains(&new_client_id)
+        || new_client_id.to_string() == original.client_id
+    {
+        return Err(WireError::Invalid);
+    }
+    numeric_id(&target.remote_id)?;
+    numeric_id(&original.message_id)?;
+    numeric_id(&original.client_id)
 }
 
 /// Source derives success from the authenticated endpoint's error envelope. It
@@ -93,15 +124,19 @@ fn unavailable(value: &Value) -> bool {
     value.is_null() || value.as_i64() == Some(-1) || value.as_str() == Some("-1")
 }
 
-/// Call only for the authenticated ordinary DM collection. Do not infer the
-/// recalled message ID from the action envelope or a legacy client-only notice.
-pub(crate) fn direct_notice(account: &str, raw: &Value) -> Result<RecallNotice, WireError> {
-    numeric_id(account)?;
+fn ordinary_notice(raw: &Value, kind: ThreadKind) -> Result<(), WireError> {
+    let group_flag = raw.get("isGroup").filter(|v| !v.is_null());
+    let scope_matches = group_flag.is_none_or(|value| match kind {
+        ThreadKind::Direct => value.as_bool() == Some(false) || zero(value),
+        ThreadKind::Group => {
+            value.as_bool() == Some(true)
+                || value.as_u64() == Some(1)
+                || value.as_str() == Some("1")
+        }
+    });
     if raw.get("msgType").and_then(Value::as_str) != Some("chat.undo")
         || raw.get("e2eeExt").is_some()
-        || raw
-            .get("isGroup")
-            .is_some_and(|v| !v.is_null() && v.as_bool() != Some(false) && !zero(v))
+        || !scope_matches
         || ["isE2EE", "isE2ee", "e2ee"].iter().any(|key| {
             raw.get(key)
                 .is_some_and(|v| !v.is_null() && v.as_bool() != Some(false) && !zero(v))
@@ -109,27 +144,39 @@ pub(crate) fn direct_notice(account: &str, raw: &Value) -> Result<RecallNotice, 
     {
         return Err(WireError::Unsupported);
     }
-    let account_or_id = |value: &Value| {
-        if zero(value) {
-            Ok(account.to_owned())
-        } else {
-            id_string(value)
-        }
-    };
-    let actor_id = account_or_id(raw.get("uidFrom").ok_or(WireError::Invalid)?)?;
-    let recipient = account_or_id(raw.get("idTo").ok_or(WireError::Invalid)?)?;
+    Ok(())
+}
+
+fn notice_content(raw: &Value) -> Result<&Value, WireError> {
+    raw.get("content")
+        .filter(|content| content.is_object())
+        .ok_or(WireError::Invalid)
+}
+
+fn notice_actor(account: &str, value: &Value) -> Result<String, WireError> {
+    if zero(value) {
+        Ok(account.to_owned())
+    } else {
+        id_string(value)
+    }
+}
+
+/// Call only for the authenticated ordinary DM collection. Do not infer the
+/// recalled message ID from the action envelope or a legacy client-only notice.
+pub(crate) fn direct_notice(account: &str, raw: &Value) -> Result<RecallNotice, WireError> {
+    numeric_id(account)?;
+    ordinary_notice(raw, ThreadKind::Direct)?;
+    let actor_id = notice_actor(account, raw.get("uidFrom").ok_or(WireError::Invalid)?)?;
+    let recipient = notice_actor(account, raw.get("idTo").ok_or(WireError::Invalid)?)?;
     let peer = match (actor_id.as_str() == account, recipient.as_str() == account) {
         (true, false) => recipient.as_str(),
         (false, true) => actor_id.as_str(),
         _ => return Err(WireError::Invalid),
     };
     let thread_id = Target::new(ThreadKind::Direct, peer)?.thread_id();
-    let content = raw
-        .get("content")
-        .and_then(Value::as_object)
-        .ok_or(WireError::Invalid)?;
+    let content = notice_content(raw)?;
     if let Some(source) = content.get("srcId").filter(|value| !unavailable(value)) {
-        if account_or_id(source)? != actor_id {
+        if notice_actor(account, source)? != actor_id {
             return Err(WireError::Invalid);
         }
     }
@@ -144,6 +191,55 @@ pub(crate) fn direct_notice(account: &str, raw: &Value) -> Result<RecallNotice, 
             return Err(WireError::Invalid);
         }
     }
+    parse_notice(raw, content, thread_id, actor_id)
+}
+
+/// Call only for the authenticated group queue. The envelope and identifiers
+/// carried by the action must agree before the store may match its author.
+pub(crate) fn group_notice(account: &str, raw: &Value) -> Result<RecallNotice, WireError> {
+    numeric_id(account)?;
+    ordinary_notice(raw, ThreadKind::Group)?;
+    if raw
+        .get("visibility")
+        .is_some_and(|value| !value.is_null() && !zero(value))
+    {
+        return Err(WireError::Unsupported);
+    }
+    let actor_id = notice_actor(account, raw.get("uidFrom").ok_or(WireError::Invalid)?)?;
+    let group = id_string(raw.get("idTo").ok_or(WireError::Invalid)?)?;
+    if let Some(key) = raw.get("msgKey").filter(|value| !value.is_null()) {
+        let key = match key.as_str() {
+            Some(key) => key.strip_prefix('g').unwrap_or(key).to_owned(),
+            None => id_string(key)?,
+        };
+        if key != group {
+            return Err(WireError::Invalid);
+        }
+    }
+    let content = notice_content(raw)?;
+    if let Some(source) = content.get("srcId").filter(|value| !unavailable(value)) {
+        if notice_actor(account, source)? != actor_id {
+            return Err(WireError::Invalid);
+        }
+    }
+    if let Some(destination) = content
+        .get("destId")
+        .filter(|value| !unavailable(value) && !zero(value))
+    {
+        if id_string(destination)? != group {
+            return Err(WireError::Invalid);
+        }
+    }
+    let thread_id = Target::new(ThreadKind::Group, &group)?.thread_id();
+    parse_notice(raw, content, thread_id, actor_id)
+}
+
+fn parse_notice(
+    raw: &Value,
+    content: &Value,
+    thread_id: String,
+    actor_id: String,
+) -> Result<RecallNotice, WireError> {
     let message_id = id_string(content.get("globalMsgId").ok_or(WireError::Invalid)?)?;
     let client_id = content
         .get("cliMsgId")
@@ -203,6 +299,66 @@ mod tests {
             assert!(!original.within_window(301_000, DEFAULT_MAX_AGE_MS));
             assert!(!original.within_window(999, DEFAULT_MAX_AGE_MS));
         }
+    }
+
+    #[test]
+    fn original_oracle_matches_ordinary_group_recall_builder() {
+        let oracle: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/messaging/recall.json"))
+                .unwrap();
+        let fixture = &oracle["group"];
+        let payload = &fixture["payload"];
+        let target = Target::new(ThreadKind::Group, payload["grid"].as_str().unwrap()).unwrap();
+        let original = RecallReference {
+            message_id: payload["msgId"].as_str().unwrap().into(),
+            client_id: payload["cliMsgIdUndo"].as_str().unwrap().into(),
+            sent_at_ms: 1000,
+        };
+        let client = payload["clientId"].as_u64().unwrap();
+        let imei = payload["imei"].as_str().unwrap();
+        assert_eq!(fixture["path"], GROUP_PATH);
+        assert_eq!(
+            group_parameters(&target, client, &original, 0, imei).unwrap(),
+            *payload
+        );
+        assert_eq!(
+            group_parameters(&target, client, &original, 1, imei),
+            Err(WireError::Invalid)
+        );
+    }
+
+    #[test]
+    fn authenticated_group_recall_checks_scope_and_original_author() {
+        let raw = json!({
+            "msgType":"chat.undo","msgId":"990","uidFrom":"0","idTo":"77",
+            "isGroup":true,"msgKey":"g77","ts":"1500",
+            "content":{"globalMsgId":"900719925474099123","cliMsgId":800,"srcId":"11","destId":77}
+        });
+        assert_eq!(
+            group_notice("11", &raw).unwrap(),
+            RecallNotice {
+                thread_id: "g:77".into(),
+                actor_id: "11".into(),
+                message_id: "900719925474099123".into(),
+                client_id: Some("800".into()),
+                event_id: "990".into(),
+                occurred_at_ms: 1500,
+            }
+        );
+        for (pointer, mismatch) in [
+            ("/content/srcId", json!("22")),
+            ("/content/destId", json!("78")),
+            ("/content/globalMsgId", json!("990")),
+            ("/isGroup", json!(0)),
+            ("/msgKey", json!("g78")),
+        ] {
+            let mut bad = raw.clone();
+            *bad.pointer_mut(pointer).unwrap() = mismatch;
+            assert!(group_notice("11", &bad).is_err(), "{pointer}");
+        }
+        let mut encrypted = raw;
+        encrypted["e2ee"] = json!(true);
+        assert_eq!(group_notice("11", &encrypted), Err(WireError::Unsupported));
     }
 
     #[test]

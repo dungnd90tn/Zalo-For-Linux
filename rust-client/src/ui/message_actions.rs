@@ -526,9 +526,7 @@ impl NativeApp {
                             buttons.push(button.id);
                         }
                         recall_selected = button.clicked();
-                        button.on_disabled_hover_text(
-                            "Chỉ hỗ trợ tin văn bản cá nhân đã gửi khi đang kết nối.",
-                        );
+                        button.on_disabled_hover_text(self.recall_unavailable());
                     }
                 });
         });

@@ -1023,7 +1023,7 @@ impl LiveWorker {
             } => {
                 *request_id > 0
                     && Target::from_thread(thread)
-                        .is_ok_and(|t| t.kind == ThreadKind::Direct && t.remote_id != self.account)
+                        .is_ok_and(|t| t.kind == ThreadKind::Group || t.remote_id != self.account)
                     && crate::protocol::messaging::numeric_id(message_id).is_ok()
             }
             LiveCommand::Forward {

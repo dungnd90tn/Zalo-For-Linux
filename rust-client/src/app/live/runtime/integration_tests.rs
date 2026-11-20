@@ -50,6 +50,7 @@ enum Reply {
     ReadStates,
     Forward(u8),
     Recall(u8),
+    GroupRecall(group_recall_tests::Mode),
     Reactions,
     ReactionReplay,
     GroupActions(bool),
@@ -784,6 +785,14 @@ fn serve(
             ))
             .unwrap();
         }
+        if let Reply::GroupRecall(mode) = reply {
+            let payload = group_recall_tests::messages(&state, mode);
+            ws.send(tungstenite::Message::Binary(
+                wire::encode_frame(521, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        }
         loop {
             let message = match ws.read() {
                 Ok(m) => m,
@@ -1472,6 +1481,10 @@ fn serve(
         .unwrap();
         stream.write_all(&response).unwrap();
         stream.flush().unwrap();
+        return;
+    }
+    if let Reply::GroupRecall(mode) = reply {
+        group_recall_tests::respond(&mut stream, &state, &cipher, mode, &path, &headers, &body);
         return;
     }
     if let Reply::Forward(mode) = reply {
@@ -6064,6 +6077,7 @@ mod file_upload_tests;
 mod forward_batch_tests;
 
 mod group_pin_tests;
+mod group_recall_tests;
 mod mention_tests;
 mod photo_upload_tests;
 mod reaction_replay_tests;
