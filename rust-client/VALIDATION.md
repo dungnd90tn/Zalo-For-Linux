@@ -1545,3 +1545,30 @@ The 2.0.5-2 Debian package upgraded 2.0.5-1 in Ubuntu 20.04 and preserved a
 synthetic history row at schema 18. The RPM installed, verified and removed
 cleanly on AlmaLinux 9. Both packages carried the same executable, and both
 SHA-256 checks and the schema 18 release smoke passed.
+
+## Packaged build pilot (2.0.5-2)
+
+The same checked packages passed clean installation, CLI diagnostics, desktop
+launcher and icon checks, and removal on Ubuntu 22.04, Ubuntu 24.04, Debian 12
+and Fedora 42. Ubuntu 20.04 upgrade and AlmaLinux 9 results are recorded above.
+Packaging now reads the tested revision from Cargo metadata. A disposable script
+fixture checked the default revision 2, explicit override 3, and rejection of
+invalid revisions before writing package outputs.
+
+The extracted 2.0.5-2 binary ran with the installed x-unikey IBus engine on
+isolated X11 in offline demo mode. Enter committed and saved `chào` once in two
+trials, and subsequent presses added no rows. Enter and mouse Send worked with
+x-unikey off and after committing Telex text with a space. Switching between two
+conversations preserved both Unicode drafts and saved each only on explicit
+submission. The profile, X server and IBus bus were private to the test.
+
+The same extracted binary ran on a headless GNOME Wayland compositor with
+`DISPLAY` unset, a private IBus x-unikey engine and negotiated text input v3.
+With active Telex preedit, the first Enter committed the word and a second
+Enter saved it once. Extra Enter presses added no rows. A space-committed
+draft and ASCII with the engine off each saved on a single Enter. A native
+pointer click on the demo composer button saved exactly one committed draft.
+
+The user confirmed sticker sending and adding/removing reactions between Linux
+and phone on 2.0.5-2. Detailed direct/group, catalog search and offline reaction
+catch-up acceptance remain tracked in the [release plan](PLAN_2.0.5.md).

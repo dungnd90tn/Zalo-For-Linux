@@ -8,9 +8,8 @@ on:
   workflow_dispatch:
     inputs:
       package_release:
-        description: 'Package release number (the "-N" after the version); raise it for a rebuild of the same version'
-        default: '1'
-        required: true
+        description: 'Override the package revision in Cargo.toml (the "-N" after the version)'
+        required: false
 
 permissions:
   contents: write
@@ -41,7 +40,7 @@ jobs:
       # builds the .deb there and the .rpm in a pinned Fedora container. Docker is preinstalled.
       - name: Build .deb and .rpm
         env:
-          ZALO_PKG_RELEASE: ${{ github.event.inputs.package_release || '1' }}
+          ZALO_PKG_RELEASE: ${{ github.event.inputs.package_release }}
         run: ./scripts/rust/package.sh
 
       - name: Install the packages with apt and dnf in clean containers

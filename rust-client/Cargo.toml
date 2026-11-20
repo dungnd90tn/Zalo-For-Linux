@@ -7,6 +7,9 @@ description = "Independent native Linux chat migration prototype"
 default-run = "zalo-rust"
 autobins = false
 
+[package.metadata.zalo]
+package-release = 2
+
 [lib]
 name = "zalo_rust"
 path = "src/lib.rs"

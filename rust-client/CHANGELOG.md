@@ -6,7 +6,7 @@ Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) đ�
 
 ## 2.0.5 — gói thử 2.0.5-2
 
-Theo dõi thứ tự triển khai và tiêu chí phát hành trong [kế hoạch 2.0.5](PLAN_2.0.5.md).
+Xem [ghi chú 2.0.5](../changelogs/RELEASE-v2.0.5.md) và các mục kiểm thử còn mở trong [kế hoạch 2.0.5](PLAN_2.0.5.md).
 
 ### Giao diện
 
@@ -26,7 +26,7 @@ Theo dõi thứ tự triển khai và tiêu chí phát hành trong [kế hoạch
 
 ### Ưu tiên kiểm chứng
 
-- Thử gửi nhãn dán và thêm/gỡ cảm xúc qua điện thoại và Linux trong cả chat cá nhân và nhóm thường. Xác nhận cập nhật từ thiết bị khác và sau khi kết nối lại.
+- Gửi nhãn dán và thêm/gỡ cảm xúc giữa điện thoại và Linux đã được người dùng xác nhận hoạt động. Tiếp tục ghi kết quả riêng cho tìm sticker, chat nhóm và lấy bù khi Linux ngoại tuyến.
 - Xác nhận phiên đã lưu giữ Online sau đồng bộ. Thử gửi bằng **Enter** và nút **Gửi** khi bật/tắt x-unikey, trên X11 và Wayland.
 - Kiểm chứng trên tài khoản thử các luồng trả lời, gửi tệp và ảnh, thông báo, chuyển tiếp, thu hồi và thao tác nhóm. Ghi kết quả theo từng luồng trong [VALIDATION.md](VALIDATION.md).
 

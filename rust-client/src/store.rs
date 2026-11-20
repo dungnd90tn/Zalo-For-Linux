@@ -805,7 +805,10 @@ impl MessageStore {
             cursor,
             ReceiveExtras {
                 attention: Some((receipts, context)),
-                ..ReceiveExtras::default()
+                #[cfg(feature = "messaging")]
+                notices: &[],
+                #[cfg(feature = "messaging")]
+                reactions: None,
             },
         )
         .map(|(messages, unread, _)| (messages, unread))

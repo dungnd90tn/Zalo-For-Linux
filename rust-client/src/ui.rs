@@ -252,7 +252,7 @@ impl NativeApp {
 
     fn latch_modal_input(&mut self, ctx: &egui::Context) {
         if self.modal_open() && !self.modal_blocked {
-            self.modal_focus = self
+            let focus = self
                 .account_popup
                 .as_mut()
                 .and_then(|popup| popup.focus.take())
@@ -260,15 +260,10 @@ impl NativeApp {
                     self.message_menu
                         .as_mut()
                         .and_then(|popup| popup.focus.take())
-                })
-                .or_else(|| {
-                    #[cfg(feature = "messaging")]
-                    if let Some(state) = &mut self.live {
-                        return state.sticker_send.take_focus();
-                    }
-                    None
-                })
-                .or_else(|| self.modal_focus_snapshot(ctx));
+                });
+            #[cfg(feature = "messaging")]
+            let focus = focus.or_else(|| self.live.as_mut()?.sticker_send.take_focus());
+            self.modal_focus = focus.or_else(|| self.modal_focus_snapshot(ctx));
             if let Some(focus) = &self.modal_focus {
                 ctx.memory_mut(|memory| memory.surrender_focus(focus.id));
             }
