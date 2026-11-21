@@ -16,7 +16,9 @@ use anyhow::Result;
 use std::{sync::Arc, thread::JoinHandle};
 use tokio::sync::{mpsc, watch};
 mod photo;
+pub use crate::domain::PhotoResolution;
 pub use photo::{PhotoPreparationFailure, PhotoThumbnail, PreparedPhoto};
+pub(crate) const MAX_ORIGINAL_PHOTO_BYTES: u64 = crate::store::photos::MAX_PHOTO_BYTES;
 pub(crate) mod runtime;
 #[cfg(feature = "signal-crypto")]
 pub mod signal_crypto;
@@ -441,6 +443,7 @@ pub enum LiveCommand {
         generation: u64,
         thread: String,
         attachment: crate::domain::Attachment,
+        resolution: PhotoResolution,
         request_id: u64,
     },
     CancelPhotoPreparation {
@@ -634,6 +637,7 @@ pub enum LiveEvent {
     PhotoCapability {
         account_id: String,
         available: bool,
+        original_available: bool,
     },
     PhotoPrepared {
         account_id: String,
@@ -1343,12 +1347,17 @@ impl LiveWorker {
                 thread,
                 attachment,
                 request_id,
+                resolution,
                 ..
             } => {
                 Target::from_thread(thread).is_ok()
                     && *request_id != 0
                     && attachment.size_bytes > 0
-                    && attachment.size_bytes <= 20 * 1024 * 1024
+                    && attachment.size_bytes
+                        <= match resolution {
+                            PhotoResolution::Hd => 20 * 1024 * 1024,
+                            PhotoResolution::Original => MAX_ORIGINAL_PHOTO_BYTES,
+                        }
             }
             LiveCommand::CancelPhotoPreparation { request_id } => *request_id != 0,
             LiveCommand::SendPhoto {
@@ -1426,6 +1435,27 @@ impl super::Composer {
         attachment: crate::domain::Attachment,
         enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
     ) -> std::result::Result<(), SubmitError> {
+        self.prepare_live_photo_with_resolution(
+            generation,
+            thread,
+            attachment,
+            PhotoResolution::Hd,
+            enqueue,
+        )
+    }
+
+    pub fn photo_resolution(&self) -> PhotoResolution {
+        self.photo_resolution
+    }
+
+    pub fn prepare_live_photo_with_resolution(
+        &mut self,
+        generation: u64,
+        thread: String,
+        attachment: crate::domain::Attachment,
+        resolution: PhotoResolution,
+        enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
+    ) -> std::result::Result<(), SubmitError> {
         if self.reply().is_some() || self.attachment().is_some() {
             return Err(SubmitError::Invalid);
         }
@@ -1435,10 +1465,12 @@ impl super::Composer {
             generation,
             thread: thread.clone(),
             attachment: attachment.clone(),
+            resolution,
             request_id,
         })?;
         self.photo_revision = self.photo_revision.wrapping_add(1);
         self.photo_source = Some(attachment);
+        self.photo_resolution = resolution;
         self.photo = None;
         self.photo_problem = None;
         self.photo_preparation = Some(super::PendingPhotoPreparation {
@@ -1597,13 +1629,18 @@ impl super::Composer {
                         );
                     } else {
                         match result {
-                            Ok(photo) => {
+                            Ok(photo) if photo.resolution() == self.photo_resolution => {
                                 self.photo = Some(photo.clone());
                                 self.photo_problem = None;
                             }
                             Err(error) => {
                                 self.photo = None;
                                 self.photo_problem = Some(error.to_string());
+                            }
+                            Ok(_) => {
+                                self.photo = None;
+                                self.photo_problem =
+                                    Some("Chế độ ảnh đã thay đổi; hãy chọn lại ảnh.".into());
                             }
                         }
                     }

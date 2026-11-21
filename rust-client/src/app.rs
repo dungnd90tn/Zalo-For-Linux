@@ -515,6 +515,8 @@ pub struct Composer {
     #[cfg(feature = "messaging")]
     photo_source: Option<crate::domain::Attachment>,
     #[cfg(feature = "messaging")]
+    photo_resolution: crate::domain::PhotoResolution,
+    #[cfg(feature = "messaging")]
     photo: Option<live::PreparedPhoto>,
     #[cfg(feature = "messaging")]
     photo_preparation: Option<PendingPhotoPreparation>,
@@ -579,6 +581,7 @@ impl Composer {
     #[cfg(feature = "messaging")]
     pub fn clear_photo(&mut self) {
         if self.photo_source.take().is_some() {
+            self.photo_resolution = crate::domain::PhotoResolution::Hd;
             self.photo = None;
             self.photo_preparation = None;
             self.photo_problem = None;

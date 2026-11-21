@@ -13,6 +13,7 @@ Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) đ�
 - Thu hồi tin văn bản do bạn gửi trong nhóm thường tối đa 100 thành viên khi còn trong thời hạn. Khi xác nhận thu hồi, ứng dụng cập nhật bong bóng và bỏ nội dung gốc khỏi trích dẫn, kết quả tìm kiếm và bản xem trước tin ghim trên máy.
 - Duyệt các bộ nhãn dán công khai được trả trực tiếp từ danh mục Zalo. Mở một bộ, cuộn xem và gửi sticker đủ điều kiện vào hội thoại hiện tại. Phần chữ, trích dẫn và tệp đang soạn được giữ lại.
 - Tải từng trang tin văn bản cũ trong nhóm thường đủ điều kiện khi Zalo bật dịch vụ lịch sử nhóm. Ứng dụng giữ nguyên trang đang đọc và bản nháp, rồi mở phần đã lưu qua **Xem trang trước**.
+- Gửi một ảnh gốc JPEG tối đa 5 MiB và 2560 px mỗi chiều khi tài khoản có quyền Zalo Cloud. Ảnh có xem trước và chú thích. Ứng dụng bỏ metadata APP1 mà không nén lại ảnh. JPEG cần xoay hoặc lật theo EXIF có thể gửi dưới dạng tệp.
 - Hồ sơ nâng lên **schema 20** để lưu thông tin nhắc tên và trạng thái ghim chưa xác nhận. Giữ lịch sử đã lưu khi nâng cấp. Bản cài 2.0.5 dùng schema 18 sẽ từ chối mở hồ sơ đã nâng cấp.
 
 ## 2.0.5 — gói thử 2.0.5-2

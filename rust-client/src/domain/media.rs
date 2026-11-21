@@ -476,6 +476,8 @@ fn photo(content: &Value) -> PhotoDescriptor {
         },
         original_url: if encrypted {
             None
+        } else if params.get("is_original").and_then(Value::as_u64) == Some(1) {
+            url(params.get("rawUrl")).or_else(|| url(content.get("href")))
         } else {
             url(params.get("hd")).or_else(|| url(content.get("href")))
         },

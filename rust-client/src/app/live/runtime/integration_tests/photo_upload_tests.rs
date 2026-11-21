@@ -32,8 +32,27 @@ async fn prepare(
     thread: &str,
     request_id: u64,
 ) -> Result<PreparedPhoto, PhotoPreparationFailure> {
+    prepare_resolution(
+        commands,
+        events,
+        attachment,
+        thread,
+        request_id,
+        PhotoResolution::Hd,
+    )
+    .await
+}
+async fn prepare_resolution(
+    commands: &mpsc::Sender<LiveCommand>,
+    events: &mut mpsc::Receiver<LiveEvent>,
+    attachment: Attachment,
+    thread: &str,
+    request_id: u64,
+    resolution: PhotoResolution,
+) -> Result<PreparedPhoto, PhotoPreparationFailure> {
     commands
         .send(LiveCommand::PreparePhoto {
+            resolution,
             generation: 1,
             thread: thread.into(),
             attachment,
@@ -334,6 +353,130 @@ fn prepared_bytes(photo: &PreparedPhoto) -> Vec<u8> {
     let mut bytes = vec![0; photo.size_bytes() as usize];
     std::os::unix::fs::FileExt::read_exact_at(&photo.0.file, &mut bytes, 0).unwrap();
     bytes
+}
+
+#[tokio::test]
+async fn original_photo_tls_requires_current_plan_and_exact_original_resource() {
+    let mut clean = Vec::new();
+    let pixels = image::RgbImage::from_pixel(64, 32, image::Rgb([23, 110, 180]));
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut clean, 94)
+        .encode_image(&image::DynamicImage::ImageRgb8(pixels))
+        .unwrap();
+    let mut source = clean[..2].to_vec();
+    let metadata = b"http://ns.adobe.com/xap/1.0/\0synthetic-private-photo-metadata";
+    source.extend_from_slice(&[255, 225]);
+    source.extend_from_slice(&((metadata.len() + 2) as u16).to_be_bytes());
+    source.extend_from_slice(metadata);
+    source.extend_from_slice(&clean[2..]);
+    for (mode, thread) in [(10, "d:22"), (10, "g:22"), (11, "d:22"), (12, "d:22")] {
+        let f = Fixture::new(Reply::PhotoUpload(mode));
+        let origin = json!(["https://wpa.zaloapp.com"]);
+        let config = ServerConfig::parse(&json!({
+            "zpw_service_map_v3":{
+                "chat":origin,"group":origin,"conversation":origin,"file":origin,
+                "zcloud":origin,"zcloud_up_file":origin
+            },
+            "zpw_ws":["wss://wpa.zaloapp.com"],
+            "settings":{"features":{"file_photo_limit":{"enable_upload_original":1}}}
+        }))
+        .unwrap();
+        let session = Arc::new(synthetic_session(f.profile.clone(), config));
+        let (commands, requests) = mpsc::channel(16);
+        let (events, mut incoming) = mpsc::channel(64);
+        let (stop, cancel) = watch::channel(false);
+        let task = tokio::spawn(run_with_transports(
+            f.profile.clone(),
+            session,
+            requests,
+            events,
+            Arc::new(|| {}),
+            cancel,
+            f.transports(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut connected, mut paid) = (false, false);
+            while !connected || !paid {
+                match incoming.recv().await.unwrap() {
+                    LiveEvent::Connection {
+                        state: LiveConnection::Online,
+                        ..
+                    } => connected = true,
+                    LiveEvent::PhotoCapability {
+                        original_available,
+                        available,
+                        ..
+                    } => {
+                        assert!(available);
+                        paid = original_available;
+                    }
+                    LiveEvent::Fault { error, .. } => panic!("original photo entitlement: {error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let photo = prepare_resolution(
+            &commands,
+            &mut incoming,
+            selected(&f, "synthetic-original.jpg", &source),
+            thread,
+            901,
+            PhotoResolution::Original,
+        )
+        .await
+        .unwrap();
+        assert_eq!(photo.resolution(), PhotoResolution::Original);
+        assert_eq!(prepared_bytes(&photo), clean);
+        commands
+            .send(LiveCommand::SendPhoto {
+                generation: 1,
+                thread: thread.into(),
+                photo,
+                caption: "Ảnh tổng hợp gốc".into(),
+                request_id: 902,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal(&mut incoming, 902).await,
+            if mode == 10 {
+                FileTransferPhase::Accepted
+            } else {
+                FileTransferPhase::Failed
+            }
+        );
+        assert_eq!(
+            f.state.photo.original_plan_requests.load(Ordering::SeqCst),
+            2
+        );
+        let uploads = f.state.photo.uploads.lock().unwrap().clone();
+        assert_eq!(uploads.len(), usize::from(mode != 11));
+        if let Some((params, bytes)) = uploads.first() {
+            assert_eq!(bytes, &clean);
+            assert_eq!(params["fileName"], "photo.jpg");
+            assert_eq!(params["totalSize"], clean.len());
+            assert!(params.get("checksum").is_none());
+        }
+        let finals = f.state.photo.finals.lock().unwrap().clone();
+        assert_eq!(finals.len(), usize::from(mode == 10));
+        if let Some(final_params) = finals.first() {
+            assert_eq!(final_params["jcp"], "{\"is_original\":1}");
+            assert_eq!(final_params["fileSize"], clean.len());
+            assert_eq!(
+                final_params["rawUrl"],
+                "https://files.example.test/uploaded"
+            );
+            let db = rusqlite::Connection::open(f.profile.paths.data_dir.join("messages.sqlite"))
+                .unwrap();
+            let hash: String = db
+                .query_row("SELECT checksum FROM photo_outbox", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(hash, format!("{:x}", Md5::digest(&clean)));
+        }
+        stop.send(true).unwrap();
+        task.await.unwrap();
+    }
 }
 
 #[tokio::test]

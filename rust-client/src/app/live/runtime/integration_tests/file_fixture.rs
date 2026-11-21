@@ -9,6 +9,7 @@ pub(super) struct FileState {
     pub final_started: AtomicBool,
     pub stalled: AtomicBool,
     pub eligibility_requests: AtomicUsize,
+    pub original_plan_requests: AtomicUsize,
     pub echo_sent: AtomicBool,
     control_pending: AtomicBool,
     echo_pending: Mutex<Option<Value>>,
@@ -73,6 +74,12 @@ pub(super) fn socket(mut ws: Socket, state: Arc<State>, mode: u8, photo: bool) {
                     .map(|(params, _)| params["totalSize"].clone())
                     .unwrap_or(json!(0));
                 controls = json!({"error_code":0,"data":{"controls":[{"content":{"act_type":"file_done","fileId":"987","data":{"url":"https://files.example.test/not-photo"}}},{"content":{"act_type":"photo_success","act":"photo","fileId":"987","data":{"org":"https://files.example.test/uploaded","thumb":"https://files.example.test/thumb","hd":"https://files.example.test/hd","fileSize":size}}}]}});
+                if mode == 12 {
+                    controls["data"]["controls"][1]["content"]["data"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("org");
+                }
             }
             // Offline controls deliberately remain unconsumed; a matching offline URL must not win.
             let offline = json!({"error_code":0,"data":{"controls":[{"content":{"act_type":"file_done","fileId":"987","data":{"url":"https://files.example.test/offline-wrong"}}}]}});
@@ -185,6 +192,9 @@ fn response(stream: &mut StreamOwned<ServerConnection, TcpStream>, inner: Value)
     let cipher =
         SessionCipher::from_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
     let bytes=serde_json::to_vec(&json!({"error_code":0,"data":cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()})).unwrap();
+    write_json(stream, &bytes);
+}
+fn write_json(stream: &mut StreamOwned<ServerConnection, TcpStream>, bytes: &[u8]) {
     if write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -192,7 +202,7 @@ fn response(stream: &mut StreamOwned<ServerConnection, TcpStream>, inner: Value)
     )
     .is_ok()
     {
-        let _ = stream.write_all(&bytes);
+        let _ = stream.write_all(bytes);
         let _ = stream.flush();
     }
 }
@@ -214,9 +224,52 @@ pub(super) fn http(
 ) -> bool {
     let transfer = if photo { &state.photo } else { &state.file };
     let route = path.split('?').next().unwrap();
+    if photo && mode >= 10 {
+        match route {
+            "/api/getCloudViewerKey" => {
+                assert_eq!(path, "/api/getCloudViewerKey?zpw_ver=681&zpw_type=24");
+                assert!(headers.starts_with("GET "));
+                assert!(headers
+                    .to_ascii_lowercase()
+                    .contains("cookie: zpw_sek=synthetic"));
+                assert!(!headers.to_ascii_lowercase().contains("cloud-viewer-key:"));
+                response(
+                    stream,
+                    json!({"error_code":0,"data":{"viewer_key":"fixture-viewer",
+                    "enk":STANDARD.encode([7u8;32])}}),
+                );
+                return true;
+            }
+            "/cloudmedia/info/pc/v1/usage-mycloud" => {
+                use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+                assert_eq!(
+                    path,
+                    "/cloudmedia/info/pc/v1/usage-mycloud?zpw_ver=681&zpw_type=24"
+                );
+                assert!(headers.starts_with("GET "));
+                let headers = headers.to_ascii_lowercase();
+                assert!(headers.contains("cookie: zpw_sek=synthetic"));
+                assert!(headers.contains("cloud-viewer-key: fixture-viewer"));
+                let previous = transfer
+                    .original_plan_requests
+                    .fetch_add(1, Ordering::SeqCst);
+                let plan = if mode == 11 && previous > 0 { 69 } else { 0 };
+                let iv = [9u8; 16];
+                let payload = json!({"plan":plan}).to_string();
+                let cipher = cbc::Encryptor::<aes::Aes256>::new_from_slices(&[7u8; 32], &iv)
+                    .unwrap()
+                    .encrypt_padded_vec_mut::<Pkcs7>(payload.as_bytes());
+                let bytes = serde_json::to_vec(&json!({"error_code":0,"data":STANDARD.encode([iv.as_slice(),cipher.as_slice()].concat())})).unwrap();
+                write_json(stream, &bytes);
+                return true;
+            }
+            _ => {}
+        }
+    }
     if if photo {
         !(route.ends_with("/photo_original/upload")
             || route.ends_with("/upload/photo")
+            || route.ends_with("/zcloud-upload/photo")
             || route.ends_with("/photo_original/send"))
     } else {
         !route.ends_with("/asyncfile/upload") && !route.ends_with("/asyncfile/msg")
@@ -226,7 +279,15 @@ pub(super) fn http(
     transfer.paths.lock().unwrap().push(route.into());
     let cipher =
         SessionCipher::from_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
-    let upload = route.ends_with("/upload") || route.ends_with("/upload/photo");
+    let upload = route.ends_with("/upload")
+        || route.ends_with("/upload/photo")
+        || route.ends_with("/zcloud-upload/photo");
+    if photo && mode >= 10 {
+        assert!(!headers.to_ascii_lowercase().contains("cloud-viewer-key:"));
+        if upload {
+            assert!(route.ends_with("/zcloud-upload/photo"));
+        }
+    }
     let encoded = if upload {
         path.split_once('?').unwrap().1.as_bytes()
     } else {

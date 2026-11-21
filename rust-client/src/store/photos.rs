@@ -1,12 +1,15 @@
-//! Durable ordinary processed-photo intent; independent from file and text correlation.
+//! Durable ordinary photo intent; independent from file and text correlation.
 use super::*;
-use crate::domain::{MediaDescriptor, MediaKind, MediaMessageContent};
+use crate::domain::{MediaDescriptor, MediaKind, MediaMessageContent, PhotoResolution};
 use anyhow::ensure;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const MAX_PHOTO_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_FINAL_BYTES: usize = 128 * 1024;
+// Before a final resource exists, this mode marker is the only permitted
+// non-null parameters value. Ready rows carry the sealed final JSON instead.
+const ORIGINAL_RESERVATION: &[u8] = b"original-photo";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PhotoSpec {
@@ -83,11 +86,33 @@ fn metadata(raw: &Value) -> Result<Value> {
         value.clone()
     })
 }
+
+fn parameter_resolution(value: &Value) -> Result<PhotoResolution> {
+    let Some(marker) = value.get("jcp") else {
+        return Ok(PhotoResolution::Hd);
+    };
+    let encoded = marker
+        .as_str()
+        .filter(|marker| marker.len() <= 64)
+        .ok_or(FailureReason::ConflictingMetadata)?;
+    let mode: Value = serde_json::from_str(encoded)?;
+    ensure!(
+        mode == serde_json::json!({"is_original":1}),
+        FailureReason::ConflictingMetadata
+    );
+    Ok(PhotoResolution::Original)
+}
+
+fn original_marker(metadata: &Value) -> bool {
+    metadata.get("is_original").and_then(Value::as_u64) == Some(1)
+}
+
 fn bound_resource(
     spec: &PhotoSpec,
     thread: &str,
     client: u64,
     resource: &PhotoResource,
+    resolution: PhotoResolution,
 ) -> Result<Vec<u8>> {
     spec.validate()?;
     ensure!(
@@ -122,6 +147,7 @@ fn bound_resource(
         "ttl",
         "toid",
         "grid",
+        "jcp",
     ];
     ensure!(
         params.keys().all(|key| allowed.contains(&key.as_str())),
@@ -137,6 +163,7 @@ fn bound_resource(
             && integer("height") == Some(u64::from(spec.height))
             && integer("ttl") == Some(0)
             && string("language") == Some("VN")
+            && parameter_resolution(&resource.parameters)? == resolution
             && string("imei").is_some_and(|v| !v.is_empty() && v.len() <= 256),
         "Photo parameters differ from their intent"
     );
@@ -184,6 +211,7 @@ fn bound_resource(
             && raw.get("thumb").and_then(Value::as_str) == string("thumbUrl")
             && meta.get("hd").and_then(Value::as_str) == string("hdUrl")
             && meta.get("rawUrl").and_then(Value::as_str) == string("rawUrl")
+            && original_marker(&meta) == (resolution == PhotoResolution::Original)
             && meta.get("width").and_then(Value::as_u64) == Some(u64::from(spec.width))
             && meta.get("height").and_then(Value::as_u64) == Some(u64::from(spec.height)),
         "Photo echo differs from resource"
@@ -191,11 +219,16 @@ fn bound_resource(
     let MediaDescriptor::Photo(photo) = resource.content.descriptor() else {
         bail!(FailureReason::Validation);
     };
+    let original = if resolution == PhotoResolution::Original {
+        "rawUrl"
+    } else {
+        "hdUrl"
+    };
     ensure!(
         photo.width == Some(spec.width)
             && photo.height == Some(spec.height)
             && photo.thumbnail_url.as_deref() == string("thumbUrl")
-            && photo.original_url.as_deref() == string("hdUrl"),
+            && photo.original_url.as_deref() == string(original),
         "Photo presentation differs from resource"
     );
     let bytes = serde_json::to_vec(&resource.parameters)?;
@@ -224,6 +257,10 @@ fn verify_echo(
         FailureReason::ConflictingEcho
     );
     let meta = metadata(&raw)?;
+    ensure!(
+        original_marker(&meta) == original_marker(&metadata(&expected_raw)?),
+        FailureReason::ConflictingEcho
+    );
     if let Some(value) = meta.get("checksum") {
         ensure!(
             value
@@ -389,7 +426,8 @@ fn final_resource(conn: &Connection, account: &str, client: u64) -> Result<Final
             },
             &thread,
             client,
-            &resource
+            &resource,
+            parameter_resolution(&resource.parameters)?,
         )? == parameters,
         "Photo resource binding changed"
     );
@@ -408,6 +446,16 @@ impl MessageStore {
         account: &str,
         thread: &str,
         spec: &PhotoSpec,
+        now_ms: i64,
+    ) -> Result<u64> {
+        self.reserve_photo_resolution(account, thread, spec, PhotoResolution::Hd, now_ms)
+    }
+    pub(crate) fn reserve_photo_resolution(
+        &mut self,
+        account: &str,
+        thread: &str,
+        spec: &PhotoSpec,
+        resolution: PhotoResolution,
         now_ms: i64,
     ) -> Result<u64> {
         plain_visible(self, account, thread)?;
@@ -436,7 +484,8 @@ impl MessageStore {
         );
         ensure!(next <= 9_007_199_254_740_991, "Photo client ID exhausted");
         tx.execute("INSERT INTO outgoing_counters VALUES(?1,?2) ON CONFLICT(account_id) DO UPDATE SET last_id=excluded.last_id",params![account,next])?;
-        tx.execute("INSERT INTO photo_outbox(account_id,client_id,thread_id,caption,width,height,size,checksum,created_at_ms,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'uploading')",params![account,next.to_string(),thread,spec.caption,spec.width,spec.height,spec.size as i64,checksum,now_ms])?;
+        let intent = (resolution == PhotoResolution::Original).then_some(ORIGINAL_RESERVATION);
+        tx.execute("INSERT INTO photo_outbox(account_id,client_id,thread_id,caption,width,height,size,checksum,created_at_ms,state,parameters) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'uploading',?10)",params![account,next.to_string(),thread,spec.caption,spec.width,spec.height,spec.size as i64,checksum,now_ms,intent])?;
         tx.commit()?;
         Ok(next as u64)
     }
@@ -471,6 +520,16 @@ impl MessageStore {
         );
         let (thread,caption,width,height,size,checksum,state,old):Row=self.conn.query_row("SELECT thread_id,caption,width,height,size,checksum,state,parameters FROM photo_outbox WHERE account_id=?1 AND client_id=?2",params![account,client.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))?;
         plain_visible(self, account, &thread)?;
+        let resolution = match (state.as_str(), old.as_deref()) {
+            ("uploading", Some(marker)) if marker == ORIGINAL_RESERVATION => {
+                PhotoResolution::Original
+            }
+            ("uploading", None) => PhotoResolution::Hd,
+            ("resource_ready", Some(previous)) => {
+                parameter_resolution(&serde_json::from_slice(previous)?)?
+            }
+            _ => bail!(FailureReason::ConflictingMetadata),
+        };
         let bytes = bound_resource(
             &PhotoSpec {
                 caption,
@@ -482,6 +541,7 @@ impl MessageStore {
             &thread,
             client,
             resource,
+            resolution,
         )?;
         let hash = Sha256::digest(&bytes);
         if state == "resource_ready" {
@@ -642,5 +702,92 @@ mod tests {
                 Some(PhotoState::ResourceReady)
             );
         }
+    }
+
+    #[test]
+    fn original_photo_mode_is_bound_before_upload_and_through_ack_recovery() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let spec = PhotoSpec {
+            caption: "Ảnh tổng hợp".into(),
+            width: 80,
+            height: 60,
+            size: 1000,
+            checksum: "a".repeat(32),
+        };
+        let raw_url = "https://files.zdn.vn/original.jpg";
+        let thumb_url = "https://files.zdn.vn/thumb.jpg";
+        let hd_url = "https://files.zdn.vn/hd.jpg";
+        let resource = |client, original| {
+            let mut parameters = json!({
+                "photoId":"synthetic-photo","clientId":client,"desc":spec.caption,
+                "width":80,"height":60,"rawUrl":raw_url,"thumbUrl":thumb_url,"hdUrl":hd_url,
+                "normalUrl":raw_url,"language":"VN","imei":"synthetic-device","ttl":0,"toid":"22"
+            });
+            let mut content = json!({
+                "title":"","description":spec.caption,"href":raw_url,"thumb":thumb_url,
+                "params":{"width":80,"height":60,"hd":hd_url,"rawUrl":raw_url}
+            });
+            if original {
+                parameters["jcp"] = json!("{\"is_original\":1}");
+                content["params"]["is_original"] = json!(1);
+            }
+            PhotoResource {
+                photo_id: "synthetic-photo".into(),
+                parameters,
+                content: MediaMessageContent::new(MediaKind::Photo, &content).unwrap(),
+            }
+        };
+        let client = store.reserve_photo("11", "d:22", &spec, 1000).unwrap();
+        assert!(store
+            .photo_resource_ready("11", client, &resource(client, true))
+            .is_err());
+        store.interrupt_photo("11", client).unwrap();
+
+        let client = store
+            .reserve_photo_resolution("11", "d:22", &spec, PhotoResolution::Original, 1010)
+            .unwrap();
+        let hd = resource(client, false);
+        let original = resource(client, true);
+        assert!(store.photo_resource_ready("11", client, &hd).is_err());
+        assert!(verify_echo(
+            &original.content,
+            &hd.content,
+            &original.photo_id,
+            &spec.checksum
+        )
+        .is_err());
+        let mut wrong_meta: Value = serde_json::from_str(original.content.as_json()).unwrap();
+        wrong_meta["params"]["is_original"] = json!(0);
+        assert!(store
+            .photo_resource_ready(
+                "11",
+                client,
+                &PhotoResource {
+                    photo_id: original.photo_id.clone(),
+                    parameters: original.parameters.clone(),
+                    content: MediaMessageContent::new(MediaKind::Photo, &wrong_meta).unwrap(),
+                }
+            )
+            .is_err());
+        store.photo_resource_ready("11", client, &original).unwrap();
+        let parameters = store.begin_photo_dispatch("11", client).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&parameters).unwrap(),
+            original.parameters
+        );
+        store
+            .record_photo_ack("11", client, "901", Some(1020))
+            .unwrap();
+        let mut reopened = MessageStore::initialize(store.conn).unwrap();
+        reopened.reconcile_photos("11").unwrap();
+        let messages = reopened.page("11", "d:22", None, 2).unwrap();
+        let Some(MediaDescriptor::Photo(photo)) = &messages[0].media else {
+            panic!("expected a persisted photo");
+        };
+        assert_eq!(photo.original_url.as_deref(), Some(raw_url));
+        assert_eq!(
+            reopened.photo_state("11", client).unwrap(),
+            Some(PhotoState::Accepted)
+        );
     }
 }

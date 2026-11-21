@@ -1312,21 +1312,10 @@ impl NativeApp {
                     self.sticker_button(ui, enabled);
                     #[cfg(not(feature = "messaging"))]
                     icon_button(ui, Icon::Sticker, "Gửi nhãn dán · chưa khả dụng", false);
-                    if icon_button(
-                        ui,
-                        Icon::Image,
-                        if self.has_draft_mentions() {
-                            "Xóa phần nhắc thành viên để gửi ảnh HD."
-                        } else {
-                            "Ảnh HD · JPEG/PNG/WebP tĩnh, tối đa 20 MiB · nén JPEG, không gửi bản gốc"
-                        },
-                        enabled && self.photo_can_choose() && !self.attachments.busy(),
-                    )
-                    .clicked()
-                    {
-                        #[cfg(feature = "messaging")]
-                        self.choose_hd_photo(ctx);
-                    }
+                    #[cfg(feature = "messaging")]
+                    self.photo_toolbar_buttons(ui, enabled);
+                    #[cfg(not(feature = "messaging"))]
+                    icon_button(ui, Icon::Image, "Gửi ảnh · chưa khả dụng", false);
                     if icon_button(
                         ui,
                         Icon::Paperclip,
@@ -1592,7 +1581,7 @@ impl NativeApp {
                 } else if let Some(hint) = connection_hint {
                     hint
                 } else if self.photo_selected() {
-                    "Chờ xử lý và xem ảnh HD trước khi gửi; bỏ ảnh để chỉ gửi nội dung đang soạn."
+                    "Chờ xử lý và xem ảnh trước khi gửi; bỏ ảnh để chỉ gửi nội dung đang soạn."
                 } else if self.drafts.active.text.trim().is_empty()
                     && self.drafts.active.attachment().is_none()
                 {

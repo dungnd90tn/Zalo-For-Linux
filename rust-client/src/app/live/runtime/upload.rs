@@ -157,17 +157,26 @@ fn next_worker_lease() -> u64 {
 pub(super) struct Uploads {
     running: Option<Running>,
     lease: u64,
+    original_probe: Option<tokio::task::JoinHandle<bool>>,
+    original_epoch: Option<tokio::time::Instant>,
+    original_available: bool,
 }
 impl Default for Uploads {
     fn default() -> Self {
         Self {
             running: None,
             lease: next_worker_lease(),
+            original_probe: None,
+            original_epoch: None,
+            original_available: false,
         }
     }
 }
 impl Drop for Uploads {
     fn drop(&mut self) {
+        if let Some(probe) = &self.original_probe {
+            probe.abort();
+        }
         if let Some(job) = &self.running {
             job.cancel.store(true, Ordering::Release);
             job.task.abort();
@@ -180,6 +189,67 @@ impl Uploads {
     }
     pub fn active(&self) -> bool {
         self.running.is_some()
+    }
+    pub fn original_limits(
+        &self,
+        session: &VerifiedSession,
+    ) -> Option<crate::protocol::bootstrap::PhotoLimits> {
+        session
+            .config()
+            .original_photo_limits
+            .filter(|_| self.original_available)
+    }
+    pub async fn check_original_entitlement(
+        &mut self,
+        epoch: Option<tokio::time::Instant>,
+        session: &Arc<VerifiedSession>,
+        client: &reqwest::Client,
+        events: &Events,
+    ) -> Result<()> {
+        if self.original_epoch == epoch || session.config().original_photo_limits.is_none() {
+            return Ok(());
+        }
+        self.original_epoch = epoch;
+        if let Some(probe) = self.original_probe.take() {
+            probe.abort();
+        }
+        if self.original_available {
+            self.set_original_entitlement(false, session, events)
+                .await?;
+        }
+        if self.lease == 0 || epoch.is_none() {
+            return Ok(());
+        }
+        let (session, client) = (session.clone(), client.clone());
+        self.original_probe = Some(tokio::spawn(async move {
+            original_photo::entitled(&client, &session)
+                .await
+                .unwrap_or(false)
+        }));
+        Ok(())
+    }
+    pub async fn original_entitlement(&mut self) -> bool {
+        let Some(probe) = self.original_probe.as_mut() else {
+            return std::future::pending().await;
+        };
+        let paid = probe.await.unwrap_or(false);
+        self.original_probe = None;
+        paid
+    }
+    pub async fn set_original_entitlement(
+        &mut self,
+        paid: bool,
+        session: &VerifiedSession,
+        events: &Events,
+    ) -> Result<()> {
+        self.original_available = paid;
+        events
+            .emit(LiveEvent::PhotoCapability {
+                account_id: events.account.clone(),
+                available: session.config().photo_upload_route.is_some() && self.lease() != 0,
+                original_available: paid,
+            })
+            .await
     }
     pub fn control(&self, frame: &DecodedFrame) {
         if frame.cmd != 601 {
@@ -319,9 +389,15 @@ impl Uploads {
                 request_id,
                 ..
             } => {
-                let limits = session.config().photo_limits;
+                let limits = match photo.resolution() {
+                    PhotoResolution::Hd => session
+                        .config()
+                        .photo_upload_route
+                        .map(|_| session.config().photo_limits),
+                    PhotoResolution::Original => self.original_limits(session),
+                };
                 if !photo.permits(&events.account, &thread, self.lease)
-                    || !photo.fits_limits(limits)
+                    || !limits.is_some_and(|limits| photo.fits_limits(limits))
                     || caption.len() > crate::domain::MAX_TEXT_BYTES
                 {
                     emit(
@@ -374,7 +450,6 @@ impl Uploads {
         let total = input.size();
         if self.running.is_some()
             || root_for(session, "file").is_err()
-            || (kind == TransferKind::Photo && session.config().photo_upload_route.is_none())
             || !events.privacy.read().is_ok_and(|p| p.permits(&thread))
         {
             emit(
@@ -735,6 +810,14 @@ async fn run(
     let kind = input.kind();
     let result:Result<(Message,Conversation)>=async {
         let name=input.name();
+        let original=matches!(&input, UploadInput::Photo{photo,..} if photo.resolution()==PhotoResolution::Original);
+        if original {
+            let eligible=tokio::select!{biased;
+                result=original_photo::entitled(&client,&session)=>result.unwrap_or(false),
+                _=cancelled(&cancel)=>false,
+            };
+            anyhow::ensure!(eligible,"Original photo is unavailable");
+        }
         let mut source=match &input {
             UploadInput::File(attachment)=>{let copied=attachment.clone();let p=profile.clone();let c=cancel.clone();tokio::task::spawn_blocking(move||snapshot(&p,&copied,&c)).await??},
             UploadInput::Photo{photo,..}=>Snapshot{file:photo.0.file.try_clone()?,checksum:photo.0.checksum.clone(),size:photo.size_bytes()},
@@ -743,12 +826,17 @@ async fn run(
         let account=session.account_id().to_owned();let t=thread.clone();
         let id=match &input {
             UploadInput::File(_)=>{let spec=AttachmentSpec{file_name:wire_upload::normalized_file_name(&name),size:source.size,checksum:source.checksum.clone()};db.call_with(StorageOperation::PrepareOutgoing,move|s|s.reserve_attachment(&account,&t,&spec,now_ms())).await?},
-            UploadInput::Photo{photo,caption}=>{let spec=PhotoSpec{caption:caption.clone(),width:photo.width(),height:photo.height(),size:source.size,checksum:source.checksum.clone()};db.call_with(StorageOperation::PrepareOutgoing,move|s|s.reserve_photo(&account,&t,&spec,now_ms())).await?},
+            UploadInput::Photo{photo,caption}=>{let spec=PhotoSpec{caption:caption.clone(),width:photo.width(),height:photo.height(),size:source.size,checksum:source.checksum.clone()};let resolution=photo.resolution();db.call_with(StorageOperation::PrepareOutgoing,move|s|s.reserve_photo_resolution(&account,&t,&spec,resolution,now_ms())).await?},
         };reserved=Some(id);
         authorize(&requests,&cancel,id,false).await?;
         let target=Target::from_thread(&thread)?;let final_root=root_for(&session,"file")?;
-        let photo_route=session.config().photo_upload_route;
-        let upload_root=if kind==TransferKind::Photo && photo_route==Some(crate::protocol::bootstrap::PhotoUploadRoute::Photo){root_for(&session,"up_file")?}else{final_root.clone()};
+        use crate::protocol::bootstrap::PhotoUploadRoute;
+        let photo_route=if original {Some(PhotoUploadRoute::Original)} else {session.config().photo_upload_route};
+        let upload_root=match (kind,photo_route) {
+            (TransferKind::Photo,Some(PhotoUploadRoute::Photo))=>root_for(&session,"up_file")?,
+            (TransferKind::Photo,Some(PhotoUploadRoute::Original))=>root_for(&session,crate::protocol::original_photo::UPLOAD_SERVICE)?,
+            _=>final_root.clone(),
+        };
         let chunk_size=session.config().file_chunk_size;let total=source.size.div_ceil(chunk_size as u64);
         let mut file_resource=None;let mut photo_resource=None;let mut uploaded=0u64;
         for index in 1..=total {
@@ -786,8 +874,12 @@ async fn run(
             UploadInput::Photo{photo,caption}=>{
                 let(photo_id,urls)=photo_resource.ok_or(WireError::Invalid)?;
                 let urls=if let Some(urls)=urls{urls}else{tokio::time::timeout(Duration::from_secs(wire_upload::RESOURCE_TTL_SECS),async{loop{anyhow::ensure!(!cancel.load(Ordering::Acquire),"Upload cancelled");if let Some(urls)=photo_cache.lock().ok().and_then(|c|c.get(&photo_id)){break Ok::<_,anyhow::Error>(urls)}tokio::time::sleep(Duration::from_millis(50)).await;}}).await??};
-                let parameters=wire_photo::message_parameters(&target,&photo_id,id,caption,photo.width(),photo.height(),session.imei(),&urls)?;
-                let content=wire_photo::media_content(caption,photo.width(),photo.height(),&urls)?;
+                let mut parameters=wire_photo::message_parameters(&target,&photo_id,id,caption,photo.width(),photo.height(),session.imei(),&urls)?;
+                if original {
+                    anyhow::ensure!(urls.matches_original(source.size),"Missing original photo resource proof");
+                    parameters["jcp"]=json!("{\"is_original\":1}");
+                }
+                let content=wire_photo::content_for_resolution(caption,photo.width(),photo.height(),&urls,photo.resolution())?;
                 let resource=PhotoResource{photo_id,parameters,content};db.call_with(StorageOperation::PrepareOutgoing,move|s|s.photo_resource_ready(&account,id,&resource)).await?;
             },
         }

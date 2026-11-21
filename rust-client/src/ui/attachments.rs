@@ -2,6 +2,8 @@
 //! external program (`zenity` or `kdialog`) and the file is only inspected, never read, so
 //! everything here runs on a short-lived background thread and reports back through a channel.
 use super::{visuals, NativeApp};
+#[cfg(feature = "messaging")]
+use crate::app::live::{PhotoResolution, MAX_ORIGINAL_PHOTO_BYTES};
 use crate::domain::Attachment;
 use eframe::egui::{self, pos2, vec2, FontId, Sense, Stroke};
 use std::{
@@ -22,7 +24,22 @@ pub(super) enum Picked {
 enum PickerKind {
     #[default]
     File,
-    Photo,
+    #[cfg(feature = "messaging")]
+    Photo(PhotoResolution),
+}
+
+impl PickerKind {
+    fn is_photo(self) -> bool {
+        self != Self::File
+    }
+
+    #[cfg(feature = "messaging")]
+    fn resolution(self) -> Option<PhotoResolution> {
+        match self {
+            Self::Photo(resolution) => Some(resolution),
+            Self::File => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -33,6 +50,7 @@ pub(super) struct AttachmentPicker {
     for_thread: Option<String>,
     for_account: Option<String>,
     for_auth_generation: Option<u64>,
+    for_photo_generation: Option<u64>,
     /// The last problem, shown in the attachment tray until the user dismisses it or chooses again.
     pub notice: Option<String>,
 }
@@ -60,13 +78,16 @@ impl AttachmentPicker {
         thread: Option<&str>,
         account: &str,
         auth_generation: Option<u64>,
+        generation: u64,
+        resolution: PhotoResolution,
     ) {
         if self.busy() {
             return;
         }
         self.for_account = Some(account.into());
         self.for_auth_generation = auth_generation;
-        self.kind = PickerKind::Photo;
+        self.for_photo_generation = Some(generation);
+        self.kind = PickerKind::Photo(resolution);
         self.open_dialog(ctx, thread);
     }
     fn photo_scope(
@@ -74,18 +95,21 @@ impl AttachmentPicker {
         account: &str,
         auth_generation: Option<u64>,
         thread: Option<&str>,
+        generation: u64,
     ) -> bool {
-        self.kind == PickerKind::Photo
+        self.kind.is_photo()
             && self.for_account.as_deref() == Some(account)
             && self.for_auth_generation == auth_generation
             && self.for_thread.as_deref() == thread
+            && self.for_photo_generation == Some(generation)
     }
     #[cfg(feature = "messaging")]
     pub fn invalidate_photo_choice(&mut self) {
-        if self.kind == PickerKind::Photo {
+        if self.kind.is_photo() {
             self.notice = None;
             self.for_thread = None;
             self.for_account = None;
+            self.for_photo_generation = None;
         }
     }
     #[cfg(feature = "messaging")]
@@ -96,13 +120,15 @@ impl AttachmentPicker {
         thread: Option<&str>,
         account: &str,
         auth_generation: Option<u64>,
+        generation: u64,
     ) {
         if self.busy() {
             return;
         }
         self.for_account = Some(account.into());
         self.for_auth_generation = auth_generation;
-        self.kind = PickerKind::Photo;
+        self.for_photo_generation = Some(generation);
+        self.kind = PickerKind::Photo(PhotoResolution::Hd);
         self.inspect(ctx, path, thread);
     }
     fn inspect_scoped(
@@ -131,28 +157,24 @@ impl AttachmentPicker {
         }
         self.notice = None;
         self.for_thread = thread.map(str::to_owned);
-        let Some((program, mut args)) = dialog_command() else {
+        let Some((program, args)) = dialog_command() else {
             self.notice = Some(
-                "Không tìm thấy zenity hoặc kdialog để mở hộp thoại. Hãy kéo thả tệp vào cửa sổ."
-                    .into(),
+                if self.kind.is_photo() {
+                    "Không tìm thấy zenity hoặc kdialog để mở hộp chọn ảnh."
+                } else {
+                    "Không tìm thấy zenity hoặc kdialog để mở hộp thoại. Hãy kéo thả tệp vào cửa sổ."
+                }.into(),
             );
             return;
         };
         let kind = self.kind;
-        if kind == PickerKind::Photo {
-            for arg in &mut args {
-                if arg == "--title=Chọn tệp để gửi" {
-                    *arg = "--title=Chọn ảnh HD".into();
-                }
-            }
-            if program.file_name().is_some_and(|name| name == "zenity") {
-                args.push("--file-filter=Ảnh JPEG, PNG, WebP | *.jpg *.jpeg *.png *.webp *.JPG *.JPEG *.PNG *.WEBP".into());
-            } else {
-                args.push("*.jpg *.jpeg *.png *.webp|Ảnh JPEG, PNG, WebP".into());
-            }
-        }
+        #[cfg(feature = "messaging")]
+        let args = match kind.resolution() {
+            Some(resolution) => photo_dialog_args(&program, args, resolution),
+            None => args,
+        };
         self.spawn(ctx, move || {
-            if kind == PickerKind::Photo {
+            if kind.is_photo() {
                 run_dialog_kind(&program, &args, kind)
             } else {
                 run_dialog(&program, &args)
@@ -208,17 +230,64 @@ fn inspect_path(path: &Path) -> Picked {
 }
 fn inspect_path_kind(path: &Path, kind: PickerKind) -> Picked {
     let picked = inspect_path(path);
-    if kind == PickerKind::Photo {
-        if let Picked::File(file) = &picked {
-            if file.size_bytes > 20 * 1024 * 1024 {
-                return Picked::Failed("Ảnh nguồn lớn hơn 20 MiB; hãy chọn ảnh nhỏ hơn.".into());
+    #[cfg(not(feature = "messaging"))]
+    let _ = kind;
+    #[cfg(feature = "messaging")]
+    if let (PickerKind::Photo(resolution), Picked::File(file)) = (kind, &picked) {
+        let (limit, limit_label) = match resolution {
+            PhotoResolution::Hd => (20 * 1024 * 1024, "20 MiB"),
+            PhotoResolution::Original => (MAX_ORIGINAL_PHOTO_BYTES, "5 MiB"),
+        };
+        if file.size_bytes > limit {
+            return Picked::Failed(format!(
+                "Ảnh nguồn lớn hơn {limit_label}. Hãy chọn ảnh nhỏ hơn."
+            ));
+        }
+        let supported = match resolution {
+            PhotoResolution::Hd => {
+                matches!(file.extension.as_str(), "jpg" | "jpeg" | "png" | "webp")
             }
-            if !matches!(file.extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
-                return Picked::Failed("Ảnh HD chỉ nhận JPEG, PNG hoặc WebP tĩnh. Dùng Đính kèm tệp nếu muốn gửi định dạng khác.".into());
-            }
+            PhotoResolution::Original => matches!(file.extension.as_str(), "jpg" | "jpeg"),
+        };
+        if !supported {
+            return Picked::Failed(match resolution {
+                    PhotoResolution::Hd => "Ảnh HD chỉ nhận JPEG, PNG hoặc WebP tĩnh. Dùng Đính kèm tệp để gửi định dạng khác.",
+                    PhotoResolution::Original => "Ảnh gốc chỉ nhận JPEG hợp lệ. Dùng Đính kèm tệp để gửi định dạng khác.",
+                }.into());
         }
     }
     picked
+}
+
+#[cfg(feature = "messaging")]
+fn photo_dialog_args(
+    program: &Path,
+    mut args: Vec<OsString>,
+    resolution: PhotoResolution,
+) -> Vec<OsString> {
+    let (title, formats, extensions) = match resolution {
+        PhotoResolution::Hd => (
+            "Chọn ảnh HD",
+            "Ảnh JPEG, PNG, WebP",
+            "*.jpg *.jpeg *.png *.webp *.JPG *.JPEG *.PNG *.WEBP",
+        ),
+        PhotoResolution::Original => ("Chọn ảnh gốc", "Ảnh JPEG", "*.jpg *.jpeg *.JPG *.JPEG"),
+    };
+    for arg in &mut args {
+        if arg == "--title=Chọn tệp để gửi" {
+            *arg = format!("--title={title}").into();
+        } else if arg == "Chọn tệp để gửi" {
+            *arg = title.into();
+        }
+    }
+    args.push(
+        if program.file_name().is_some_and(|name| name == "zenity") {
+            format!("--file-filter={formats} | {extensions}").into()
+        } else {
+            format!("{extensions}|{formats}").into()
+        },
+    );
+    args
 }
 
 /// The first dialog program found on `PATH` with its arguments, preferring the GNOME one.
@@ -301,6 +370,7 @@ impl NativeApp {
             self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT),
             self.auth_generation(),
             self.model.selected.as_deref(),
+            self.model.generation,
         ) && (self.attachments.busy() || self.attachments.notice.is_some())
     }
     pub(super) fn photo_selected(&self) -> bool {
@@ -312,9 +382,13 @@ impl NativeApp {
             .then_some(self.attachments.notice.as_deref())
             .flatten()
     }
-    #[cfg(not(feature = "messaging"))]
-    pub(super) fn photo_can_choose(&self) -> bool {
-        false
+    #[cfg(feature = "messaging")]
+    pub(super) fn photo_picker_resolution(&self) -> Option<PhotoResolution> {
+        if self.photo_picker_pending() {
+            self.attachments.kind.resolution()
+        } else {
+            None
+        }
     }
     #[cfg(not(feature = "messaging"))]
     pub(super) fn photo_can_send(&self) -> bool {
@@ -387,19 +461,21 @@ impl NativeApp {
             #[cfg(feature = "messaging")]
             if photo_drop {
                 self.drafts.active.edited();
-                if self.photo_can_choose() {
+                if self.photo_can_choose(PhotoResolution::Hd) {
                     self.attachments.inspect_photo_scoped(
                         ctx,
                         first.clone(),
                         thread.as_deref(),
                         &account,
                         auth_generation,
+                        self.model.generation,
                     );
                 } else {
-                    self.attachments.kind = PickerKind::Photo;
+                    self.attachments.kind = PickerKind::Photo(PhotoResolution::Hd);
                     self.attachments.for_thread = thread.clone();
                     self.attachments.for_account = Some(account.clone());
                     self.attachments.for_auth_generation = auth_generation;
+                    self.attachments.for_photo_generation = Some(self.model.generation);
                     self.attachments.notice = Some(
                         "Chưa thể chọn ảnh HD. Bỏ tệp hoặc trích dẫn và kiểm tra kết nối.".into(),
                     );
@@ -429,11 +505,15 @@ impl NativeApp {
                 let scoped = self.attachments.for_thread.as_deref()
                     == self.model.selected.as_deref()
                     && self.attachments.for_account.as_deref() == Some(account)
-                    && self.attachments.for_auth_generation == self.auth_generation();
-                if scoped && self.attachments.kind == PickerKind::Photo {
+                    && self.attachments.for_auth_generation == self.auth_generation()
+                    && (!self.attachments.kind.is_photo()
+                        || self.attachments.for_photo_generation == Some(self.model.generation));
+                if scoped && self.attachments.kind.is_photo() {
                     self.attachments.notice = None;
                     #[cfg(feature = "messaging")]
-                    self.begin_photo_preparation(attachment);
+                    if let Some(resolution) = self.attachments.kind.resolution() {
+                        self.begin_photo_preparation(attachment, resolution);
+                    }
                 } else if scoped
                     && accepting
                     && self.drafts.active.reply().is_none()
@@ -647,6 +727,32 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn original_chooser_is_jpeg_only_and_drops_old_page_scope() {
+        let dir = temp_dir("original");
+        let file = dir.join("preview.png");
+        std::fs::write(&file, [1u8; 10]).unwrap();
+        assert!(matches!(
+            inspect_path_kind(&file, PickerKind::Photo(PhotoResolution::Hd)),
+            Picked::File(_)
+        ));
+        assert!(
+            matches!(inspect_path_kind(&file, PickerKind::Photo(PhotoResolution::Original)), Picked::Failed(message) if message.contains("chỉ nhận JPEG"))
+        );
+        let picker = AttachmentPicker {
+            kind: PickerKind::Photo(PhotoResolution::Original),
+            for_account: Some("11".into()),
+            for_thread: Some("d:22".into()),
+            for_auth_generation: Some(3),
+            for_photo_generation: Some(4),
+            ..Default::default()
+        };
+        assert!(picker.photo_scope("11", Some(3), Some("d:22"), 4));
+        assert!(!picker.photo_scope("11", Some(3), Some("d:22"), 5));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

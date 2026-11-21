@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use url::Url;
 
 const ZERO_IV: [u8; 16] = [0; 16];
-const AUTH_ORIGIN: &str = "https://wpa.zaloapp.com";
+pub(super) const AUTH_ORIGIN: &str = "https://wpa.zaloapp.com";
 const MAX_ENDPOINTS_PER_SERVICE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +336,7 @@ impl PreloginConfig {
 pub enum PhotoUploadRoute {
     File,
     Photo,
+    Original,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhotoLimits {
@@ -369,6 +370,7 @@ pub struct ServerConfig {
     pub file_chunk_size: usize,
     pub photo_upload_route: Option<PhotoUploadRoute>,
     pub photo_limits: PhotoLimits,
+    pub original_photo_limits: Option<PhotoLimits>,
     pub seen_v2: bool,
     pub group_board_v2: bool,
     pub recall_max_age_ms: Option<i64>,
@@ -476,6 +478,8 @@ impl ServerConfig {
             "group_board",
             "group_cloud_message",
             "up_file",
+            "zcloud_up_file",
+            "zcloud",
         ] {
             let mut endpoints =
                 endpoint_list(modern.and_then(|map| map.get(name)), false).unwrap_or_default();
@@ -639,6 +643,51 @@ impl ServerConfig {
                 photo_upload_route = None;
             }
         }
+        // Original has independent limits and a different upload domain. Neither
+        // advertised origin is evidence of the account's current cloud plan.
+        let original_photo_limits = photo_config
+            .filter(|config| {
+                raw_file_handler
+                    && ["file", "zcloud_up_file", "zcloud"]
+                        .iter()
+                        .all(|name| services.contains_key(*name))
+                    && config.get("enable_upload_original").and_then(Value::as_u64) == Some(1)
+            })
+            .and_then(|config| {
+                let resolution = config.get("resolutionLimit").filter(|v| !v.is_null());
+                if resolution.is_some_and(|value| !value.is_object()) {
+                    return None;
+                }
+                let original = resolution
+                    .and_then(|limits| limits.get("original"))
+                    .filter(|v| !v.is_null());
+                if original.is_some_and(|value| !value.is_object()) {
+                    return None;
+                }
+                let bounded =
+                    |name: &str, cap: u64| match original.and_then(|value| value.get(name)) {
+                        None | Some(Value::Null) => Some(cap),
+                        Some(value) => value
+                            .as_u64()
+                            .filter(|value| *value > 0)
+                            .map(|value| value.min(cap)),
+                    };
+                let width = bounded("width", 2560)?.min(bounded("maxInputWidth", 2560)?) as u32;
+                let height = bounded("height", 2560)?.min(bounded("maxInputHeight", 2560)?) as u32;
+                let size = bounded("size", 5 * 1024 * 1024)?;
+                Some(PhotoLimits {
+                    width,
+                    height,
+                    size,
+                    input_width: width,
+                    input_height: height,
+                    input_size: size.min(bounded("maxInputSize", 5 * 1024 * 1024)?),
+                })
+            });
+        if original_photo_limits.is_none() {
+            services.remove("zcloud_up_file");
+            services.remove("zcloud");
+        }
         let seen_v2 = feature_config(value, "ack_seen").is_ok_and(|config| {
             config
                 .and_then(|v| v.get("v2_enable"))
@@ -669,6 +718,7 @@ impl ServerConfig {
             services,
             photo_upload_route,
             photo_limits,
+            original_photo_limits,
             seen_v2,
             group_board_v2,
             recall_max_age_ms,

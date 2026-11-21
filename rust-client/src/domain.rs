@@ -27,6 +27,13 @@ pub use media::{
 pub use overview::{ConversationOverview, SharedItem, SharedKind, OVERVIEW_ITEM_LIMIT};
 pub use search::{MessageHit, MessageSearch, SEARCH_RESULT_LIMIT};
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PhotoResolution {
+    #[default]
+    Hd,
+    Original,
+}
+
 pub const RECALLED_TEXT: &str = "Tin nhắn đã thu hồi";
 
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;

@@ -39,8 +39,8 @@ unknown; zero is a valid size. `files_oracle.cjs` retains eight synthetic origin
 reader cases. File URLs are exposed only as an explicit HTTPS browser action;
 HTTP links upgrade to HTTPS. No file is automatically downloaded, opened locally
 or executed. Nonempty `secureKey`/`e2eeKey` markers withhold the plaintext action.
-Ordinary single-file and single-photo HD sending are implemented as described
-below. Original-photo sending, albums, animation, transfer resume, folder
+Ordinary single-file, single-photo HD and entitled original JPEG sending are
+implemented as described below. Albums, animation, transfer resume, folder
 extraction and E2EE attachment decryption remain unavailable.
 
 ## Ordinary single-file sending
@@ -115,6 +115,15 @@ unknown final dispatch, durable ACK/local-echo repair and no automatic resend
 follow the FILE contract. Older binaries refuse schema twelve; no downgrade is
 provided. Real-service photo acceptance remains pending.
 
+## Sending an original JPEG
+
+An authenticated paid Zalo Cloud plan and the session's original-upload
+capability are required. The client rechecks the plan before sending bytes.
+It preserves JPEG image data and removes APP1 metadata, then uploads through
+the Cloud service and sends through the configured photo service. The response
+must identify an original URL at the prepared size. See
+[original JPEG verification](VALIDATION.md#sending-one-original-jpeg-206-development-branch).
+
 ## Durable content and replay
 
 **Schema eight** retains the entire canonical source content in scoped
@@ -184,7 +193,7 @@ capped at 100 MiB, never overwrite existing files, and cancel even during a stal
 response, cleaning the private partial file. An unsolicited HTTP 206 is refused.
 The viewer footer scrolls within its bound so save actions remain reachable in compact
 windows and with long captions. Browser navigation still requires a separate explicit
-click. Original-photo sending, full-resolution in-app viewing and universal OA actions remain pending.
+click. Full-resolution in-app viewing and universal OA actions remain pending.
 See [file transfer limits](PROTOCOL_FILES.md#receiving-files-implemented-unverified-against-the-real-service).
 Local HTTP and synthetic UI checks establish these behaviors, not production CDN acceptance.
 

@@ -1,4 +1,4 @@
-// Execute original ordinary-HD-photo builders, route selection, resource assignment and final submission.
+// Execute the bundled photo builders, route selection, resource assignment and final submission.
 const assert = require('assert/strict');
 const fs = require('fs');
 const path = require('path');
@@ -15,7 +15,7 @@ const info = section('getInfoUploadPhotoFromData(e) {', 'async getInfoUploadZClo
 const settings={file_photo_limit:{enable_new_endpoint_upload_photo:false}};
 const file = section('getFileAsyncItem(e, t, n, a, s, i, l, d) {', '\n            };\n            n.d = R');
 const FileAsync = vm.runInNewContext('(class {' + info + file + '})', {
-    i:{b:{getFileDomain:()=> 'https://files.example.test',getPhotoDomain:()=> 'https://photos.example.test'}}, c:{c:{File:'file',Photo:'photo'},a:{SendMsg:'send'}}, A:{default:settings}, _:{c:{HD:'hd',ORIGINAL:'original'}},
+    i:{b:{getFileDomain:()=> 'https://files.example.test',getPhotoDomain:()=> 'https://photos.example.test',getPhotoOriginalDomain:()=> 'https://original.example.test'}}, c:{c:{File:'file',Photo:'photo'},a:{SendMsg:'send'}}, A:{default:settings}, _:{c:{HD:'hd',ORIGINAL:'original'}},
     o:{default:util}, u:{b:2}, h:{c:{convertFileNameBeforeSend:()=> {throw Error('Folders out of scope');}}},
     r:{GROUPID_PREFIX:'group_'},
 });
@@ -44,7 +44,8 @@ const build = section('static buildParams(e, t, n, s, o, r, l) {', 'static sendZ
 const Api = vm.runInNewContext('(class {' + build + post + '})', {
     _:{b:{getFileDomain:()=> 'https://files.example.test'}}, a:{a:Object.assign},
     D:{a:{getZaloClientID:()=> 'synthetic-device'}}, s:{default:{retryConfig:{enable_add_missing_retry:false}}},
-    i:{default:{encodeAES:text=>text}}, y:{f:ttl}, w:{a:{getCurrentLanguageName:()=> 'VN'}},zconsole:{zsymb(){}}, B:{d:{STAGE_4_SERVER_SUBMIT:4}},
+    i:{default:{encodeAES:text=>text,safeParseJson:text=>text ? JSON.parse(text) : null}}, y:{f:ttl}, w:{a:{getCurrentLanguageName:()=> 'VN'}},zconsole:{zsymb(){}}, B:{d:{STAGE_4_SERVER_SUBMIT:4}},
+    j:{c:{ORIGINAL:'original'}},
     x:{a:{getInstance:()=>({getLogger:()=>({zsymb(){}}),setLogData:()=>({}),getLogData:()=>({})})}},
 });
 Api.transformParams=()=>{};
@@ -74,8 +75,20 @@ Api._post=async(url,body)=>({url,payload:JSON.parse(decodeURIComponent(body.slic
     assert.equal(cases[4].final.payload.imei,'synthetic-device');
     assert.equal(cases[0].final.payload.normalUrl,resource.org);
     assert.equal(cases[4].final.payload.oriUrl,resource.org);
+    for (const [group, scope, type] of [[false, 'message', 2], [true, 'group', 11]]) {
+        const sourceRoute = metadata.getInfoUploadPhotoFromData({
+            feature: 'send', photoResolutionMode: 'original', isGroup: group,
+        });
+        assert.equal(sourceRoute.domain, 'https://original.example.test/api/' + scope + '/zcloud-upload/photo?');
+        assert.equal(sourceRoute.type, type);
+        const ordinary = cases[group ? 4 : 0].final.payload;
+        const final = await Api.sendMsgPhotoAsync(ordinary, group, {photoResolutionMode: 'original'}, null);
+        assert.equal(new URL(final.url).pathname, '/api/' + scope + '/photo_original/send');
+        assert.equal(final.payload.jcp, '{"is_original":1}');
+        assert.equal(ordinary.jcp, undefined);
+    }
     const output=JSON.stringify({provenance:'Exact original getInfoUploadPhotoFromData HD routing, ordinary buildSendChunksInfo/getUrl, getFileAsyncItem Photo, __waitAsyncFileInfo resource assignment, buildParams/sendMsgPhotoAsync. Synthetic bytes/IDs; identity AES and no-network transport stubs. Resource completion is not final message acceptance.',cases},null,2)+'\n';
     const destination=path.join(__dirname,'photo_upload.json');
     if(process.argv.includes('--write'))fs.writeFileSync(destination,output);else assert.equal(fs.readFileSync(destination,'utf8'),output);
-    console.log('Original ordinary HD photo oracle: '+cases.length+' DM/group/route/caption cases');
+    console.log('Bundled photo oracle: '+cases.length+' HD cases and 2 original-photo routes');
 })().catch(error=>{console.error(error);process.exitCode=1;});

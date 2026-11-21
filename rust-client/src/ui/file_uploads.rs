@@ -1,6 +1,8 @@
 //! One account-scoped file transfer presentation; the worker owns upload and dispatch.
 use super::NativeApp;
-use crate::app::live::{FileTransferPhase, LiveCommand, LiveEvent, PreparedPhoto, TransferKind};
+use crate::app::live::{
+    FileTransferPhase, LiveCommand, LiveEvent, PhotoResolution, PreparedPhoto, TransferKind,
+};
 use crate::domain::Attachment;
 use eframe::egui::{self, vec2, RichText};
 
@@ -28,7 +30,9 @@ impl Transfer {
     }
     pub fn filename(&self) -> Option<&str> {
         if self.kind == TransferKind::Photo {
-            Some("Ảnh HD")
+            Some(self.photo.as_ref().map_or("Ảnh", |photo| {
+                super::photos::resolution_title(photo.resolution())
+            }))
         } else {
             self.attachment.as_ref().map(|file| file.name.as_str())
         }
@@ -131,10 +135,17 @@ impl Transfer {
 pub(super) struct Uploads {
     pub available: bool,
     pub photo_available: bool,
+    pub photo_original_available: bool,
     pub transfer: Option<Transfer>,
     dismissed: std::collections::VecDeque<(String, u64, TransferKind)>,
 }
 impl Uploads {
+    pub fn supports_photo(&self, resolution: PhotoResolution) -> bool {
+        match resolution {
+            PhotoResolution::Hd => self.photo_available,
+            PhotoResolution::Original => self.photo_original_available,
+        }
+    }
     pub fn blocked(&self) -> bool {
         self.transfer
             .as_ref()
@@ -171,7 +182,14 @@ impl Uploads {
     pub fn observe(&mut self, event: &LiveEvent) {
         match event {
             LiveEvent::FileCapability { available, .. } => self.available = *available,
-            LiveEvent::PhotoCapability { available, .. } => self.photo_available = *available,
+            LiveEvent::PhotoCapability {
+                available,
+                original_available,
+                ..
+            } => {
+                self.photo_available = *available;
+                self.photo_original_available = *original_available;
+            }
             LiveEvent::FileTransfer {
                 kind,
                 thread,
@@ -259,6 +277,7 @@ impl Uploads {
     pub fn worker_closed(&mut self) {
         self.available = false;
         self.photo_available = false;
+        self.photo_original_available = false;
         if let Some(job) = self.transfer.as_mut().filter(|job| job.busy()) {
             job.phase = FileTransferPhase::Unknown;
             job.note = None;
@@ -442,15 +461,8 @@ impl NativeApp {
         let photo = job.kind == TransferKind::Photo;
         ui.separator();
         ui.add(
-            egui::Label::new(
-                RichText::new(if photo {
-                    "Gửi ảnh HD"
-                } else {
-                    "Gửi tệp"
-                })
-                .strong(),
-            )
-            .wrap(),
+            egui::Label::new(RichText::new(if photo { "Gửi ảnh" } else { "Gửi tệp" }).strong())
+                .wrap(),
         );
         ui.add(egui::Label::new(label).wrap());
         if can_cancel

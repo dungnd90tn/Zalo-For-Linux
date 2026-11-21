@@ -54,14 +54,10 @@ fn ordinary_hd_photo_matches_executed_source_routes_chunks_resource_and_caption_
             );
         }
         let u = &case["urls"];
-        let urls = PhotoUrls {
-            org: u["org"].as_str().unwrap().into(),
-            thumb: u["thumb"].as_str().unwrap().into(),
-            hd: u["hd"].as_str().unwrap().into(),
-            thumb_size: Some(1),
-            file_size: Some(6),
-            hd_size: Some(4),
-        };
+        let urls = PhotoUrls::from_value(&json!({
+            "org":u["org"],"thumb":u["thumb"],"hd":u["hd"],"thumbSize":1,"fileSize":6,"hdSize":4
+        }))
+        .unwrap();
         assert_eq!(
             photo::message_parameters(
                 &target,

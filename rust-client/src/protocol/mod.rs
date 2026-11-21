@@ -22,6 +22,8 @@ pub(crate) mod mention;
 #[cfg(feature = "messaging")]
 pub mod messaging;
 #[cfg(feature = "messaging")]
+pub(crate) mod original_photo;
+#[cfg(feature = "messaging")]
 pub mod photo;
 pub mod qr;
 #[cfg(feature = "messaging")]

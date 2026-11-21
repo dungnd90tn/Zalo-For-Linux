@@ -1330,6 +1330,7 @@ pub(in crate::ui) mod tests {
                 file_chunk_size: 256_000,
                 photo_upload_route: None,
                 photo_limits: Default::default(),
+                original_photo_limits: None,
                 seen_v2: true,
                 group_board_v2: false,
                 recall_max_age_ms: Some(300_000),
@@ -3149,31 +3150,55 @@ pub(in crate::ui) mod tests {
                         .active
                         .set_reply(original.reply_reference().unwrap());
                 }
-                if std::env::var_os("ZALO_UI_FIXTURE_PHOTO").is_some() {
-                    let path = app._profile.paths.data_dir.join("synthetic-preview.png");
+                if let Ok(scene) = std::env::var("ZALO_UI_FIXTURE_PHOTO") {
+                    use crate::app::live::{PhotoPreparationFailure, PhotoResolution};
+                    let resolution = if matches!(scene.as_str(), "original" | "original-error") {
+                        PhotoResolution::Original
+                    } else {
+                        PhotoResolution::Hd
+                    };
+                    let path = app._profile.paths.data_dir.join(
+                        if resolution == PhotoResolution::Original {
+                            "synthetic-preview.jpg"
+                        } else {
+                            "synthetic-preview.png"
+                        },
+                    );
                     let image = image::RgbImage::from_fn(640, 400, |x, y| {
                         image::Rgb([(x * 200 / 640) as u8, (y * 200 / 400) as u8, 140])
                     });
                     image.save(&path).unwrap();
                     let source = crate::domain::Attachment::inspect(&path).unwrap();
-                    let photo = crate::app::live::runtime::photo::prepare_fixture(
-                        &app._profile,
-                        &source,
-                        "11",
-                        "d:22",
-                    )
-                    .unwrap();
+                    let photo = if scene == "original-error" {
+                        Err(PhotoPreparationFailure::OriginalOrientation)
+                    } else if resolution == PhotoResolution::Original {
+                        crate::app::live::runtime::photo::prepare_fixture_with_resolution(
+                            &app._profile,
+                            &source,
+                            "11",
+                            "d:22",
+                            resolution,
+                        )
+                    } else {
+                        crate::app::live::runtime::photo::prepare_fixture(
+                            &app._profile,
+                            &source,
+                            "11",
+                            "d:22",
+                        )
+                    };
                     app.model.selected = Some("d:22".into());
                     app.drafts.select("d:22").unwrap();
                     app.drafts.active.clear_reply();
-                    app.drafts.active.text = "Ảnh HD đã chuẩn bị · nội dung tổng hợp.".into();
+                    app.drafts.active.text = "Chú thích ảnh tổng hợp được giữ lại.".into();
                     let mut request = 0;
                     app.drafts
                         .active
-                        .prepare_live_photo(
+                        .prepare_live_photo_with_resolution(
                             app.model.generation,
                             "d:22".into(),
                             source,
+                            resolution,
                             |command| {
                                 if let LiveCommand::PreparePhoto { request_id, .. } = command {
                                     request = request_id;
@@ -3187,10 +3212,12 @@ pub(in crate::ui) mod tests {
                         generation: app.model.generation,
                         thread: "d:22".into(),
                         request_id: request,
-                        result: Ok(photo),
+                        result: photo,
                     };
                     app.drafts.apply_live(&event, "11");
-                    app.live.as_mut().unwrap().uploads.photo_available = true;
+                    let uploads = &mut app.live.as_mut().unwrap().uploads;
+                    uploads.photo_available = true;
+                    uploads.photo_original_available = resolution == PhotoResolution::Original;
                     if let Ok(mode) = std::env::var("ZALO_UI_FIXTURE_PHOTO_UPLOAD") {
                         use crate::app::live::{FileTransferPhase, TransferKind};
                         let prepared = app.drafts.active.photo().unwrap().clone();

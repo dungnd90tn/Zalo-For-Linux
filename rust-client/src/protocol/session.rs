@@ -253,6 +253,16 @@ impl VerifiedSession {
             });
         origin_allowed.then(|| format!("zpw_sek={}", self.cookie))
     }
+
+    #[cfg(feature = "messaging")]
+    pub(crate) fn cloud_viewer_cookie(&self, url: &Url) -> Option<String> {
+        (self.config.original_photo_limits.is_some()
+            && super::original_photo::viewer_url(self.client_type)
+                .ok()
+                .as_ref()
+                == Some(url))
+        .then(|| format!("zpw_sek={}", self.cookie))
+    }
 }
 pub(super) fn encode_key(cipher: &SessionCipher) -> String {
     STANDARD.encode(&cipher.key)

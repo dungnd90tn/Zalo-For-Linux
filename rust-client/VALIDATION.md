@@ -1751,3 +1751,35 @@ Default checks passed 309 Rust and 19 Python tests. Strict all-feature,
 all-target Clippy and the offline PC bundle request oracle passed. The
 optimized live binary passed the schema 20 profile upgrade and restart smoke
 test.
+
+## Sending one original JPEG (2.0.6 development branch)
+
+**Ảnh gốc** is offered when the authenticated Cloud usage response identifies
+paid plan `0` and the session advertises both eligible services and the
+original-upload flag. The worker rechecks the entitlement before sending
+image bytes. The viewer key and usage decryption key stay in memory during
+that lookup. The upload uses `/api/{message,group}/zcloud-upload/photo` and
+the final send uses `/api/{message,group}/photo_original/send` with
+`jcp={"is_original":1}` (PC bundle N123045–123092, N399808–399822,
+N401545–401577 and N493214–493248).
+
+The preparation worker accepts static JPEGs up to 5 MiB and 2560 px per
+dimension, subject to smaller service limits. It removes APP1 segments
+without recompressing the image. JPEGs requiring EXIF rotation or reflection
+can be sent byte-for-byte using file attachment. Upload, preview and checksum
+use the same private prepared JPEG. The final photo record requires an explicit
+original URL and the expected resource size. The existing photo ledger binds
+the mode before upload and keeps the original URL through ACK recovery.
+
+The synthetic TLS/WSS test covers direct and group sends, exact prepared
+bytes, paid entitlement revocation before upload and rejection of a response
+without original-resource evidence. Eight offline native captures cover
+the ready and EXIF error states in both themes at 640×480 and 1200×780.
+The all-feature suite passed 884 Rust tests with five opt-in tests ignored.
+Default checks passed 310 Rust and 19 Python tests. Strict all-target,
+all-feature Clippy and the PC bundle photo request oracle passed.
+The optimized live binary passed the offline schema 20 upgrade and restart
+smoke test, preserving saved originals and local history.
+
+Real Zalo Cloud entitlement and downloading the sent photo on a second
+device remain to be verified on a test account.

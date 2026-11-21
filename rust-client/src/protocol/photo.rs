@@ -1,4 +1,4 @@
-//! Ordinary HD photo upload and final submission; photo resource completion is not an ACK.
+//! Ordinary photo upload and final submission; resource completion is not an ACK.
 use super::{
     bootstrap::PhotoUploadRoute,
     client::ClientType,
@@ -16,9 +16,10 @@ pub struct PhotoUrls {
     pub thumb_size: Option<u64>,
     pub file_size: Option<u64>,
     pub hd_size: Option<u64>,
+    explicit_original: bool,
 }
 impl PhotoUrls {
-    fn from_value(value: &Value) -> Result<Self, WireError> {
+    pub fn from_value(value: &Value) -> Result<Self, WireError> {
         let get = |key| {
             value
                 .get(key)
@@ -57,7 +58,12 @@ impl PhotoUrls {
             thumb_size: size("thumbSize")?,
             file_size: size("fileSize")?,
             hd_size: size("hdSize")?,
+            explicit_original: get("org").is_some(),
         })
+    }
+
+    pub(crate) fn matches_original(&self, size: u64) -> bool {
+        self.explicit_original && self.file_size == Some(size)
     }
 }
 pub fn endpoint(
@@ -73,6 +79,10 @@ pub fn endpoint(
         (ThreadKind::Group, Some(PhotoUploadRoute::File)) => "/api/group/photo_original/upload",
         (ThreadKind::Direct, Some(PhotoUploadRoute::Photo)) => "/api/message/upload/photo",
         (ThreadKind::Group, Some(PhotoUploadRoute::Photo)) => "/api/group/upload/photo",
+        (ThreadKind::Direct, Some(PhotoUploadRoute::Original)) => {
+            "/api/message/zcloud-upload/photo"
+        }
+        (ThreadKind::Group, Some(PhotoUploadRoute::Original)) => "/api/group/zcloud-upload/photo",
         (ThreadKind::Direct, None) => "/api/message/photo_original/send",
         (ThreadKind::Group, None) => "/api/group/photo_original/send",
     });
@@ -161,9 +171,13 @@ pub fn chunk_result(payload: &Value) -> Result<PhotoChunkResult, WireError> {
             .get("thumbUrl")
             .and_then(Value::as_str)
             .ok_or(WireError::Invalid)?;
-        Some(PhotoUrls::from_value(
-            &json!({"org":normal,"thumb":thumb,"hd":data.get("hdUrl").and_then(Value::as_str).unwrap_or(normal)}),
-        )?)
+        let mut urls = json!({"org":normal,"thumb":thumb,"hd":data.get("hdUrl").and_then(Value::as_str).unwrap_or(normal)});
+        for field in ["thumbSize", "fileSize", "hdSize"] {
+            if let Some(value) = data.get(field).filter(|value| !value.is_null()) {
+                urls[field] = value.clone();
+            }
+        }
+        Some(PhotoUrls::from_value(&urls)?)
     } else {
         None
     };
@@ -222,7 +236,28 @@ pub fn media_content(
     height: u32,
     urls: &PhotoUrls,
 ) -> Result<MediaMessageContent, WireError> {
-    MediaMessageContent::new(MediaKind::Photo,&json!({"title":"","description":caption,"href":urls.org,"thumb":urls.thumb,"params":{"width":width,"height":height,"hd":urls.hd,"rawUrl":urls.org}})).map_err(|_|WireError::Invalid)
+    content_for_resolution(
+        caption,
+        width,
+        height,
+        urls,
+        crate::domain::PhotoResolution::Hd,
+    )
+}
+
+pub(crate) fn content_for_resolution(
+    caption: &str,
+    width: u32,
+    height: u32,
+    urls: &PhotoUrls,
+    resolution: crate::domain::PhotoResolution,
+) -> Result<MediaMessageContent, WireError> {
+    let mut content = json!({"title":"","description":caption,"href":urls.org,"thumb":urls.thumb,
+        "params":{"width":width,"height":height,"hd":urls.hd,"rawUrl":urls.org}});
+    if resolution == crate::domain::PhotoResolution::Original {
+        content["params"]["is_original"] = json!(1);
+    }
+    MediaMessageContent::new(MediaKind::Photo, &content).map_err(|_| WireError::Invalid)
 }
 
 #[cfg(test)]
