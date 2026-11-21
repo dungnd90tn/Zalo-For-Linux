@@ -35,11 +35,12 @@ mod read_state;
 pub(crate) mod recall;
 mod search;
 mod sticker_send;
+mod voices;
 #[cfg(feature = "messaging")]
 pub(crate) use sticker_send::Reservation as StickerReservation;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// One received message with optional outbox hint and complete rich sidecars.
 /// The immutable metadata commits with its message and receive cursor.
@@ -275,6 +276,20 @@ fn insert_validated_with_media<'a>(
             if let Some(previous) = previous {
                 if previous.0 == m.sender
                     && previous.2 == m.sent_at_ms
+                    && previous.1 == "[Tin nhắn chat.voice chưa được hỗ trợ]"
+                    && m.text == MediaKind::Voice.legacy_placeholder()
+                    && media.is_some_and(|content| content.kind() == MediaKind::Voice)
+                {
+                    inserted += conn.execute(
+                        "UPDATE messages SET body=?4 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
+                        params![m.account_id, m.thread_id, m.id, m.text],
+                    )?;
+                    message_media::persist(conn, m, media, true)?;
+                    message_reply::persist(conn, m, None)?;
+                    continue;
+                }
+                if previous.0 == m.sender
+                    && previous.2 == m.sent_at_ms
                     && previous.1 != m.text
                     && info.is_none()
                     && media.is_none()
@@ -446,6 +461,7 @@ impl MessageStore {
         mention::initialize(&conn)?;
         attachments::initialize(&conn)?;
         photos::initialize(&conn)?;
+        voices::initialize(&conn)?;
         read_state::initialize(&conn)?;
         forward::initialize(&conn)?;
         recall::initialize(&conn)?;
@@ -1122,6 +1138,9 @@ impl MessageStore {
                     adjusted += 1;
                 }
                 if photos::reconcile_received(&tx, m, client_id.as_deref(), media)? {
+                    adjusted += 1;
+                }
+                if voices::reconcile_received(&tx, m, client_id.as_deref(), media)? {
                     adjusted += 1;
                 }
             }
@@ -1952,9 +1971,9 @@ mod list_silence_tests {
     fn placeholder_from_an_older_reader_is_upgraded_on_redelivery_but_text_is_otherwise_immutable()
     {
         let mut s = MessageStore::in_memory().unwrap();
-        let old = incoming("d:22", "1", "[Tin nhắn chat.voice chưa được hỗ trợ]", 50);
+        let old = incoming("d:22", "1", "[Tin nhắn chat.gif chưa được hỗ trợ]", 50);
         s.receive_batch("11", &[(old, None)], None).unwrap();
-        let new = incoming("d:22", "1", "[Tin nhắn thoại]", 50);
+        let new = incoming("d:22", "1", "[GIF]", 50);
         let received = s.receive_batch("11", &[(new.clone(), None)], None).unwrap();
         assert_eq!(received.len(), 1);
         assert_eq!(s.page("11", "d:22", None, 10).unwrap(), vec![new.clone()]);

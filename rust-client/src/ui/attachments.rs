@@ -647,6 +647,7 @@ impl NativeApp {
             self.live
                 .as_ref()
                 .and_then(|state| state.uploads.transfer.as_ref())
+                .filter(|job| !self.voice_tray_shows(job))
                 .filter(|job| {
                     job.busy()
                         || job.review()

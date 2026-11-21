@@ -67,6 +67,8 @@ mod sticker_picker;
 #[cfg(feature = "messaging")]
 mod stickers;
 mod visuals;
+#[cfg(feature = "messaging")]
+mod voice;
 
 use crate::app::{Command, DraftBook, Event, Model, Worker, EVENTS_PER_FRAME};
 use crate::domain::{fold_search, Conversation, Message};
@@ -1285,7 +1287,8 @@ impl NativeApp {
         let reply_height = self.reply_tray_height();
         let photo_height = self.photo_tray_height();
         let attachment_height = self.attachment_tray_height();
-        let tray_height = reply_height + attachment_height + photo_height;
+        let tray_height =
+            reply_height + attachment_height + photo_height + self.voice_tray_height();
         if reply_height > 0.0 {
             self.reply_tray(ui, rect);
         }
@@ -1305,6 +1308,15 @@ impl NativeApp {
                 ),
             );
         }
+        #[cfg(feature = "messaging")]
+        self.voice_tray(
+            ui,
+            egui::Rect::from_min_max(
+                rect.min + vec2(0.0, reply_height + attachment_height + photo_height),
+                rect.max,
+            ),
+            enabled,
+        );
         if attach_here && ctx.input(|input| !input.raw.hovered_files.is_empty()) {
             ui.painter()
                 .rect_stroke(rect.shrink(1.0), 16.0, Stroke::new(2.0_f32, colors.primary));
@@ -1333,6 +1345,8 @@ impl NativeApp {
                     self.photo_toolbar_buttons(ui, enabled);
                     #[cfg(not(feature = "messaging"))]
                     icon_button(ui, Icon::Image, "Gửi ảnh · chưa khả dụng", false);
+                    #[cfg(feature = "messaging")]
+                    self.voice_toolbar_button(ui, enabled);
                     if icon_button(
                         ui,
                         Icon::Paperclip,
@@ -1360,7 +1374,12 @@ impl NativeApp {
                             auth_generation,
                         );
                     }
-                    if rect.width() >= 480.0 {
+                    let shortcut_hint_min_width = if cfg!(feature = "messaging") {
+                        535.0
+                    } else {
+                        480.0
+                    };
+                    if rect.width() >= shortcut_hint_min_width {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(8.0);
                             ui.label(
@@ -1624,6 +1643,11 @@ impl NativeApp {
         }
     }
 
+    #[cfg(not(feature = "messaging"))]
+    fn voice_tray_height(&self) -> f32 {
+        0.0
+    }
+
     fn chat(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool) {
         let colors = crate::theme::palette(ctx);
         visuals::background(ui, ui.max_rect(), "--surface-background", colors.canvas);
@@ -1638,6 +1662,7 @@ impl NativeApp {
             composer_height(ui.available_height(), &self.drafts.active.text, compact)
                 + self.attachment_tray_height()
                 + self.photo_tray_height()
+                + self.voice_tray_height()
                 + self.reply_tray_height();
         let status = timeline_status(
             &self.model.status,
@@ -2268,6 +2293,8 @@ impl eframe::App for NativeApp {
         }
         self.update_modal_input(ctx);
         #[cfg(feature = "messaging")]
+        self.sync_voice(ctx);
+        #[cfg(feature = "messaging")]
         self.begin_attention_frame(ctx);
         #[cfg(feature = "live-login")]
         {
@@ -2285,6 +2312,8 @@ impl eframe::App for NativeApp {
         }
         ctx.input(|input| update_ime_state(&mut self.ime_composing, &input.events));
         self.workspace(ctx);
+        #[cfg(feature = "messaging")]
+        self.sync_voice(ctx);
         if self.settings_open {
             self.latch_modal_input(ctx);
             self.settings

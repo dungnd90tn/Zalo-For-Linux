@@ -189,7 +189,7 @@ impl MessageStore {
                         ..base
                     });
                 }
-                MediaDescriptor::Poll(_) => {}
+                MediaDescriptor::Poll(_) | MediaDescriptor::Voice(_) => {}
             }
         }
         Ok(items)

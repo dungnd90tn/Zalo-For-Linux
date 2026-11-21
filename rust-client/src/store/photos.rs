@@ -502,8 +502,10 @@ fn check_reservations(
     thread: &str,
     specs: &[PhotoSpec],
 ) -> Result<()> {
-    let active:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM photo_outbox WHERE account_id=?1 AND state IN ('uploading','resource_ready','sending') UNION ALL SELECT 1 FROM attachment_outbox WHERE account_id=?1 AND state IN ('uploading','resource_ready','sending'))",[account],|row|row.get(0))?;
-    ensure!(!active, "A photo upload is already active");
+    ensure!(
+        !super::attachments::upload_active(conn, account)?,
+        "A photo upload is already active"
+    );
     let unresolved:i64=conn.query_row("SELECT count(*) FROM photo_outbox WHERE account_id=?1 AND state IN ('unknown','acknowledged')",[account],|row|row.get(0))?;
     ensure!(unresolved < 100, "Too many unresolved photo sends");
     for spec in specs {

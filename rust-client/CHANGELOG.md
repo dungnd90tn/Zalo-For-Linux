@@ -15,7 +15,8 @@ Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) đ�
 - Tải từng trang tin văn bản cũ trong nhóm thường đủ điều kiện khi Zalo bật dịch vụ lịch sử nhóm. Ứng dụng giữ nguyên trang đang đọc và bản nháp, rồi mở phần đã lưu qua **Xem trang trước**.
 - Gửi một ảnh gốc JPEG tối đa 5 MiB và 2560 px mỗi chiều khi tài khoản có quyền Zalo Cloud. Ảnh có xem trước và chú thích. Ứng dụng bỏ metadata APP1 mà không nén lại ảnh. JPEG cần xoay hoặc lật theo EXIF có thể gửi dưới dạng tệp.
 - Gửi album từ 2 đến 6 ảnh HD trong chat cá nhân và nhóm đủ điều kiện. Khay xem trước giữ thứ tự chọn và phần chữ đang soạn. Nếu một ảnh lỗi hoặc chưa rõ kết quả, ứng dụng báo số ảnh đã xác nhận và dừng các ảnh còn lại.
-- Hồ sơ nâng lên **schema 21** để lưu thông tin album, cùng với dữ liệu nhắc tên và trạng thái ghim ở các bản phát triển trước. Quá trình nâng cấp giữ lịch sử đã lưu. Bản cũ dùng schema 20 trở xuống sẽ từ chối mở hồ sơ đã nâng cấp.
+- Thu, nghe lại và gửi tin nhắn thoại MP3 tối đa 60 giây qua chat cá nhân và nhóm đủ điều kiện. Có nút phát tin thoại nhận được và giữ bản nháp chữ khi gửi hoặc hủy bản ghi.
+- Hồ sơ nâng lên **schema 22** để lưu xác nhận gửi và thông tin hiển thị tin thoại. Quá trình nâng cấp giữ lịch sử và album đã lưu. Bản cũ dùng schema 21 trở xuống sẽ từ chối mở hồ sơ đã nâng cấp.
 
 ## 2.0.5 — gói thử 2.0.5-2
 

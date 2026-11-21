@@ -25,6 +25,7 @@ use std::{
 enum Reply {
     FileUpload(u8),
     PhotoUpload(u8),
+    VoiceSend(voice_send_tests::ReplyKind),
     Normal,
     #[cfg(feature = "signal-crypto")]
     EncryptedSend,
@@ -667,6 +668,10 @@ fn serve(
             file_fixture::socket(ws, state, mode, true);
             return;
         }
+        if matches!(reply, Reply::VoiceSend(_)) {
+            file_fixture::socket(ws, state, 0, false);
+            return;
+        }
         if matches!(reply, Reply::AuthExpired | Reply::AuthMalformed) {
             let payload = if matches!(reply, Reply::AuthExpired) {
                 json!({"error_code":102})
@@ -1127,6 +1132,11 @@ fn serve(
     }
     if let Reply::PhotoUpload(mode) = reply {
         if file_fixture::http(&mut stream, &state, mode, &path, &headers, &body, true) {
+            return;
+        }
+    }
+    if let Reply::VoiceSend(mode) = reply {
+        if voice_send_tests::respond(&mut stream, &state, mode, &path, &headers, &body) {
             return;
         }
     }
@@ -6098,6 +6108,7 @@ mod mention_tests;
 mod photo_upload_tests;
 mod reaction_replay_tests;
 mod sticker_send_tests;
+mod voice_send_tests;
 
 #[tokio::test]
 async fn actual_forward_dispatch_uses_ttl_proof_and_retains_unknown_across_restart() {

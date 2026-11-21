@@ -8,6 +8,8 @@ use url::Url;
 pub const MAX_MEDIA_DESCRIPTOR_BYTES: usize = 16 * 1024;
 pub const MAX_MEDIA_URL_BYTES: usize = 4096;
 pub const PHOTO_PREVIEW: &str = "[Hình ảnh]";
+pub const VOICE_PREVIEW: &str = "[Tin nhắn thoại]";
+const MAX_VOICE_DURATION_MS: u32 = 60 * 60 * 1000;
 pub const WEBCONTENT_PREVIEW: &str = "[Tin nhắn Media]";
 pub const RECOMMENDED_PREVIEW: &str = "[Nội dung được chia sẻ]";
 pub const POLL_PREVIEW: &str = "[Bình chọn]";
@@ -16,6 +18,7 @@ pub const POLL_PREVIEW: &str = "[Bình chọn]";
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
     Photo,
+    Voice,
     WebContent,
     Recommended,
     Poll,
@@ -25,6 +28,7 @@ impl MediaKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Photo => "chat.photo",
+            Self::Voice => "chat.voice",
             Self::WebContent => "chat.webcontent",
             Self::Recommended => "chat.recommended",
             Self::Poll => "group.poll",
@@ -34,6 +38,7 @@ impl MediaKind {
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
             "chat.photo" => Some(Self::Photo),
+            "chat.voice" => Some(Self::Voice),
             "chat.webcontent" => Some(Self::WebContent),
             "chat.recommended" => Some(Self::Recommended),
             "group.poll" => Some(Self::Poll),
@@ -44,12 +49,20 @@ impl MediaKind {
     pub fn legacy_placeholder(self) -> &'static str {
         match self {
             Self::Photo => "[Tin nhắn chat.photo chưa được hỗ trợ]",
+            Self::Voice => VOICE_PREVIEW,
             Self::WebContent => "[Tin nhắn chat.webcontent chưa được hỗ trợ]",
             Self::Recommended => "[Tin nhắn chat.recommended chưa được hỗ trợ]",
             Self::Poll => "[Tin nhắn group.poll chưa được hỗ trợ]",
             Self::File => "[Tin nhắn share.file chưa được hỗ trợ]",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceDescriptor {
+    pub url: Option<String>,
+    pub duration_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +267,7 @@ pub struct FileDescriptor {
 )]
 pub enum MediaDescriptor {
     Photo(PhotoDescriptor),
+    Voice(VoiceDescriptor),
     WebContent(WebContentDescriptor),
     Recommended(WebContentDescriptor),
     Poll(PollDescriptor),
@@ -263,6 +277,7 @@ impl MediaDescriptor {
     pub fn kind(&self) -> MediaKind {
         match self {
             Self::Photo(_) => MediaKind::Photo,
+            Self::Voice(_) => MediaKind::Voice,
             Self::WebContent(_) => MediaKind::WebContent,
             Self::Recommended(_) => MediaKind::Recommended,
             Self::Poll(_) => MediaKind::Poll,
@@ -272,6 +287,7 @@ impl MediaDescriptor {
     pub fn preview_text(&self) -> &str {
         match self {
             Self::Photo(_) => PHOTO_PREVIEW,
+            Self::Voice(_) => VOICE_PREVIEW,
             Self::File(file) => &file.title,
             Self::WebContent(card) | Self::Recommended(card) => &card.title,
             Self::Poll(poll) => {
@@ -306,6 +322,18 @@ impl MediaDescriptor {
                         && photo.height.is_none_or(|n| n > 0 && n <= 65_535)
                         && photo.album.is_none_or(PhotoAlbumMember::is_valid),
                     "Invalid photo descriptor"
+                );
+            }
+            Self::Voice(voice) => {
+                ensure!(
+                    voice
+                        .url
+                        .as_ref()
+                        .is_none_or(|url| voice_url(url).as_ref() == Some(url))
+                        && voice
+                            .duration_ms
+                            .is_none_or(|ms| (1..=MAX_VOICE_DURATION_MS).contains(&ms)),
+                    "Invalid voice descriptor"
                 );
             }
             Self::WebContent(card) | Self::Recommended(card) => {
@@ -398,6 +426,7 @@ impl MediaMessageContent {
         })?;
         let mut descriptor = match kind {
             MediaKind::Photo => MediaDescriptor::Photo(photo(content)),
+            MediaKind::Voice => MediaDescriptor::Voice(voice(content)),
             MediaKind::WebContent => MediaDescriptor::WebContent(web_content(content)),
             MediaKind::Recommended => MediaDescriptor::Recommended(recommended(content)),
             MediaKind::Poll => MediaDescriptor::Poll(poll(content)),
@@ -483,6 +512,7 @@ fn fit_descriptor(descriptor: &mut MediaDescriptor) {
                 }
             }
             MediaDescriptor::File(file) => file.url.take().is_some(),
+            MediaDescriptor::Voice(voice) => voice.url.take().is_some(),
             MediaDescriptor::Poll(poll) => {
                 if !poll.question.is_empty() {
                     poll.question
@@ -548,6 +578,33 @@ pub fn safe_url(value: &str) -> Option<String> {
 }
 fn url(value: Option<&Value>) -> Option<String> {
     value.and_then(Value::as_str).and_then(safe_url)
+}
+
+/// Apply the playback origin boundary before a peer URL reaches the UI.
+pub fn voice_url(value: &str) -> Option<String> {
+    let normalized = safe_url(value)?;
+    let url = Url::parse(&normalized).ok()?;
+    let host = url.host_str()?;
+    (url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.fragment().is_none()
+        && (host.ends_with(".zdn.vn") || host.ends_with(".zadn.vn")))
+    .then_some(normalized)
+}
+
+fn voice(content: &Value) -> VoiceDescriptor {
+    let params = parsed(content.get("params")).unwrap_or(Value::Null);
+    let duration_ms = params.get("duration").and_then(|value| {
+        let duration = value.as_u64().or_else(|| value.as_str()?.parse().ok())?;
+        let duration = u32::try_from(duration).ok()?;
+        (1..=MAX_VOICE_DURATION_MS)
+            .contains(&duration)
+            .then_some(duration)
+    });
+    let url = (!has_encrypted_file_key(content, &params))
+        .then(|| content.get("href")?.as_str().and_then(voice_url))
+        .flatten();
+    VoiceDescriptor { url, duration_ms }
 }
 fn has_encrypted_file_key(content: &Value, params: &Value) -> bool {
     // Original getFileIdData and photo-upload normalization test key truthiness

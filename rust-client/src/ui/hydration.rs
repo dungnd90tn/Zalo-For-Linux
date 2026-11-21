@@ -52,6 +52,7 @@ fn is_media_placeholder(text: &str) -> bool {
         || text == MediaKind::Recommended.legacy_placeholder()
         || text == MediaKind::Poll.legacy_placeholder()
         || text == MediaKind::File.legacy_placeholder()
+        || text == MediaKind::Voice.legacy_placeholder()
 }
 struct Flight {
     epoch: u64,

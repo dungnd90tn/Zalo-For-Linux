@@ -96,6 +96,12 @@ pub enum Icon {
     Sticker,
     Image,
     Paperclip,
+    #[cfg(feature = "messaging")]
+    Mic,
+    #[cfg(feature = "messaging")]
+    Play,
+    #[cfg(feature = "messaging")]
+    Stop,
     Back,
     Info,
     Check,
@@ -115,6 +121,12 @@ pub fn icon(ui: &Ui, rect: Rect, kind: Icon, color: Color32) {
         Icon::Sticker => "fa-chatbar-sticker",
         Icon::Image => "fa-chatbar-photo",
         Icon::Paperclip => "fa-chatbar-attach",
+        #[cfg(feature = "messaging")]
+        Icon::Mic => "fa-Mic_24_Line",
+        #[cfg(feature = "messaging")]
+        Icon::Play => "fa-Play_24_Filled",
+        #[cfg(feature = "messaging")]
+        Icon::Stop => "fa-Stop_24_Filled",
         Icon::Back => "fa-back",
         Icon::Info => "fa-outline-info",
         Icon::Check => "fa-check",

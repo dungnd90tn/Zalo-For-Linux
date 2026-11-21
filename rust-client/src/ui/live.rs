@@ -67,6 +67,8 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub photo_preview: super::photos::Preview,
     #[cfg(feature = "messaging")]
+    pub voice: super::voice::Composer,
+    #[cfg(feature = "messaging")]
     pub directory: super::directory::DirectoryView,
     #[cfg(feature = "messaging")]
     pub stickers: super::stickers::StickerCache,
@@ -149,6 +151,8 @@ impl LiveState {
             uploads: Default::default(),
             #[cfg(feature = "messaging")]
             photo_preview: Default::default(),
+            #[cfg(feature = "messaging")]
+            voice: Default::default(),
             #[cfg(feature = "messaging")]
             directory: Default::default(),
             #[cfg(feature = "messaging")]
@@ -721,6 +725,7 @@ impl NativeApp {
         }
         // Durable settlement is independent of whether its conversation is still visible.
         state.uploads.observe(&event);
+        state.voice.observe(&event);
         let sticker_catalog_thread = match &event {
             LiveEvent::StickersFound { thread, .. }
             | LiveEvent::StickerPacksFound { thread, .. }
@@ -1333,6 +1338,7 @@ pub(in crate::ui) mod tests {
                 original_photo_limits: None,
                 photo_album_max_count: 9,
                 photo_album_extra_metadata: true,
+                voice_recording_allowed: false,
                 seen_v2: true,
                 group_board_v2: false,
                 recall_max_age_ms: Some(300_000),
@@ -2465,12 +2471,14 @@ pub(in crate::ui) mod tests {
         let sender_mode = std::env::var("ZALO_UI_FIXTURE_SENDERS").ok();
         let info_mode = std::env::var_os("ZALO_UI_FIXTURE_INFO").is_some();
         let album_scene = std::env::var("ZALO_UI_FIXTURE_ALBUM").ok();
+        let voice_scene = std::env::var("ZALO_UI_FIXTURE_VOICE").ok();
         let media_mode = std::env::var("ZALO_UI_FIXTURE_MEDIA").ok();
         let attention_scene = std::env::var("ZALO_UI_FIXTURE_ATTENTION").ok();
         let forward_scene = std::env::var("ZALO_UI_FIXTURE_FORWARD").ok();
         let recall_scene = std::env::var("ZALO_UI_FIXTURE_RECALL").ok();
         let group_scene = std::env::var("ZALO_UI_FIXTURE_GROUP").ok();
         let cached = album_scene.is_some()
+            || voice_scene.is_some()
             || media_mode.is_some()
             || forward_scene.is_some()
             || recall_scene.is_some()
@@ -2527,6 +2535,7 @@ pub(in crate::ui) mod tests {
                 *root.lock().unwrap() = Some(path);
                 if online
                     || album_scene.is_some()
+                    || voice_scene.is_some()
                     || forward_scene.is_some()
                     || recall_scene.is_some()
                     || group_scene.is_some()
@@ -3158,6 +3167,9 @@ pub(in crate::ui) mod tests {
                 if let Some(scene) = &album_scene {
                     super::super::albums::tests::scene(&mut app, &cc.egui_ctx, scene);
                 }
+                if let Some(scene) = &voice_scene {
+                    super::super::voice::tests::scene(&mut app, scene);
+                }
                 if let Ok(scene) = std::env::var("ZALO_UI_FIXTURE_PHOTO") {
                     use crate::app::live::{PhotoPreparationFailure, PhotoResolution};
                     let resolution = if matches!(scene.as_str(), "original" | "original-error") {
@@ -3352,6 +3364,7 @@ pub(in crate::ui) mod tests {
                         Some("remote-history" | "remote-history-saved" | "remote-history-offline")
                     )
                     || album_scene.is_some()
+                    || voice_scene.is_some()
                     || std::env::var_os("ZALO_UI_FIXTURE_AVATARS").is_some()
                 {
                     fixture_content_worker(&mut app, &cc.egui_ctx);
@@ -3539,7 +3552,9 @@ pub(in crate::ui) mod tests {
                 MediaDescriptor::WebContent(c) | MediaDescriptor::Recommended(c) => {
                     c.image_url.as_ref()
                 }
-                MediaDescriptor::Poll(_) | MediaDescriptor::File(_) => None,
+                MediaDescriptor::Poll(_) | MediaDescriptor::File(_) | MediaDescriptor::Voice(_) => {
+                    None
+                }
             };
             if let Some(url) = url {
                 let key = crate::app::media::MediaKey {

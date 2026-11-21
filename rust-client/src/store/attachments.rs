@@ -96,6 +96,18 @@ pub(super) fn plain_visible(store: &MessageStore, account: &str, thread: &str) -
     ensure!(!encrypted, "Encrypted attachments are not supported");
     Ok(())
 }
+
+pub(super) fn upload_active(conn: &Connection, account: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM attachment_outbox WHERE account_id=?1 AND state IN ('uploading','resource_ready','sending')
+            UNION ALL SELECT 1 FROM photo_outbox WHERE account_id=?1 AND state IN ('uploading','resource_ready','sending')
+            UNION ALL SELECT 1 FROM voice_outbox WHERE account_id=?1 AND state IN ('prepared','sending')
+        )",
+        [account],
+        |row| row.get(0),
+    )?)
+}
 fn bound_resource(
     spec: &AttachmentSpec,
     thread: &str,
@@ -428,8 +440,10 @@ impl MessageStore {
         ensure!(now_ms > 0, "Invalid attachment time");
         let checksum = spec.checksum.to_ascii_lowercase();
         let tx = self.conn.transaction()?;
-        let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attachment_outbox WHERE account_id=?1 AND state IN ('uploading','resource_ready','sending') UNION ALL SELECT 1 FROM photo_outbox WHERE account_id=?1 AND state IN ('uploading','resource_ready','sending'))",[account],|row|row.get(0))?;
-        ensure!(!active, "An attachment upload is already active");
+        ensure!(
+            !upload_active(&tx, account)?,
+            "An attachment upload is already active"
+        );
         let unresolved:i64=tx.query_row("SELECT count(*) FROM attachment_outbox WHERE account_id=?1 AND state IN ('unknown','acknowledged')",[account],|row|row.get(0))?;
         ensure!(unresolved < 100, "Too many unresolved attachment sends");
         let duplicate:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attachment_outbox WHERE account_id=?1 AND thread_id=?2 AND file_name=?3 AND size=?4 AND checksum=?5 AND state IN ('unknown','acknowledged'))",params![account,thread,spec.file_name,spec.size as i64,checksum],|row|row.get(0))?;

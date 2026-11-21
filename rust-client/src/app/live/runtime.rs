@@ -388,6 +388,7 @@ fn diagnostic_message_kind(value: wire::FrameMessageKind) -> crate::diagnostics:
         wire::FrameMessageKind::Webchat => crate::diagnostics::MessageKind::Webchat,
         wire::FrameMessageKind::WebchatInfo => crate::diagnostics::MessageKind::WebchatInfo,
         wire::FrameMessageKind::Photo => crate::diagnostics::MessageKind::Photo,
+        wire::FrameMessageKind::Voice => crate::diagnostics::MessageKind::Voice,
         wire::FrameMessageKind::WebContent => crate::diagnostics::MessageKind::WebContent,
         wire::FrameMessageKind::Recommended => crate::diagnostics::MessageKind::Recommended,
         wire::FrameMessageKind::Poll => crate::diagnostics::MessageKind::Poll,
@@ -580,6 +581,7 @@ impl Database {
                         s.reconcile_photos(&account)?;
                         s.recover_attachments(&account)?;
                         s.reconcile_attachments(&account)?;
+                        s.recover_voices(&account)?;
                         s.recover_forwards(&account)?;
                         s.recover_recalls(&account)?;
                         s.recover_group_actions(&account)?;
@@ -2098,6 +2100,8 @@ async fn handle_command(
         | LiveCommand::SendAlbum { .. }
         | LiveCommand::CancelAlbumPreparation { .. }
         | LiveCommand::CancelAlbum { .. }
+        | LiveCommand::SendVoice { .. }
+        | LiveCommand::CancelVoice { .. }
         | LiveCommand::CancelPhotoPreparation { .. }
         | LiveCommand::CancelFile { .. } => return Ok(CommandOutcome::Continue),
         LiveCommand::Shutdown => return Ok(CommandOutcome::Shutdown),
@@ -2683,6 +2687,12 @@ async fn run_inner(
         .emit(LiveEvent::FileCapability {
             account_id: events.account.clone(),
             available: root_for(&session, "file").is_ok(),
+        })
+        .await?;
+    events
+        .emit(LiveEvent::VoiceCapability {
+            account_id: events.account.clone(),
+            available: upload::voice_available(&session),
         })
         .await?;
     events

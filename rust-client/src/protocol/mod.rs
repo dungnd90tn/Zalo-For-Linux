@@ -46,6 +46,8 @@ pub(crate) mod sticker_send;
 pub mod trust;
 #[cfg(feature = "messaging")]
 pub mod upload;
+#[cfg(feature = "messaging")]
+pub mod voice;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

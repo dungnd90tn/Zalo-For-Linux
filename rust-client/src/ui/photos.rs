@@ -118,6 +118,7 @@ impl NativeApp {
             && self.drafts.active.attachment().is_none()
             && !self.drafts.active.photo_preparing()
             && !self.drafts.active.album_preparing()
+            && self.voice_tray_height() == 0.0
             && self.live.as_ref().is_some_and(|state| {
                 state.uploads.supports_photo(resolution)
                     && !state.uploads.blocked()

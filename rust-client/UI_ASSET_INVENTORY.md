@@ -51,7 +51,7 @@ Cùng một tên token không bảo đảm cùng giá trị ở mọi selector. 
 
 ## Icon và font
 
-Native hiện khai báo **15** biến thể `Icon` trong `src/ui/visuals.rs`, đều dùng icon font gốc. Mỗi biến thể tra class trong registry đầy đủ thay vì giữ codepoint riêng. Generator giữ alias/font family, chỉ lấy class pseudo-element đích và xác minh cmap: không gán glyph cho ancestor như `.fa-ic_checkbox tick:after`. Không đếm 15 control thành tổng icon Zalo.
+Native khai báo **18** biến thể `Icon` trong `src/ui/visuals.rs`, gồm ba biến thể thoại trong bản live. Mỗi biến thể tra class trong registry đầy đủ và dùng icon font gốc. Generator giữ alias/font family, chỉ lấy class pseudo-element đích và xác minh cmap.
 
 | Native `Icon` | Class nguồn | Codepoint |
 | --- | --- | --- |
@@ -60,6 +60,7 @@ Native hiện khai báo **15** biến thể `Icon` trong `src/ui/visuals.rs`, đ
 | Search / Plus | `.fa-outline-search` / `.fa-outline-plus` | `U+ECA1` / `U+EC97` |
 | Phone / Video | `.fa-outline-call` / `.fa-outline-video` | `U+EC83` / `U+ECAC` |
 | Sticker / Image / Paperclip | `.fa-chatbar-sticker` / `.fa-chatbar-photo` / `.fa-chatbar-attach` | `U+EA71` / `U+EA6A` / `U+EA5A` |
+| Mic / Play / Stop | `.fa-Mic_24_Line` / `.fa-Play_24_Filled` / `.fa-Stop_24_Filled` | `U+EC53` / `U+ECC1` / `U+ED62` |
 | Back / Info | `.fa-back` / `.fa-outline-info` | `U+EA25` / `U+EC8D` |
 | Check / Shield | `.fa-check` / `.fa-icon-outline-lock` | `U+EA7E` / `U+EBC5` |
 

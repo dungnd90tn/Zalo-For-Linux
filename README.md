@@ -16,6 +16,7 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 - **Hiển thị nội dung nhận được:** văn bản, thông báo hệ thống, sticker (tĩnh và động, hiển thị không nền), ảnh và một số thẻ OA/nội dung được chia sẻ. Hỗ trợ PNG/JPEG/WebP và một phần JPEG XL tĩnh; ảnh đã tải có thể mở trong khung xem của ứng dụng.
 - **Trả lời và gửi tệp:** trả lời tin văn bản thường, gửi một tệp tối đa 100 MiB hoặc một ảnh HD tĩnh, có tiến độ và nút hủy. Ảnh HD có bản xem trước và chú thích.
 - **Gửi album ảnh HD** (bản đang phát triển). Dùng nút ảnh để chọn từ 2 đến 6 ảnh, trong giới hạn tài khoản. Kiểm tra thứ tự trên khay xem trước rồi chọn **Gửi album**. Phần chữ đang soạn được giữ riêng. Nếu album chỉ gửi được một phần, ứng dụng báo số ảnh đã xác nhận và dừng các ảnh còn lại.
+- **Tin nhắn thoại** (bản đang phát triển). Bấm nút mic để thu tối đa 60 giây, rồi nghe lại, hủy hoặc gửi. Phần chữ đang soạn được giữ riêng. Thu và phát cần FFmpeg và hệ thống âm thanh tương thích PulseAudio, chẳng hạn PipeWire có `pipewire-pulse`. Thu MP3 dùng bộ mã hóa `libmp3lame`.
 - **Gửi ảnh gốc** (bản đang phát triển). Chọn **Ảnh gốc** khi Zalo xác nhận quyền cho tài khoản. Chế độ này giữ dữ liệu nén của JPEG tối đa 5 MiB và 2560 px mỗi chiều, bỏ metadata APP1. Dùng nút đính kèm tệp để gửi nguyên từng byte, kể cả metadata.
 - **Sticker và cảm xúc.** Gửi sticker mặc định, tìm theo từ khóa hoặc mở **Bộ nhãn dán** để duyệt và gửi từ các bộ công khai mà phiên Zalo trả trực tiếp trong danh mục. Menu chuột phải có sáu cảm xúc và thao tác sao chép nhiều tin văn bản trên trang hiện tại.
 - **Chuyển tiếp và thu hồi:** chuyển tiếp một tin văn bản cá nhân thông thường đến tối đa 10 bạn bè và xem kết quả cho từng người. Bấm chuột phải và chọn **Thu hồi** cho tin văn bản thông thường do bạn gửi còn trong thời hạn cho phép. Tính năng áp dụng trong chat cá nhân và nhóm thường tối đa 100 thành viên mà bạn vẫn tham gia.
@@ -177,7 +178,7 @@ Sau mỗi lần biên dịch bản mới, chạy lại trình cài đặt để 
 | --- | --- |
 | Nhắn tin | Xác nhận đầy đủ gửi–nhận cá nhân/nhóm với tài khoản thực, kết nối lại và vận hành lâu dài |
 | Đồng bộ | Lịch sử chat cá nhân, lịch sử ngoài phần văn bản nhóm được hỗ trợ, thành viên nhóm lớn và cộng đồng, xác nhận tải ảnh đại diện trên tài khoản thực |
-| Nội dung | Gửi ảnh gốc ngoài phạm vi JPEG hiện tại, gửi nhiều tệp, ghi âm, tiếp tục lượt tải dở và các mẫu thẻ OA còn lại |
+| Nội dung | Gửi ảnh gốc ngoài phạm vi JPEG hiện tại, gửi nhiều tệp, tin thoại mã hóa, tiếp tục lượt tải dở và các mẫu thẻ OA còn lại |
 | Thao tác tin nhắn | Ghim trong chat cá nhân, cập nhật tin ghim theo thời gian thực, chuyển tiếp từ hoặc đến nhóm, nhắc cả nhóm, thu hồi ảnh và tệp, xóa cục bộ, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
 | Quản lý nhóm | Tạo nhóm, xóa thành viên, chuyển quyền trưởng nhóm, mời nhiều người và tham gia lại nhóm đã rời |
 | Bình chọn và tìm kiếm | Chi tiết/kết quả/bỏ phiếu và tìm kiếm toàn bộ tin nhắn |

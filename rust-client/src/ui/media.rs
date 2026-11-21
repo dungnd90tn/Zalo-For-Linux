@@ -40,6 +40,15 @@ pub(super) fn show(
         }
         MediaDescriptor::Poll(poll) => poll_card(ui, poll),
         MediaDescriptor::File(file) => file_card(ui, message, file, cache),
+        MediaDescriptor::Voice(voice) => {
+            let playback = cache
+                .filter(|cache| {
+                    cache.matches_scope(&message.account_id, &message.thread_id, generation)
+                        && !cache.has_viewer()
+                })
+                .map(|cache| &mut cache.voice);
+            super::voice::message_card(ui, message, voice, playback);
+        }
     }
 }
 fn file_card(

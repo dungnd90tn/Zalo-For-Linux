@@ -55,6 +55,7 @@ pub(crate) struct MediaCache {
     downloads: LruCache<MediaKey, Download>,
     bytes: usize,
     pub(super) viewer: Option<Viewer>,
+    pub(in crate::ui) voice: crate::ui::voice::Playback,
     #[cfg(test)]
     fixture_only: bool,
 }
@@ -71,6 +72,7 @@ impl Default for MediaCache {
             downloads: LruCache::new(NonZeroUsize::new(STATES).unwrap()),
             bytes: 0,
             viewer: None,
+            voice: Default::default(),
             #[cfg(test)]
             fixture_only: false,
         }
@@ -85,6 +87,7 @@ impl MediaCache {
         }) {
             self.viewer = None;
         }
+        self.voice.clear_message(account, thread, id);
     }
 
     pub fn scope(&mut self, account: &str, thread: &str, generation: u64) {
@@ -101,17 +104,24 @@ impl MediaCache {
             self.loader = None;
             self.states.clear();
             self.viewer = None;
+            self.voice.clear();
             self.startup_retry = None;
             self.scope = Some((thread.into(), generation));
         }
     }
     fn matches(&self, key: &MediaKey, generation: u64) -> bool {
-        self.account.as_deref() == Some(key.account_id.as_str())
+        self.matches_scope(&key.account_id, &key.thread_id, generation)
+    }
+    pub(super) fn matches_scope(&self, account: &str, thread: &str, generation: u64) -> bool {
+        self.account.as_deref() == Some(account)
             && self
                 .scope
                 .as_ref()
                 .map(|(thread, revision)| (thread.as_str(), *revision))
-                == Some((key.thread_id.as_str(), generation))
+                == Some((thread, generation))
+    }
+    pub(in crate::ui) fn has_viewer(&self) -> bool {
+        self.viewer.is_some()
     }
     pub(super) fn visible(
         &mut self,

@@ -81,6 +81,7 @@ fn actions(message: &Message) -> Vec<Action> {
             vec![poll.title.as_str(), poll.question.as_str()],
             None,
         ),
+        Some(MediaDescriptor::Voice(_)) => return result,
         None if message.sticker.is_none()
             && !(message.text.starts_with("[Tin nhắn ")
                 && message.text.ends_with(" chưa được hỗ trợ]")) =>

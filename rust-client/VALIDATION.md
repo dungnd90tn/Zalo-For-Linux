@@ -1816,3 +1816,33 @@ To reproduce the captures, set `ZALO_UI_FIXTURE_ALBUM=ready|partial`,
 Run the ignored `ui::live::tests::signed_in_offline_native_window_fixture` under
 an isolated X11 display. Receiving the album on a real Zalo device remains
 to be verified.
+
+## Recording and sending a voice message (2.0.6 development branch)
+
+The recorder only starts on an explicit action and keeps MP3 bytes in memory.
+Playback depends on local FFmpeg and a PulseAudio-compatible audio server.
+Ordinary direct and group sends use the authenticated FILE origin and a scoped
+voice receipt ledger. An uncertain result keeps the current clip available
+for review and blocks automatic resend. Text drafts remain independent.
+
+The focused all-feature tests cover the direct/group request parameters,
+strict HTTPS media projection, explicit server disable, scope and receipt
+matching, and rejection of an uncertain duplicate after restart. The
+optional FFmpeg test generated an in-memory synthetic tone and validated its
+MP3 frames and duration. No microphone or sound output was used.
+The default checks passed 317 Rust and 19 Python tests. Focused all-feature
+checks passed 13 voice tests and 166 store tests in separate runs. The
+schema 21 fixture upgraded to schema 22 with all 19 synthetic messages
+intact, and the previous optimized binary refused the upgraded profile.
+Strict all-target, all-feature Clippy and the final optimized binary's
+offline schema 22 and restart smoke checks passed.
+
+Native fixtures use `ZALO_UI_FIXTURE_VOICE=ready|received|unknown` with
+`ZALO_UI_FIXTURE_READY=1` in the ignored X11 screenshot test above. Both
+themes were reviewed at 640×480 and 1200×780. The unknown state has one
+review row, and the test confirms it dismisses the matching recording
+without resending. The captures used no network or audio-device connections.
+
+The voice TLS/WSS integration case was compiled. Its permission review
+timed out, so the loopback run is pending renewed permission. Microphone
+and speaker checks and Zalo phone-to-Linux acceptance remain pending.

@@ -2,13 +2,14 @@
 use super::*;
 use crate::{
     domain::Attachment,
-    protocol::{photo as wire_photo, upload as wire_upload},
+    protocol::{photo as wire_photo, upload as wire_upload, voice as wire_voice},
     store::{
         attachments::{AttachmentResource, AttachmentSpec},
         photos::{AlbumPosition, PhotoResource, PhotoSpec},
     },
 };
 use md5::{Digest, Md5};
+use sha2::Sha256;
 use std::{
     collections::VecDeque,
     fs::File,
@@ -41,18 +42,21 @@ enum UploadInput {
 enum UploadJob {
     Single(UploadInput),
     Album(Vec<PreparedPhoto>),
+    Voice(PreparedVoice),
 }
 impl UploadJob {
     fn kind(&self) -> TransferKind {
         match self {
             Self::Single(input) => input.kind(),
             Self::Album(_) => TransferKind::Album,
+            Self::Voice(_) => TransferKind::Voice,
         }
     }
     fn size(&self) -> u64 {
         match self {
             Self::Single(input) => input.size(),
             Self::Album(photos) => photos.iter().map(PreparedPhoto::size_bytes).sum(),
+            Self::Voice(recording) => recording.bytes().len() as u64,
         }
     }
 }
@@ -302,6 +306,7 @@ impl Uploads {
                         }
                     }
                 }
+                TransferKind::Voice => {}
             }
         }
     }
@@ -388,7 +393,9 @@ impl Uploads {
         match command {
             LiveCommand::CancelFile { request_id } => {
                 if let Some(job) = &self.running {
-                    if job.kind != TransferKind::Album && job.request_id == request_id {
+                    if matches!(job.kind, TransferKind::File | TransferKind::Photo)
+                        && job.request_id == request_id
+                    {
                         job.cancel.store(true, Ordering::Release);
                     }
                 }
@@ -403,6 +410,52 @@ impl Uploads {
                         job.cancel.store(true, Ordering::Release);
                     }
                 }
+                Ok(None)
+            }
+            LiveCommand::CancelVoice { thread, request_id } => {
+                if let Some(job) = &self.running {
+                    if job.kind == TransferKind::Voice
+                        && job.thread == thread
+                        && job.request_id == request_id
+                    {
+                        job.cancel.store(true, Ordering::Release);
+                    }
+                }
+                Ok(None)
+            }
+            LiveCommand::SendVoice {
+                thread,
+                recording,
+                request_id,
+                ..
+            } => {
+                if !voice_available(session) || !voice_fits_limits(&recording) {
+                    emit(
+                        events,
+                        &thread,
+                        request_id,
+                        TransferKind::Voice,
+                        Progress {
+                            phase: FileTransferPhase::Failed,
+                            uploaded: 0,
+                            total: recording.bytes().len() as u64,
+                        },
+                        Some("Chưa thể gửi bản ghi âm trong phiên này."),
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+                self.start(
+                    thread,
+                    request_id,
+                    UploadJob::Voice(recording),
+                    profile,
+                    session,
+                    db,
+                    client,
+                    events,
+                )
+                .await?;
                 Ok(None)
             }
             LiveCommand::SendFile {
@@ -534,7 +587,7 @@ impl Uploads {
         let total = input.size();
         if self.running.is_some()
             || root_for(session, "file").is_err()
-            || !events.privacy.read().is_ok_and(|p| p.permits(&thread))
+            || !permits_upload(events, &thread, kind)
         {
             emit(
                 events,
@@ -599,7 +652,7 @@ impl Uploads {
         let Some(job) = self.running.as_mut() else {
             return Ok(());
         };
-        if !events.privacy.read().is_ok_and(|p| p.permits(&job.thread))
+        if !permits_upload(events, &job.thread, job.kind)
             || !connection
                 .as_ref()
                 .is_some_and(|c| c.decoder.authenticated())
@@ -679,7 +732,7 @@ impl Uploads {
                 pending.result.take().expect("completed probe")?;
                 anyhow::ensure!(
                     !job.cancel.load(Ordering::Acquire)
-                        && events.privacy.read().is_ok_and(|p| p.permits(&job.thread))
+                        && permits_upload(events, &job.thread, job.kind)
                         && connection
                             .as_ref()
                             .is_some_and(|c| c.decoder.authenticated()),
@@ -689,11 +742,17 @@ impl Uploads {
                     let account = events.account.clone();
                     let id = pending.request.id;
                     let kind = job.kind;
+                    let thread = job.thread.clone();
                     Ok(Some(
                         db.call_with(StorageOperation::PrepareOutgoing, move |s| match kind {
                             TransferKind::File => s.begin_attachment_dispatch(&account, id),
                             TransferKind::Photo | TransferKind::Album => {
                                 s.begin_photo_dispatch(&account, id)
+                            }
+                            TransferKind::Voice => {
+                                let id = i64::try_from(id)?;
+                                s.begin_voice_dispatch(&account, &thread, id)?;
+                                Ok(Vec::new())
                             }
                         })
                         .await?,
@@ -781,6 +840,27 @@ async fn cancelled(cancel: &AtomicBool) {
     while !cancel.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn permits_upload(events: &Events, thread: &str, kind: TransferKind) -> bool {
+    events.privacy.read().is_ok_and(|privacy| {
+        privacy.permits(thread)
+            && (kind != TransferKind::Voice
+                || (privacy.confirmed && privacy.status == LivePrivacyStatus::Ready))
+    })
+}
+
+pub(super) fn voice_available(session: &VerifiedSession) -> bool {
+    session.config().voice_recording_allowed
+        && root_for(session, "file")
+            .and_then(|root| {
+                Ok(wire_voice::endpoint(
+                    &root,
+                    ThreadKind::Direct,
+                    session.client_type(),
+                )?)
+            })
+            .is_ok()
 }
 async fn authorize(
     tx: &mpsc::Sender<Authorization>,
@@ -892,6 +972,12 @@ async fn run(
     let total = input.size();
     let photos = match input {
         UploadJob::Album(photos) => photos,
+        UploadJob::Voice(recording) => {
+            return run_voice(
+                session, db, client, thread, recording, cancel, progress, requests,
+            )
+            .await
+        }
         UploadJob::Single(input) => {
             let result = run_one(
                 profile,
@@ -1030,6 +1116,167 @@ fn photo_spec(photo: &PreparedPhoto, caption: String) -> PhotoSpec {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn run_voice(
+    session: Arc<VerifiedSession>,
+    db: DatabaseHandle,
+    client: reqwest::Client,
+    thread: String,
+    recording: PreparedVoice,
+    cancel: Arc<AtomicBool>,
+    progress: watch::Sender<Progress>,
+    requests: mpsc::Sender<Authorization>,
+) -> Outcome {
+    let mut reserved = None;
+    let mut dispatched = false;
+    let mut acknowledged = false;
+    let result: Result<()> = async {
+        let target = Target::from_thread(&thread)?;
+        let mut url = wire_voice::endpoint(
+            &root_for(&session, "file")?,
+            target.kind,
+            session.client_type(),
+        )?;
+        let account = session.account_id().to_owned();
+        let scope = thread.clone();
+        let checksum = Sha256::digest(recording.bytes()).into();
+        let id = db
+            .call_with(StorageOperation::PrepareOutgoing, move |s| {
+                s.reserve_voice(&account, &scope, checksum, now_ms())
+            })
+            .await?;
+        reserved = Some(id);
+        let id = u64::try_from(id)?;
+        let parameters = wire_voice::message_parameters(&target, id)?;
+        let encrypted = session.encrypt_payload(&serde_json::to_vec(&parameters)?)?;
+        url.query_pairs_mut().append_pair("params", &encrypted);
+        let cookie = session
+            .authorization_cookie(&url)
+            .ok_or(WireError::Invalid)?;
+        let boundary = format!("zalo-native-{:032x}", rand::random::<u128>());
+        let body = voice_multipart(&boundary, recording.bytes());
+        let total = recording.bytes().len() as u64;
+        let request = client
+            .post(url)
+            .header("User-Agent", session.client_type().user_agent().ok_or(WireError::Unsupported)?)
+            .header("Cookie", cookie)
+            .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+            .body(body);
+
+        authorize(&requests, &cancel, id, true).await?;
+        anyhow::ensure!(!cancel.load(Ordering::Acquire), "Voice dispatch cancelled");
+        progress.send_replace(Progress { phase: FileTransferPhase::Finalizing, uploaded: 0, total });
+        dispatched = true;
+        let payload = tokio::select! {
+            biased;
+            result = async {
+                let response = request.send().await.map_err(|_| anyhow::anyhow!("Voice request failed"))?;
+                read_response(response, &session).await
+            } => result?,
+            _ = cancelled(&cancel) => anyhow::bail!("Voice dispatch cancelled"),
+        };
+        let ack = voice_ack(&payload, &target, id)?;
+        acknowledged = true;
+        let account = session.account_id().to_owned();
+        let id = i64::try_from(id)?;
+        db.call_with(StorageOperation::PersistAck, move |s| {
+            s.record_voice_ack(&account, id, &ack.server_id)
+        }).await?;
+        Ok(())
+    }.await;
+    let accepted = || Outcome {
+        phase: FileTransferPhase::Accepted,
+        accepted: Vec::new(),
+        message: Some("Zalo đã nhận tin nhắn thoại.".into()),
+    };
+    let Err(error) = result else {
+        return accepted();
+    };
+    if error.downcast_ref::<StorageContext>().is_some() {
+        let _ = diagnostic(&error, LiveStage::Storage);
+    }
+    let rejected = wire_error(&error)
+        .is_some_and(|e| matches!(e, WireError::Service(_) | WireError::Authentication));
+    let unknown = dispatched && !rejected;
+    if let Some(id) = reserved.filter(|_| !acknowledged) {
+        let account = session.account_id().to_owned();
+        match db
+            .call_with(StorageOperation::FailOutgoing, move |s| {
+                s.finish_voice_failure(&account, id, unknown)
+            })
+            .await
+        {
+            Ok(true) => return accepted(),
+            Ok(false) => {}
+            Err(error) => {
+                let _ = diagnostic(&error, LiveStage::Storage);
+            }
+        }
+    }
+    let (phase, message) = if acknowledged {
+        (
+            FileTransferPhase::AcceptedLocalFailure,
+            "Zalo đã nhận tin nhắn thoại. Chưa lưu được xác nhận trên thiết bị.",
+        )
+    } else if unknown {
+        (
+            FileTransferPhase::Unknown,
+            "Chưa xác nhận được tin nhắn thoại đã gửi. Hãy kiểm tra hội thoại trước khi gửi lại.",
+        )
+    } else if cancel.load(Ordering::Acquire) {
+        (
+            FileTransferPhase::Cancelled,
+            "Đã hủy gửi. Bản ghi âm được giữ lại.",
+        )
+    } else {
+        (
+            FileTransferPhase::Failed,
+            "Chưa gửi được tin nhắn thoại. Bản ghi âm được giữ lại.",
+        )
+    };
+    Outcome {
+        phase,
+        accepted: Vec::new(),
+        message: Some(message.into()),
+    }
+}
+
+fn voice_multipart(boundary: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"fileContent\"; filename=\"voice.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n"
+    ).into_bytes();
+    body.reserve(bytes.len() + boundary.len() + 8);
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
+fn voice_ack(payload: &Value, target: &Target, id: u64) -> Result<wire::SendAck, WireError> {
+    let ack = wire::send_ack(payload)?;
+    let data = &payload["data"];
+    let expected_client = id.to_string();
+    for key in ["clientId", "cliMsgId"] {
+        if let Some(value) = data.get(key) {
+            if wire::id_string(value)? != expected_client {
+                return Err(WireError::Invalid);
+            }
+        }
+    }
+    let (recipient, unexpected) = match target.kind {
+        ThreadKind::Direct => ("toid", "grid"),
+        ThreadKind::Group => ("grid", "toid"),
+    };
+    if data.get(unexpected).is_some() {
+        return Err(WireError::Invalid);
+    }
+    if let Some(value) = data.get(recipient) {
+        if wire::id_string(value)? != target.remote_id {
+            return Err(WireError::Invalid);
+        }
+    }
+    Ok(ack)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     profile: Arc<Profile>,
     session: Arc<VerifiedSession>,
@@ -1123,7 +1370,7 @@ async fn run_one(
             let finished=match kind {
                 TransferKind::File=>match wire_upload::chunk_result(&payload)? {wire_upload::ChunkResult::Continue=>false,wire_upload::ChunkResult::Finished{file_id,url}=>{file_resource=Some((file_id,url));true}},
                 TransferKind::Photo=>match wire_photo::chunk_result(&payload)? {wire_photo::PhotoChunkResult::Continue=>false,wire_photo::PhotoChunkResult::Finished{photo_id,urls}=>{photo_resource=Some((photo_id,urls));true}},
-                TransferKind::Album => unreachable!("Only single members are uploaded here"),
+                TransferKind::Album | TransferKind::Voice => unreachable!("Only single photo or file is uploaded here"),
             };
             if finished{anyhow::ensure!(index==total||payload.get("error_code").and_then(Value::as_i64)==Some(1),"Premature resource completion");break}
             anyhow::ensure!(index<total,"Missing resource completion");
@@ -1163,7 +1410,7 @@ async fn run_one(
         dispatched=true;
         let payload=tokio::select!{biased;r=authenticated_request(&client,&session,final_url,Some(body))=>r?,_=cancelled(&cancel)=>anyhow::bail!("Upload cancelled after dispatch")};
         let ack=wire::send_ack(&payload)?;acknowledged=true;let account=session.account_id().to_owned();
-        db.call_with(StorageOperation::PersistAck,move|s|match kind{TransferKind::File=>{s.record_attachment_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_attachment(&account,id)},TransferKind::Photo | TransferKind::Album=>{s.record_photo_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_photo(&account,id)}}).await
+        db.call_with(StorageOperation::PersistAck,move|s|match kind{TransferKind::File=>{s.record_attachment_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_attachment(&account,id)},TransferKind::Photo | TransferKind::Album=>{s.record_photo_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_photo(&account,id)},TransferKind::Voice => unreachable!("Voice has a separate dispatch")}).await
     }.await;
     match result {
         Ok(accepted) => SingleOutcome {
@@ -1194,12 +1441,18 @@ async fn run_one(
                                 TransferKind::Photo | TransferKind::Album => {
                                     store.fail_photo_dispatch(&account, id, unknown)?
                                 }
+                                TransferKind::Voice => {
+                                    unreachable!("Voice has a separate dispatch")
+                                }
                             };
                         } else {
                             match kind {
                                 TransferKind::File => store.interrupt_attachment(&account, id)?,
                                 TransferKind::Photo | TransferKind::Album => {
                                     store.interrupt_photo(&account, id)?
+                                }
+                                TransferKind::Voice => {
+                                    unreachable!("Voice has a separate dispatch")
                                 }
                             };
                         }
@@ -1208,12 +1461,16 @@ async fn run_one(
                             TransferKind::Photo | TransferKind::Album => {
                                 store.photo_state(&account, id)?
                             }
+                            TransferKind::Voice => unreachable!("Voice has a separate dispatch"),
                         } {
                             Some(AttachmentState::Accepted | AttachmentState::Acknowledged) => {
                                 Ok(Some(match kind {
                                     TransferKind::File => store.accept_attachment(&account, id),
                                     TransferKind::Photo | TransferKind::Album => {
                                         store.accept_photo(&account, id)
+                                    }
+                                    TransferKind::Voice => {
+                                        unreachable!("Voice has a separate dispatch")
                                     }
                                 }))
                             }
@@ -1309,6 +1566,21 @@ async fn upload_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn voice_ack_rejects_explicit_client_or_recipient_conflicts() {
+        let direct = Target::from_thread("d:22").unwrap();
+        let group = Target::from_thread("g:22").unwrap();
+        let plain = json!({"error_code":0,"data":{"msgId":"901"}});
+        assert!(voice_ack(&plain, &direct, 1000).is_ok());
+        let checked = json!({"error_code":0,"data":{"msgId":"901","grid":22,"cliMsgId":1000,"clientId":"1000"}});
+        assert!(voice_ack(&checked, &group, 1000).is_ok());
+        assert!(voice_ack(&checked, &group, 1001).is_err());
+        assert!(voice_ack(&checked, &direct, 1000).is_err());
+        let wrong_direct =
+            json!({"error_code":0,"data":{"msgId":"901","toid":"33","cliMsgId":"1000"}});
+        assert!(voice_ack(&wrong_direct, &direct, 1000).is_err());
+    }
+
     #[test]
     fn control_cache_is_bounded_and_conflict_stays_invalid_until_expiration() {
         let mut cache: ResourceCache<String> = ResourceCache::default();

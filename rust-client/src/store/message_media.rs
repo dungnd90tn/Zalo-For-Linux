@@ -11,23 +11,30 @@ const MAX_PROJECTION_BYTES: usize = MAX_MEDIA_DESCRIPTOR_BYTES;
 const MAX_PREVIEW_BYTES: usize = 4 * MAX_PREVIEW_CHARS;
 
 pub(super) fn initialize(conn: &Connection, version: i64) -> Result<()> {
-    // Extend the v6/v7 sidecar CHECK constraint inside the caller's transaction.
+    // Extend the sidecar CHECK constraint inside the caller's transaction.
     // INSERT...SELECT retains the original immutable JSON and presentation bytes.
-    if version == 6 || version == 7 {
-        conn.execute_batch("ALTER TABLE message_media RENAME TO message_media_v6;")?;
+    const VOICE_SCHEMA_VERSION: i64 = 22;
+    let migrate = version < VOICE_SCHEMA_VERSION
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_media')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+    if migrate {
+        conn.execute_batch("ALTER TABLE message_media RENAME TO message_media_legacy;")?;
     }
     conn.execute_batch("CREATE TABLE IF NOT EXISTS message_media(
         account_id TEXT NOT NULL,thread_id TEXT NOT NULL,message_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK(kind IN ('chat.photo','chat.webcontent','chat.recommended','group.poll','share.file')),
+        kind TEXT NOT NULL CHECK(kind IN ('chat.photo','chat.webcontent','chat.recommended','group.poll','share.file','chat.voice')),
         metadata TEXT NOT NULL CHECK(length(CAST(metadata AS BLOB))<=4194304),
         projection TEXT NOT NULL CHECK(length(CAST(projection AS BLOB))<=16384),
         preview TEXT NOT NULL CHECK(length(CAST(preview AS BLOB))<=1024),
         PRIMARY KEY(account_id,thread_id,message_id),
         FOREIGN KEY(account_id,thread_id,message_id) REFERENCES messages(account_id,thread_id,message_id) ON DELETE CASCADE);")?;
-    if version == 6 || version == 7 {
+    if migrate {
         conn.execute_batch("INSERT INTO message_media(account_id,thread_id,message_id,kind,metadata,projection,preview)
-            SELECT account_id,thread_id,message_id,kind,metadata,projection,preview FROM message_media_v6;
-            DROP TABLE message_media_v6;")?;
+            SELECT account_id,thread_id,message_id,kind,metadata,projection,preview FROM message_media_legacy;
+            DROP TABLE message_media_legacy;")?;
     }
     Ok(())
 }
@@ -182,7 +189,7 @@ pub(super) fn projection(conn: &Connection, message: &Message) -> Result<Option<
             kind == descriptor.kind().as_str()
                 && stored_preview.as_deref() == Some(preview(&descriptor).as_str())
                 && message.sticker.is_none()
-                && message.text == format!("[Tin nhắn {kind} chưa được hỗ trợ]"),
+                && message.text == descriptor.kind().legacy_placeholder(),
             FailureReason::ConflictingMetadata
         );
         Ok(descriptor)
@@ -262,7 +269,7 @@ pub(super) fn persist(
     ensure!(
         message.media.as_ref() == Some(content.descriptor())
             && message.sticker.is_none()
-            && message.text == format!("[Tin nhắn {kind} chưa được hỗ trợ]"),
+            && message.text == content.kind().legacy_placeholder(),
         FailureReason::ConflictingMetadata
     );
     let projection =
@@ -327,7 +334,7 @@ mod tests {
                 thread_id: "d:22".into(),
                 id: id.into(),
                 sender: "22".into(),
-                text: format!("[Tin nhắn {} chưa được hỗ trợ]", kind.as_str()),
+                text: kind.legacy_placeholder().into(),
                 sticker: None,
                 media: Some(content.descriptor().clone()),
                 sent_at_ms: 1000,
@@ -848,6 +855,61 @@ mod tests {
     }
 
     #[test]
+    fn schema_21_upgrade_preserves_album_and_enriches_saved_voice_on_replay() {
+        let mut previous = MessageStore::in_memory().unwrap();
+        let (mut album, _) = message(MediaKind::Photo, "album");
+        let album_content = MediaMessageContent::new(
+            MediaKind::Photo,
+            &json!({"params":{"group_layout_id":"100","id_in_group":0,"is_group_layout":1,"total_item_in_group":2}}),
+        )
+        .unwrap();
+        album.media = Some(album_content.descriptor().clone());
+        previous
+            .receive_batch_with_media(
+                "11",
+                &[(album.clone(), None, None, Some(album_content))],
+                None,
+            )
+            .unwrap();
+        let (mut voice, _) = message(MediaKind::Voice, "voice");
+        let mut old_voice = voice.clone();
+        old_voice.media = None;
+        previous
+            .receive_batch("11", &[(old_voice, None)], None)
+            .unwrap();
+        let old_schema: String = previous.conn.query_row(
+            "SELECT replace(sql, ',' || quote('chat.voice'), '') FROM sqlite_master WHERE name='message_media'",
+            [], |row| row.get(0)
+        ).unwrap();
+        previous
+            .conn
+            .execute_batch("ALTER TABLE message_media RENAME TO media_fixture;")
+            .unwrap();
+        previous.conn.execute_batch(&old_schema).unwrap();
+        previous.conn.execute_batch("INSERT INTO message_media SELECT * FROM media_fixture; DROP TABLE media_fixture; PRAGMA user_version=21;").unwrap();
+        let rows = media_rows(&previous.conn);
+        let mut store = MessageStore::initialize(previous.conn).unwrap();
+        assert_eq!(media_rows(&store.conn), rows);
+        let voice_content = MediaMessageContent::new(
+            MediaKind::Voice,
+            &json!({"href":"https://voice.talk.zdn.vn/synthetic.mp3","params":{"duration":4500}}),
+        )
+        .unwrap();
+        voice.media = Some(voice_content.descriptor().clone());
+        let received = store
+            .receive_batch_with_media(
+                "11",
+                &[(voice.clone(), None, None, Some(voice_content))],
+                None,
+            )
+            .unwrap();
+        assert_eq!(&received[0].0, &voice);
+        let page = store.page("11", "d:22", None, 20).unwrap();
+        assert!(page.contains(&album));
+        assert!(page.contains(&voice));
+    }
+
+    #[test]
     fn populated_v6_upgrade_preserves_exact_sidecars_scope_and_pending_state() {
         let mut previous = MessageStore::in_memory().unwrap();
         let mut originals = Vec::new();
@@ -961,7 +1023,7 @@ mod tests {
         assert_eq!(media_rows(&conn), rows);
         assert_eq!(
             conn.query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name='message_media_v6'",
+                "SELECT count(*) FROM sqlite_master WHERE name='message_media_legacy'",
                 [],
                 |r| r.get::<_, i64>(0)
             )

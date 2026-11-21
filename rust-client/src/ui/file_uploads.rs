@@ -58,6 +58,7 @@ impl Transfer {
                 super::photos::resolution_title(photo.resolution())
             })),
             TransferKind::Album => Some("Album"),
+            TransferKind::Voice => Some("Tin nhắn thoại"),
             TransferKind::File => self.attachment.as_ref().map(|file| file.name.as_str()),
         }
     }
@@ -65,6 +66,7 @@ impl Transfer {
         match self.kind {
             TransferKind::Photo => "ảnh",
             TransferKind::Album => "album",
+            TransferKind::Voice => "tin nhắn thoại",
             TransferKind::File => "tệp",
         }
     }
@@ -177,6 +179,7 @@ pub(super) struct Uploads {
     pub available: bool,
     pub photo_available: bool,
     pub photo_original_available: bool,
+    pub voice_available: bool,
     pub album_max_count: usize,
     pub transfer: Option<Transfer>,
     dismissed: std::collections::VecDeque<(String, u64, TransferKind)>,
@@ -238,9 +241,25 @@ impl Uploads {
             album: Some(album),
         });
     }
+    pub fn submitted_voice(&mut self, thread: &str, request: u64, total: u64) {
+        self.transfer = Some(Transfer {
+            kind: TransferKind::Voice,
+            thread: thread.into(),
+            request,
+            phase: FileTransferPhase::Preparing,
+            uploaded: 0,
+            total,
+            note: None,
+            cancel_pending: false,
+            attachment: None,
+            photo: None,
+            album: None,
+        });
+    }
     pub fn observe(&mut self, event: &LiveEvent) {
         match event {
             LiveEvent::FileCapability { available, .. } => self.available = *available,
+            LiveEvent::VoiceCapability { available, .. } => self.voice_available = *available,
             LiveEvent::PhotoCapability {
                 available,
                 original_available,
@@ -343,6 +362,7 @@ impl Uploads {
         self.available = false;
         self.photo_available = false;
         self.photo_original_available = false;
+        self.voice_available = false;
         self.album_max_count = 0;
         if let Some(job) = self.transfer.as_mut().filter(|job| job.busy()) {
             job.phase = FileTransferPhase::Unknown;
@@ -410,6 +430,7 @@ impl NativeApp {
         self.drafts.active.reply().is_none()
             && !self.has_draft_mentions()
             && !self.photo_selected()
+            && self.voice_tray_height() == 0.0
             && (self.demo
                 || self
                     .live
@@ -425,6 +446,7 @@ impl NativeApp {
             .and_then(|state| state.uploads.transfer.as_ref())
             .is_some_and(|job| {
                 (job.busy() || job.review())
+                    && !self.voice_tray_shows(job)
                     && !self.model.selected.as_deref().is_some_and(|thread| {
                         (job.is_photo(thread, self.drafts.active.photo())
                             || job.is_album(thread, self.drafts.active.album()))
@@ -465,15 +487,18 @@ impl NativeApp {
         let Some(worker) = &state.worker else {
             return;
         };
-        let command = if job.kind == TransferKind::Album {
-            LiveCommand::CancelAlbum {
+        let command = match job.kind {
+            TransferKind::Album => LiveCommand::CancelAlbum {
                 thread: job.thread.clone(),
                 request_id: request,
-            }
-        } else {
-            LiveCommand::CancelFile {
+            },
+            TransferKind::Voice => LiveCommand::CancelVoice {
+                thread: job.thread.clone(),
                 request_id: request,
-            }
+            },
+            _ => LiveCommand::CancelFile {
+                request_id: request,
+            },
         };
         match worker.submit(command) {
             Ok(()) => {
@@ -498,6 +523,12 @@ impl NativeApp {
             .as_mut()
             .and_then(|state| state.uploads.dismiss_review());
         if let Some(job) = dismissed {
+            if job.kind == TransferKind::Voice {
+                if let Some(state) = &mut self.live {
+                    state.voice.clear_receipt(&job.thread, job.request);
+                    state.media.voice.clear_recording();
+                }
+            }
             if self.model.selected.as_deref() == Some(job.thread.as_str()) {
                 if job
                     .attachment

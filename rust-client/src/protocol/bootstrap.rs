@@ -373,6 +373,7 @@ pub struct ServerConfig {
     pub original_photo_limits: Option<PhotoLimits>,
     pub photo_album_max_count: u32,
     pub photo_album_extra_metadata: bool,
+    pub voice_recording_allowed: bool,
     pub seen_v2: bool,
     pub group_board_v2: bool,
     pub recall_max_age_ms: Option<i64>,
@@ -744,6 +745,18 @@ impl ServerConfig {
             services.remove("zcloud");
         }
         let (photo_album_max_count, photo_album_extra_metadata) = photo_album_config(value);
+        // The bundled client declares this field but does not wire a recorder.
+        // An explicit session disable always takes precedence.
+        let voice_recording_allowed = [
+            "/isOffVoiceRecord",
+            "/settings/isOffVoiceRecord",
+            "/setttings/isOffVoiceRecord",
+            "/settings/features/isOffVoiceRecord",
+            "/setttings/features/isOffVoiceRecord",
+        ]
+        .into_iter()
+        .filter_map(|path| value.pointer(path))
+        .all(|value| value.as_bool() == Some(false) || value.as_u64() == Some(0));
         let seen_v2 = feature_config(value, "ack_seen").is_ok_and(|config| {
             config
                 .and_then(|v| v.get("v2_enable"))
@@ -777,6 +790,7 @@ impl ServerConfig {
             original_photo_limits,
             photo_album_max_count,
             photo_album_extra_metadata,
+            voice_recording_allowed,
             seen_v2,
             group_board_v2,
             recall_max_age_ms,

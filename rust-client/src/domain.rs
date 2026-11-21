@@ -22,7 +22,7 @@ pub use attachment::{Attachment, AttachmentError, MAX_DIRECT_FILE_BYTES};
 pub use media::{
     CardButton, CardRow, FileDescriptor, MediaContentError, MediaDescriptor, MediaKind,
     MediaMessageContent, MessageMediaBinding, PhotoAlbumMember, PhotoDescriptor, PollDescriptor,
-    WebContentDescriptor, MAX_MEDIA_DESCRIPTOR_BYTES,
+    VoiceDescriptor, WebContentDescriptor, MAX_MEDIA_DESCRIPTOR_BYTES,
 };
 pub use overview::{ConversationOverview, SharedItem, SharedKind, OVERVIEW_ITEM_LIMIT};
 pub use search::{MessageHit, MessageSearch, SEARCH_RESULT_LIMIT};

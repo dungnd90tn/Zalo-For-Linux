@@ -12,6 +12,8 @@ mod mention_draft;
 pub mod search;
 #[cfg(feature = "live-login")]
 pub mod stickers;
+#[cfg(feature = "messaging")]
+pub mod voice;
 
 use crate::domain::{
     local_message_id, validate_id, Conversation, ConversationOverview, Cursor, Message,

@@ -298,6 +298,7 @@ pub enum FrameMessageKind {
     Webchat,
     WebchatInfo,
     Photo,
+    Voice,
     WebContent,
     Recommended,
     Poll,
@@ -793,6 +794,7 @@ fn incoming_with_reason(
                 "webchat" => FrameMessageKind::Webchat,
                 "chat.sticker" => FrameMessageKind::Sticker,
                 "chat.photo" => FrameMessageKind::Photo,
+                "chat.voice" => FrameMessageKind::Voice,
                 "chat.webcontent" => FrameMessageKind::WebContent,
                 "chat.recommended" => FrameMessageKind::Recommended,
                 "group.poll" => FrameMessageKind::Poll,
@@ -900,7 +902,9 @@ fn incoming_with_reason(
                         && !text.trim().is_empty()
                         && !text.chars().any(|ch| matches!(ch, '\u{0}'..='\u{7}'))
                 });
-            let media = if let Some(kind) = MediaKind::from_wire(message_type) {
+            let media = if let Some(kind) = MediaKind::from_wire(message_type).filter(|kind| {
+                *kind != MediaKind::Voice || (legacy && content.is_some_and(Value::is_object))
+            }) {
                 // Encrypted messages cannot be projected into the legacy media path.
                 if v.get("e2eeExt").is_some()
                     || ["isE2EE", "isE2ee", "e2ee"].iter().any(|key| {
@@ -1015,6 +1019,8 @@ fn incoming_with_reason(
                     rich_text
                         .unwrap_or("[Tin nhắn webchat chưa được hỗ trợ]")
                         .into()
+                } else if message_type == "chat.voice" {
+                    MediaKind::Voice.legacy_placeholder().into()
                 } else if let Some(text) = presented {
                     text
                 } else if message_type != "webchat" {
@@ -1073,6 +1079,7 @@ fn incoming_with_reason(
                     && !structured_webchat
                     && ((media.is_none() && message_type == "webchat")
                         || matches!(message_type, "share.file" | "chat.photo")
+                        || (message_type == "chat.voice" && media.is_some())
                         || (sticker.is_some_and(StickerDescriptor::can_send)
                             && legacy
                             && v.get("ttl")

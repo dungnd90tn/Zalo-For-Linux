@@ -21,6 +21,7 @@ fn searchable(body: String, sticker: bool, projection: Option<String>) -> Option
             .filter(|descriptor| descriptor.validate().is_ok())?;
         let text = match descriptor {
             MediaDescriptor::Photo(photo) => photo.caption,
+            MediaDescriptor::Voice(_) => return None,
             MediaDescriptor::File(file) => file.title,
             MediaDescriptor::Recommended(card) | MediaDescriptor::WebContent(card) => {
                 format!("{}\n{}", card.title, card.description)

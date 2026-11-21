@@ -1,6 +1,7 @@
 //! Live account worker: bounded commands/events, no rendering-thread I/O.
 use super::SubmitError;
 pub use crate::app::directory::{DirectoryFailure, DirectoryReport};
+use crate::app::voice::{PreparedVoice, MAX_VOICE_BYTES, MAX_VOICE_DURATION_MS};
 pub use crate::protocol::group_roster::{Page as GroupMemberPage, Role as GroupMemberRole};
 pub use crate::protocol::messaging::ThreadKind;
 pub use crate::store::directory::{
@@ -477,6 +478,16 @@ pub enum LiveCommand {
         photos: Vec<PreparedPhoto>,
         request_id: u64,
     },
+    SendVoice {
+        generation: u64,
+        thread: String,
+        recording: PreparedVoice,
+        request_id: u64,
+    },
+    CancelVoice {
+        thread: String,
+        request_id: u64,
+    },
     Shutdown,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +495,12 @@ pub enum TransferKind {
     File,
     Photo,
     Album,
+    Voice,
+}
+
+fn voice_fits_limits(recording: &PreparedVoice) -> bool {
+    (1..=MAX_VOICE_BYTES).contains(&recording.bytes().len())
+        && (1..=MAX_VOICE_DURATION_MS).contains(&recording.duration_ms())
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileTransferPhase {
@@ -678,6 +695,10 @@ pub enum LiveEvent {
         result: std::result::Result<Vec<PreparedPhoto>, PhotoPreparationFailure>,
     },
     FileCapability {
+        account_id: String,
+        available: bool,
+    },
+    VoiceCapability {
         account_id: String,
         available: bool,
     },
@@ -883,6 +904,7 @@ impl LiveEvent {
             | Self::PhotoPrepared { account_id, .. }
             | Self::AlbumPrepared { account_id, .. }
             | Self::FileCapability { account_id, .. }
+            | Self::VoiceCapability { account_id, .. }
             | Self::FileTransfer { account_id, .. }
             | Self::FileAccepted { account_id, .. }
             | Self::Avatars { account_id, .. }
@@ -1393,7 +1415,8 @@ impl LiveWorker {
             }
             LiveCommand::CancelPhotoPreparation { request_id } => *request_id != 0,
             LiveCommand::CancelAlbum { thread, request_id }
-            | LiveCommand::CancelAlbumPreparation { thread, request_id } => {
+            | LiveCommand::CancelAlbumPreparation { thread, request_id }
+            | LiveCommand::CancelVoice { thread, request_id } => {
                 Target::from_thread(thread).is_ok() && *request_id != 0
             }
             LiveCommand::PrepareAlbum {
@@ -1438,6 +1461,16 @@ impl LiveWorker {
                     })
             }
             LiveCommand::CancelFile { request_id } => *request_id != 0,
+            LiveCommand::SendVoice {
+                thread,
+                recording,
+                request_id,
+                ..
+            } => {
+                Target::from_thread(thread).is_ok()
+                    && *request_id != 0
+                    && voice_fits_limits(recording)
+            }
             LiveCommand::Reconnect
             | LiveCommand::RefreshDirectory { .. }
             | LiveCommand::Shutdown => true,
@@ -2162,8 +2195,8 @@ impl super::Model {
                 ..
             } => {
                 if self.selected.as_deref() == Some(&thread) {
-                    if kind == TransferKind::Album {
-                        if phase == FileTransferPhase::Accepted {
+                    if matches!(kind, TransferKind::Album | TransferKind::Voice) {
+                        if kind == TransferKind::Album && phase == FileTransferPhase::Accepted {
                             self.status = "Zalo đã nhận đủ ảnh trong album.".into();
                         } else if let Some(message) = message {
                             self.status = message;
@@ -2278,6 +2311,7 @@ impl super::Model {
             | LiveEvent::AlbumPrepared { .. }
             | LiveEvent::PhotoCapability { .. }
             | LiveEvent::FileCapability { .. }
+            | LiveEvent::VoiceCapability { .. }
             | LiveEvent::PrivacyChanged { .. }
             | LiveEvent::HiddenMatches { .. }
             | LiveEvent::HiddenUnlockResult { .. }

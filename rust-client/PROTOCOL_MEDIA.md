@@ -141,6 +141,24 @@ adds the album projection and prevents earlier clients from opening the
 upgraded profile. The timeline groups complete contiguous runs and keeps the
 separate photo actions.
 
+## Recording and sending a voice message
+
+The recorder holds one MP3 clip in memory, up to 60 seconds or 2 MiB. A user
+action starts FFmpeg on the local PulseAudio-compatible socket. Switching
+thread or account cancels capture and playback. Ordinary direct and group
+sends use FILE paths `/api/message/voicemp3` and `/api/group/sendmp3`
+respectively. Encrypted URL parameters carry the scoped target and decimal
+client ID. The multipart body contains the MP3 as `fileContent`. See
+`compact-app-pc` lines 489489–489503.
+
+Schema 22 adds a voice receipt ledger and preserves existing media rows.
+The ledger stores a digest and scoped send state. A typed HTTP receipt or
+matching own echo settles a send. A send that may have reached the server is
+never retried automatically. The timeline uses the actual incoming
+`chat.voice` sidecar. Voice playback fetches up to 8 MiB from an approved
+HTTPS CDN only after a click, then decodes MP3, AAC or AMR via a pipe.
+Encrypted audio and service-side format conversion remain unavailable.
+
 ## Durable content and replay
 
 **Schema eight** retains the entire canonical source content in scoped
