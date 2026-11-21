@@ -1331,6 +1331,8 @@ pub(in crate::ui) mod tests {
                 photo_upload_route: None,
                 photo_limits: Default::default(),
                 original_photo_limits: None,
+                photo_album_max_count: 9,
+                photo_album_extra_metadata: true,
                 seen_v2: true,
                 group_board_v2: false,
                 recall_max_age_ms: Some(300_000),
@@ -2462,12 +2464,14 @@ pub(in crate::ui) mod tests {
         let directory = std::env::var_os("ZALO_UI_FIXTURE_DIRECTORY").is_some();
         let sender_mode = std::env::var("ZALO_UI_FIXTURE_SENDERS").ok();
         let info_mode = std::env::var_os("ZALO_UI_FIXTURE_INFO").is_some();
+        let album_scene = std::env::var("ZALO_UI_FIXTURE_ALBUM").ok();
         let media_mode = std::env::var("ZALO_UI_FIXTURE_MEDIA").ok();
         let attention_scene = std::env::var("ZALO_UI_FIXTURE_ATTENTION").ok();
         let forward_scene = std::env::var("ZALO_UI_FIXTURE_FORWARD").ok();
         let recall_scene = std::env::var("ZALO_UI_FIXTURE_RECALL").ok();
         let group_scene = std::env::var("ZALO_UI_FIXTURE_GROUP").ok();
-        let cached = media_mode.is_some()
+        let cached = album_scene.is_some()
+            || media_mode.is_some()
             || forward_scene.is_some()
             || recall_scene.is_some()
             || group_scene.is_some()
@@ -2522,6 +2526,7 @@ pub(in crate::ui) mod tests {
                 let (mut app, path) = fixture(&cc.egui_ctx);
                 *root.lock().unwrap() = Some(path);
                 if online
+                    || album_scene.is_some()
                     || forward_scene.is_some()
                     || recall_scene.is_some()
                     || group_scene.is_some()
@@ -3150,6 +3155,9 @@ pub(in crate::ui) mod tests {
                         .active
                         .set_reply(original.reply_reference().unwrap());
                 }
+                if let Some(scene) = &album_scene {
+                    super::super::albums::tests::scene(&mut app, &cc.egui_ctx, scene);
+                }
                 if let Ok(scene) = std::env::var("ZALO_UI_FIXTURE_PHOTO") {
                     use crate::app::live::{PhotoPreparationFailure, PhotoResolution};
                     let resolution = if matches!(scene.as_str(), "original" | "original-error") {
@@ -3343,6 +3351,7 @@ pub(in crate::ui) mod tests {
                         interactions_scene.as_deref(),
                         Some("remote-history" | "remote-history-saved" | "remote-history-offline")
                     )
+                    || album_scene.is_some()
                     || std::env::var_os("ZALO_UI_FIXTURE_AVATARS").is_some()
                 {
                     fixture_content_worker(&mut app, &cc.egui_ctx);

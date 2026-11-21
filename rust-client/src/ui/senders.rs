@@ -470,6 +470,7 @@ mod tests {
                         None,
                         0,
                         None,
+                        super::super::AlbumPosition::Single,
                     );
                 });
             },

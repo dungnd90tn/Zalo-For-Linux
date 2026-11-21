@@ -5,9 +5,75 @@ use super::{
     messaging::{self, Target, ThreadKind, WireError},
     upload,
 };
+pub use crate::domain::{
+    media::{has_album_message_fields, MAX_WIRE_ALBUM_PHOTOS},
+    PhotoAlbumMember as AlbumMember,
+};
 use crate::domain::{MediaKind, MediaMessageContent, MAX_TEXT_BYTES};
 use serde_json::{json, Value};
 use url::Url;
+
+impl AlbumMember {
+    /// PC bundle N136681–136724 and N401554–401571. Every photo is submitted
+    /// separately with the same layout ID and total, and its own zero-based index.
+    pub fn apply_to_message_parameters(
+        self,
+        parameters: &mut Value,
+        attach_extra_metadata: bool,
+    ) -> Result<(), WireError> {
+        if has_album_message_fields(parameters)
+            || !self.is_valid()
+            || self.count() > MAX_WIRE_ALBUM_PHOTOS
+        {
+            return Err(WireError::Invalid);
+        }
+        let fields = parameters.as_object_mut().ok_or(WireError::Invalid)?;
+        let layout_id = self.layout_id().to_string();
+        if attach_extra_metadata {
+            fields.insert(
+                "extMsgProp".into(),
+                json!(json!({"groupMediaMsg":{"groupLayoutId":layout_id}}).to_string()),
+            );
+        }
+        fields.insert("groupLayoutId".into(), json!(layout_id));
+        fields.insert("idInGroup".into(), json!(self.index()));
+        fields.insert("isGroupLayout".into(), json!(1));
+        fields.insert("totalItemInGroup".into(), json!(self.count()));
+        Ok(())
+    }
+
+    pub fn apply_to_media_content(
+        self,
+        content: &MediaMessageContent,
+    ) -> Result<MediaMessageContent, WireError> {
+        if content.kind() != MediaKind::Photo || self.count() > MAX_WIRE_ALBUM_PHOTOS {
+            return Err(WireError::Invalid);
+        }
+        let mut raw: Value =
+            serde_json::from_str(content.as_json()).map_err(|_| WireError::Invalid)?;
+        let params = raw
+            .get_mut("params")
+            .and_then(Value::as_object_mut)
+            .ok_or(WireError::Invalid)?;
+        for (name, value) in [
+            ("group_layout_id", json!(self.layout_id().to_string())),
+            ("id_in_group", json!(self.index())),
+            ("is_group_layout", json!(1)),
+            ("total_item_in_group", json!(self.count())),
+        ] {
+            if params.insert(name.into(), value).is_some() {
+                return Err(WireError::Invalid);
+            }
+        }
+        let result =
+            MediaMessageContent::new(MediaKind::Photo, &raw).map_err(|_| WireError::Invalid)?;
+        if result.album_member() != Some(self) {
+            return Err(WireError::Invalid);
+        }
+        Ok(result)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhotoUrls {
     pub org: String,

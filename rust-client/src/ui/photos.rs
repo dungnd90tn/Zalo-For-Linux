@@ -15,10 +15,16 @@ pub(super) fn resolution_title(resolution: PhotoResolution) -> &'static str {
 
 #[derive(Default)]
 pub(super) struct Preview {
+    single: PhotoTexture,
+    album: Vec<PhotoTexture>,
+    scope: Option<(String, String, Option<u64>)>,
+}
+
+#[derive(Default)]
+struct PhotoTexture {
     identity: Option<std::sync::Weak<[u8]>>,
     texture: Option<egui::TextureHandle>,
     shown_at: Option<f64>,
-    scope: Option<(String, String, Option<u64>)>,
 }
 impl Preview {
     pub fn clear(&mut self) {
@@ -31,6 +37,30 @@ impl Preview {
         }
     }
     pub fn presented(&self, photo: &PreparedPhoto, now: f64) -> bool {
+        self.single.presented(photo, now)
+    }
+    pub fn album_presented(&self, photos: &[PreparedPhoto], now: f64) -> bool {
+        self.album.len() == photos.len()
+            && self
+                .album
+                .iter()
+                .zip(photos)
+                .all(|(view, photo)| view.presented(photo, now))
+    }
+    pub fn album_textures<'a>(
+        &'a mut self,
+        ctx: &'a egui::Context,
+        photos: &'a [PreparedPhoto],
+    ) -> impl Iterator<Item = Option<egui::TextureHandle>> + 'a {
+        self.album.resize_with(photos.len(), PhotoTexture::default);
+        self.album
+            .iter_mut()
+            .zip(photos)
+            .map(move |(view, photo)| view.texture(ctx, photo))
+    }
+}
+impl PhotoTexture {
+    fn presented(&self, photo: &PreparedPhoto, now: f64) -> bool {
         self.identity
             .as_ref()
             .is_some_and(|key| key.ptr_eq(&std::sync::Arc::downgrade(&photo.thumbnail().rgba)))
@@ -47,9 +77,7 @@ impl Preview {
             .as_ref()
             .is_some_and(|key| key.ptr_eq(&std::sync::Arc::downgrade(&photo.thumbnail().rgba)))
         {
-            let scope = self.scope.take();
-            self.clear();
-            self.scope = scope;
+            *self = Self::default();
             let thumbnail = photo.thumbnail();
             let pixels = (thumbnail.width as usize).checked_mul(thumbnail.height as usize)?;
             if thumbnail.width == 0
@@ -89,11 +117,17 @@ impl NativeApp {
             && !self.has_draft_mentions()
             && self.drafts.active.attachment().is_none()
             && !self.drafts.active.photo_preparing()
+            && !self.drafts.active.album_preparing()
             && self.live.as_ref().is_some_and(|state| {
-                state.uploads.supports_photo(resolution) && state.worker.is_some()
+                state.uploads.supports_photo(resolution)
+                    && !state.uploads.blocked()
+                    && state.worker.is_some()
             })
     }
     pub(super) fn photo_can_send(&self) -> bool {
+        if self.album_selected() {
+            return self.album_can_send();
+        }
         !self.photo_picker_pending()
             && self.live_can_send()
             && self.live.as_ref().is_some_and(|state| {
@@ -107,7 +141,9 @@ impl NativeApp {
             })
     }
     pub(super) fn photo_tray_height(&self) -> f32 {
-        if self.photo_selected() {
+        if self.album_selected() && !self.photo_picker_pending() {
+            super::albums::HEIGHT
+        } else if self.photo_selected() {
             HEIGHT
         } else {
             0.0
@@ -120,6 +156,8 @@ impl NativeApp {
             visuals::Icon::Image,
             if self.has_draft_mentions() {
                 "Xóa phần nhắc thành viên để gửi ảnh HD."
+            } else if self.album_limit().is_some() {
+                "Chọn một ảnh HD hoặc chọn nhiều ảnh để gửi album."
             } else {
                 "Ảnh HD · JPEG, PNG hoặc WebP tĩnh, tối đa 20 MiB."
             },
@@ -164,6 +202,7 @@ impl NativeApp {
             .unwrap_or(crate::app::DEMO_ACCOUNT)
             .to_owned();
         let auth_generation = self.auth_generation();
+        let limit = self.album_limit();
         // A new selection is a draft intent even before its background result.
         // A late ACK for the previous photo must not erase this caption.
         self.drafts.active.edited();
@@ -173,7 +212,7 @@ impl NativeApp {
             &account,
             auth_generation,
             self.model.generation,
-            resolution,
+            (resolution, limit),
         );
     }
     pub(super) fn begin_photo_preparation(
@@ -207,6 +246,11 @@ impl NativeApp {
         self.focus_composer = true;
     }
     pub(super) fn remove_selected_photo(&mut self) {
+        if self.album_selected() && self.photo_picker_pending() {
+            self.attachments.invalidate_photo_choice();
+            self.focus_composer = true;
+            return;
+        }
         let pending = self.drafts.active.photo_preparation_request();
         if let Some(state) = &mut self.live {
             if let (Some(request_id), Some(worker)) = (pending, state.worker.as_ref()) {
@@ -258,6 +302,9 @@ impl NativeApp {
         self.focus_composer = true;
     }
     pub(super) fn photo_send_label(&self) -> &'static str {
+        if self.album_selected() {
+            return self.album_send_label();
+        }
         if self
             .live
             .as_ref()
@@ -280,6 +327,10 @@ impl NativeApp {
     }
     pub(super) fn photo_tray(&mut self, ui: &mut egui::Ui, card: egui::Rect) {
         if !self.photo_selected() {
+            return;
+        }
+        if self.album_selected() && !self.photo_picker_pending() {
+            self.album_tray(ui, card);
             return;
         }
         let colors = crate::theme::palette(ui.ctx());
@@ -343,7 +394,7 @@ impl NativeApp {
             });
         let texture = self.live.as_mut().and_then(|state| {
             if let Some(photo) = &prepared {
-                state.photo_preview.texture(ui.ctx(), photo)
+                state.photo_preview.single.texture(ui.ctx(), photo)
             } else {
                 state.photo_preview.clear();
                 None
@@ -561,7 +612,7 @@ mod tests {
         let mut preview = Preview::default();
         preview.scope(Some(("11".into(), "d:22".into(), Some(1))));
         let _ = ctx.run(Default::default(), |ctx| {
-            assert!(preview.texture(ctx, &photo).is_some());
+            assert!(preview.single.texture(ctx, &photo).is_some());
         });
         drop(photo);
         assert!(
@@ -569,8 +620,8 @@ mod tests {
             "GPU cache must not keep prepared snapshot or its thumbnail alive"
         );
         preview.scope(Some(("11".into(), "d:33".into(), Some(1))));
-        assert!(preview.texture.is_none());
-        assert!(preview.identity.is_none());
+        assert!(preview.single.texture.is_none());
+        assert!(preview.single.identity.is_none());
         drop(profile);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -585,6 +636,7 @@ mod tests {
             account_id: "11".into(),
             available: true,
             original_available: false,
+            album_max_count: 0,
         });
         app.model.selected = Some("d:22".into());
         app.drafts.select("d:22").unwrap();
@@ -604,6 +656,7 @@ mod tests {
                 account_id: "11".into(),
                 available: false,
                 original_available: true,
+                album_max_count: 0,
             });
         assert!(!app.photo_can_choose(PhotoResolution::Hd));
         assert!(app.photo_can_choose(PhotoResolution::Original));

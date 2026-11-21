@@ -264,7 +264,7 @@ mod tests {
                 .conn
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            20
+            crate::store::SCHEMA_VERSION
         );
         assert_eq!(state(&store, pending), "unknown");
         assert_eq!(store.receive_cursor("11", "511_0").unwrap(), "74");

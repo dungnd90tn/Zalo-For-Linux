@@ -2,7 +2,7 @@
 use super::{canonical_content_json, InfoContentError};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use url::Url;
 
 pub const MAX_MEDIA_DESCRIPTOR_BYTES: usize = 16 * 1024;
@@ -61,6 +61,149 @@ pub struct PhotoDescriptor {
     pub original_url: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<PhotoAlbumMember>,
+}
+
+pub const MAX_WIRE_ALBUM_PHOTOS: u32 = 9;
+const ALBUM_FIELDS: [&str; 5] = [
+    "groupLayoutId",
+    "idInGroup",
+    "isGroupLayout",
+    "totalItemInGroup",
+    "extMsgProp",
+];
+
+pub fn has_album_message_fields(parameters: &Value) -> bool {
+    ALBUM_FIELDS
+        .iter()
+        .any(|name| parameters.get(*name).is_some())
+}
+
+/// A per-message position in an album. The layout ID is scoped by sender and thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoAlbumMember {
+    layout_id: u64,
+    index: u32,
+    count: u32,
+}
+impl PhotoAlbumMember {
+    pub fn new(layout_id: u64, index: u32, count: u32) -> Option<Self> {
+        let member = Self {
+            layout_id,
+            index,
+            count,
+        };
+        member.is_valid().then_some(member)
+    }
+
+    pub(crate) fn is_valid(self) -> bool {
+        (1..=9_007_199_254_740_991).contains(&self.layout_id)
+            && (2..=100).contains(&self.count)
+            && self.index < self.count
+    }
+
+    pub fn layout_id(self) -> u64 {
+        self.layout_id
+    }
+
+    pub fn index(self) -> u32 {
+        self.index
+    }
+
+    pub fn count(self) -> u32 {
+        self.count
+    }
+
+    pub fn from_message_parameters(parameters: &Value) -> Option<Self> {
+        let layout = parameters.get("groupLayoutId")?.as_str()?;
+        let layout_id: u64 = layout.parse().ok()?;
+        if layout != layout_id.to_string() || parameters.get("isGroupLayout")?.as_u64()? != 1 {
+            return None;
+        }
+        let index = parameters.get("idInGroup")?.as_u64()?.try_into().ok()?;
+        let count = parameters
+            .get("totalItemInGroup")?
+            .as_u64()?
+            .try_into()
+            .ok()?;
+        if count > MAX_WIRE_ALBUM_PHOTOS {
+            return None;
+        }
+        if let Some(extra) = parameters.get("extMsgProp") {
+            let text = extra.as_str().filter(|text| text.len() <= 128)?;
+            if serde_json::from_str::<Value>(text).ok()?
+                != json!({"groupMediaMsg":{"groupLayoutId":layout}})
+            {
+                return None;
+            }
+        }
+        Self::new(layout_id, index, count)
+    }
+
+    fn from_photo_params(params: &Value) -> Option<Self> {
+        fn integer(value: &Value) -> Option<u64> {
+            value.as_u64().or_else(|| {
+                let value = value.as_str()?;
+                if value.is_empty()
+                    || value.len() > 16
+                    || !value.bytes().all(|byte| byte.is_ascii_digit())
+                    || (value.len() > 1 && value.starts_with('0'))
+                {
+                    return None;
+                }
+                value.parse().ok()
+            })
+        }
+        let layout_marker = params.get("is_group_layout")?;
+        if layout_marker.as_bool() != Some(true) && integer(layout_marker) != Some(1) {
+            return None;
+        }
+        Self::new(
+            integer(params.get("group_layout_id")?)?,
+            integer(params.get("id_in_group")?)?.try_into().ok()?,
+            integer(params.get("total_item_in_group")?)?
+                .try_into()
+                .ok()?,
+        )
+    }
+}
+
+#[cfg(test)]
+mod album_tests {
+    use super::*;
+
+    #[test]
+    fn album_projection_requires_bounded_unencrypted_member_metadata() {
+        let params = json!({
+            "group_layout_id":"7001","id_in_group":0,"is_group_layout":1,"total_item_in_group":3
+        });
+        let mut phone = params.clone();
+        phone["is_group_layout"] = json!(true);
+        for encoded in [params.clone(), json!(params.to_string()), phone] {
+            let raw = json!({"title":"Ảnh tổng hợp","params":encoded});
+            let media = MediaMessageContent::new(MediaKind::Photo, &raw).unwrap();
+            assert_eq!(media.album_member(), PhotoAlbumMember::new(7001, 0, 3));
+            assert_eq!(media.as_json(), canonical_content_json(&raw).unwrap());
+        }
+        for (field, invalid) in [
+            ("group_layout_id", json!("0007001")),
+            ("group_layout_id", json!("9007199254740992")),
+            ("id_in_group", json!(3)),
+            ("id_in_group", json!(-1)),
+            ("is_group_layout", json!(0)),
+            ("total_item_in_group", json!(101)),
+            ("total_item_in_group", Value::Null),
+            ("secureKey", json!("synthetic-protected")),
+        ] {
+            let mut raw = json!({"params": params});
+            raw["params"][field] = invalid;
+            let media = MediaMessageContent::new(MediaKind::Photo, &raw).unwrap();
+            assert_eq!(media.album_member(), None, "{field}");
+            assert_eq!(media.as_json(), canonical_content_json(&raw).unwrap());
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -160,7 +303,8 @@ impl MediaDescriptor {
                         && url(&photo.thumbnail_url)
                         && url(&photo.original_url)
                         && photo.width.is_none_or(|n| n > 0 && n <= 65_535)
-                        && photo.height.is_none_or(|n| n > 0 && n <= 65_535),
+                        && photo.height.is_none_or(|n| n > 0 && n <= 65_535)
+                        && photo.album.is_none_or(PhotoAlbumMember::is_valid),
                     "Invalid photo descriptor"
                 );
             }
@@ -278,6 +422,13 @@ impl MediaMessageContent {
     pub fn descriptor(&self) -> &MediaDescriptor {
         &self.descriptor
     }
+
+    pub fn album_member(&self) -> Option<PhotoAlbumMember> {
+        match &self.descriptor {
+            MediaDescriptor::Photo(photo) => photo.album,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +437,15 @@ pub struct MessageMediaBinding {
     pub thread_id: String,
     pub message_id: String,
     pub content: MediaMessageContent,
+}
+
+/// Derive the exact projection that the reader before album support would have stored.
+pub(crate) fn legacy_photo_projection(content: &Value) -> MediaDescriptor {
+    let mut old_photo = photo(content);
+    old_photo.album = None;
+    let mut descriptor = MediaDescriptor::Photo(old_photo);
+    fit_descriptor(&mut descriptor);
+    descriptor
 }
 
 // Keep the rendering snapshot bounded even when legal raw fields contain many
@@ -483,6 +643,11 @@ fn photo(content: &Value) -> PhotoDescriptor {
         },
         width: dimension("width"),
         height: dimension("height"),
+        album: if encrypted {
+            None
+        } else {
+            PhotoAlbumMember::from_photo_params(&params)
+        },
     }
 }
 fn web_content(content: &Value) -> WebContentDescriptor {

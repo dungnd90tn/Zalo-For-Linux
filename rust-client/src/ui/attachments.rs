@@ -17,6 +17,8 @@ use std::{
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Picked {
     File(Attachment),
+    #[cfg(feature = "messaging")]
+    Album(Vec<Attachment>),
     Cancelled,
     Failed(String),
 }
@@ -26,6 +28,8 @@ enum PickerKind {
     File,
     #[cfg(feature = "messaging")]
     Photo(PhotoResolution),
+    #[cfg(feature = "messaging")]
+    Photos(usize),
 }
 
 impl PickerKind {
@@ -37,6 +41,7 @@ impl PickerKind {
     fn resolution(self) -> Option<PhotoResolution> {
         match self {
             Self::Photo(resolution) => Some(resolution),
+            Self::Photos(_) => Some(PhotoResolution::Hd),
             Self::File => None,
         }
     }
@@ -79,7 +84,7 @@ impl AttachmentPicker {
         account: &str,
         auth_generation: Option<u64>,
         generation: u64,
-        resolution: PhotoResolution,
+        selection: (PhotoResolution, Option<usize>),
     ) {
         if self.busy() {
             return;
@@ -87,7 +92,10 @@ impl AttachmentPicker {
         self.for_account = Some(account.into());
         self.for_auth_generation = auth_generation;
         self.for_photo_generation = Some(generation);
-        self.kind = PickerKind::Photo(resolution);
+        self.kind = match selection {
+            (PhotoResolution::Hd, Some(limit)) => PickerKind::Photos(limit),
+            (resolution, _) => PickerKind::Photo(resolution),
+        };
         self.open_dialog(ctx, thread);
     }
     fn photo_scope(
@@ -116,7 +124,7 @@ impl AttachmentPicker {
     fn inspect_photo_scoped(
         &mut self,
         ctx: &egui::Context,
-        path: PathBuf,
+        selection: (Vec<PathBuf>, Option<usize>),
         thread: Option<&str>,
         account: &str,
         auth_generation: Option<u64>,
@@ -128,8 +136,19 @@ impl AttachmentPicker {
         self.for_account = Some(account.into());
         self.for_auth_generation = auth_generation;
         self.for_photo_generation = Some(generation);
-        self.kind = PickerKind::Photo(PhotoResolution::Hd);
-        self.inspect(ctx, path, thread);
+        let (paths, limit) = selection;
+        self.kind = limit.map_or(PickerKind::Photo(PhotoResolution::Hd), PickerKind::Photos);
+        self.notice = None;
+        self.for_thread = thread.map(str::to_owned);
+        self.spawn(ctx, move || {
+            if paths.len() == 1 {
+                inspect_path_kind(&paths[0], PickerKind::Photo(PhotoResolution::Hd))
+            } else if let Some(limit) = limit {
+                inspect_album(paths.into_iter(), limit)
+            } else {
+                Picked::Failed("Chưa thể gửi album trong hội thoại này. Hãy chọn từng ảnh.".into())
+            }
+        });
     }
     fn inspect_scoped(
         &mut self,
@@ -170,7 +189,12 @@ impl AttachmentPicker {
         let kind = self.kind;
         #[cfg(feature = "messaging")]
         let args = match kind.resolution() {
-            Some(resolution) => photo_dialog_args(&program, args, resolution),
+            Some(resolution) => photo_dialog_args(
+                &program,
+                args,
+                resolution,
+                matches!(kind, PickerKind::Photos(_)),
+            ),
             None => args,
         };
         self.spawn(ctx, move || {
@@ -264,6 +288,7 @@ fn photo_dialog_args(
     program: &Path,
     mut args: Vec<OsString>,
     resolution: PhotoResolution,
+    multiple: bool,
 ) -> Vec<OsString> {
     let (title, formats, extensions) = match resolution {
         PhotoResolution::Hd => (
@@ -280,13 +305,20 @@ fn photo_dialog_args(
             *arg = title.into();
         }
     }
-    args.push(
-        if program.file_name().is_some_and(|name| name == "zenity") {
-            format!("--file-filter={formats} | {extensions}").into()
+    let zenity = program.file_name().is_some_and(|name| name == "zenity");
+    args.push(if zenity {
+        format!("--file-filter={formats} | {extensions}").into()
+    } else {
+        format!("{extensions}|{formats}").into()
+    });
+    if multiple {
+        args.push("--multiple".into());
+        if zenity {
+            args.push("--separator=\u{1f}".into());
         } else {
-            format!("{extensions}|{formats}").into()
-        },
-    );
+            args.push("--separate-output".into());
+        }
+    }
     args
 }
 
@@ -347,14 +379,55 @@ fn run_dialog_kind(program: &Path, args: &[OsString], kind: PickerKind) -> Picke
         Some(1) => return Picked::Cancelled,
         _ => return Picked::Failed("Hộp thoại chọn tệp báo lỗi.".into()),
     }
-    let chosen = String::from_utf8_lossy(&output.stdout);
-    // A dialog may allow several files joined by `|`; only the first is attached.
-    let chosen = chosen.trim_end_matches(['\n', '\r']);
-    let first = chosen.split('|').next().unwrap_or("");
-    if first.is_empty() {
+    use std::os::unix::ffi::OsStrExt;
+    let chosen = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+    if chosen.is_empty() {
         return Picked::Cancelled;
     }
-    inspect_path_kind(Path::new(first), kind)
+    #[cfg(feature = "messaging")]
+    if let PickerKind::Photos(limit) = kind {
+        let separator = if program.file_name().is_some_and(|name| name == "zenity") {
+            0x1f
+        } else {
+            b'\n'
+        };
+        if chosen.contains(&separator) && Path::new(std::ffi::OsStr::from_bytes(chosen)).is_file() {
+            return Picked::Failed(
+                "Tên ảnh có ký tự phân cách của hộp chọn. Hãy đổi tên ảnh hoặc kéo thả.".into(),
+            );
+        }
+        return inspect_album(
+            chosen
+                .split(|byte| *byte == separator)
+                .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path))),
+            limit,
+        );
+    }
+    let first = chosen.split(|byte| *byte == b'|').next().unwrap_or(chosen);
+    inspect_path_kind(Path::new(std::ffi::OsStr::from_bytes(first)), kind)
+}
+
+#[cfg(feature = "messaging")]
+fn inspect_album(paths: impl Iterator<Item = PathBuf>, limit: usize) -> Picked {
+    let paths: Vec<_> = paths.take(limit + 1).collect();
+    if paths.len() > limit {
+        return Picked::Failed(format!("Chọn tối đa {limit} ảnh cho mỗi album."));
+    }
+    let mut photos = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !path.is_absolute() || photos.iter().any(|photo: &Attachment| photo.path == path) {
+            return Picked::Failed("Không đọc được danh sách ảnh đã chọn. Hãy chọn lại.".into());
+        }
+        match inspect_path_kind(&path, PickerKind::Photo(PhotoResolution::Hd)) {
+            Picked::File(photo) => photos.push(photo),
+            failure => return failure,
+        }
+    }
+    match photos.len() {
+        0 => Picked::Cancelled,
+        1 => Picked::File(photos.pop().unwrap()),
+        _ => Picked::Album(photos),
+    }
 }
 
 /// Height of the tray above the composer's toolbar while a file, a problem or a check is shown.
@@ -374,6 +447,10 @@ impl NativeApp {
         ) && (self.attachments.busy() || self.attachments.notice.is_some())
     }
     pub(super) fn photo_selected(&self) -> bool {
+        #[cfg(feature = "messaging")]
+        if self.album_selected() {
+            return true;
+        }
         self.drafts.active.has_photo_intent() || self.photo_picker_pending()
     }
     #[cfg(feature = "messaging")]
@@ -448,23 +525,26 @@ impl NativeApp {
                 .unwrap_or(crate::app::DEMO_ACCOUNT)
                 .to_owned();
             let auth_generation = self.auth_generation();
-            let extension = first
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let image = matches!(
-                extension.as_str(),
-                "jpg" | "jpeg" | "png" | "webp" | "gif" | "jxl" | "bmp" | "avif" | "heic"
-            );
+            let image = dropped.iter().any(|path| {
+                let extension = path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                matches!(
+                    extension.as_str(),
+                    "jpg" | "jpeg" | "png" | "webp" | "gif" | "jxl" | "bmp" | "avif" | "heic"
+                )
+            });
             let photo_drop = !self.demo && image && !ctx.input(|input| input.modifiers.shift);
             #[cfg(feature = "messaging")]
             if photo_drop {
                 self.drafts.active.edited();
                 if self.photo_can_choose(PhotoResolution::Hd) {
+                    let limit = self.album_limit();
                     self.attachments.inspect_photo_scoped(
                         ctx,
-                        first.clone(),
+                        (dropped.clone(), limit),
                         thread.as_deref(),
                         &account,
                         auth_generation,
@@ -494,12 +574,24 @@ impl NativeApp {
                     );
                 }
             }
-            if dropped.len() > 1 {
+            if !photo_drop && dropped.len() > 1 {
                 self.attachments.notice =
                     Some("Mỗi lần chỉ chọn một mục; đã chọn mục đầu tiên.".into());
             }
         }
         match self.attachments.poll() {
+            #[cfg(feature = "messaging")]
+            Some(Picked::Album(attachments)) => {
+                if self.attachments.photo_scope(
+                    self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT),
+                    self.auth_generation(),
+                    self.model.selected.as_deref(),
+                    self.model.generation,
+                ) {
+                    self.attachments.notice = None;
+                    self.begin_album_preparation(attachments);
+                }
+            }
             Some(Picked::File(attachment)) => {
                 let account = self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT);
                 let scoped = self.attachments.for_thread.as_deref()
@@ -751,6 +843,43 @@ mod tests {
         };
         assert!(picker.photo_scope("11", Some(3), Some("d:22"), 4));
         assert!(!picker.photo_scope("11", Some(3), Some("d:22"), 5));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn native_album_choice_is_ordered_and_validates_the_whole_selection() {
+        let dir = temp_dir("album");
+        let first = dir.join("một|album.jpg");
+        let second = dir.join("hai.png");
+        let unsupported = dir.join("động.gif");
+        for file in [&first, &second, &unsupported] {
+            std::fs::write(file, b"synthetic paths only").unwrap();
+        }
+        let zenity = script(
+            &dir,
+            "zenity",
+            &format!(
+                "printf '%s\\037%s\\n' '{}' '{}'",
+                second.display(),
+                first.display()
+            ),
+        );
+        let picked = run_dialog_kind(&zenity, &[], PickerKind::Photos(2));
+        assert!(matches!(picked, Picked::Album(photos)
+            if photos.iter().map(|photo| photo.path.as_path()).eq([second.as_path(), first.as_path()])));
+        assert!(matches!(
+            run_dialog_kind(&zenity, &[], PickerKind::Photos(1)),
+            Picked::Failed(_)
+        ));
+        assert!(matches!(
+            inspect_album([first.clone(), unsupported].into_iter(), 2),
+            Picked::Failed(_)
+        ));
+        assert!(matches!(
+            inspect_album([first.clone(), first].into_iter(), 2),
+            Picked::Failed(_)
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

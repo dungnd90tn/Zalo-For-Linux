@@ -773,6 +773,7 @@ mod tests {
                         original_url: None,
                         width: Some(pixel_width),
                         height: Some(pixel_height),
+                        album: None,
                     }));
                     let mut sizes = Vec::new();
                     let mut frame_time = 0.0;
@@ -1160,6 +1161,7 @@ mod tests {
                     original_url: Some(original.into()),
                     width: Some(16),
                     height: Some(16),
+                    album: None,
                 };
                 let message = message(MediaDescriptor::Photo(photo.clone()));
                 let mut cache = MediaCache::default();

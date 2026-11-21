@@ -1,5 +1,17 @@
 //! Synthetic TLS file-service and multiplexed control witness; never connects outward.
 use super::*;
+
+pub(super) const ALBUM_ACCEPT: u8 = 20;
+pub(super) const ALBUM_REJECT_SECOND: u8 = 21;
+pub(super) const ALBUM_LOSE_SECOND_ACK: u8 = 22;
+
+fn album_mode(mode: u8) -> bool {
+    (ALBUM_ACCEPT..=ALBUM_LOSE_SECOND_ACK).contains(&mode)
+}
+
+fn album_photo_id(parameters: &Value) -> String {
+    format!("album-{}", parameters["clientId"].as_u64().unwrap())
+}
 #[derive(Default)]
 pub(super) struct FileState {
     pub paths: Mutex<Vec<String>>,
@@ -21,6 +33,28 @@ impl Fixture {
     }
     pub(super) fn photo_session(&self, new_endpoint: bool) -> Arc<VerifiedSession> {
         self.photo_session_with_limits(new_endpoint, 2560, 2560, 5 * 1024 * 1024)
+    }
+    pub(super) fn album_session(
+        &self,
+        new_endpoint: bool,
+        max_count: u32,
+        extra_metadata: bool,
+    ) -> Arc<VerifiedSession> {
+        let config = ServerConfig::parse(&json!({
+            "zpw_service_map_v3":{
+                "chat":["https://wpa.zaloapp.com"],"group":["https://wpa.zaloapp.com"],
+                "conversation":["https://wpa.zaloapp.com"],"file":["https://wpa.zaloapp.com"],
+                "up_file":["https://wpa.zaloapp.com"]
+            },
+            "zpw_ws":["wss://wpa.zaloapp.com"],
+            "settings":{
+                "sharefile":{"chunk_size_file":64000,"max_file":max_count},
+                "features":{"should_attach_extraMsgProp":extra_metadata},
+                "file_photo_limit":{"enable_new_endpoint_upload_photo":if new_endpoint{1}else{0}}
+            }
+        }))
+        .unwrap();
+        Arc::new(synthetic_session(self.profile.clone(), config))
     }
     pub(super) fn photo_session_with_limits(
         &self,
@@ -66,14 +100,21 @@ pub(super) fn socket(mut ws: Socket, state: Arc<State>, mode: u8, photo: bool) {
         if transfer.control_pending.swap(false, Ordering::SeqCst) {
             let mut controls = json!({"error_code":0,"data":{"controls":[{"controlId":"1","content":{"act_type":"other_control","data":{}}},{"controlId":"2","content":{"act_type":"file_done","fileId":"wrong-file","data":{"url":"https://files.example.test/wrong"}}},{"controlId":"3","content":{"act_type":"file_done","fileId":"987","data":"{\"url\":\"https://files.example.test/uploaded\"}"}}]}});
             if photo {
-                let size = transfer
-                    .uploads
-                    .lock()
-                    .unwrap()
-                    .last()
-                    .map(|(params, _)| params["totalSize"].clone())
-                    .unwrap_or(json!(0));
-                controls = json!({"error_code":0,"data":{"controls":[{"content":{"act_type":"file_done","fileId":"987","data":{"url":"https://files.example.test/not-photo"}}},{"content":{"act_type":"photo_success","act":"photo","fileId":"987","data":{"org":"https://files.example.test/uploaded","thumb":"https://files.example.test/thumb","hd":"https://files.example.test/hd","fileSize":size}}}]}});
+                let uploads = transfer.uploads.lock().unwrap();
+                let (parameters, _) = uploads.last().unwrap();
+                let size = &parameters["totalSize"];
+                let id = if album_mode(mode) {
+                    album_photo_id(parameters)
+                } else {
+                    "987".to_string()
+                };
+                let tag = if album_mode(mode) {
+                    id.as_str()
+                } else {
+                    "uploaded"
+                };
+                let original = format!("https://files.example.test/{tag}");
+                controls = json!({"error_code":0,"data":{"controls":[{"content":{"act_type":"file_done","fileId":id,"data":{"url":"https://files.example.test/not-photo"}}},{"content":{"act_type":"photo_success","act":"photo","fileId":id,"data":{"org":original,"thumb":"https://files.example.test/thumb","hd":"https://files.example.test/hd","fileSize":size}}}]}});
                 if mode == 12 {
                     controls["data"]["controls"][1]["content"]["data"]
                         .as_object_mut()
@@ -224,7 +265,7 @@ pub(super) fn http(
 ) -> bool {
     let transfer = if photo { &state.photo } else { &state.file };
     let route = path.split('?').next().unwrap();
-    if photo && mode >= 10 {
+    if photo && (10..=12).contains(&mode) {
         match route {
             "/api/getCloudViewerKey" => {
                 assert_eq!(path, "/api/getCloudViewerKey?zpw_ver=681&zpw_type=24");
@@ -282,7 +323,7 @@ pub(super) fn http(
     let upload = route.ends_with("/upload")
         || route.ends_with("/upload/photo")
         || route.ends_with("/zcloud-upload/photo");
-    if photo && mode >= 10 {
+    if photo && (10..=12).contains(&mode) {
         assert!(!headers.to_ascii_lowercase().contains("cloud-viewer-key:"));
         if upload {
             assert!(route.ends_with("/zcloud-upload/photo"));
@@ -332,20 +373,44 @@ pub(super) fn http(
         }
         let finished = parameters["chunkId"] == parameters["totalChunk"];
         if finished && mode != 1 {
+            if photo && album_mode(mode) {
+                transfer.control_sent.store(false, Ordering::SeqCst);
+            }
             transfer.control_pending.store(true, Ordering::SeqCst);
             wait(&transfer.control_sent);
         }
+        let photo_id = if album_mode(mode) {
+            album_photo_id(&parameters)
+        } else {
+            "987".to_string()
+        };
         response(
             stream,
-            json!({"error_code":0,"data":if finished{if photo{json!({"finished":1,"photoId":"987"})}else{json!({"finished":1,"fileId":"987"})}}else{json!({})}}),
+            json!({"error_code":0,"data":if finished{if photo{json!({"finished":1,"photoId":photo_id})}else{json!({"finished":1,"fileId":"987"})}}else{json!({})}}),
         );
         if finished && mode == 1 {
             transfer.control_pending.store(true, Ordering::SeqCst);
         }
     } else {
         state.http_sends.fetch_add(1, Ordering::SeqCst);
-        transfer.finals.lock().unwrap().push(parameters.clone());
+        let final_number = {
+            let mut finals = transfer.finals.lock().unwrap();
+            finals.push(parameters.clone());
+            finals.len()
+        };
         transfer.final_started.store(true, Ordering::SeqCst);
+        if photo && album_mode(mode) {
+            if final_number == 2 && mode == ALBUM_LOSE_SECOND_ACK {
+                return true;
+            }
+            let inner = if final_number == 2 && mode == ALBUM_REJECT_SECOND {
+                json!({"error_code":1234,"data":{}})
+            } else {
+                json!({"error_code":0,"data":{"msgId":(900+final_number).to_string(),"ts":"1760000000001"}})
+            };
+            response(stream, inner);
+            return true;
+        }
         if mode == 9 {
             transfer.stalled.store(true, Ordering::SeqCst);
             let mut byte = [0];

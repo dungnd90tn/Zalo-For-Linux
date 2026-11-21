@@ -39,8 +39,8 @@ unknown; zero is a valid size. `files_oracle.cjs` retains eight synthetic origin
 reader cases. File URLs are exposed only as an explicit HTTPS browser action;
 HTTP links upgrade to HTTPS. No file is automatically downloaded, opened locally
 or executed. Nonempty `secureKey`/`e2eeKey` markers withhold the plaintext action.
-Ordinary single-file, single-photo HD and entitled original JPEG sending are
-implemented as described below. Albums, animation, transfer resume, folder
+Ordinary single-file, single-photo HD, HD album and entitled original JPEG
+sending are implemented as described below. Animation, transfer resume, folder
 extraction and E2EE attachment decryption remain unavailable.
 
 ## Ordinary single-file sending
@@ -123,6 +123,23 @@ It preserves JPEG image data and removes APP1 metadata, then uploads through
 the Cloud service and sends through the configured photo service. The response
 must identify an original URL at the prepared size. See
 [original JPEG verification](VALIDATION.md#sending-one-original-jpeg-206-development-branch).
+
+## Sending an HD album
+
+The image picker prepares 2–6 HD JPEGs in the chosen order and honors smaller
+session limits. The existing HD service sends each image with a distinct client
+ID, shared decimal-string `groupLayoutId`, zero-based `idInGroup`,
+`isGroupLayout:1`, and `totalItemInGroup`. When advertised by session settings,
+`extMsgProp` also carries the layout ID. See PC bundle N136681–136724 and
+N401554–401571. Draft text stays in the composer.
+
+Each image uses the scoped photo ledger, including its group metadata through
+receipt reconciliation. The next image starts only after durable acceptance of
+the previous one. Failure or an uncertain response stops the send. A restart
+can reconcile a recorded receipt and does not resume the album. Schema 21
+adds the album projection and prevents earlier clients from opening the
+upgraded profile. The timeline groups complete contiguous runs and keeps the
+separate photo actions.
 
 ## Durable content and replay
 

@@ -22,16 +22,18 @@ impl Drop for ProcessingPermit {
 struct Pending {
     generation: u64,
     thread: String,
-    attachment: Attachment,
+    attachments: Vec<Attachment>,
     request_id: u64,
     resolution: PhotoResolution,
+    album: bool,
 }
 struct Running {
     generation: u64,
     thread: String,
     request_id: u64,
+    album: bool,
     cancel: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<std::result::Result<PreparedPhoto, PhotoPreparationFailure>>,
+    task: tokio::task::JoinHandle<std::result::Result<Vec<PreparedPhoto>, PhotoPreparationFailure>>,
 }
 #[derive(Default)]
 pub(super) struct Photos {
@@ -54,61 +56,95 @@ impl Photos {
         command: LiveCommand,
         events: &Events,
     ) -> Result<Option<LiveCommand>> {
-        match command {
+        let pending = match command {
             LiveCommand::PreparePhoto {
                 generation,
                 thread,
                 attachment,
                 request_id,
                 resolution,
-            } => {
-                if let Some(old) = self.pending.take() {
-                    self.emit(
-                        events,
-                        old.generation,
-                        old.thread,
-                        old.request_id,
-                        Err(PhotoPreparationFailure::Cancelled),
-                    )
-                    .await?;
-                }
-                if let Some(job) = &self.running {
-                    job.cancel.store(true, Ordering::Release);
-                }
-                self.pending = Some(Pending {
-                    generation,
-                    thread,
-                    attachment,
-                    request_id,
-                    resolution,
-                });
-                Ok(None)
-            }
+            } => Pending {
+                generation,
+                thread,
+                attachments: vec![attachment],
+                request_id,
+                resolution,
+                album: false,
+            },
+            LiveCommand::PrepareAlbum {
+                generation,
+                thread,
+                attachments,
+                request_id,
+            } => Pending {
+                generation,
+                thread,
+                attachments,
+                request_id,
+                resolution: PhotoResolution::Hd,
+                album: true,
+            },
             LiveCommand::CancelPhotoPreparation { request_id } => {
-                if let Some(job) = &self.running {
-                    if job.request_id == request_id {
-                        job.cancel.store(true, Ordering::Release);
-                    }
-                }
-                if self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|job| job.request_id == request_id)
-                {
-                    let job = self.pending.take().unwrap();
-                    self.emit(
-                        events,
-                        job.generation,
-                        job.thread,
-                        job.request_id,
-                        Err(PhotoPreparationFailure::Cancelled),
-                    )
-                    .await?;
-                }
-                Ok(None)
+                self.cancel(events, request_id, None).await?;
+                return Ok(None);
             }
-            command => Ok(Some(command)),
+            LiveCommand::CancelAlbumPreparation { thread, request_id } => {
+                self.cancel(events, request_id, Some(&thread)).await?;
+                return Ok(None);
+            }
+            command => return Ok(Some(command)),
+        };
+        if let Some(old) = self.pending.replace(pending) {
+            self.emit(
+                events,
+                old.generation,
+                old.thread,
+                old.request_id,
+                old.album,
+                Err(PhotoPreparationFailure::Cancelled),
+            )
+            .await?;
         }
+        if let Some(job) = &self.running {
+            job.cancel.store(true, Ordering::Release);
+        }
+        Ok(None)
+    }
+    async fn cancel(
+        &mut self,
+        events: &Events,
+        request_id: u64,
+        album_thread: Option<&str>,
+    ) -> Result<()> {
+        let matches_scope = |id, thread: &str, album| {
+            id == request_id
+                && match album_thread {
+                    Some(scope) => album && scope == thread,
+                    None => !album,
+                }
+        };
+        if let Some(job) = &self.running {
+            if matches_scope(job.request_id, &job.thread, job.album) {
+                job.cancel.store(true, Ordering::Release);
+            }
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|job| matches_scope(job.request_id, &job.thread, job.album))
+        {
+            let job = self.pending.take().expect("matched preparation");
+            self.emit(
+                events,
+                job.generation,
+                job.thread,
+                job.request_id,
+                job.album,
+                Err(PhotoPreparationFailure::Cancelled),
+            )
+            .await?;
+        }
+        Ok(())
     }
     async fn emit(
         &self,
@@ -116,17 +152,28 @@ impl Photos {
         generation: u64,
         thread: String,
         request_id: u64,
-        result: std::result::Result<PreparedPhoto, PhotoPreparationFailure>,
+        album: bool,
+        result: std::result::Result<Vec<PreparedPhoto>, PhotoPreparationFailure>,
     ) -> Result<()> {
-        events
-            .emit(LiveEvent::PhotoPrepared {
+        let event = if album {
+            LiveEvent::AlbumPrepared {
                 account_id: events.account.clone(),
                 generation,
                 thread,
                 request_id,
                 result,
-            })
-            .await
+            }
+        } else {
+            LiveEvent::PhotoPrepared {
+                account_id: events.account.clone(),
+                generation,
+                thread,
+                request_id,
+                result: result
+                    .and_then(|mut photos| photos.pop().ok_or(PhotoPreparationFailure::Storage)),
+            }
+        };
+        events.emit(event).await
     }
     pub async fn poll(
         &mut self,
@@ -135,6 +182,7 @@ impl Photos {
         lease: u64,
         limits: crate::protocol::bootstrap::PhotoLimits,
         original_limits: Option<crate::protocol::bootstrap::PhotoLimits>,
+        album_max_count: usize,
     ) -> Result<()> {
         if let Some(job) = &self.running {
             if !events.privacy.read().is_ok_and(|p| p.permits(&job.thread)) {
@@ -151,17 +199,31 @@ impl Photos {
                 .task
                 .await
                 .unwrap_or(Err(PhotoPreparationFailure::Storage));
-            self.emit(events, job.generation, job.thread, job.request_id, result)
-                .await?;
+            let result = if job.cancel.load(Ordering::Acquire) {
+                Err(PhotoPreparationFailure::Cancelled)
+            } else {
+                result
+            };
+            self.emit(
+                events,
+                job.generation,
+                job.thread,
+                job.request_id,
+                job.album,
+                result,
+            )
+            .await?;
         }
         if self.running.is_none() {
             if let Some(job) = self.pending.take() {
+                let album = job.album;
                 if lease == 0 || !events.privacy.read().is_ok_and(|p| p.permits(&job.thread)) {
                     self.emit(
                         events,
                         job.generation,
                         job.thread,
                         job.request_id,
+                        album,
                         Err(PhotoPreparationFailure::Cancelled),
                     )
                     .await?;
@@ -171,12 +233,15 @@ impl Photos {
                     PhotoResolution::Hd => Some(limits),
                     PhotoResolution::Original => original_limits,
                 };
-                let Some(limits) = limits else {
+                let Some(limits) = limits
+                    .filter(|_| !album || (2..=album_max_count).contains(&job.attachments.len()))
+                else {
                     self.emit(
                         events,
                         job.generation,
                         job.thread,
                         job.request_id,
+                        album,
                         Err(PhotoPreparationFailure::Unavailable),
                     )
                     .await?;
@@ -200,15 +265,20 @@ impl Photos {
                     let permit = ProcessingPermit;
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit;
-                        prepare(
-                            &profile,
-                            &account,
-                            &thread,
-                            lease,
-                            &job.attachment,
-                            &flag,
-                            (limits, job.resolution),
-                        )
+                        job.attachments
+                            .iter()
+                            .map(|attachment| {
+                                prepare(
+                                    &profile,
+                                    &account,
+                                    &thread,
+                                    lease,
+                                    attachment,
+                                    &flag,
+                                    (limits, job.resolution),
+                                )
+                            })
+                            .collect()
                     })
                     .await
                     .unwrap_or(Err(PhotoPreparationFailure::Storage))
@@ -217,6 +287,7 @@ impl Photos {
                     generation: job.generation,
                     thread: job.thread,
                     request_id: job.request_id,
+                    album,
                     cancel,
                     task,
                 });

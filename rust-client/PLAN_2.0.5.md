@@ -22,4 +22,4 @@ Ba hạng mục đầu đã có trong bản thử `2.0.5-2` và qua kiểm thử
 
 ## Sau 2.0.5
 
-Nhánh `v2.0.6` đã có nhắc tên và ghim tin văn bản trong nhóm thường, chuyển tiếp tin văn bản cá nhân đến tối đa 10 bạn bè, thu hồi tin văn bản của mình trong nhóm thường, duyệt bộ sticker khi phiên trả danh mục trực tiếp, tải từng trang tin văn bản cũ trong nhóm đủ điều kiện và gửi ảnh gốc JPEG trong chat riêng hoặc nhóm khi tài khoản có quyền Zalo Cloud. Cần xác nhận các luồng này trên tài khoản thử. Hạng mục tiếp theo là gửi album, sau đó đến ghi âm.
+Nhánh `v2.0.6` đã có nhắc tên và ghim tin văn bản trong nhóm thường, chuyển tiếp tin văn bản cá nhân đến tối đa 10 bạn bè, thu hồi tin văn bản của mình trong nhóm thường, duyệt bộ sticker khi phiên trả danh mục trực tiếp, tải từng trang tin văn bản cũ trong nhóm đủ điều kiện và gửi ảnh gốc JPEG trong chat riêng hoặc nhóm khi tài khoản có quyền Zalo Cloud. Nhánh này cũng gửi album từ 2 đến 6 ảnh HD và hiển thị các ảnh thuộc album trong khung chat. Cần xác nhận các luồng này trên tài khoản thử. Hạng mục tiếp theo là ghi âm.

@@ -113,6 +113,9 @@ impl Projection {
             LiveEvent::PhotoPrepared { result, thread, .. } if !self.permits(thread) => {
                 *result = Err(PhotoPreparationFailure::Cancelled);
             }
+            LiveEvent::AlbumPrepared { result, thread, .. } if !self.permits(thread) => {
+                *result = Err(PhotoPreparationFailure::Cancelled);
+            }
             LiveEvent::StickersFound {
                 thread, stickers, ..
             }
@@ -163,6 +166,9 @@ impl Projection {
                 request_id,
                 ..
             } if !self.permits(thread) => {
+                if *kind == TransferKind::Album {
+                    return None;
+                }
                 return Some(LiveEvent::FileTransfer {
                     kind: *kind,
                     account_id: account_id.clone(),

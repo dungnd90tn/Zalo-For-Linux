@@ -39,6 +39,7 @@ mod sticker_send;
 pub(crate) use sticker_send::Reservation as StickerReservation;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// One received message with optional outbox hint and complete rich sidecars.
 /// The immutable metadata commits with its message and receive cursor.
@@ -403,7 +404,7 @@ impl MessageStore {
     fn initialize(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(2))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 20 {
+        if version > SCHEMA_VERSION {
             bail!("Database was created by a newer client");
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
@@ -454,7 +455,8 @@ impl MessageStore {
         reactions::initialize(&conn)?;
         message_media::reproject(&conn)?;
         silence_legacy(&conn)?;
-        conn.execute_batch("PRAGMA user_version=20; COMMIT;")?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        conn.execute_batch("COMMIT;")?;
         privacy::initialize(&conn)?;
         Ok(Self { conn })
     }

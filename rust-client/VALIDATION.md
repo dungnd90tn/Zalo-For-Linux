@@ -1783,3 +1783,36 @@ smoke test, preserving saved originals and local history.
 
 Real Zalo Cloud entitlement and downloading the sent photo on a second
 device remain to be verified on a test account.
+
+## Sending an HD album (2.0.6 development branch)
+
+The native picker previews 2–6 static images in selection order, subject to
+smaller session limits. A single selection keeps the existing HD flow. Text
+stays in its draft. The worker waits for durable acceptance of each album member
+before starting the next. A rejected or uncertain member stops the upload.
+Schema 21 reprojects legacy album data and makes older clients refuse the
+upgraded profile.
+
+The bundle oracle passed four album cases across direct and group sends. The
+synthetic TLS/WSS test passed exact prepared-byte uploads, shared layout IDs,
+distinct indexes and client IDs, and stopping after the second photo was
+rejected or its confirmation was lost. Eight offline native captures cover the
+ready and partial states in both themes at 640×480 and 1200×780. The album UI
+unit tests passed separately, including pointer dismissal with draft retention.
+The final default checks passed 312 Rust and 19 Python tests. Separate
+all-feature runs passed 161 store tests and 32 integration tests that require
+no network. The optimized live binary passed the disposable-profile smoke
+test, including schema 20 to 21. The prior schema-20 binary refused the
+upgraded profile, and all 19 synthetic messages remained in the database.
+
+The first all-feature run passed the album TLS/WSS test and found stale schema
+assertions and a synthetic click exceeding egui's click threshold. Those
+checks passed in targeted reruns after the test-only fixes. The final complete
+loopback rerun is pending renewed permission after automatic review timed out.
+
+To reproduce the captures, set `ZALO_UI_FIXTURE_ALBUM=ready|partial`,
+`ZALO_UI_FIXTURE_READY=1`, `ZALO_UI_FIXTURE_WIDTH=640|1200`,
+`ZALO_UI_FIXTURE_THEME=light|dark` and `ZALO_UI_SHOT=/tmp/album.ppm`.
+Run the ignored `ui::live::tests::signed_in_offline_native_window_fixture` under
+an isolated X11 display. Receiving the album on a real Zalo device remains
+to be verified.

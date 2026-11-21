@@ -6,7 +6,7 @@ use zalo_rust::{
     domain::{MediaDescriptor, MediaKind, MediaMessageContent, Message},
     store::{
         attachments::{AttachmentResource, AttachmentSpec, AttachmentState},
-        MessageStore,
+        MessageStore, SCHEMA_VERSION,
     },
 };
 
@@ -421,10 +421,11 @@ fn schema_ten_upgrade_and_failed_migration_preserve_quote_history_and_crypto_int
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            20
+            SCHEMA_VERSION
         );
     }
-    conn.execute_batch("PRAGMA user_version=21;").unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        .unwrap();
     assert!(MessageStore::open(&db.0).is_err());
     assert_eq!(rows(&db.0), before);
 }

@@ -2094,6 +2094,10 @@ async fn handle_command(
         LiveCommand::SendFile { .. }
         | LiveCommand::SendPhoto { .. }
         | LiveCommand::PreparePhoto { .. }
+        | LiveCommand::PrepareAlbum { .. }
+        | LiveCommand::SendAlbum { .. }
+        | LiveCommand::CancelAlbumPreparation { .. }
+        | LiveCommand::CancelAlbum { .. }
         | LiveCommand::CancelPhotoPreparation { .. }
         | LiveCommand::CancelFile { .. } => return Ok(CommandOutcome::Continue),
         LiveCommand::Shutdown => return Ok(CommandOutcome::Shutdown),
@@ -2692,6 +2696,7 @@ async fn run_inner(
             account_id: events.account.clone(),
             available: session.config().photo_upload_route.is_some() && uploads.lease() != 0,
             original_available: false,
+            album_max_count: uploads.album_max_count(&session),
         })
         .await?;
     events
@@ -2744,7 +2749,7 @@ async fn run_inner(
             permit = events.tx.reserve(), if directory.notifications_pending() => {
                 directory.publish_notification(permit.map_err(|_|anyhow::anyhow!("UI stopped"))?,&db,events).await?;
             },
-            _ = upload_tick.tick(), if uploads.active() || photos.active() => { photos.poll(&profile,events,uploads.lease(),session.config().photo_limits,original_limits).await?; uploads.poll(&mut connection,&db,events,&session,&client).await?; },
+            _ = upload_tick.tick(), if uploads.active() || photos.active() => { photos.poll(&profile,events,uploads.lease(),session.config().photo_limits,original_limits,uploads.album_max_count(&session)).await?; uploads.poll(&mut connection,&db,events,&session,&client).await?; },
             paid = uploads.original_entitlement() => { uploads.set_original_entitlement(paid, &session, events).await?; },
             candidate = unread.recv() => {
                 if let Some(candidate) = candidate { attention.notify(candidate, events); }
@@ -2920,7 +2925,7 @@ async fn run_inner(
                         permit = events.tx.reserve(), if directory.notifications_pending() => {
                             directory.publish_notification(permit.map_err(|_|anyhow::anyhow!("UI stopped"))?,&db,events).await?;
                         },
-                        _ = upload_tick.tick(), if uploads.active() || photos.active() => { photos.poll(&profile,events,uploads.lease(),session.config().photo_limits,None).await?; uploads.poll(&mut connection,&db,events,&session,&client).await?; },
+                        _ = upload_tick.tick(), if uploads.active() || photos.active() => { photos.poll(&profile,events,uploads.lease(),session.config().photo_limits,None,uploads.album_max_count(&session)).await?; uploads.poll(&mut connection,&db,events,&session,&client).await?; },
                         result = &mut connecting => break Some(result),
                         _ = attention::wait_until(attention_deadline) => {
                             attention.poll(None, &db, events, &session, &client).await?;

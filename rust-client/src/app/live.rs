@@ -19,6 +19,7 @@ mod photo;
 pub use crate::domain::PhotoResolution;
 pub use photo::{PhotoPreparationFailure, PhotoThumbnail, PreparedPhoto};
 pub(crate) const MAX_ORIGINAL_PHOTO_BYTES: u64 = crate::store::photos::MAX_PHOTO_BYTES;
+pub const MAX_ALBUM_PHOTOS: usize = crate::store::photos::MAX_ALBUM_PHOTOS;
 pub(crate) mod runtime;
 #[cfg(feature = "signal-crypto")]
 pub mod signal_crypto;
@@ -439,6 +440,10 @@ pub enum LiveCommand {
     CancelFile {
         request_id: u64,
     },
+    CancelAlbum {
+        thread: String,
+        request_id: u64,
+    },
     PreparePhoto {
         generation: u64,
         thread: String,
@@ -446,7 +451,17 @@ pub enum LiveCommand {
         resolution: PhotoResolution,
         request_id: u64,
     },
+    PrepareAlbum {
+        generation: u64,
+        thread: String,
+        attachments: Vec<crate::domain::Attachment>,
+        request_id: u64,
+    },
     CancelPhotoPreparation {
+        request_id: u64,
+    },
+    CancelAlbumPreparation {
+        thread: String,
         request_id: u64,
     },
     SendPhoto {
@@ -456,12 +471,19 @@ pub enum LiveCommand {
         caption: String,
         request_id: u64,
     },
+    SendAlbum {
+        generation: u64,
+        thread: String,
+        photos: Vec<PreparedPhoto>,
+        request_id: u64,
+    },
     Shutdown,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferKind {
     File,
     Photo,
+    Album,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileTransferPhase {
@@ -474,6 +496,7 @@ pub enum FileTransferPhase {
     Failed,
     Unknown,
     AcceptedLocalFailure,
+    Partial,
 }
 #[derive(Debug)]
 pub enum LiveEvent {
@@ -638,6 +661,7 @@ pub enum LiveEvent {
         account_id: String,
         available: bool,
         original_available: bool,
+        album_max_count: usize,
     },
     PhotoPrepared {
         account_id: String,
@@ -645,6 +669,13 @@ pub enum LiveEvent {
         thread: String,
         request_id: u64,
         result: std::result::Result<PreparedPhoto, PhotoPreparationFailure>,
+    },
+    AlbumPrepared {
+        account_id: String,
+        generation: u64,
+        thread: String,
+        request_id: u64,
+        result: std::result::Result<Vec<PreparedPhoto>, PhotoPreparationFailure>,
     },
     FileCapability {
         account_id: String,
@@ -850,6 +881,7 @@ impl LiveEvent {
             | Self::NotificationOpen { account_id, .. }
             | Self::PhotoCapability { account_id, .. }
             | Self::PhotoPrepared { account_id, .. }
+            | Self::AlbumPrepared { account_id, .. }
             | Self::FileCapability { account_id, .. }
             | Self::FileTransfer { account_id, .. }
             | Self::FileAccepted { account_id, .. }
@@ -1360,6 +1392,23 @@ impl LiveWorker {
                         }
             }
             LiveCommand::CancelPhotoPreparation { request_id } => *request_id != 0,
+            LiveCommand::CancelAlbum { thread, request_id }
+            | LiveCommand::CancelAlbumPreparation { thread, request_id } => {
+                Target::from_thread(thread).is_ok() && *request_id != 0
+            }
+            LiveCommand::PrepareAlbum {
+                thread,
+                attachments,
+                request_id,
+                ..
+            } => {
+                Target::from_thread(thread).is_ok()
+                    && *request_id != 0
+                    && (2..=MAX_ALBUM_PHOTOS).contains(&attachments.len())
+                    && attachments
+                        .iter()
+                        .all(|attachment| (1..=20 * 1024 * 1024).contains(&attachment.size_bytes))
+            }
             LiveCommand::SendPhoto {
                 thread,
                 photo,
@@ -1372,6 +1421,21 @@ impl LiveWorker {
                     && photo.size_bytes() > 0
                     && photo.size_bytes() <= 5 * 1024 * 1024
                     && caption.len() <= MAX_TEXT_BYTES
+            }
+            LiveCommand::SendAlbum {
+                thread,
+                photos,
+                request_id,
+                ..
+            } => {
+                Target::from_thread(thread).is_ok()
+                    && *request_id != 0
+                    && (2..=MAX_ALBUM_PHOTOS).contains(&photos.len())
+                    && photos.iter().all(|photo| {
+                        photo.resolution() == PhotoResolution::Hd
+                            && (1..=crate::store::photos::MAX_PHOTO_BYTES)
+                                .contains(&photo.size_bytes())
+                    })
             }
             LiveCommand::CancelFile { request_id } => *request_id != 0,
             LiveCommand::Reconnect
@@ -1409,12 +1473,16 @@ impl super::Composer {
                 && file.photo.is_some()
                 && file.revision == self.photo_revision
                 && self.photo.as_ref() == file.photo.as_ref();
+            let same_album = kind == TransferKind::Album && file.revision == self.photo_revision;
             let clear_caption = same_photo && self.revision == file.draft_revision;
             if same_file {
                 self.clear_attachment();
             }
             if same_photo {
                 self.clear_photo();
+            }
+            if same_album {
+                self.clear_album();
             }
             if clear_caption {
                 self.text.clear();
@@ -1468,6 +1536,7 @@ impl super::Composer {
             resolution,
             request_id,
         })?;
+        self.clear_album();
         self.photo_revision = self.photo_revision.wrapping_add(1);
         self.photo_source = Some(attachment);
         self.photo_resolution = resolution;
@@ -1480,6 +1549,81 @@ impl super::Composer {
             revision: self.photo_revision,
         });
         self.edited();
+        Ok(())
+    }
+
+    pub fn prepare_live_album(
+        &mut self,
+        generation: u64,
+        thread: String,
+        attachments: Vec<crate::domain::Attachment>,
+        enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
+    ) -> std::result::Result<(), SubmitError> {
+        if self.reply().is_some()
+            || self.attachment().is_some()
+            || !(2..=MAX_ALBUM_PHOTOS).contains(&attachments.len())
+        {
+            return Err(SubmitError::Invalid);
+        }
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = self.next_request_id;
+        enqueue(LiveCommand::PrepareAlbum {
+            generation,
+            thread: thread.clone(),
+            attachments: attachments.clone(),
+            request_id,
+        })?;
+        self.clear_photo();
+        self.photo_revision = self.photo_revision.wrapping_add(1);
+        self.album = super::AlbumDraft {
+            sources: attachments,
+            preparation: Some(super::PendingPhotoPreparation {
+                request_id,
+                thread,
+                generation,
+                revision: self.photo_revision,
+            }),
+            ..Default::default()
+        };
+        self.edited();
+        Ok(())
+    }
+
+    pub fn send_live_album(
+        &mut self,
+        generation: u64,
+        thread: String,
+        enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
+    ) -> std::result::Result<(), SubmitError> {
+        if self.reply().is_some()
+            || self.attachment().is_some()
+            || self.album_preparing()
+            || self.album_problem().is_some()
+        {
+            return Err(SubmitError::Invalid);
+        }
+        if self.in_flight() {
+            return Err(SubmitError::Busy);
+        }
+        let photos = self.album().ok_or(SubmitError::Invalid)?.to_vec();
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = self.next_request_id;
+        enqueue(LiveCommand::SendAlbum {
+            generation,
+            thread: thread.clone(),
+            photos,
+            request_id,
+        })?;
+        self.pending_file = Some(super::PendingFile {
+            request_id,
+            thread,
+            revision: self.photo_revision,
+            kind: TransferKind::Album,
+            attachment: None,
+            photo: None,
+            draft_revision: self.revision,
+        });
+        self.pending = Some((request_id, self.revision));
         Ok(())
     }
 
@@ -1653,7 +1797,8 @@ impl super::Composer {
                 conversation,
                 kind,
                 ..
-            } if message.account_id == account_id
+            } if *kind != TransferKind::Album
+                && message.account_id == account_id
                 && message.thread_id == *thread
                 && conversation.id == *thread =>
             {
@@ -1670,20 +1815,74 @@ impl super::Composer {
                 // file message after its privacy lease has been revoked.
                 self.accept_live_attachment(thread, *request_id, *kind);
             }
+            LiveEvent::AlbumPrepared {
+                generation,
+                thread,
+                request_id,
+                result,
+                ..
+            } if self.album.preparation.as_ref().is_some_and(|pending| {
+                pending.request_id == *request_id
+                    && pending.thread == *thread
+                    && pending.generation == *generation
+                    && pending.revision == self.photo_revision
+            }) =>
+            {
+                self.album.preparation = None;
+                if self.reply().is_some() || self.attachment().is_some() {
+                    self.album.problem = Some(
+                        "Bản nháp đã thay đổi. Hãy bỏ album để gửi tệp hoặc trích dẫn.".into(),
+                    );
+                } else {
+                    match result {
+                        Ok(photos)
+                            if photos.len() == self.album.sources.len()
+                                && photos
+                                    .iter()
+                                    .all(|photo| photo.resolution() == PhotoResolution::Hd) =>
+                        {
+                            self.album.photos.clone_from(photos);
+                            self.album.problem = None;
+                        }
+                        Ok(_) => {
+                            self.album.problem = Some("Album đã thay đổi. Hãy chọn lại ảnh.".into())
+                        }
+                        Err(error) => self.album.problem = Some(error.to_string()),
+                    }
+                }
+            }
             LiveEvent::FileTransfer {
                 request_id,
                 thread,
                 kind,
                 phase:
-                    FileTransferPhase::Cancelled
+                    phase @ (FileTransferPhase::Cancelled
                     | FileTransferPhase::Failed
                     | FileTransferPhase::Unknown
-                    | FileTransferPhase::AcceptedLocalFailure,
+                    | FileTransferPhase::AcceptedLocalFailure
+                    | FileTransferPhase::Partial),
+                message,
                 ..
             } => {
                 if self.pending_file.as_ref().is_some_and(|file| {
                     file.request_id == *request_id && file.thread == *thread && file.kind == *kind
                 }) {
+                    if *kind == TransferKind::Album
+                        && self
+                            .pending_file
+                            .as_ref()
+                            .is_some_and(|file| file.revision == self.photo_revision)
+                        && matches!(
+                            phase,
+                            FileTransferPhase::Unknown
+                                | FileTransferPhase::AcceptedLocalFailure
+                                | FileTransferPhase::Partial
+                        )
+                    {
+                        self.album.problem = Some(message.clone().unwrap_or_else(|| {
+                            "Hãy kiểm tra tin đã gửi trước khi chọn lại album.".into()
+                        }));
+                    }
                     self.pending_file = None;
                     if self.pending.is_some_and(|(id, _)| id == *request_id) {
                         self.pending = None;
@@ -1732,6 +1931,15 @@ impl super::Composer {
                         Some("Kết nối đã thay đổi; chuẩn bị lại ảnh trước khi gửi.".into());
                     self.photo_revision = self.photo_revision.wrapping_add(1);
                 }
+                if !self.album.sources.is_empty() {
+                    self.album.photos.clear();
+                    self.album.preparation = None;
+                    self.album.problem = Some(
+                        "Kết nối đã thay đổi. Hãy kiểm tra hội thoại trước khi chọn lại album."
+                            .into(),
+                    );
+                    self.photo_revision = self.photo_revision.wrapping_add(1);
+                }
             }
             _ => {}
         }
@@ -1747,6 +1955,7 @@ impl super::DraftBook {
             | LiveEvent::FileAccepted { thread, .. }
             | LiveEvent::FileTransfer { thread, .. }
             | LiveEvent::PhotoPrepared { thread, .. }
+            | LiveEvent::AlbumPrepared { thread, .. }
             | LiveEvent::SendFailed { thread, .. }
             | LiveEvent::SendSettled { thread, .. } => {
                 if self.thread.as_deref() == Some(thread) {
@@ -1930,6 +2139,7 @@ impl super::Model {
                 thread,
                 message,
                 conversation,
+                kind,
                 ..
             } => {
                 if message.account_id != account_id
@@ -1939,7 +2149,7 @@ impl super::Model {
                     return false;
                 }
                 self.append_live_message(message, conversation, latest_page);
-                if self.selected.as_deref() == Some(&thread) {
+                if kind != TransferKind::Album && self.selected.as_deref() == Some(&thread) {
                     self.status = "Zalo đã nhận tệp. Chưa xác nhận người nhận đã xem.".into();
                 }
                 true
@@ -1948,9 +2158,20 @@ impl super::Model {
                 thread,
                 phase,
                 message,
+                kind,
                 ..
             } => {
                 if self.selected.as_deref() == Some(&thread) {
+                    if kind == TransferKind::Album {
+                        if phase == FileTransferPhase::Accepted {
+                            self.status = "Zalo đã nhận đủ ảnh trong album.".into();
+                        } else if let Some(message) = message {
+                            self.status = message;
+                        } else {
+                            return false;
+                        }
+                        return true;
+                    }
                     self.status = match phase {
                         FileTransferPhase::Unknown => {
                             "Chưa xác định tệp đã gửi hay chưa. Không tự gửi lại.".into()
@@ -2054,6 +2275,7 @@ impl super::Model {
             | LiveEvent::NotificationOpen { .. }
             | LiveEvent::Avatars { .. }
             | LiveEvent::PhotoPrepared { .. }
+            | LiveEvent::AlbumPrepared { .. }
             | LiveEvent::PhotoCapability { .. }
             | LiveEvent::FileCapability { .. }
             | LiveEvent::PrivacyChanged { .. }
@@ -2301,6 +2523,77 @@ mod tests {
             },
             "11",
         );
+    }
+    #[test]
+    fn album_ack_applies_only_to_the_complete_batch_and_leaves_text_intact() {
+        let files = FileFixtures::new();
+        let (source, photo) = photo_draft_fixture(&files);
+        for final_phase in [FileTransferPhase::Accepted, FileTransferPhase::Partial] {
+            let mut composer = crate::app::Composer {
+                text: "Bản nháp".into(),
+                ..Default::default()
+            };
+            composer
+                .prepare_live_album(
+                    1,
+                    "d:22".into(),
+                    vec![source.clone(), source.clone()],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            let prepared = |generation| LiveEvent::AlbumPrepared {
+                account_id: "11".into(),
+                thread: "d:22".into(),
+                generation,
+                request_id: 1,
+                result: Ok(vec![photo.clone(), photo.clone()]),
+            };
+            composer.apply_live(&prepared(2), "11");
+            assert!(composer.album_preparing());
+            composer.apply_live(&prepared(1), "11");
+            assert_eq!(composer.album().map(|album| album.len()), Some(2));
+            composer
+                .send_live_album(1, "d:22".into(), |_| Ok(()))
+                .unwrap();
+            // Receipt publication may happen for every member. The draft waits
+            // for the actor's batch result, even if one receipt precedes failure.
+            composer.apply_live(
+                &LiveEvent::FileAccepted {
+                    account_id: "11".into(),
+                    thread: "d:22".into(),
+                    kind: TransferKind::Album,
+                    request_id: 2,
+                    message: message(),
+                    conversation: conversation(),
+                },
+                "11",
+            );
+            assert!(composer.in_flight());
+            composer.apply_live(
+                &LiveEvent::FileTransfer {
+                    account_id: "11".into(),
+                    thread: "d:22".into(),
+                    kind: TransferKind::Album,
+                    request_id: 2,
+                    phase: final_phase,
+                    uploaded: 50,
+                    total: 50,
+                    message: None,
+                },
+                "11",
+            );
+            assert!(!composer.in_flight());
+            assert_eq!(composer.text, "Bản nháp");
+            if final_phase == FileTransferPhase::Partial {
+                assert_eq!(composer.album_sources().len(), 2);
+                assert!(composer.album_problem().is_some());
+                assert!(composer
+                    .send_live_album(1, "d:22".into(), |_| panic!("Album retry is blocked"))
+                    .is_err());
+            } else {
+                assert!(composer.album_sources().is_empty());
+            }
+        }
     }
     #[test]
     fn photo_ack_preserves_new_component_caption_and_quote_intent() {

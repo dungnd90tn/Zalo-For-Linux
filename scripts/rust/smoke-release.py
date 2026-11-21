@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import tempfile
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 def require(condition, message):
     if not condition:
@@ -79,6 +79,13 @@ def main():
             local_history = conn.execute("SELECT body FROM messages WHERE account_id='0' AND thread_id='welcome' AND message_id='qa-legacy-preserved'").fetchall()
         require((upgraded_count, upgraded_threads) == (20, 6), "legacy upgrade was not additive and idempotent")
         require(upgraded_originals == originals and local_history == [("Existing local history",)], "legacy upgrade changed existing message contents")
+        with sqlite3.connect(data / "messages.sqlite3") as conn:
+            conn.execute("PRAGMA user_version=20")
+            conn.execute("DELETE FROM store_markers WHERE name='media_photo_album_v1'")
+        require(json.loads(run("--demo", "--headless").stdout)["messages_loaded"] == 3, "schema 20 upgrade lost local history")
+        with sqlite3.connect(f"file:{data / 'messages.sqlite3'}?mode=ro", uri=True) as conn:
+            require(conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION, "profile did not upgrade from schema 20")
+            require(conn.execute("SELECT 1 FROM store_markers WHERE name='media_photo_album_v1'").fetchone() == (1,), "album projection migration was not recorded")
         with (data / ".profile.lock").open("r+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             refused = run("--demo", "--headless", check=False)

@@ -525,6 +525,8 @@ pub struct Composer {
     #[cfg(feature = "messaging")]
     photo_revision: u64,
     #[cfg(feature = "messaging")]
+    album: AlbumDraft,
+    #[cfg(feature = "messaging")]
     pending_file: Option<PendingFile>,
     next_request_id: u64,
     pending: Option<(u64, u64)>,
@@ -547,11 +549,19 @@ struct PendingPhotoPreparation {
     generation: u64,
     revision: u64,
 }
+#[cfg(feature = "messaging")]
+#[derive(Default)]
+struct AlbumDraft {
+    sources: Vec<crate::domain::Attachment>,
+    photos: Vec<live::PreparedPhoto>,
+    preparation: Option<PendingPhotoPreparation>,
+    problem: Option<String>,
+}
 impl Composer {
     pub fn has_photo_intent(&self) -> bool {
         #[cfg(feature = "messaging")]
         {
-            self.photo_source.is_some()
+            self.photo_source.is_some() || !self.album.sources.is_empty()
         }
         #[cfg(not(feature = "messaging"))]
         {
@@ -585,6 +595,37 @@ impl Composer {
             self.photo = None;
             self.photo_preparation = None;
             self.photo_problem = None;
+            self.photo_revision = self.photo_revision.wrapping_add(1);
+            self.edited();
+        }
+    }
+    #[cfg(feature = "messaging")]
+    pub fn album(&self) -> Option<&[live::PreparedPhoto]> {
+        (!self.album.photos.is_empty()).then_some(self.album.photos.as_slice())
+    }
+    #[cfg(feature = "messaging")]
+    pub fn album_sources(&self) -> &[crate::domain::Attachment] {
+        &self.album.sources
+    }
+    #[cfg(feature = "messaging")]
+    pub fn album_preparing(&self) -> bool {
+        self.album.preparation.is_some()
+    }
+    #[cfg(feature = "messaging")]
+    pub fn album_preparation_request(&self) -> Option<u64> {
+        self.album
+            .preparation
+            .as_ref()
+            .map(|pending| pending.request_id)
+    }
+    #[cfg(feature = "messaging")]
+    pub fn album_problem(&self) -> Option<&str> {
+        self.album.problem.as_deref()
+    }
+    #[cfg(feature = "messaging")]
+    pub fn clear_album(&mut self) {
+        if !self.album.sources.is_empty() {
+            self.album = AlbumDraft::default();
             self.photo_revision = self.photo_revision.wrapping_add(1);
             self.edited();
         }

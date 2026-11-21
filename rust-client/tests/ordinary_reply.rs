@@ -4,7 +4,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use zalo_rust::{
     domain::{Message, QuoteContent},
-    store::MessageStore,
+    store::{MessageStore, SCHEMA_VERSION},
 };
 
 struct Database(PathBuf);
@@ -399,7 +399,7 @@ fn schema_nine_upgrade_preserves_all_old_bytes_and_does_not_invent_reply_identit
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            20
+            SCHEMA_VERSION
         );
         for (table, expected) in OLD_TABLES.iter().zip(&before) {
             assert_eq!(&rows(&conn, table), expected, "Changed {table}");
@@ -431,7 +431,9 @@ fn failed_schema_nine_upgrade_rolls_back_both_sidecars_and_refuses_future_schema
     for (table, expected) in OLD_TABLES.iter().zip(&before) {
         assert_eq!(&rows(&conn, table), expected);
     }
-    conn.execute_batch("DROP TRIGGER reject_reply_upgrade; PRAGMA user_version=21;")
+    conn.execute_batch("DROP TRIGGER reject_reply_upgrade;")
+        .unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
         .unwrap();
     assert!(MessageStore::open(&db.0).is_err());
 }

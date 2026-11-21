@@ -7,7 +7,7 @@ use zalo_rust::{
     store::{
         attachments::AttachmentSpec,
         photos::{PhotoResource, PhotoSpec, PhotoState},
-        MessageStore,
+        MessageStore, SCHEMA_VERSION,
     },
 };
 struct Database(PathBuf);
@@ -384,10 +384,11 @@ fn schema_eleven_migration_preserves_file_quote_and_crypto_bytes_and_rolls_back(
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            20
+            SCHEMA_VERSION
         );
     }
-    conn.execute_batch("PRAGMA user_version=21;").unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        .unwrap();
     assert!(MessageStore::open(&db.0).is_err());
     assert_eq!(rows(&db.0), before);
 }

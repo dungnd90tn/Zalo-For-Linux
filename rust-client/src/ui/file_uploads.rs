@@ -17,6 +17,30 @@ pub(super) struct Transfer {
     pub cancel_pending: bool,
     attachment: Option<Attachment>,
     photo: Option<PreparedPhoto>,
+    album: Option<AlbumBinding>,
+}
+
+pub(super) struct AlbumBinding {
+    images: Vec<std::sync::Weak<[u8]>>,
+    size_bytes: u64,
+}
+
+impl AlbumBinding {
+    pub fn new(photos: &[PreparedPhoto]) -> Self {
+        Self {
+            images: photos
+                .iter()
+                .map(|photo| std::sync::Arc::downgrade(&photo.thumbnail().rgba))
+                .collect(),
+            size_bytes: photos.iter().map(PreparedPhoto::size_bytes).sum(),
+        }
+    }
+    fn matches(&self, photos: &[PreparedPhoto]) -> bool {
+        self.images.len() == photos.len()
+            && self.images.iter().zip(photos).all(|(image, photo)| {
+                image.ptr_eq(&std::sync::Arc::downgrade(&photo.thumbnail().rgba))
+            })
+    }
 }
 impl Transfer {
     fn stage(phase: FileTransferPhase) -> Option<u8> {
@@ -29,20 +53,23 @@ impl Transfer {
         }
     }
     pub fn filename(&self) -> Option<&str> {
-        if self.kind == TransferKind::Photo {
-            Some(self.photo.as_ref().map_or("Ảnh", |photo| {
+        match self.kind {
+            TransferKind::Photo => Some(self.photo.as_ref().map_or("Ảnh", |photo| {
                 super::photos::resolution_title(photo.resolution())
-            }))
-        } else {
-            self.attachment.as_ref().map(|file| file.name.as_str())
+            })),
+            TransferKind::Album => Some("Album"),
+            TransferKind::File => self.attachment.as_ref().map(|file| file.name.as_str()),
+        }
+    }
+    fn noun(&self) -> &'static str {
+        match self.kind {
+            TransferKind::Photo => "ảnh",
+            TransferKind::Album => "album",
+            TransferKind::File => "tệp",
         }
     }
     pub fn generic_label(&self) -> String {
-        let noun = if self.kind == TransferKind::Photo {
-            "ảnh"
-        } else {
-            "tệp"
-        };
+        let noun = self.noun();
         if self.cancel_pending {
             return format!("Đang hủy một lượt gửi {noun}…");
         }
@@ -54,6 +81,7 @@ impl Transfer {
             FileTransferPhase::Unknown => {
                 format!("Một lượt gửi {noun} chưa rõ kết quả. Không tự gửi lại.")
             }
+            FileTransferPhase::Partial => "Zalo đã nhận một phần album. Không tự gửi lại.".into(),
             FileTransferPhase::AcceptedLocalFailure => {
                 format!("Zalo đã nhận một {noun}; chưa lưu được xác nhận.")
             }
@@ -72,7 +100,9 @@ impl Transfer {
     pub fn review(&self) -> bool {
         matches!(
             self.phase,
-            FileTransferPhase::Unknown | FileTransferPhase::AcceptedLocalFailure
+            FileTransferPhase::Partial
+                | FileTransferPhase::Unknown
+                | FileTransferPhase::AcceptedLocalFailure
         )
     }
     pub fn can_cancel(&self) -> bool {
@@ -99,12 +129,17 @@ impl Transfer {
             && self.photo.is_some()
             && self.photo.as_ref() == photo
     }
+    pub fn is_album(&self, thread: &str, photos: Option<&[PreparedPhoto]>) -> bool {
+        self.kind == TransferKind::Album
+            && self.thread == thread
+            && self
+                .album
+                .as_ref()
+                .zip(photos)
+                .is_some_and(|(album, photos)| album.matches(photos))
+    }
     pub fn label(&self) -> String {
-        let noun = if self.kind == TransferKind::Photo {
-            "ảnh"
-        } else {
-            "tệp"
-        };
+        let noun = self.noun();
         if self.cancel_pending {
             return format!("Đang hủy gửi {noun}…");
         }
@@ -123,6 +158,12 @@ impl Transfer {
                 .note
                 .clone()
                 .unwrap_or_else(|| format!("Chưa gửi được {noun} · có thể thử lại")),
+            FileTransferPhase::Partial | FileTransferPhase::Unknown
+                if self.kind == TransferKind::Album =>
+            {
+                self.note.clone().unwrap_or_else(|| self.generic_label())
+            }
+            FileTransferPhase::Partial => self.generic_label(),
             FileTransferPhase::Unknown => format!("Chưa rõ {noun} đã gửi chưa · không tự gửi lại"),
             FileTransferPhase::AcceptedLocalFailure => {
                 format!("Zalo đã nhận {noun} · chưa lưu được xác nhận")
@@ -136,6 +177,7 @@ pub(super) struct Uploads {
     pub available: bool,
     pub photo_available: bool,
     pub photo_original_available: bool,
+    pub album_max_count: usize,
     pub transfer: Option<Transfer>,
     dismissed: std::collections::VecDeque<(String, u64, TransferKind)>,
 }
@@ -163,6 +205,7 @@ impl Uploads {
             cancel_pending: false,
             attachment: Some(attachment),
             photo: None,
+            album: None,
         });
     }
     pub fn submitted_photo(&mut self, thread: &str, request: u64, photo: PreparedPhoto) {
@@ -177,6 +220,22 @@ impl Uploads {
             cancel_pending: false,
             attachment: None,
             photo: Some(photo),
+            album: None,
+        });
+    }
+    pub fn submitted_album(&mut self, thread: &str, request: u64, album: AlbumBinding) {
+        self.transfer = Some(Transfer {
+            kind: TransferKind::Album,
+            thread: thread.into(),
+            request,
+            phase: FileTransferPhase::Preparing,
+            uploaded: 0,
+            total: album.size_bytes,
+            note: None,
+            cancel_pending: false,
+            attachment: None,
+            photo: None,
+            album: Some(album),
         });
     }
     pub fn observe(&mut self, event: &LiveEvent) {
@@ -185,10 +244,12 @@ impl Uploads {
             LiveEvent::PhotoCapability {
                 available,
                 original_available,
+                album_max_count,
                 ..
             } => {
                 self.photo_available = *available;
                 self.photo_original_available = *original_available;
+                self.album_max_count = *album_max_count;
             }
             LiveEvent::FileTransfer {
                 kind,
@@ -214,7 +275,9 @@ impl Uploads {
                 if self.transfer.is_none()
                     && matches!(
                         phase,
-                        FileTransferPhase::Unknown | FileTransferPhase::AcceptedLocalFailure
+                        FileTransferPhase::Partial
+                            | FileTransferPhase::Unknown
+                            | FileTransferPhase::AcceptedLocalFailure
                     )
                 {
                     self.transfer = Some(Transfer {
@@ -228,6 +291,7 @@ impl Uploads {
                         cancel_pending: false,
                         attachment: None,
                         photo: None,
+                        album: None,
                     });
                 }
                 if let Some(job) = self.transfer.as_mut().filter(|job| {
@@ -260,7 +324,8 @@ impl Uploads {
                 request_id,
                 message,
                 conversation,
-            } if message.account_id == *account_id
+            } if *kind != TransferKind::Album
+                && message.account_id == *account_id
                 && message.thread_id == *thread
                 && conversation.id == *thread =>
             {
@@ -278,13 +343,14 @@ impl Uploads {
         self.available = false;
         self.photo_available = false;
         self.photo_original_available = false;
+        self.album_max_count = 0;
         if let Some(job) = self.transfer.as_mut().filter(|job| job.busy()) {
             job.phase = FileTransferPhase::Unknown;
             job.note = None;
             job.cancel_pending = false;
         }
     }
-    fn dismiss_review(&mut self) -> Option<(String, Option<Attachment>, Option<PreparedPhoto>)> {
+    fn dismiss_review(&mut self) -> Option<Transfer> {
         if !self.transfer.as_ref().is_some_and(|job| job.review()) {
             return None;
         }
@@ -294,7 +360,7 @@ impl Uploads {
         }
         self.dismissed
             .push_back((job.thread.clone(), job.request, job.kind));
-        Some((job.thread, job.attachment, job.photo))
+        Some(job)
     }
 }
 
@@ -360,7 +426,8 @@ impl NativeApp {
             .is_some_and(|job| {
                 (job.busy() || job.review())
                     && !self.model.selected.as_deref().is_some_and(|thread| {
-                        job.is_photo(thread, self.drafts.active.photo())
+                        (job.is_photo(thread, self.drafts.active.photo())
+                            || job.is_album(thread, self.drafts.active.album()))
                             && self.privacy_visible(thread)
                     })
             })
@@ -398,9 +465,17 @@ impl NativeApp {
         let Some(worker) = &state.worker else {
             return;
         };
-        match worker.submit(LiveCommand::CancelFile {
-            request_id: request,
-        }) {
+        let command = if job.kind == TransferKind::Album {
+            LiveCommand::CancelAlbum {
+                thread: job.thread.clone(),
+                request_id: request,
+            }
+        } else {
+            LiveCommand::CancelFile {
+                request_id: request,
+            }
+        };
+        match worker.submit(command) {
             Ok(()) => {
                 if let Some(job) = state
                     .uploads
@@ -412,7 +487,8 @@ impl NativeApp {
                 }
             }
             Err(_) => {
-                self.model.status = "Chưa gửi được yêu cầu hủy tệp; bản nháp được giữ lại.".into()
+                self.model.status =
+                    "Chưa gửi được yêu cầu hủy lượt gửi. Bản nháp được giữ lại.".into()
             }
         }
     }
@@ -421,19 +497,27 @@ impl NativeApp {
             .live
             .as_mut()
             .and_then(|state| state.uploads.dismiss_review());
-        if let Some((thread, attachment, photo)) = dismissed {
-            if self.model.selected.as_deref() == Some(thread.as_str()) {
-                if attachment
+        if let Some(job) = dismissed {
+            if self.model.selected.as_deref() == Some(job.thread.as_str()) {
+                if job
+                    .attachment
                     .as_ref()
                     .is_some_and(|file| self.drafts.active.attachment() == Some(file))
                 {
                     self.drafts.active.clear_attachment();
                 }
-                if photo
+                if job
+                    .photo
                     .as_ref()
                     .is_some_and(|photo| self.drafts.active.photo() == Some(photo))
                 {
                     self.drafts.active.clear_photo();
+                    if let Some(state) = self.live.as_mut() {
+                        state.photo_preview.clear();
+                    }
+                }
+                if job.is_album(&job.thread, self.drafts.active.album()) {
+                    self.drafts.active.clear_album();
                     if let Some(state) = self.live.as_mut() {
                         state.photo_preview.clear();
                     }
@@ -458,22 +542,15 @@ impl NativeApp {
         let label = job.generic_label();
         let can_cancel = job.can_cancel();
         let review = job.review();
-        let photo = job.kind == TransferKind::Photo;
+        let noun = job.noun();
         ui.separator();
-        ui.add(
-            egui::Label::new(RichText::new(if photo { "Gửi ảnh" } else { "Gửi tệp" }).strong())
-                .wrap(),
-        );
+        ui.add(egui::Label::new(RichText::new(format!("Gửi {noun}")).strong()).wrap());
         ui.add(egui::Label::new(label).wrap());
         if can_cancel
             && ui
                 .add_sized(
                     vec2(ui.available_width(), 44.0),
-                    egui::Button::new(if photo {
-                        "Hủy gửi ảnh"
-                    } else {
-                        "Hủy gửi tệp"
-                    }),
+                    egui::Button::new(format!("Hủy gửi {noun}")),
                 )
                 .clicked()
         {
@@ -489,11 +566,7 @@ impl NativeApp {
             if ui
                 .add_sized(
                     vec2(ui.available_width(), 44.0),
-                    egui::Button::new(if photo {
-                        "Đóng cảnh báo gửi ảnh"
-                    } else {
-                        "Đóng cảnh báo gửi tệp"
-                    }),
+                    egui::Button::new(format!("Đóng cảnh báo gửi {noun}")),
                 )
                 .clicked()
             {
@@ -551,8 +624,8 @@ mod tests {
         uploads.observe(&progress("d:22", 1, FileTransferPhase::Unknown));
         assert!(uploads.blocked());
         let dismissed = uploads.dismiss_review().unwrap();
-        assert_eq!(dismissed.0, "d:22");
-        assert_eq!(dismissed.1, Some(file_a));
+        assert_eq!(dismissed.thread, "d:22");
+        assert_eq!(dismissed.attachment, Some(file_a));
         assert!(!uploads.blocked());
         assert!(uploads.available);
         uploads.submitted("d:22", 2, files.attachment("B.pdf"));

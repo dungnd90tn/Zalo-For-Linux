@@ -371,6 +371,8 @@ pub struct ServerConfig {
     pub photo_upload_route: Option<PhotoUploadRoute>,
     pub photo_limits: PhotoLimits,
     pub original_photo_limits: Option<PhotoLimits>,
+    pub photo_album_max_count: u32,
+    pub photo_album_extra_metadata: bool,
     pub seen_v2: bool,
     pub group_board_v2: bool,
     pub recall_max_age_ms: Option<i64>,
@@ -378,6 +380,59 @@ pub struct ServerConfig {
     pub control_poll: Vec<Url>,
     pub websocket: Vec<Url>,
 }
+
+fn photo_album_config(value: &Value) -> (u32, bool) {
+    use crate::domain::media::MAX_WIRE_ALBUM_PHOTOS;
+    // Source N227219/N228183, N227921/N223233: the picker count and
+    // optional extra message property have independent session settings.
+    let count = |path| {
+        value
+            .pointer(path)
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| {
+                        let value = value.as_str()?;
+                        if value.len() > 16 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                            return None;
+                        }
+                        value.parse().ok()
+                    })
+                    .map(|count| count.min(u64::from(MAX_WIRE_ALBUM_PHOTOS)) as u32)
+            })
+    };
+    let count = match [
+        count("/settings/sharefile/max_file"),
+        count("/setttings/sharefile/max_file"),
+    ] {
+        [Some(a), Some(b)] if a != b => 0,
+        [Some(count), _] | [_, Some(count)] => count.unwrap_or(0),
+        _ => MAX_WIRE_ALBUM_PHOTOS,
+    };
+    let extra = |path| {
+        value
+            .pointer(path)
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value.as_bool().or_else(|| match value.as_u64() {
+                    Some(0) => Some(false),
+                    Some(1) => Some(true),
+                    _ => None,
+                })
+            })
+    };
+    let extra = match [
+        extra("/settings/features/should_attach_extraMsgProp"),
+        extra("/setttings/features/should_attach_extraMsgProp"),
+    ] {
+        [Some(a), Some(b)] if a != b => false,
+        [Some(extra), _] | [_, Some(extra)] => extra.unwrap_or(false),
+        _ => true,
+    };
+    (count, extra)
+}
+
 /// Optional authenticated feature settings have used both spellings and legacy aliases.
 /// Null means source defaults; conflicting/malformed nonnull aliases never authorize a capability.
 fn feature_config<'a>(
@@ -688,6 +743,7 @@ impl ServerConfig {
             services.remove("zcloud_up_file");
             services.remove("zcloud");
         }
+        let (photo_album_max_count, photo_album_extra_metadata) = photo_album_config(value);
         let seen_v2 = feature_config(value, "ack_seen").is_ok_and(|config| {
             config
                 .and_then(|v| v.get("v2_enable"))
@@ -719,6 +775,8 @@ impl ServerConfig {
             photo_upload_route,
             photo_limits,
             original_photo_limits,
+            photo_album_max_count,
+            photo_album_extra_metadata,
             seen_v2,
             group_board_v2,
             recall_max_age_ms,

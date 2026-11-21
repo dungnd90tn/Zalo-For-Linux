@@ -442,7 +442,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            20
+            crate::store::SCHEMA_VERSION
         );
         assert_eq!(upgraded.receive_cursor("11", "510_0").unwrap(), "123");
         assert_eq!(upgraded.page("11", "d:22", None, 2).unwrap(), [historical]);
@@ -502,6 +502,6 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, crate::store::SCHEMA_VERSION);
     }
 }

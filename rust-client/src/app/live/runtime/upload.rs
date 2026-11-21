@@ -5,7 +5,7 @@ use crate::{
     protocol::{photo as wire_photo, upload as wire_upload},
     store::{
         attachments::{AttachmentResource, AttachmentSpec},
-        photos::{PhotoResource, PhotoSpec},
+        photos::{AlbumPosition, PhotoResource, PhotoSpec},
     },
 };
 use md5::{Digest, Md5};
@@ -37,6 +37,24 @@ enum UploadInput {
         photo: PreparedPhoto,
         caption: String,
     },
+}
+enum UploadJob {
+    Single(UploadInput),
+    Album(Vec<PreparedPhoto>),
+}
+impl UploadJob {
+    fn kind(&self) -> TransferKind {
+        match self {
+            Self::Single(input) => input.kind(),
+            Self::Album(_) => TransferKind::Album,
+        }
+    }
+    fn size(&self) -> u64 {
+        match self {
+            Self::Single(input) => input.size(),
+            Self::Album(photos) => photos.iter().map(PreparedPhoto::size_bytes).sum(),
+        }
+    }
 }
 impl UploadInput {
     fn kind(&self) -> TransferKind {
@@ -95,6 +113,11 @@ impl Drop for PendingAuthorization {
     }
 }
 struct Outcome {
+    phase: FileTransferPhase,
+    accepted: Vec<(Message, Conversation)>,
+    message: Option<String>,
+}
+struct SingleOutcome {
     phase: FileTransferPhase,
     accepted: Option<(Message, Conversation)>,
     message: Option<&'static str>,
@@ -190,6 +213,13 @@ impl Uploads {
     pub fn active(&self) -> bool {
         self.running.is_some()
     }
+    pub fn album_max_count(&self, session: &VerifiedSession) -> usize {
+        if self.lease != 0 && session.config().photo_upload_route.is_some() {
+            (session.config().photo_album_max_count as usize).min(MAX_ALBUM_PHOTOS)
+        } else {
+            0
+        }
+    }
     pub fn original_limits(
         &self,
         session: &VerifiedSession,
@@ -248,6 +278,7 @@ impl Uploads {
                 account_id: events.account.clone(),
                 available: session.config().photo_upload_route.is_some() && self.lease() != 0,
                 original_available: paid,
+                album_max_count: self.album_max_count(session),
             })
             .await
     }
@@ -264,7 +295,7 @@ impl Uploads {
                         }
                     }
                 }
-                TransferKind::Photo => {
+                TransferKind::Photo | TransferKind::Album => {
                     if let Ok(mut cache) = job.photo_cache.lock() {
                         for (id, urls) in wire_photo::photo_success(&frame.payload) {
                             cache.insert(id, urls);
@@ -357,7 +388,18 @@ impl Uploads {
         match command {
             LiveCommand::CancelFile { request_id } => {
                 if let Some(job) = &self.running {
-                    if job.request_id == request_id {
+                    if job.kind != TransferKind::Album && job.request_id == request_id {
+                        job.cancel.store(true, Ordering::Release);
+                    }
+                }
+                Ok(None)
+            }
+            LiveCommand::CancelAlbum { thread, request_id } => {
+                if let Some(job) = &self.running {
+                    if job.kind == TransferKind::Album
+                        && job.thread == thread
+                        && job.request_id == request_id
+                    {
                         job.cancel.store(true, Ordering::Release);
                     }
                 }
@@ -372,7 +414,7 @@ impl Uploads {
                 self.start(
                     thread,
                     request_id,
-                    UploadInput::File(attachment),
+                    UploadJob::Single(UploadInput::File(attachment)),
                     profile,
                     session,
                     db,
@@ -418,10 +460,52 @@ impl Uploads {
                 self.start(
                     thread,
                     request_id,
-                    UploadInput::Photo {
+                    UploadJob::Single(UploadInput::Photo {
                         photo,
                         caption: crate::domain::canonical_plain_text(&caption).to_owned(),
-                    },
+                    }),
+                    profile,
+                    session,
+                    db,
+                    client,
+                    events,
+                )
+                .await?;
+                Ok(None)
+            }
+            LiveCommand::SendAlbum {
+                thread,
+                photos,
+                request_id,
+                ..
+            } => {
+                let limits = session.config().photo_limits;
+                if !(2..=self.album_max_count(session)).contains(&photos.len())
+                    || photos.iter().any(|photo| {
+                        photo.resolution() != PhotoResolution::Hd
+                            || !photo.permits(&events.account, &thread, self.lease)
+                            || !photo.fits_limits(limits)
+                    })
+                {
+                    emit(
+                        events,
+                        &thread,
+                        request_id,
+                        TransferKind::Album,
+                        Progress {
+                            phase: FileTransferPhase::Failed,
+                            uploaded: 0,
+                            total: photos.iter().map(PreparedPhoto::size_bytes).sum(),
+                        },
+                        Some("Bản xem trước album đã hết hiệu lực. Hãy chọn lại ảnh."),
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+                self.start(
+                    thread,
+                    request_id,
+                    UploadJob::Album(photos),
                     profile,
                     session,
                     db,
@@ -439,7 +523,7 @@ impl Uploads {
         &mut self,
         thread: String,
         request_id: u64,
-        input: UploadInput,
+        input: UploadJob,
         profile: &Arc<Profile>,
         session: &Arc<VerifiedSession>,
         db: &Database,
@@ -608,7 +692,9 @@ impl Uploads {
                     Ok(Some(
                         db.call_with(StorageOperation::PrepareOutgoing, move |s| match kind {
                             TransferKind::File => s.begin_attachment_dispatch(&account, id),
-                            TransferKind::Photo => s.begin_photo_dispatch(&account, id),
+                            TransferKind::Photo | TransferKind::Album => {
+                                s.begin_photo_dispatch(&account, id)
+                            }
                         })
                         .await?,
                     ))
@@ -639,10 +725,10 @@ impl Uploads {
             let job = self.running.take().expect("finished upload");
             let outcome = job.task.await.unwrap_or(Outcome {
                 phase: FileTransferPhase::Unknown,
-                accepted: None,
-                message: Some("Tác vụ gửi tệp đã dừng. Kiểm tra lịch sử trước khi gửi lại."),
+                accepted: Vec::new(),
+                message: Some("Tác vụ gửi đã dừng. Kiểm tra hội thoại trước khi gửi lại.".into()),
             });
-            if let Some((message, conversation)) = outcome.accepted {
+            for (message, conversation) in outcome.accepted {
                 events
                     .emit(LiveEvent::FileAccepted {
                         kind: job.kind,
@@ -663,7 +749,7 @@ impl Uploads {
                     phase: outcome.phase,
                     ..progress
                 },
-                outcome.message,
+                outcome.message.as_deref(),
             )
             .await?;
         }
@@ -796,18 +882,186 @@ async fn run(
     db: DatabaseHandle,
     client: reqwest::Client,
     thread: String,
-    input: UploadInput,
+    input: UploadJob,
     cancel: Arc<AtomicBool>,
     progress: watch::Sender<Progress>,
     requests: mpsc::Sender<Authorization>,
     cache: Arc<Mutex<ResourceCache>>,
     photo_cache: Arc<Mutex<ResourceCache<wire_photo::PhotoUrls>>>,
 ) -> Outcome {
+    let total = input.size();
+    let photos = match input {
+        UploadJob::Album(photos) => photos,
+        UploadJob::Single(input) => {
+            let result = run_one(
+                profile,
+                session,
+                db,
+                client,
+                thread,
+                input,
+                cancel,
+                progress,
+                requests,
+                cache,
+                photo_cache,
+                None,
+                (0, total),
+            )
+            .await;
+            return Outcome {
+                phase: result.phase,
+                accepted: result.accepted.into_iter().collect(),
+                message: result.message.map(str::to_owned),
+            };
+        }
+    };
+    let count = photos.len();
+    let specs = photos
+        .iter()
+        .map(|photo| photo_spec(photo, String::new()))
+        .collect::<Vec<_>>();
+    let account = session.account_id().to_owned();
+    let scope = thread.clone();
+    if let Err(error) = db
+        .call_with(StorageOperation::PrepareOutgoing, move |store| {
+            store.preflight_album(&account, &scope, &specs)
+        })
+        .await
+    {
+        let _ = diagnostic(&error, LiveStage::Storage);
+        return Outcome {
+            phase: FileTransferPhase::Failed,
+            accepted: Vec::new(),
+            message: Some(
+                "Chưa thể gửi album. Kiểm tra lượt gửi ảnh trước đó và quyền gửi.".into(),
+            ),
+        };
+    }
+    let mut accepted = Vec::with_capacity(count);
+    let mut layout_id = None;
+    let mut offset = 0;
+    for (index, photo) in photos.into_iter().enumerate() {
+        let size = photo.size_bytes();
+        let position = AlbumPosition {
+            layout_id,
+            index: index as u32,
+            count: count as u32,
+        };
+        let result = run_one(
+            profile.clone(),
+            session.clone(),
+            db.clone(),
+            client.clone(),
+            thread.clone(),
+            UploadInput::Photo {
+                photo,
+                caption: String::new(),
+            },
+            cancel.clone(),
+            progress.clone(),
+            requests.clone(),
+            cache.clone(),
+            photo_cache.clone(),
+            Some(position),
+            (offset, total),
+        )
+        .await;
+        if let Some((message, conversation)) = result.accepted {
+            if layout_id.is_none() {
+                layout_id = message
+                    .source_client_id
+                    .as_deref()
+                    .and_then(|id| id.parse().ok());
+            }
+            accepted.push((message, conversation));
+            offset += size;
+        }
+        if result.phase != FileTransferPhase::Accepted || layout_id.is_none() {
+            let committed = accepted.len();
+            let unknown = result.phase == FileTransferPhase::Unknown;
+            let local_failure = result.phase == FileTransferPhase::AcceptedLocalFailure;
+            let (phase, message) = if committed > 0 {
+                let suffix = if unknown {
+                    " Kết quả của ảnh đang gửi chưa rõ."
+                } else if local_failure {
+                    " Zalo đã nhận thêm một ảnh đang chờ lưu xác nhận."
+                } else {
+                    ""
+                };
+                (FileTransferPhase::Partial, format!("Đã lưu xác nhận {committed}/{count} ảnh.{suffix} Hãy kiểm tra hội thoại trước khi gửi lại."))
+            } else if unknown {
+                (FileTransferPhase::Unknown, "Chưa xác nhận được kết quả gửi album. Hãy kiểm tra hội thoại trước khi gửi lại.".into())
+            } else if local_failure {
+                (FileTransferPhase::AcceptedLocalFailure, "Zalo đã nhận một ảnh. Ứng dụng chưa lưu được xác nhận. Hãy kiểm tra hội thoại trước khi gửi lại.".into())
+            } else if result.phase == FileTransferPhase::Cancelled {
+                (
+                    FileTransferPhase::Cancelled,
+                    "Đã hủy gửi album. Các ảnh đã chọn được giữ lại.".into(),
+                )
+            } else {
+                (
+                    FileTransferPhase::Failed,
+                    "Chưa gửi được album. Các ảnh đã chọn được giữ lại.".into(),
+                )
+            };
+            return Outcome {
+                phase,
+                accepted,
+                message: Some(message),
+            };
+        }
+    }
+    Outcome {
+        phase: FileTransferPhase::Accepted,
+        accepted,
+        message: None,
+    }
+}
+
+fn photo_spec(photo: &PreparedPhoto, caption: String) -> PhotoSpec {
+    PhotoSpec {
+        caption,
+        width: photo.width(),
+        height: photo.height(),
+        size: photo.size_bytes(),
+        checksum: photo.0.checksum.clone(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one(
+    profile: Arc<Profile>,
+    session: Arc<VerifiedSession>,
+    db: DatabaseHandle,
+    client: reqwest::Client,
+    thread: String,
+    input: UploadInput,
+    cancel: Arc<AtomicBool>,
+    progress: watch::Sender<Progress>,
+    requests: mpsc::Sender<Authorization>,
+    cache: Arc<Mutex<ResourceCache>>,
+    photo_cache: Arc<Mutex<ResourceCache<wire_photo::PhotoUrls>>>,
+    position: Option<AlbumPosition>,
+    (progress_offset, progress_total): (u64, u64),
+) -> SingleOutcome {
     let mut reserved = None;
     let mut permitted = false;
     let mut dispatched = false;
     let mut acknowledged = false;
     let kind = input.kind();
+    let report = |phase, uploaded, source_size| {
+        let phase = if progress_offset + source_size < progress_total {
+            FileTransferPhase::Uploading
+        } else {
+            phase
+        };
+        progress.send_replace(Progress {
+            phase,
+            uploaded: progress_offset + uploaded,
+            total: progress_total,
+        });
+    };
     let result:Result<(Message,Conversation)>=async {
         let name=input.name();
         let original=matches!(&input, UploadInput::Photo{photo,..} if photo.resolution()==PhotoResolution::Original);
@@ -824,9 +1078,20 @@ async fn run(
         };
         anyhow::ensure!(!cancel.load(Ordering::Acquire),"Upload cancelled");
         let account=session.account_id().to_owned();let t=thread.clone();
-        let id=match &input {
-            UploadInput::File(_)=>{let spec=AttachmentSpec{file_name:wire_upload::normalized_file_name(&name),size:source.size,checksum:source.checksum.clone()};db.call_with(StorageOperation::PrepareOutgoing,move|s|s.reserve_attachment(&account,&t,&spec,now_ms())).await?},
-            UploadInput::Photo{photo,caption}=>{let spec=PhotoSpec{caption:caption.clone(),width:photo.width(),height:photo.height(),size:source.size,checksum:source.checksum.clone()};let resolution=photo.resolution();db.call_with(StorageOperation::PrepareOutgoing,move|s|s.reserve_photo_resolution(&account,&t,&spec,resolution,now_ms())).await?},
+        let (id, album)=match &input {
+            UploadInput::File(_)=>{let spec=AttachmentSpec{file_name:wire_upload::normalized_file_name(&name),size:source.size,checksum:source.checksum.clone()};(db.call_with(StorageOperation::PrepareOutgoing,move|s|s.reserve_attachment(&account,&t,&spec,now_ms())).await?, None)},
+            UploadInput::Photo{photo,caption}=>{
+                let spec = photo_spec(photo, caption.clone());
+                let resolution = photo.resolution();
+                db.call_with(StorageOperation::PrepareOutgoing, move |s| {
+                    if let Some(position) = position {
+                        let (id, member) = s.reserve_album_photo(&account, &t, &spec, position, now_ms())?;
+                        Ok((id, Some(member)))
+                    } else {
+                        Ok((s.reserve_photo_resolution(&account, &t, &spec, resolution, now_ms())?, None))
+                    }
+                }).await?
+            },
         };reserved=Some(id);
         authorize(&requests,&cancel,id,false).await?;
         let target=Target::from_thread(&thread)?;let final_root=root_for(&session,"file")?;
@@ -853,15 +1118,17 @@ async fn run(
             let cookie=session.authorization_cookie(&url).ok_or(WireError::Invalid)?;
             let request=async {let response=client.post(url).header("Cookie",cookie).header("Content-Type",format!("multipart/form-data; boundary={boundary}")).body(body).send().await?;upload_response(response,&session).await};
             let payload=tokio::select!{biased;r=request=>r?,_=cancelled(&cancel)=>anyhow::bail!("Upload cancelled")};
-            uploaded+=wanted as u64;progress.send_replace(Progress{phase:FileTransferPhase::Uploading,uploaded,total:source.size});
+            uploaded += wanted as u64;
+            report(FileTransferPhase::Uploading, uploaded, source.size);
             let finished=match kind {
                 TransferKind::File=>match wire_upload::chunk_result(&payload)? {wire_upload::ChunkResult::Continue=>false,wire_upload::ChunkResult::Finished{file_id,url}=>{file_resource=Some((file_id,url));true}},
                 TransferKind::Photo=>match wire_photo::chunk_result(&payload)? {wire_photo::PhotoChunkResult::Continue=>false,wire_photo::PhotoChunkResult::Finished{photo_id,urls}=>{photo_resource=Some((photo_id,urls));true}},
+                TransferKind::Album => unreachable!("Only single members are uploaded here"),
             };
             if finished{anyhow::ensure!(index==total||payload.get("error_code").and_then(Value::as_i64)==Some(1),"Premature resource completion");break}
             anyhow::ensure!(index<total,"Missing resource completion");
         }
-        progress.send_replace(Progress{phase:FileTransferPhase::WaitingForResource,uploaded,total:source.size});
+        report(FileTransferPhase::WaitingForResource, uploaded, source.size);
         let account=session.account_id().to_owned();
         match &input {
             UploadInput::File(_)=>{
@@ -879,22 +1146,27 @@ async fn run(
                     anyhow::ensure!(urls.matches_original(source.size),"Missing original photo resource proof");
                     parameters["jcp"]=json!("{\"is_original\":1}");
                 }
-                let content=wire_photo::content_for_resolution(caption,photo.width(),photo.height(),&urls,photo.resolution())?;
+                let mut content=wire_photo::content_for_resolution(caption,photo.width(),photo.height(),&urls,photo.resolution())?;
+                if let Some(member) = album {
+                    member.apply_to_message_parameters(&mut parameters, session.config().photo_album_extra_metadata)?;
+                    content = member.apply_to_media_content(&content)?;
+                }
                 let resource=PhotoResource{photo_id,parameters,content};db.call_with(StorageOperation::PrepareOutgoing,move|s|s.photo_resource_ready(&account,id,&resource)).await?;
             },
         }
-        progress.send_replace(Progress{phase:FileTransferPhase::Finalizing,uploaded,total:source.size});
+        report(FileTransferPhase::Finalizing, uploaded, source.size);
         let canonical=authorize(&requests,&cancel,id,true).await?.ok_or(WireError::Invalid)?;permitted=true;
         anyhow::ensure!(!cancel.load(Ordering::Acquire),"Upload cancelled after dispatch permit");
         let params=session.encrypt_payload(&canonical)?;let body=url::form_urlencoded::Serializer::new(String::new()).append_pair("params",&params).finish();
         let final_url=if kind==TransferKind::File{wire_upload::endpoint(&final_root,target.kind,session.client_type(),false)?}else{wire_photo::endpoint(&final_root,target.kind,session.client_type(),None)?};
+        anyhow::ensure!(!cancel.load(Ordering::Acquire),"Upload cancelled before dispatch");
         dispatched=true;
         let payload=tokio::select!{biased;r=authenticated_request(&client,&session,final_url,Some(body))=>r?,_=cancelled(&cancel)=>anyhow::bail!("Upload cancelled after dispatch")};
         let ack=wire::send_ack(&payload)?;acknowledged=true;let account=session.account_id().to_owned();
-        db.call_with(StorageOperation::PersistAck,move|s|match kind{TransferKind::File=>{s.record_attachment_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_attachment(&account,id)},TransferKind::Photo=>{s.record_photo_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_photo(&account,id)}}).await
+        db.call_with(StorageOperation::PersistAck,move|s|match kind{TransferKind::File=>{s.record_attachment_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_attachment(&account,id)},TransferKind::Photo | TransferKind::Album=>{s.record_photo_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_photo(&account,id)}}).await
     }.await;
     match result {
-        Ok(accepted) => Outcome {
+        Ok(accepted) => SingleOutcome {
             phase: FileTransferPhase::Accepted,
             accepted: Some(accepted),
             message: None,
@@ -919,24 +1191,30 @@ async fn run(
                                 TransferKind::File => {
                                     store.fail_attachment_dispatch(&account, id, unknown)?
                                 }
-                                TransferKind::Photo => {
+                                TransferKind::Photo | TransferKind::Album => {
                                     store.fail_photo_dispatch(&account, id, unknown)?
                                 }
                             };
                         } else {
                             match kind {
                                 TransferKind::File => store.interrupt_attachment(&account, id)?,
-                                TransferKind::Photo => store.interrupt_photo(&account, id)?,
+                                TransferKind::Photo | TransferKind::Album => {
+                                    store.interrupt_photo(&account, id)?
+                                }
                             };
                         }
                         match match kind {
                             TransferKind::File => store.attachment_state(&account, id)?,
-                            TransferKind::Photo => store.photo_state(&account, id)?,
+                            TransferKind::Photo | TransferKind::Album => {
+                                store.photo_state(&account, id)?
+                            }
                         } {
                             Some(AttachmentState::Accepted | AttachmentState::Acknowledged) => {
                                 Ok(Some(match kind {
                                     TransferKind::File => store.accept_attachment(&account, id),
-                                    TransferKind::Photo => store.accept_photo(&account, id),
+                                    TransferKind::Photo | TransferKind::Album => {
+                                        store.accept_photo(&account, id)
+                                    }
                                 }))
                             }
                             _ => Ok(None),
@@ -945,7 +1223,7 @@ async fn run(
                     .await;
                 match confirmed {
                     Ok(Some(Ok(accepted))) => {
-                        return Outcome {
+                        return SingleOutcome {
                             phase: FileTransferPhase::Accepted,
                             accepted: Some(accepted),
                             message: None,
@@ -983,7 +1261,7 @@ async fn run(
             } else {
                 (FileTransferPhase::Failed,"Chưa gửi được tệp. Tệp đã chọn được giữ lại; hãy kiểm tra kết nối và quyền gửi.")
             };
-            Outcome {
+            SingleOutcome {
                 phase,
                 accepted: None,
                 message: Some(message),

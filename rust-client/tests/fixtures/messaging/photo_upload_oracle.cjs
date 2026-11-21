@@ -37,13 +37,22 @@ const ttlStart = source.indexOf('                d = (e, t = {}) => {', source.i
 const ttlEnd = source.indexOf('                A = (e, t = {}) => {', ttlStart);
 const ttl = vm.runInNewContext('(' + source.slice(ttlStart,ttlEnd).trim().replace(/^d = /,'').replace(/,$/,'') + ')', {a:{a:Object.assign}});
 const post = section('static sendMsgPhotoAsync(e, t, n, o) {', 'static createOneOneGroupTopic(e) {');
+let nextId = 8000;
+const Picker = vm.runInNewContext('(class {' + section('async _uploadImg(e, t = null, n, a) {', 'async onUploadPhotoClicked(e) {') + '})', {
+    l: {default: {maxNumberOfFile: 9}},
+    m: {default: {getExtension: name => path.extname(name).slice(1)}},
+    E: {a: {next: () => ++nextId}},
+    s: {a: Object.assign},
+});
 const assignResource = section('__waitAsyncFileInfo(e, t, n, a, s) {','__logQos(e, t, n) {');
 let resource;
 const PhotoWait=vm.runInNewContext('(class {'+assignResource+'})',{o:{d:{getFileIdData:()=>resource}},_:{c:{Photo:'photo',File:'file',Video:'video',Voice:'voice',PhotoThumb:'thumb',VideoThumb:'vthumb'}},h:{default:{}},setTimeout:()=>1,clearTimeout(){}});
 const build = section('static buildParams(e, t, n, s, o, r, l) {', 'static sendZText(e, t, n, a, s, o, r = null) {');
+const apiSettings = {retryConfig:{enable_add_missing_retry:false}, should_attach_extraMsgProp: 0};
 const Api = vm.runInNewContext('(class {' + build + post + '})', {
     _:{b:{getFileDomain:()=> 'https://files.example.test'}}, a:{a:Object.assign},
-    D:{a:{getZaloClientID:()=> 'synthetic-device'}}, s:{default:{retryConfig:{enable_add_missing_retry:false}}},
+    D:{a:{getZaloClientID:()=> 'synthetic-device'}}, s:{default:apiSettings},
+    me: {ZGroupPhotoSkeleton: {getGroupPhotoSkeleton: () => null}},
     i:{default:{encodeAES:text=>text,safeParseJson:text=>text ? JSON.parse(text) : null}}, y:{f:ttl}, w:{a:{getCurrentLanguageName:()=> 'VN'}},zconsole:{zsymb(){}}, B:{d:{STAGE_4_SERVER_SUBMIT:4}},
     j:{c:{ORIGINAL:'original'}},
     x:{a:{getInstance:()=>({getLogger:()=>({zsymb(){}}),setLogData:()=>({}),getLogData:()=>({})})}},
@@ -90,5 +99,36 @@ Api._post=async(url,body)=>({url,payload:JSON.parse(decodeURIComponent(body.slic
     const output=JSON.stringify({provenance:'Exact original getInfoUploadPhotoFromData HD routing, ordinary buildSendChunksInfo/getUrl, getFileAsyncItem Photo, __waitAsyncFileInfo resource assignment, buildParams/sendMsgPhotoAsync. Synthetic bytes/IDs; identity AES and no-network transport stubs. Resource completion is not final message acceptance.',cases},null,2)+'\n';
     const destination=path.join(__dirname,'photo_upload.json');
     if(process.argv.includes('--write'))fs.writeFileSync(destination,output);else assert.equal(fs.readFileSync(destination,'utf8'),output);
-    console.log('Bundled photo oracle: '+cases.length+' HD cases and 2 original-photo routes');
+    const albums = [];
+    for (const group of [false, true]) for (const extraMetadata of [false, true]) {
+        const select = new Picker();
+        const selected = [];
+        select._checkBroadcastMessageLimit = () => false;
+        select._uploadDragPhoto = (_, data) => { selected.push(data); };
+        await select._uploadImg({target: {files: [
+            {name: 'first.jpg'}, {name: 'not-in-album.gif'}, {name: 'second.png'}, {name: 'third.jpg'},
+        ]}}, {userId: group ? 'group_33' : '22'});
+        assert.equal(selected.length, 4);
+        assert.equal(selected[1].photoBundle, null);
+        const memberSelection = selected.filter(item => item.photoBundle);
+        const layoutId = memberSelection[0].photoBundle.groupLayoutId;
+        const finals = [];
+        apiSettings.should_attach_extraMsgProp = extraMetadata ? 1 : 0;
+        for (const [index, selected] of memberSelection.entries()) {
+            assert.deepEqual({...selected.photoBundle}, {
+                groupLayoutId: layoutId, idInGroup: index, isGroupLayout: 1, totalItemInGroup: 3,
+            });
+            const plain = cases[group ? 4 : 0].final.payload;
+            const whenBundled = {...plain, clientId: selected.clientId, ...selected.photoBundle};
+            const final = await Api.sendMsgPhotoAsync(whenBundled, group, null, null);
+            assert.equal(final.payload.extMsgProp, extraMetadata ? JSON.stringify({groupMediaMsg: {groupLayoutId: layoutId}}) : undefined);
+            finals.push(final);
+        }
+        assert.equal(new Set(finals.map(final => final.payload.clientId)).size, 3);
+        albums.push({group, extraMetadata, layoutId, finals});
+    }
+    const albumOutput = JSON.stringify({provenance:'Original _uploadImg group layout allocation and sendMsgPhotoAsync, no-network transport, synthetic IDs and service URLs.', albums}, null, 2)+'\n';
+    const albumDestination=path.join(__dirname,'photo_album_upload.json');
+    if(process.argv.includes('--write'))fs.writeFileSync(albumDestination,albumOutput);else assert.equal(fs.readFileSync(albumDestination,'utf8'),albumOutput);
+    console.log('Bundled photo oracle: '+cases.length+' HD cases, 2 original-photo routes and '+albums.length+' albums');
 })().catch(error=>{console.error(error);process.exitCode=1;});

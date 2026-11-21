@@ -618,6 +618,7 @@ mod tests {
             thumbnail_url: Some("https://f1.zdn.vn/thumbnail.jpg".into()),
             width: None,
             height: None,
+            album: None,
         }));
         let photo = actions(&message);
         assert_eq!(photo.len(), 2);

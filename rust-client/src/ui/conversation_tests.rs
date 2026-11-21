@@ -165,6 +165,7 @@ fn short_bubbles_hug_content_and_long_messages_stay_inside_wide_and_compact_boun
                                 None,
                                 1,
                                 None,
+                                AlbumPosition::Single,
                             );
                         });
                     },
@@ -284,6 +285,7 @@ fn sticker_messages_have_no_bubble_and_fit_the_picture() {
                             None,
                             1,
                             None,
+                            AlbumPosition::Single,
                         );
                     });
                 },

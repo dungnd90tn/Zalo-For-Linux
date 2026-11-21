@@ -267,6 +267,7 @@ mod tests {
             original_url: None,
             width: Some(640),
             height: Some(480),
+            album: None,
         })
     }
     fn model() -> Model {

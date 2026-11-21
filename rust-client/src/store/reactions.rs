@@ -605,7 +605,7 @@ mod tests {
                 .conn
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            20
+            crate::store::SCHEMA_VERSION
         );
         assert_eq!(upgraded.receive_cursor("11", "510_0").unwrap(), "73");
         assert_eq!(upgraded.page("11", "d:22", None, 10).unwrap(), [cached]);

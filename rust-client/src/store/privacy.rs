@@ -211,9 +211,9 @@ mod tests {
         );
         assert_eq!(
             s.conn
-                .query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            20
+            crate::store::SCHEMA_VERSION
         );
     }
 }

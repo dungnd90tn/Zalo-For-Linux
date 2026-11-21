@@ -264,6 +264,266 @@ async fn photo_tls_preview_is_exact_uploaded_jpeg_oriented_and_metadata_free_wit
     }
 }
 
+async fn prepare_album(
+    commands: &mpsc::Sender<LiveCommand>,
+    events: &mut mpsc::Receiver<LiveEvent>,
+    attachments: Vec<Attachment>,
+    thread: &str,
+) -> Result<Vec<PreparedPhoto>, PhotoPreparationFailure> {
+    commands
+        .send(LiveCommand::PrepareAlbum {
+            generation: 1,
+            thread: thread.into(),
+            attachments,
+            request_id: 901,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            match events.recv().await.unwrap() {
+                LiveEvent::AlbumPrepared {
+                    request_id: 901,
+                    generation: 1,
+                    thread: selected,
+                    result,
+                    ..
+                } => {
+                    assert_eq!(selected, thread);
+                    return result;
+                }
+                LiveEvent::Fault { error, .. } => panic!("album preparation: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn photo_album_tls_groups_three_members_and_stops_before_the_tail_after_uncertain_delivery() {
+    use super::file_fixture::{ALBUM_ACCEPT, ALBUM_LOSE_SECOND_ACK, ALBUM_REJECT_SECOND};
+    for (thread, new_route, mode, extra_metadata, expected_states) in [
+        (
+            "d:22",
+            false,
+            ALBUM_ACCEPT,
+            true,
+            &["accepted", "accepted", "accepted"][..],
+        ),
+        (
+            "g:22",
+            true,
+            ALBUM_ACCEPT,
+            false,
+            &["accepted", "accepted", "accepted"][..],
+        ),
+        (
+            "d:22",
+            false,
+            ALBUM_REJECT_SECOND,
+            true,
+            &["accepted", "rejected"][..],
+        ),
+        (
+            "g:22",
+            true,
+            ALBUM_LOSE_SECOND_ACK,
+            false,
+            &["accepted", "unknown"][..],
+        ),
+    ] {
+        let f = Fixture::new(Reply::PhotoUpload(mode));
+        let (commands, rx) = mpsc::channel(16);
+        let (tx, mut events) = mpsc::channel(128);
+        let (stop, cancel) = watch::channel(false);
+        let task = tokio::spawn(run_with_transports(
+            f.profile.clone(),
+            f.album_session(new_route, 3, extra_metadata),
+            rx,
+            tx,
+            Arc::new(|| {}),
+            cancel,
+            f.transports(),
+        ));
+        online(&mut events).await;
+        let synthetic = (0..4)
+            .map(|index| {
+                let pixels = image::RgbImage::from_pixel(
+                    20 + index,
+                    16,
+                    image::Rgb([50 * index as u8, 200, 30]),
+                );
+                let mut jpeg = Vec::new();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+                    .encode_image(&image::DynamicImage::ImageRgb8(pixels))
+                    .unwrap();
+                selected(&f, &format!("synthetic-{index}.jpg"), &jpeg)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            prepare_album(&commands, &mut events, synthetic.clone(), thread)
+                .await
+                .is_err()
+        );
+        assert!(f.state.photo.uploads.lock().unwrap().is_empty());
+        let photos = prepare_album(
+            &commands,
+            &mut events,
+            synthetic.into_iter().take(3).collect(),
+            thread,
+        )
+        .await
+        .unwrap();
+        let previews = photos
+            .iter()
+            .map(|photo| {
+                let mut preview = vec![0; photo.size_bytes() as usize];
+                std::os::unix::fs::FileExt::read_exact_at(&photo.0.file, &mut preview, 0).unwrap();
+                preview
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(previews.len(), 3);
+        commands
+            .send(LiveCommand::SendAlbum {
+                generation: 1,
+                thread: thread.into(),
+                photos,
+                request_id: 902,
+            })
+            .await
+            .unwrap();
+        let mut accepted = Vec::new();
+        let phase = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    LiveEvent::FileAccepted {
+                        kind: TransferKind::Album,
+                        request_id: 902,
+                        message,
+                        ..
+                    } => accepted.push(message),
+                    LiveEvent::FileTransfer {
+                        kind: TransferKind::Album,
+                        request_id: 902,
+                        phase,
+                        ..
+                    } if matches!(
+                        phase,
+                        FileTransferPhase::Accepted
+                            | FileTransferPhase::Partial
+                            | FileTransferPhase::Cancelled
+                            | FileTransferPhase::Failed
+                            | FileTransferPhase::Unknown
+                            | FileTransferPhase::AcceptedLocalFailure
+                    ) =>
+                    {
+                        break phase
+                    }
+                    LiveEvent::Fault { error, .. } => panic!("album upload: {error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let successful = mode == ALBUM_ACCEPT;
+        assert_eq!(
+            phase,
+            if successful {
+                FileTransferPhase::Accepted
+            } else {
+                FileTransferPhase::Partial
+            }
+        );
+        assert_eq!(accepted.len(), if successful { 3 } else { 1 });
+        let expected_attempts = expected_states.len();
+        let finals = f.state.photo.finals.lock().unwrap().clone();
+        assert_eq!(finals.len(), expected_attempts);
+        let uploads = f.state.photo.uploads.lock().unwrap().clone();
+        assert_eq!(uploads.len(), expected_attempts);
+        let prefix = if thread.starts_with("g:") {
+            "/api/group"
+        } else {
+            "/api/message"
+        };
+        let paths = f.state.photo.paths.lock().unwrap().clone();
+        assert_eq!(
+            paths,
+            [
+                format!(
+                    "{prefix}{}",
+                    if new_route {
+                        "/upload/photo"
+                    } else {
+                        "/photo_original/upload"
+                    }
+                ),
+                format!("{prefix}/photo_original/send"),
+            ]
+            .into_iter()
+            .cycle()
+            .take(expected_attempts * 2)
+            .collect::<Vec<_>>()
+        );
+        let layout_id = finals[0]["groupLayoutId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut clients = std::collections::HashSet::new();
+        for (index, (payload, (upload, bytes))) in finals.iter().zip(&uploads).enumerate() {
+            let album = crate::domain::PhotoAlbumMember::new(layout_id, index as u32, 3).unwrap();
+            assert_eq!(
+                crate::domain::PhotoAlbumMember::from_message_parameters(payload),
+                Some(album)
+            );
+            assert_eq!(payload["clientId"], upload["clientId"]);
+            assert!(clients.insert(payload["clientId"].as_u64().unwrap()));
+            assert_eq!(payload["groupLayoutId"], finals[0]["groupLayoutId"]);
+            assert_eq!(
+                payload["photoId"],
+                format!("album-{}", payload["clientId"].as_u64().unwrap())
+            );
+            assert_eq!(payload["desc"], "");
+            assert_eq!(payload["width"], 20 + index);
+            assert_eq!(payload["height"], 16);
+            assert_eq!(payload.get("extMsgProp").is_some(), extra_metadata);
+            assert_eq!(payload[if new_route { "grid" } else { "toid" }], "22");
+            assert!(!crate::protocol::photo::has_album_message_fields(upload));
+            assert_eq!(bytes, &previews[index]);
+            if let Some(message) = accepted.get(index) {
+                assert_eq!(message.thread_id, thread);
+                assert_eq!(message.id, (901 + index).to_string());
+                let Some(crate::domain::MediaDescriptor::Photo(photo)) = &message.media else {
+                    panic!("missing accepted photo");
+                };
+                assert_eq!(photo.album, Some(album));
+            }
+        }
+        stop.send(true).unwrap();
+        task.await.unwrap();
+        let db =
+            rusqlite::Connection::open(f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+        let mut read = db
+            .prepare("SELECT state,checksum FROM photo_outbox ORDER BY CAST(client_id AS INTEGER)")
+            .unwrap();
+        let rows = read
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), expected_attempts);
+        for (index, (state, checksum)) in rows.iter().enumerate() {
+            assert_eq!(state, expected_states[index]);
+            assert_eq!(checksum, &format!("{:x}", Md5::digest(&previews[index])));
+        }
+    }
+}
+
 #[test]
 fn retained_preview_charge_is_checked_and_released_only_after_the_last_shared_owner() {
     use crate::app::live::photo::{CacheCharge, MAX_PREPARED_BYTES};

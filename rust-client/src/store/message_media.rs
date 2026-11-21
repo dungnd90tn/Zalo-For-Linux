@@ -35,6 +35,7 @@ pub(super) fn initialize(conn: &Connection, version: i64) -> Result<()> {
 /// Brings stored presentation snapshots up to the current reader. The full source content is immutable and is the
 /// only input; a row whose content no longer parses is left as it is. Runs once per reader revision.
 pub(super) fn reproject(conn: &Connection) -> Result<()> {
+    reproject_photo_albums(conn)?;
     // Bump the marker when a descriptor derivation changes (v1: call logs read their params).
     if conn.execute(
         "INSERT OR IGNORE INTO store_markers(name) VALUES('media_projection_v1')",
@@ -77,6 +78,64 @@ pub(super) fn reproject(conn: &Connection) -> Result<()> {
                 params![rowid, next, next_preview],
             )?;
         }
+    }
+    Ok(())
+}
+
+fn reproject_photo_albums(conn: &Connection) -> Result<()> {
+    if conn.execute(
+        "INSERT OR IGNORE INTO store_markers(name) VALUES('media_photo_album_v1')",
+        [],
+    )? == 0
+    {
+        return Ok(());
+    }
+    // Params may be encoded as a JSON string with escaped keys, so inspect
+    // the source content one row at a time. Only replace the exact old projection.
+    let mut query = conn.prepare(
+        "SELECT rowid,metadata,projection,preview FROM message_media
+         WHERE rowid>?1 AND kind='chat.photo'
+         AND (instr(metadata,'group_layout_id')>0 OR instr(metadata,char(92)||'u')>0)
+         ORDER BY rowid LIMIT 1",
+    )?;
+    let mut cursor = i64::MIN;
+    while let Some((rowid, metadata, projection, stored_preview)) = query
+        .query_row([cursor], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .optional()?
+    {
+        cursor = rowid;
+        let Ok(value) = serde_json::from_str(&metadata) else {
+            continue;
+        };
+        let Ok(content) = MediaMessageContent::new(MediaKind::Photo, &value) else {
+            continue;
+        };
+        if content.album_member().is_none()
+            || content.as_json() != metadata
+            || preview(content.descriptor()) != stored_preview
+        {
+            continue;
+        }
+        let previous = crate::domain::media::legacy_photo_projection(&value);
+        if serde_json::from_str::<MediaDescriptor>(&projection)
+            .ok()
+            .as_ref()
+            != Some(&previous)
+        {
+            continue;
+        }
+        let next = serde_json::to_string(content.descriptor())?;
+        conn.execute(
+            "UPDATE message_media SET projection=?2 WHERE rowid=?1",
+            params![rowid, next],
+        )?;
     }
     Ok(())
 }
@@ -329,6 +388,89 @@ mod tests {
             store.conversations("11", 10).unwrap()[0].last_text,
             "Cuộc gọi thoại đến"
         );
+    }
+
+    #[test]
+    fn old_album_projections_upgrade_without_accepting_tampered_members() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let address = "https://f1.zdn.vn/";
+        let mut raw = json!({
+            "title":"\"".repeat(1024), "description":"\"".repeat(4096),
+            "href":address, "thumb":address
+        });
+        let base = MediaMessageContent::new(MediaKind::Photo, &raw).unwrap();
+        let base_bytes = serde_json::to_vec(base.descriptor()).unwrap().len();
+        let fill = (MAX_PROJECTION_BYTES - base_bytes - 8) / 2;
+        let address = format!("{address}{}", "x".repeat(fill));
+        raw["href"] = json!(address);
+        raw["thumb"] = json!(address);
+        let previous = MediaMessageContent::new(MediaKind::Photo, &raw)
+            .unwrap()
+            .descriptor()
+            .clone();
+        raw["params"] = json!(
+            r#"{"group_\u006cayout_id":"7001","id_in_group":0,"is_group_layout":1,"total_item_in_group":3}"#
+        );
+        let content = MediaMessageContent::new(MediaKind::Photo, &raw).unwrap();
+        assert!(content.album_member().is_some());
+        assert!(!content.as_json().contains("group_layout_id"));
+        let (MediaDescriptor::Photo(old), MediaDescriptor::Photo(new)) =
+            (&previous, content.descriptor())
+        else {
+            panic!("expected photo")
+        };
+        assert_eq!(old.caption.len(), 4096);
+        assert!(new.caption.len() < old.caption.len());
+        let (mut legacy, _) = message(MediaKind::Photo, "album-legacy");
+        legacy.media = Some(content.descriptor().clone());
+        let mut altered = legacy.clone();
+        altered.id = "album-altered".into();
+        store
+            .receive_batch_with_media(
+                "11",
+                &[
+                    (legacy.clone(), None, None, Some(content.clone())),
+                    (altered.clone(), None, None, Some(content.clone())),
+                ],
+                None,
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE message_media SET projection=?1 WHERE message_id='album-legacy'",
+                [serde_json::to_string(&previous).unwrap()],
+            )
+            .unwrap();
+        let mut tampered = serde_json::to_value(content.descriptor()).unwrap();
+        tampered["data"]["album"]["index"] = json!(1);
+        store
+            .conn
+            .execute(
+                "UPDATE message_media SET projection=?1 WHERE message_id='album-altered'",
+                [tampered.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM store_markers WHERE name='media_photo_album_v1'",
+                [],
+            )
+            .unwrap();
+        assert!(load(&store.conn, "11", "d:22", &legacy.id).is_err());
+        reproject(&store.conn).unwrap();
+        assert_eq!(
+            load(&store.conn, "11", "d:22", &legacy.id).unwrap(),
+            Some(content.clone())
+        );
+        assert_eq!(
+            projection(&store.conn, &legacy).unwrap().as_ref(),
+            Some(content.descriptor())
+        );
+        assert!(load(&store.conn, "11", "d:22", &altered.id).is_err());
+        assert!(persist(&store.conn, &altered, Some(&content), true).is_err());
+        persist(&store.conn, &legacy, Some(&content), true).unwrap();
     }
     #[test]
     fn legacy_media_enrichment_preserves_body_and_publishes_typed_history_and_preview() {
@@ -680,7 +822,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            20
+            crate::store::SCHEMA_VERSION
         );
     }
 
@@ -733,7 +875,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            20
+            crate::store::SCHEMA_VERSION
         );
         for m in originals {
             assert_eq!(

@@ -2,6 +2,8 @@
 mod account;
 #[cfg(all(test, feature = "messaging"))]
 mod account_tests;
+#[cfg(feature = "messaging")]
+mod albums;
 mod attachments;
 mod attention;
 #[cfg(feature = "messaging")]
@@ -546,6 +548,11 @@ impl NativeApp {
         }
         #[cfg(feature = "messaging")]
         if self.has_draft_mentions() && self.mention_scope().is_none() {
+            return;
+        }
+        #[cfg(feature = "messaging")]
+        if self.album_selected() && !self.demo {
+            self.send_live_album();
             return;
         }
         #[cfg(feature = "messaging")]
@@ -1276,16 +1283,26 @@ impl NativeApp {
         };
         self.poll_attachments(ctx, attach_here, attach_reason);
         let reply_height = self.reply_tray_height();
-        let tray_height = reply_height + self.attachment_tray_height() + self.photo_tray_height();
-        #[cfg(feature = "messaging")]
-        self.photo_tray(ui, rect);
+        let photo_height = self.photo_tray_height();
+        let attachment_height = self.attachment_tray_height();
+        let tray_height = reply_height + attachment_height + photo_height;
         if reply_height > 0.0 {
             self.reply_tray(ui, rect);
         }
-        if self.attachment_tray_height() > 0.0 {
+        if attachment_height > 0.0 {
             self.attachment_tray(
                 ui,
                 egui::Rect::from_min_max(rect.min + vec2(0.0, reply_height), rect.max),
+            );
+        }
+        #[cfg(feature = "messaging")]
+        if photo_height > 0.0 {
+            self.photo_tray(
+                ui,
+                egui::Rect::from_min_max(
+                    rect.min + vec2(0.0, reply_height + attachment_height),
+                    rect.max,
+                ),
             );
         }
         if attach_here && ctx.input(|input| !input.raw.hovered_files.is_empty()) {
@@ -1522,18 +1539,22 @@ impl NativeApp {
                     colors.primary
                 };
                 ui.painter().rect_filled(send_rect, 12.0, send_fill);
+                let send_label = if self.demo {
+                    "Lưu"
+                } else if self.photo_selected() {
+                    self.photo_send_label()
+                } else if self.drafts.active.attachment().is_some() {
+                    self.file_send_label()
+                } else {
+                    "Gửi"
+                };
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, can_send, send_label)
+                });
                 ui.painter().text(
                     send_rect.center(),
                     Align2::CENTER_CENTER,
-                    if self.demo {
-                        "Lưu"
-                    } else if self.photo_selected() {
-                        self.photo_send_label()
-                    } else if self.drafts.active.attachment().is_some() {
-                        self.file_send_label()
-                    } else {
-                        "Gửi"
-                    },
+                    send_label,
                     FontId::new(
                         visuals::TEXT_BODY,
                         egui::FontFamily::Name("Zalo Semibold".into()),
@@ -1741,7 +1762,9 @@ impl NativeApp {
                                     .map(|focus| (focus.message_id.clone(), focus.shown_at));
                                 let now = std::time::Instant::now();
                                 let mut focus_drawn = false;
-                                for message in &self.model.messages {
+                                let album_positions = album_positions(&self.model.messages);
+                                for (index, message) in self.model.messages.iter().enumerate() {
+                                    let album_position = album_positions.get(index).copied().unwrap_or(AlbumPosition::Single);
                                     let day = local_parts(message.sent_at_ms)
                                         .map(|parts| (parts.tm_year, parts.tm_yday));
                                     if previous_day != day || previous_day.is_none() {
@@ -1761,7 +1784,8 @@ impl NativeApp {
                                     #[cfg(feature = "messaging")]
                                     let avatar_texture = self.live.as_mut().and_then(|state| {
                                         let identity = format!("d:{}",message.sender);
-                                        (state.privacy.ready() && state.privacy.visible(&identity)
+                                        (album_position.starts_sender()
+                                            && state.privacy.ready() && state.privacy.visible(&identity)
                                             && ui.is_rect_visible(egui::Rect::from_min_size(ui.cursor().min,vec2(30.0,30.0))))
                                             .then(||state.avatars.visible(ui.ctx(), &identity)).flatten()
                                     });
@@ -1783,7 +1807,7 @@ impl NativeApp {
                                         sticker_cache,
                                         #[cfg(feature = "messaging")]
                                         media_cache,
-                                        self.model.generation, delivery_label,
+                                        self.model.generation, delivery_label, album_position,
                                     ));
                                     #[cfg(feature = "messaging")]
                                     if let Some(state) = self.live.as_mut().filter(|_| ui.is_enabled()) {
@@ -1827,7 +1851,7 @@ impl NativeApp {
                                             ),
                                         );
                                     }
-                                    ui.add_space(13.0);
+                                    ui.add_space(if matches!(album_position, AlbumPosition::First(_) | AlbumPosition::Continuation) { 6.0 } else { 13.0 });
                                 }
                                 if focus_drawn {
                                     self.model.focus_shown(now);
@@ -2525,6 +2549,79 @@ fn message_body(
     ui.painter().layout(message.text.clone(), font, ink, width)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AlbumPosition {
+    Single,
+    First(u32),
+    Continuation,
+    Last,
+}
+
+impl AlbumPosition {
+    fn starts_sender(self) -> bool {
+        matches!(self, Self::Single | Self::First(_))
+    }
+}
+
+fn album_positions(messages: &[Message]) -> Vec<AlbumPosition> {
+    fn member(message: &Message) -> Option<crate::domain::PhotoAlbumMember> {
+        if message.is_recalled() {
+            return None;
+        }
+        match &message.media {
+            Some(crate::domain::MediaDescriptor::Photo(photo)) => photo.album,
+            _ => None,
+        }
+    }
+    fn scope(message: &Message, id: u64) -> (&str, &str, &str, u64) {
+        (&message.account_id, &message.thread_id, &message.sender, id)
+    }
+    fn day(message: &Message) -> Option<(i32, i32)> {
+        local_parts(message.sent_at_ms).map(|parts| (parts.tm_year, parts.tm_yday))
+    }
+    let mut occurrences = std::collections::HashMap::new();
+    for message in messages {
+        if let Some(member) = member(message) {
+            *occurrences
+                .entry(scope(message, member.layout_id()))
+                .or_insert(0usize) += 1;
+        }
+    }
+    if occurrences.is_empty() {
+        return Vec::new();
+    }
+    let mut positions = vec![AlbumPosition::Single; messages.len()];
+    for (start, message) in messages.iter().enumerate() {
+        let Some(metadata) = member(message).filter(|member| member.index() == 0) else {
+            continue;
+        };
+        let key = scope(message, metadata.layout_id());
+        let count = metadata.count() as usize;
+        if count < 2 || occurrences.get(&key) != Some(&count) {
+            continue;
+        }
+        let Some(run) = messages.get(start..start + count) else {
+            continue;
+        };
+        let first_day = day(message);
+        if first_day.is_some()
+            && run.iter().enumerate().all(|(index, candidate)| {
+                member(candidate).is_some_and(|part| {
+                    scope(candidate, part.layout_id()) == key
+                        && part.count() == metadata.count()
+                        && part.index() as usize == index
+                        && day(candidate) == first_day
+                })
+            })
+        {
+            positions[start] = AlbumPosition::First(metadata.count());
+            positions[start + 1..start + count - 1].fill(AlbumPosition::Continuation);
+            positions[start + count - 1] = AlbumPosition::Last;
+        }
+    }
+    positions
+}
+
 #[allow(clippy::too_many_arguments)]
 fn message_bubble(
     ui: &mut egui::Ui,
@@ -2539,6 +2636,7 @@ fn message_bubble(
     #[cfg(feature = "messaging")] media_cache: Option<&mut media::MediaCache>,
     generation: u64,
     delivery: Option<&str>,
+    album_position: AlbumPosition,
 ) -> egui::Rect {
     let colors = crate::theme::palette(ui.ctx());
     let own = is_own_sender(&message.sender, account);
@@ -2647,7 +2745,9 @@ fn message_bubble(
         |ui| {
             if !own {
                 let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-                visuals::avatar_photo(ui, rect, sender_avatar, avatar_texture);
+                if album_position.starts_sender() {
+                    visuals::avatar_photo(ui, rect, sender_avatar, avatar_texture);
+                }
             }
             let frame = egui::Frame::none()
                 .fill(if bare {
@@ -2681,7 +2781,7 @@ fn message_bubble(
                     ui.set_max_width(content_width);
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 5.0;
-                        if !own {
+                        if !own && album_position.starts_sender() {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(sender_name)
@@ -2692,6 +2792,13 @@ fn message_bubble(
                                 .truncate(),
                             )
                             .on_hover_text(sender_name);
+                        }
+                        if let AlbumPosition::First(count) = album_position {
+                            ui.label(
+                                RichText::new(format!("Album · {count} ảnh"))
+                                    .size(visuals::TEXT_SMALL)
+                                    .color(colors.text_secondary),
+                            );
                         }
                         if let Some(quote) = &message.quote {
                             replies::quote_block(ui, quote_sender_name, &quote.text, content_width);
