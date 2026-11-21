@@ -51,6 +51,7 @@ enum Reply {
     Forward(u8),
     Recall(u8),
     GroupRecall(group_recall_tests::Mode),
+    GroupHistory,
     Reactions,
     ReactionReplay,
     GroupActions(bool),
@@ -793,6 +794,16 @@ fn serve(
             ))
             .unwrap();
         }
+        if matches!(reply, Reply::GroupHistory) {
+            ws.send(tungstenite::Message::Binary(
+                wire::encode_frame(521, 0, &json!({"error_code":0,"encrypt":0,
+                    "data":{"error_code":0,"data":{"groupMsgs":[
+                        {"uidFrom":"33","idTo":"22","msgId":"910","cliMsgId":"999",
+                         "ts":1760000000999_i64,"msgType":"webchat","content":"Tin mốc tổng hợp"}
+                    ]}}
+                })).unwrap(),
+            )).unwrap();
+        }
         loop {
             let message = match ws.read() {
                 Ok(m) => m,
@@ -1485,6 +1496,10 @@ fn serve(
     }
     if let Reply::GroupRecall(mode) = reply {
         group_recall_tests::respond(&mut stream, &state, &cipher, mode, &path, &headers, &body);
+        return;
+    }
+    if matches!(reply, Reply::GroupHistory) {
+        group_history_tests::respond(&mut stream, &state, &cipher, &path, &headers, &body);
         return;
     }
     if let Reply::Forward(mode) = reply {
@@ -6076,6 +6091,7 @@ mod file_fixture;
 mod file_upload_tests;
 mod forward_batch_tests;
 
+mod group_history_tests;
 mod group_pin_tests;
 mod group_recall_tests;
 mod mention_tests;

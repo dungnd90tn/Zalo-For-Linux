@@ -191,6 +191,14 @@ pub enum RecallOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteHistoryOutcome {
+    Imported { count: usize, has_more: bool },
+    Exhausted,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StickerOutcome {
     Accepted,
     Rejected,
@@ -278,6 +286,13 @@ pub enum LiveCommand {
         request_id: u64,
         thread: String,
         message_id: String,
+    },
+    LoadRemoteHistory {
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        anchor: Cursor,
+        privacy_revision: u64,
     },
     Forward {
         request_id: u64,
@@ -524,6 +539,18 @@ pub enum LiveEvent {
         thread: String,
         message_id: String,
         outcome: RecallOutcome,
+    },
+    RemoteHistoryCapability {
+        account_id: String,
+        available: bool,
+    },
+    RemoteHistoryFinished {
+        account_id: String,
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        privacy_revision: u64,
+        outcome: RemoteHistoryOutcome,
     },
     Recalled {
         account_id: String,
@@ -802,6 +829,8 @@ impl LiveEvent {
             | Self::GroupPins { account_id, .. }
             | Self::GroupPinFinished { account_id, .. }
             | Self::RecallFinished { account_id, .. }
+            | Self::RemoteHistoryCapability { account_id, .. }
+            | Self::RemoteHistoryFinished { account_id, .. }
             | Self::Recalled { account_id, .. }
             | Self::ForwardFinished { account_id, .. }
             | Self::ForwardBatchFinished { account_id, .. }
@@ -1070,6 +1099,18 @@ impl LiveWorker {
                     && Target::from_thread(thread)
                         .is_ok_and(|t| t.kind == ThreadKind::Group || t.remote_id != self.account)
                     && crate::protocol::messaging::numeric_id(message_id).is_ok()
+            }
+            LiveCommand::LoadRemoteHistory {
+                request_id,
+                thread,
+                anchor,
+                ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+                    && anchor.sent_at_ms > 0
+                    && crate::protocol::messaging::numeric_id(&anchor.id).is_ok()
             }
             LiveCommand::Forward {
                 request_id,
@@ -1960,6 +2001,8 @@ impl super::Model {
             | LiveEvent::GroupPins { .. }
             | LiveEvent::GroupPinFinished { .. }
             | LiveEvent::RecallFinished { .. }
+            | LiveEvent::RemoteHistoryCapability { .. }
+            | LiveEvent::RemoteHistoryFinished { .. }
             | LiveEvent::ForwardFinished { .. }
             | LiveEvent::ForwardBatchFinished { .. }
             | LiveEvent::ForwardTargets { .. }

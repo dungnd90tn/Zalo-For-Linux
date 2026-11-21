@@ -22,4 +22,4 @@ Ba hạng mục đầu đã có trong bản thử `2.0.5-2` và qua kiểm thử
 
 ## Sau 2.0.5
 
-Nhánh `v2.0.6` đã có nhắc tên và ghim tin văn bản trong nhóm thường, chuyển tiếp tin văn bản cá nhân đến tối đa 10 bạn bè, thu hồi tin văn bản của mình trong nhóm thường và duyệt bộ sticker khi phiên trả danh mục trực tiếp. Cần xác nhận các luồng này giữa Linux và điện thoại trên tài khoản thử. Hạng mục tiếp theo là đồng bộ lịch sử từ xa, sau đó đến ảnh gốc, album và ghi âm.
+Nhánh `v2.0.6` đã có nhắc tên và ghim tin văn bản trong nhóm thường, chuyển tiếp tin văn bản cá nhân đến tối đa 10 bạn bè, thu hồi tin văn bản của mình trong nhóm thường, duyệt bộ sticker khi phiên trả danh mục trực tiếp và tải từng trang tin văn bản cũ trong nhóm đủ điều kiện. Cần xác nhận các luồng này trên tài khoản thử. Hạng mục tiếp theo là gửi ảnh gốc, sau đó đến album và ghi âm.

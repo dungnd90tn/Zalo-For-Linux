@@ -30,6 +30,8 @@ pub(crate) mod reactions;
 pub(crate) mod read_state;
 #[cfg(feature = "messaging")]
 pub(crate) mod recall;
+#[cfg(feature = "messaging")]
+pub(crate) mod remote_history;
 #[cfg(feature = "live-login")]
 pub mod session;
 #[cfg(feature = "messaging")]

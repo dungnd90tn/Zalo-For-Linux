@@ -131,6 +131,18 @@ impl Projection {
             {
                 *packs = None;
             }
+            LiveEvent::RemoteHistoryFinished {
+                thread,
+                privacy_revision,
+                outcome,
+                ..
+            } if !self.confirmed
+                || self.status != LivePrivacyStatus::Ready
+                || *privacy_revision != self.revision
+                || self.hidden.contains(thread) =>
+            {
+                *outcome = RemoteHistoryOutcome::Unavailable;
+            }
             LiveEvent::Avatars { avatars, .. } => {
                 avatars.retain(|entry| self.permits(&entry.thread_id))
             }

@@ -59,6 +59,8 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub group_pins: super::group_pins::Pins,
     #[cfg(feature = "messaging")]
+    pub remote_history: super::remote_history::RemoteHistory,
+    #[cfg(feature = "messaging")]
     pub mention_picker: super::mentions::Picker,
     #[cfg(feature = "messaging")]
     pub uploads: super::file_uploads::Uploads,
@@ -139,6 +141,8 @@ impl LiveState {
             groups: Default::default(),
             #[cfg(feature = "messaging")]
             group_pins: Default::default(),
+            #[cfg(feature = "messaging")]
+            remote_history: Default::default(),
             #[cfg(feature = "messaging")]
             mention_picker: Default::default(),
             #[cfg(feature = "messaging")]
@@ -235,6 +239,7 @@ impl LiveState {
         self.stickers = Default::default();
         self.reactions.worker_closed();
         self.group_pins.set_scope(None);
+        self.remote_history.worker_closed();
         self.directory.privacy_reset(&self.context, false);
         match LiveWorker::start(
             profile,
@@ -281,6 +286,7 @@ impl LiveState {
                 self.forwarding.worker_closed();
                 self.recall.worker_closed();
                 self.groups.worker_closed();
+                self.remote_history.worker_closed();
                 self.mention_picker.set_scope(None);
                 self.photo_preview.clear();
             }
@@ -311,6 +317,7 @@ impl LiveState {
         self.forwarding.worker_closed();
         self.recall.worker_closed();
         self.groups.worker_closed();
+        self.remote_history.worker_closed();
         self.mention_picker.set_scope(None);
         self.photo_preview.clear();
         self.directory.worker_closed();
@@ -610,6 +617,7 @@ impl NativeApp {
                         state.recall = Default::default();
                         state.groups = Default::default();
                         state.group_pins = Default::default();
+                        state.remote_history = Default::default();
                         state.mention_picker = Default::default();
                         state.uploads = Default::default();
                         state.photo_preview.clear();
@@ -708,7 +716,7 @@ impl NativeApp {
         let Some(account_id) = state.account.as_ref().map(|account| account.id.clone()) else {
             return;
         };
-        if event.account_id() != account_id {
+        if event.account_id() != account_id || self.apply_remote_history_event(state, &event) {
             return;
         }
         // Durable settlement is independent of whether its conversation is still visible.
@@ -794,6 +802,7 @@ impl NativeApp {
             state.forwarding.worker_closed();
             state.recall.worker_closed();
             state.groups.worker_closed();
+            state.remote_history.worker_closed();
             state.mention_picker.set_scope(None);
             state.privacy.reset_worker();
             state.privacy.status = crate::app::live::LivePrivacyStatus::Failed;
@@ -995,6 +1004,7 @@ impl NativeApp {
                             state.recall = Default::default();
                             state.groups = Default::default();
                             state.group_pins = Default::default();
+                            state.remote_history = Default::default();
                             state.mention_picker = Default::default();
                             state.uploads = Default::default();
                             state.photo_preview.clear();
@@ -2685,6 +2695,23 @@ pub(in crate::ui) mod tests {
                             },
                         );
                     }
+                    Some("remote-history" | "remote-history-saved" | "remote-history-offline") => {
+                        let group = "g:44";
+                        app.model.conversations[0].id = group.into();
+                        app.model.conversations[0].title = "Nhóm kiểm thử lịch sử".into();
+                        app.model.messages[0].thread_id = group.into();
+                        app.model.messages[0].id = "901".into();
+                        app.model.messages[0].text = "Tin cũ nhất hiện có trên máy.".into();
+                        app.model.selected = Some(group.into());
+                        app.drafts.select(group).unwrap();
+                        app.drafts.active.text = "Bản nháp giữ nguyên khi tải lịch sử".into();
+                        app.fixture_remote_history(
+                            interactions_scene.as_deref() == Some("remote-history-saved"),
+                        );
+                        if interactions_scene.as_deref() == Some("remote-history-offline") {
+                            app.fixture_connection = Some(LiveConnection::Offline);
+                        }
+                    }
                     _ => {}
                 }
                 if let Some(scene) = attention_scene.as_deref() {
@@ -3285,6 +3312,10 @@ pub(in crate::ui) mod tests {
                     || forward_scene.is_some()
                     || recall_scene.is_some()
                     || group_scene.is_some()
+                    || matches!(
+                        interactions_scene.as_deref(),
+                        Some("remote-history" | "remote-history-saved" | "remote-history-offline")
+                    )
                     || std::env::var_os("ZALO_UI_FIXTURE_AVATARS").is_some()
                 {
                     fixture_content_worker(&mut app, &cc.egui_ctx);

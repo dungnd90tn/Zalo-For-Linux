@@ -1718,3 +1718,36 @@ all-target Clippy and the offline source oracle passed. The optimized live
 binary passed the schema 20 profile upgrade and restart smoke test.
 
 Real-account catalog availability and cross-device sending remain pending.
+
+## Loading older group text from Zalo (2.0.6 development branch)
+
+The timeline offers **Tải tin cũ từ Zalo** at the oldest saved message in an
+eligible group. One click requests up to 50 rows from the advertised
+`group_cloud_message` service when both cloud flags permit scrolling back.
+The worker verifies visibility and membership against the current session.
+The request starts on `/api/cm/getrecentv2`, uses `/api/cm/getoldv2` when the
+server indicates the archive, and carries its cursor across local page
+navigation (PC bundle N401643–401657 and N330032–330057).
+
+Only ordinary plain text older than the bound anchor is saved. The parser
+checks group and sender aliases, skips unsupported rows and rejects pages
+with unsupported deletion or recall controls. Existing local tombstones keep
+recalled content redacted. The transaction commits without updating unread
+counts, live queue offsets or outgoing acknowledgements. **Xem trang trước**
+reads the committed rows, while the current pane and draft remain in place.
+The database schema stays at 20.
+
+The parser, store and TLS/WSS fixtures cover exact numeric cursors and
+same-anchor archive transitions, wrong groups, privacy changes, rollback,
+typed rows, local paging after an import, and preservation of live state.
+Isolated X11 captures covered `remote-history`, `remote-history-saved` and
+`remote-history-offline` at 640×480 and 1200×780 in both themes. Connection
+traces contained no IPv4 or IPv6 traffic. Real-account availability and
+archive paging remain pending. The scope is limited to ordinary joined
+groups verified by the existing roster gate, with up to 100 members.
+
+The all-feature suite passed 878 Rust tests with five opt-in tests ignored.
+Default checks passed 309 Rust and 19 Python tests. Strict all-feature,
+all-target Clippy and the offline PC bundle request oracle passed. The
+optimized live binary passed the schema 20 profile upgrade and restart smoke
+test.

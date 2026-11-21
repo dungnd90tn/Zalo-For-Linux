@@ -474,6 +474,7 @@ impl ServerConfig {
             "sticker",
             "reaction",
             "group_board",
+            "group_cloud_message",
             "up_file",
         ] {
             let mut endpoints =
@@ -518,6 +519,20 @@ impl ServerConfig {
                 });
         if !group_board_v2 {
             services.remove("group_board");
+        }
+        // PC NEW_TO_OLD explicitly requires both cloud switches.
+        if !feature_config(value, "cloud_setting")
+            .ok()
+            .flatten()
+            .is_some_and(|config| {
+                ["enable", "scroll_top_enable"].iter().all(|key| {
+                    config.get(key).is_some_and(|value| {
+                        value.as_bool() == Some(true) || value.as_u64() == Some(1)
+                    })
+                })
+            })
+        {
+            services.remove("group_cloud_message");
         }
         // Native implements the source's raw async-file handler only. An advertised
         // multi-site/cloud handler is a separate protocol and cannot fall back silently.
@@ -1134,6 +1149,37 @@ mod tests {
             config.services["group_board"][0].as_str(),
             "https://groupboard-wpa.zaloapp.com/"
         );
+    }
+
+    #[test]
+    fn remote_group_history_requires_both_cloud_flags_and_trusted_advertisement() {
+        let mut value = json!({"zpw_service_map_v3":{
+            "group_cloud_message":["https://wpa.chat.zalo.me/"]
+        }});
+        let has_cloud = |value: &Value| {
+            ServerConfig::parse(value)
+                .unwrap()
+                .services
+                .contains_key("group_cloud_message")
+        };
+        assert!(!has_cloud(&value));
+        for cloud in [
+            json!({"enable":true}),
+            json!({"enable":true,"scroll_top_enable":false}),
+            json!({"enable":"1","scroll_top_enable":true}),
+        ] {
+            value["settings"] = json!({"features":{"cloud_setting":cloud}});
+            assert!(!has_cloud(&value));
+        }
+        value["settings"]["features"]["cloud_setting"] =
+            json!({"enable":1,"scroll_top_enable":true});
+        assert!(has_cloud(&value));
+        value["setttings"] =
+            json!({"features":{"cloud_setting":{"enable":0,"scroll_top_enable":true}}});
+        assert!(!has_cloud(&value));
+        value.as_object_mut().unwrap().remove("setttings");
+        value["zpw_service_map_v3"]["group_cloud_message"] = json!(["https://untrusted.invalid/"]);
+        assert!(!has_cloud(&value));
     }
     #[test]
     fn optional_directory_routes_fail_locally_without_rejecting_verified_bootstrap_identity() {

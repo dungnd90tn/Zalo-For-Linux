@@ -224,6 +224,23 @@ mod live {
         message: &Message,
         ordinary_text: bool,
     ) -> Result<Option<Message>> {
+        redact_bound_copy(conn, message, ordinary_text, true)
+    }
+
+    pub(in super::super) fn history_redacted_copy(
+        conn: &Connection,
+        message: &Message,
+        ordinary_text: bool,
+    ) -> Result<Option<Message>> {
+        redact_bound_copy(conn, message, ordinary_text, false)
+    }
+
+    fn redact_bound_copy(
+        conn: &Connection,
+        message: &Message,
+        ordinary_text: bool,
+        settle_intent: bool,
+    ) -> Result<Option<Message>> {
         let Some(scope) = scope(&message.account_id, &message.thread_id) else {
             return Ok(None);
         };
@@ -260,7 +277,7 @@ mod live {
                 &message.id,
                 &prior.actor,
             )?;
-            if message.sender == message.account_id {
+            if settle_intent && message.sender == message.account_id {
                 settle_own_recall(
                     conn,
                     &message.account_id,
@@ -787,7 +804,8 @@ mod live {
 
 #[cfg(feature = "messaging")]
 pub(super) use live::{
-    apply_notice, redact_quote, redact_replay, redacted_copy, settle_recalled_own_echo,
+    apply_notice, history_redacted_copy, redact_quote, redact_replay, redacted_copy,
+    settle_recalled_own_echo,
 };
 #[cfg(feature = "messaging")]
 pub(crate) use live::{RecallFailure, RecallOutcome};

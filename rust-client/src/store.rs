@@ -17,6 +17,8 @@ pub(crate) use group_actions::GroupActionFailure;
 #[cfg(feature = "messaging")]
 pub use group_actions::{GroupActionOutcome, GroupInviteTarget};
 mod group_actions;
+#[cfg(feature = "messaging")]
+mod group_history;
 mod group_pins;
 #[cfg(feature = "messaging")]
 pub(crate) use group_pins::PinSource;

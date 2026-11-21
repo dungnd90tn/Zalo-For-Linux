@@ -53,6 +53,8 @@ mod privacy_tests;
 mod reactions;
 #[cfg(feature = "messaging")]
 mod recall;
+#[cfg(feature = "messaging")]
+mod remote_history;
 mod replies;
 mod senders;
 mod settings;
@@ -1702,25 +1704,34 @@ impl NativeApp {
                                         );
                                         ui.add_space(12.0);
                                     }
-                                    if self.model.has_older
-                                        || self.model.pending
-                                        || !self.latest_page
-                                    {
+                                    let local_controls = self.model.has_older || self.model.pending || !self.latest_page;
+                                    #[cfg(feature = "messaging")]
+                                    let remote_controls = self.remote_history_visible();
+                                    #[cfg(not(feature = "messaging"))]
+                                    let remote_controls = false;
+                                    if local_controls || remote_controls {
                                         ui.horizontal(|ui| {
-                                            older = ui
-                                                .add_enabled(
-                                                    self.model.has_older && !self.model.pending,
-                                                    egui::Button::new("Xem trang trước").small(),
-                                                )
-                                                .clicked();
-                                            latest = ui
-                                                .add_enabled(
-                                                    !self.model.pending,
-                                                    egui::Button::new("Về mới nhất").small(),
-                                                )
-                                                .clicked();
-                                            if self.model.pending {
-                                                ui.spinner();
+                                            if local_controls {
+                                                older = ui
+                                                    .add_enabled(
+                                                        self.model.has_older && !self.model.pending,
+                                                        egui::Button::new("Xem trang trước").small(),
+                                                    )
+                                                    .clicked();
+                                                latest = ui
+                                                    .add_enabled(
+                                                        !self.model.pending,
+                                                        egui::Button::new("Về mới nhất").small(),
+                                                    )
+                                                    .clicked();
+                                                if self.model.pending {
+                                                    ui.spinner();
+                                                }
+                                            }
+                                            #[cfg(feature = "messaging")]
+                                            if remote_controls {
+                                                ui.set_min_height(44.0);
+                                                self.remote_history_controls(ui);
                                             }
                                         });
                                     }
@@ -2240,6 +2251,7 @@ impl eframe::App for NativeApp {
             self.sync_recall();
             self.sync_groups(ctx);
             self.sync_group_pins();
+            self.sync_remote_history();
         }
         self.update_modal_input(ctx);
         #[cfg(feature = "messaging")]

@@ -498,6 +498,7 @@ impl NativeApp {
             state.recall.clear_confirmation();
             state.groups.clear_projection();
             state.group_pins.set_scope(None);
+            state.remote_history.clear_view();
             state.mention_picker.set_scope(None);
         }
     }
@@ -520,6 +521,7 @@ impl NativeApp {
             state.forwarding.worker_closed();
             state.recall.worker_closed();
             state.groups.worker_closed();
+            state.remote_history.worker_closed();
             state.privacy.reset_worker();
             state.connection = crate::app::live::LiveConnection::Offline;
             state.reason = Some("Chưa xác nhận được trạng thái riêng tư. Hãy kết nối lại.".into());
