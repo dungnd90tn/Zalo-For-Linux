@@ -2,9 +2,53 @@
 use super::{visuals, NativeApp};
 use crate::{
     app::live::{LiveCommand, LiveConnection, LiveEvent, LivePrivacyStatus, RecallOutcome},
-    domain::{reply::valid_source_id, Message},
+    domain::{reply::valid_source_id, MediaDescriptor, Message},
 };
 use eframe::egui::{self, vec2, RichText};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Text,
+    Photo,
+    File,
+}
+
+impl Kind {
+    fn of(message: &Message) -> Option<Self> {
+        match &message.media {
+            // Live media has a projected source ID only after matching a
+            // committed PHOTO or FILE receipt in the worker.
+            Some(MediaDescriptor::Photo(photo))
+                if message.reply_blocked && photo.original_url.is_some() =>
+            {
+                Some(Self::Photo)
+            }
+            Some(MediaDescriptor::File(file))
+                if message.reply_blocked
+                    && file.url.is_some()
+                    && !file.encrypted
+                    && !file.is_folder =>
+            {
+                Some(Self::File)
+            }
+            None if !message.reply_blocked
+                && !message.text.trim().is_empty()
+                && !message.text.starts_with("[Tin nhắn ") =>
+            {
+                Some(Self::Text)
+            }
+            _ => None,
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Text => "tin nhắn",
+            Self::Photo => "ảnh này",
+            Self::File => "tệp này",
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct Subject {
@@ -13,6 +57,8 @@ struct Subject {
     thread: String,
     page: u64,
     message: String,
+    source_client_id: String,
+    kind: Kind,
 }
 
 impl Subject {
@@ -134,10 +180,18 @@ impl Recall {
             .into(),
             page,
             message: "901".into(),
+            source_client_id: "900".into(),
+            kind: if scene.contains("photo") {
+                Kind::Photo
+            } else if scene.contains("file") {
+                Kind::File
+            } else {
+                Kind::Text
+            },
         };
         self.confirmation = Some(Confirmation {
             subject,
-            result: matches!(scene, "unknown" | "group-unknown").then_some(RecallOutcome::Unknown),
+            result: scene.ends_with("unknown").then_some(RecallOutcome::Unknown),
             busy_queue: false,
         });
     }
@@ -165,6 +219,11 @@ impl NativeApp {
     fn recall_subject(&self, message: &Message) -> Option<Subject> {
         let account = self.account_id()?;
         let thread = self.model.selected.as_ref()?;
+        let source_client_id = message
+            .source_client_id
+            .as_deref()
+            .filter(|id| valid_source_id(id))?;
+        let kind = Kind::of(message)?;
         if self.demo
             || self.model.pending
             || !self.recall_thread(thread, account)
@@ -172,19 +231,11 @@ impl NativeApp {
             || message.sender != account
             || message.thread_id != *thread
             || !valid_source_id(&message.id)
-            || !message
-                .source_client_id
-                .as_deref()
-                .is_some_and(valid_source_id)
             || message.is_recalled()
-            || message.reply_blocked
             || !message.mentions.is_empty()
             || message.quote.is_some()
-            || message.media.is_some()
             || message.sticker.is_some()
             || message.sent_at_ms <= 0
-            || message.text.trim().is_empty()
-            || message.text.starts_with("[Tin nhắn ")
         {
             return None;
         }
@@ -194,6 +245,8 @@ impl NativeApp {
             thread: thread.clone(),
             page: self.model.generation,
             message: message.id.clone(),
+            source_client_id: source_client_id.into(),
+            kind,
         })
     }
 
@@ -225,7 +278,7 @@ impl NativeApp {
         {
             "Phiên này chưa đủ điều kiện thu hồi tin nhắn nhóm."
         } else {
-            "Chỉ thu hồi tin văn bản bạn đã gửi, đủ dữ liệu gốc và còn trong thời hạn."
+            "Chỉ thu hồi tin văn bản, ảnh hoặc tệp bạn đã gửi, đủ dữ liệu gốc và còn trong thời hạn."
         }
     }
 
@@ -297,8 +350,22 @@ impl NativeApp {
             .model
             .messages
             .iter()
-            .find(|message| message.id == confirmation.subject.message)
-            .map(Message::preview_text);
+            .find(|message| {
+                let subject = &confirmation.subject;
+                message.account_id == subject.account
+                    && message.thread_id == subject.thread
+                    && message.id == subject.message
+                    && message.sender == subject.account
+                    && message.source_client_id.as_deref()
+                        == Some(subject.source_client_id.as_str())
+                    && Kind::of(message) == Some(subject.kind)
+            })
+            .map(|message| match &message.media {
+                Some(MediaDescriptor::Photo(photo)) if !photo.caption.trim().is_empty() => {
+                    photo.caption.as_str()
+                }
+                _ => message.preview_text(),
+            });
         let pending = recall.flight.is_some();
         let ready = confirmation.result.is_none();
         let online = state.connection == LiveConnection::Online && state.worker.is_some();
@@ -329,12 +396,16 @@ impl NativeApp {
                             .wrap(),
                         );
                     } else {
+                        let audience = if confirmation.subject.thread.starts_with("g:") {
+                            "tất cả thành viên trong nhóm"
+                        } else {
+                            "mọi người trong cuộc trò chuyện"
+                        };
                         ui.add(
-                            egui::Label::new(if confirmation.subject.thread.starts_with("g:") {
-                                "Thu hồi tin nhắn đối với tất cả thành viên trong nhóm?"
-                            } else {
-                                "Thu hồi tin nhắn đối với mọi người trong cuộc trò chuyện?"
-                            })
+                            egui::Label::new(format!(
+                                "Thu hồi {} đối với {audience}?",
+                                confirmation.subject.kind.noun()
+                            ))
                             .wrap(),
                         );
                         if let Some(preview) = preview {
@@ -396,6 +467,83 @@ impl NativeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{FileDescriptor, MediaKind, PhotoAlbumMember, PhotoDescriptor};
+
+    #[test]
+    fn committed_photo_and_file_recall_keeps_the_exact_selected_source() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = super::super::live::tests::fixture(&ctx);
+        let (worker, _commands, _events) = crate::app::live::LiveWorker::presentation_fixture("11");
+        let state = app.live.as_mut().unwrap();
+        state.connection = LiveConnection::Online;
+        state.worker = Some(worker);
+        app.model.selected = Some("d:22".into());
+        app.drafts.select("d:22").unwrap();
+        app.drafts.active.text = "Bản nháp cần giữ".into();
+        let photo = MediaDescriptor::Photo(PhotoDescriptor {
+            title: String::new(),
+            caption: "Ảnh trong album".into(),
+            thumbnail_url: None,
+            original_url: Some("https://f12-zpcloud.zdn.vn/synthetic-recall.jpg".into()),
+            width: Some(100),
+            height: Some(100),
+            album: PhotoAlbumMember::new(777, 1, 3),
+        });
+        let file = MediaDescriptor::File(FileDescriptor {
+            title: "Bao cao.pdf".into(),
+            extension: "pdf".into(),
+            size_bytes: Some(16_384),
+            url: Some("https://f12-zfile.zdn.vn/synthetic-recall.pdf".into()),
+            is_folder: false,
+            encrypted: false,
+        });
+        for media in [photo, file] {
+            let kind = media.kind();
+            let mut message = Message {
+                account_id: "11".into(),
+                thread_id: "d:22".into(),
+                id: "901".into(),
+                sender: "11".into(),
+                text: kind.legacy_placeholder().into(),
+                sent_at_ms: 1,
+                source_client_id: None,
+                reply_blocked: true,
+                recalled: false,
+                mentions: vec![],
+                quote: None,
+                media: Some(media),
+                sticker: None,
+            };
+            assert!(!app.can_recall(&message));
+            message.source_client_id = Some("900".into());
+            let mut foreign = message.clone();
+            foreign.sender = "22".into();
+            assert!(!app.can_recall(&foreign));
+            if let Some(MediaDescriptor::File(descriptor)) = message.media.as_ref() {
+                let mut encrypted = descriptor.clone();
+                encrypted.encrypted = true;
+                let mut candidate = message.clone();
+                candidate.media = Some(MediaDescriptor::File(encrypted));
+                assert!(!app.can_recall(&candidate));
+            }
+            assert!(app.can_recall(&message));
+            app.model.messages = vec![message];
+            app.open_recall("901");
+            let state = &app.live.as_ref().unwrap().recall;
+            let subject = &state.confirmation.as_ref().unwrap().subject;
+            assert!(matches!(
+                (kind, subject.kind),
+                (MediaKind::Photo, Kind::Photo) | (MediaKind::File, Kind::File)
+            ));
+            assert_eq!(subject.source_client_id, "900");
+            app.model.messages[0].source_client_id = Some("911".into());
+            app.sync_recall();
+            assert!(!app.live.as_ref().unwrap().recall.is_open());
+        }
+        assert_eq!(app.drafts.active.text, "Bản nháp cần giữ");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn unrelated_replies_cannot_settle_recall_and_durable_update_can_resolve_unknown() {

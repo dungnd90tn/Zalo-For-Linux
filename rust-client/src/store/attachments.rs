@@ -578,7 +578,10 @@ impl MessageStore {
     ) -> Result<(Message, Conversation)> {
         validate_id(account)?;
         let tx = self.conn.transaction()?;
-        let (thread,server,created,timestamp,raw):(String,String,i64,Option<i64>,String)=tx.query_row("SELECT thread_id,server_id,created_at_ms,server_ts,media_metadata FROM attachment_outbox WHERE account_id=?1 AND client_id=?2 AND state IN ('acknowledged','accepted')",params![account,client.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        let (thread,server,created,timestamp,raw):(String,String,i64,Option<i64>,Option<String>)=tx.query_row("SELECT thread_id,server_id,created_at_ms,server_ts,media_metadata FROM attachment_outbox WHERE account_id=?1 AND client_id=?2 AND state IN ('acknowledged','accepted')",params![account,client.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        let Some(raw) = raw else {
+            return super::recall::accepted_media_replay(&tx, account, &thread, &server, client);
+        };
         ensure!(
             raw.len() <= MAX_FINAL_BYTES,
             "Attachment echo exceeds limit"
@@ -617,6 +620,15 @@ impl MessageStore {
         insert_validated_with_media(&tx, std::iter::once((&message, None, Some(&content))))?;
         super::message_reply::hydrate(&tx, &mut message)?;
         ensure!(tx.execute("UPDATE attachment_outbox SET state='accepted' WHERE account_id=?1 AND client_id=?2 AND state IN ('acknowledged','accepted')",params![account,client.to_string()])?==1,"Attachment acceptance conflict");
+        #[cfg(feature = "messaging")]
+        if let Some(change) = super::recall::materialize_pending_media(&tx, &message)? {
+            let recalled = change
+                .message
+                .zip(change.conversation)
+                .ok_or(FailureReason::ConflictingEcho)?;
+            tx.commit()?;
+            return Ok(recalled);
+        }
         let conversation = tx.query_row(
             CONVERSATION_SQL,
             params![account, thread, MAX_PREVIEW_CHARS as i64],
@@ -643,6 +655,127 @@ impl MessageStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn file_recall_scrubs_payload_and_dominates_typed_replay() {
+        use crate::protocol::recall::RecallNotice;
+
+        let mut store = MessageStore::in_memory().unwrap();
+        store.replace_live_privacy("11", &[], None).unwrap();
+        let spec = AttachmentSpec {
+            file_name: "synthetic-recall.txt".into(),
+            size: 6,
+            checksum: "a".repeat(32),
+        };
+        let client = store.reserve_attachment("11", "d:22", &spec, 1000).unwrap();
+        let url = "https://files.zdn.vn/synthetic-recall.txt";
+        let resource = AttachmentResource {
+            file_id: "synthetic-file".into(),
+            file_url: url.into(),
+            checksum: spec.checksum.clone(),
+            parameters: json!({
+                "fileId":"synthetic-file","checksum":spec.checksum,"checksumSha":"",
+                "extension":"txt","totalSize":6,"fileName":spec.file_name,"clientId":client,
+                "fType":1,"fileCount":0,"fdata":"{}","fileUrl":url,"ttl":0,"toid":"22",
+                "imei":"synthetic-device"
+            }),
+            content: MediaMessageContent::new(
+                MediaKind::File,
+                &json!({
+                    "title":spec.file_name,"href":url,
+                    "params":{"fileSize":6,"fileExt":"txt","checksum":spec.checksum,"fType":1}
+                }),
+            )
+            .unwrap(),
+        };
+        store
+            .attachment_resource_ready("11", client, &resource)
+            .unwrap();
+        store.begin_attachment_dispatch("11", client).unwrap();
+        store
+            .record_attachment_ack("11", client, "901", Some(1020))
+            .unwrap();
+        let (message, _) = store.accept_attachment("11", client).unwrap();
+        let bad_notice = RecallNotice {
+            thread_id: "d:22".into(),
+            message_id: "901".into(),
+            actor_id: "11".into(),
+            client_id: Some("999".into()),
+            event_id: "902".into(),
+            occurred_at_ms: 1040,
+        };
+        let (_, _, changes) = store
+            .receive_batch_with_recalls(
+                "11",
+                &[],
+                None,
+                &[],
+                ReceiveContext::OfflineSync,
+                &[bad_notice],
+            )
+            .unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(
+            store
+                .search_messages("11", "d:22", "synthetic-recall", 5)
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+
+        let recall = store
+            .prepare_recall("11", "d:22", "901", 1050, 1000)
+            .unwrap();
+        assert_eq!(recall.reference.client_id, client.to_string());
+        store.record_recall_ack("11", recall.client_id).unwrap();
+        assert!(store
+            .accept_recall_ack("11", recall.client_id)
+            .unwrap()
+            .message
+            .unwrap()
+            .is_recalled());
+
+        store
+            .record_attachment_ack("11", client, "901", Some(1020))
+            .unwrap();
+        assert!(store
+            .accept_attachment("11", client)
+            .unwrap()
+            .0
+            .is_recalled());
+        store
+            .receive_batch_with_media(
+                "11",
+                &[(
+                    message,
+                    Some(client.to_string()),
+                    None,
+                    Some(resource.content),
+                )],
+                None,
+            )
+            .unwrap();
+        let saved = store
+            .refresh_messages("11", "d:22", &["901".into()])
+            .unwrap();
+        assert!(saved[0].is_recalled());
+        assert!(saved[0].media.is_none());
+        assert!(store.message_media("11", "d:22", "901").unwrap().is_none());
+        assert!(store
+            .search_messages("11", "d:22", "synthetic-recall", 5)
+            .unwrap()
+            .hits
+            .is_empty());
+        assert!(store.conn.query_row(
+            "SELECT file_name='' AND file_id IS NULL AND file_url IS NULL AND parameters IS NULL
+                AND parameters_hash IS NULL AND media_metadata IS NULL
+             FROM attachment_outbox WHERE account_id='11' AND client_id=?1",
+            [client.to_string()], |row| row.get::<_, bool>(0),
+        ).unwrap());
+    }
+
     #[test]
     fn final_file_dispatch_rechecks_hidden_policy_and_encryption_without_claiming_bytes() {
         for mode in 0..3 {

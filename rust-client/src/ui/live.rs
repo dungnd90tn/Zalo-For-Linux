@@ -899,9 +899,7 @@ impl NativeApp {
             thread, message_id, ..
         } = &event
         {
-            state
-                .media
-                .close_message_viewer(&account_id, thread, message_id);
+            state.media.forget_message(&account_id, thread, message_id);
             state.group_pins.remove_preview(thread, message_id);
             if self.model.selected.as_deref() == Some(thread) {
                 self.model.overview = Default::default();
@@ -2961,11 +2959,56 @@ pub(in crate::ui) mod tests {
                         app.drafts.select(group).unwrap();
                         app.drafts.active.text = "Bản nháp cần giữ".into();
                     }
-                    if scene == "recalled" {
+                    if scene.contains("photo") {
+                        use crate::domain::{
+                            MediaDescriptor, MediaKind, PhotoAlbumMember, PhotoDescriptor,
+                        };
+
+                        let url = "https://f12-zpcloud.zdn.vn/synthetic-recall.jpg";
+                        message.text = MediaKind::Photo.legacy_placeholder().into();
+                        message.media = Some(MediaDescriptor::Photo(PhotoDescriptor {
+                            title: String::new(),
+                            caption: "Ảnh thứ hai trong album mẫu".into(),
+                            thumbnail_url: Some(url.into()),
+                            original_url: Some(url.into()),
+                            width: Some(64),
+                            height: Some(40),
+                            album: PhotoAlbumMember::new(892, 1, 3),
+                        }));
+                        message.reply_blocked = true;
+                        app.live.as_mut().unwrap().media.seed(
+                            &cc.egui_ctx,
+                            crate::app::media::MediaKey {
+                                account_id: "11".into(),
+                                thread_id: message.thread_id.clone(),
+                                message_id: message.id.clone(),
+                                url: url.into(),
+                            },
+                            app.model.generation,
+                            64,
+                            40,
+                            [55, 112, 202, 255].repeat(64 * 40),
+                        );
+                    } else if scene.contains("file") {
+                        use crate::domain::{FileDescriptor, MediaDescriptor, MediaKind};
+
+                        message.text = MediaKind::File.legacy_placeholder().into();
+                        message.media = Some(MediaDescriptor::File(FileDescriptor {
+                            title: "Báo cáo kiểm thử.pdf".into(),
+                            extension: "pdf".into(),
+                            size_bytes: Some(16_384),
+                            url: Some("https://f12-zfile.zdn.vn/synthetic-recall.pdf".into()),
+                            encrypted: false,
+                            is_folder: false,
+                        }));
+                        message.reply_blocked = true;
+                    }
+                    if scene.ends_with("recalled") {
                         message.recalled = true;
                         message.text = crate::domain::RECALLED_TEXT.into();
                         message.reply_blocked = true;
                         message.source_client_id = None;
+                        message.media = None;
                         app.model.conversations[0].last_text = crate::domain::RECALLED_TEXT.into();
                         app.model.conversations[0].last_sender = "11".into();
                     } else {

@@ -22,4 +22,6 @@ Ba hạng mục đầu đã có trong bản thử `2.0.5-2` và qua kiểm thử
 
 ## Sau 2.0.5
 
+- Đã triển khai thu hồi ảnh và tệp có xác nhận gửi từ Linux, theo từng tin hoặc từng ảnh trong album. Cần đối chiếu kết quả trên Linux và điện thoại bằng tài khoản thử, trong chat cá nhân và nhóm.
+
 Nhánh `v2.0.6` đã có nhắc tên và ghim tin văn bản trong nhóm thường, chuyển tiếp tin văn bản cá nhân đến tối đa 10 bạn bè, thu hồi tin văn bản của mình trong nhóm thường, duyệt bộ sticker khi phiên trả danh mục trực tiếp, tải từng trang tin văn bản cũ trong nhóm đủ điều kiện và gửi ảnh gốc JPEG trong chat riêng hoặc nhóm khi tài khoản có quyền Zalo Cloud. Nhánh này cũng gửi album từ 2 đến 6 ảnh HD và hiển thị các ảnh thuộc album trong khung chat. Cần xác nhận các luồng này trên tài khoản thử. Nhánh này cũng hỗ trợ thu, nghe lại và gửi tin thoại thường. Cần thử micro, loa và nhận tin thoại trên điện thoại trước khi chốt bản phát hành. Đã thêm xóa một tin văn bản ở phía mình, có xác nhận phạm vi và giữ dấu xóa khi tải lại lịch sử. Đã nối chiều nhận thao tác xóa tin văn bản từ thiết bị khác. Cần kiểm tra cả hai chiều trên tài khoản thử.

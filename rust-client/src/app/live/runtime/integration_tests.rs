@@ -52,6 +52,7 @@ enum Reply {
     Forward(u8),
     Recall(u8),
     GroupRecall(group_recall_tests::Mode),
+    MediaRecall(media_recall_tests::Operation),
     DeleteForMe(bool),
     SyncDeleteForMe,
     GroupHistory,
@@ -1521,6 +1522,10 @@ fn serve(
     }
     if let Reply::GroupRecall(mode) = reply {
         group_recall_tests::respond(&mut stream, &state, &cipher, mode, &path, &headers, &body);
+        return;
+    }
+    if let Reply::MediaRecall(operation) = reply {
+        operation.respond(&mut stream, &state, &cipher, &path, &headers, &body);
         return;
     }
     if let Reply::DeleteForMe(drop_receipt) = reply {
@@ -6144,6 +6149,7 @@ mod forward_batch_tests;
 mod group_history_tests;
 mod group_pin_tests;
 mod group_recall_tests;
+mod media_recall_tests;
 mod mention_tests;
 mod photo_upload_tests;
 mod reaction_replay_tests;

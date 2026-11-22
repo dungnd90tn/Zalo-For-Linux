@@ -374,6 +374,9 @@ async fn stream_to_dir_inner(
     }
     file.sync_all().map_err(|_| DownloadFailure::Disk)?;
     drop(file);
+    if progress.cancelled() {
+        return Err(DownloadFailure::Cancelled);
+    }
     let final_path = reserve_and_move(&part.path, dir, &safe_file_name(name))?;
     part.keep = true;
     Ok((final_path, received))

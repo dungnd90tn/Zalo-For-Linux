@@ -303,12 +303,21 @@ async fn prepare_album(
 
 #[tokio::test]
 async fn photo_album_tls_groups_three_members_and_stops_before_the_tail_after_uncertain_delivery() {
-    use super::file_fixture::{ALBUM_ACCEPT, ALBUM_LOSE_SECOND_ACK, ALBUM_REJECT_SECOND};
+    use super::file_fixture::{
+        ALBUM_ACCEPT, ALBUM_LOSE_SECOND_ACK, ALBUM_RECALL_FIRST, ALBUM_REJECT_SECOND,
+    };
     for (thread, new_route, mode, extra_metadata, expected_states) in [
         (
             "d:22",
             false,
             ALBUM_ACCEPT,
+            true,
+            &["accepted", "accepted", "accepted"][..],
+        ),
+        (
+            "d:22",
+            false,
+            ALBUM_RECALL_FIRST,
             true,
             &["accepted", "accepted", "accepted"][..],
         ),
@@ -395,6 +404,7 @@ async fn photo_album_tls_groups_three_members_and_stops_before_the_tail_after_un
             .await
             .unwrap();
         let mut accepted = Vec::new();
+        let mut recalled_before_publish = false;
         let phase = tokio::time::timeout(Duration::from_secs(12), async {
             loop {
                 match events.recv().await.unwrap() {
@@ -403,7 +413,17 @@ async fn photo_album_tls_groups_three_members_and_stops_before_the_tail_after_un
                         request_id: 902,
                         message,
                         ..
-                    } => accepted.push(message),
+                    } => {
+                        if mode == ALBUM_RECALL_FIRST && message.id == "901" {
+                            assert!(recalled_before_publish);
+                        }
+                        accepted.push(message);
+                    }
+                    LiveEvent::Recalled { message, .. }
+                        if message.as_ref().is_some_and(|message| message.id == "901") =>
+                    {
+                        recalled_before_publish = true;
+                    }
                     LiveEvent::FileTransfer {
                         kind: TransferKind::Album,
                         request_id: 902,
@@ -428,7 +448,7 @@ async fn photo_album_tls_groups_three_members_and_stops_before_the_tail_after_un
         })
         .await
         .unwrap();
-        let successful = mode == ALBUM_ACCEPT;
+        let successful = matches!(mode, ALBUM_ACCEPT | ALBUM_RECALL_FIRST);
         assert_eq!(
             phase,
             if successful {
@@ -496,6 +516,11 @@ async fn photo_album_tls_groups_three_members_and_stops_before_the_tail_after_un
             if let Some(message) = accepted.get(index) {
                 assert_eq!(message.thread_id, thread);
                 assert_eq!(message.id, (901 + index).to_string());
+                if mode == ALBUM_RECALL_FIRST && index == 0 {
+                    assert!(message.is_recalled());
+                    assert!(message.media.is_none());
+                    continue;
+                }
                 let Some(crate::domain::MediaDescriptor::Photo(photo)) = &message.media else {
                     panic!("missing accepted photo");
                 };
@@ -507,19 +532,34 @@ async fn photo_album_tls_groups_three_members_and_stops_before_the_tail_after_un
         let db =
             rusqlite::Connection::open(f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
         let mut read = db
-            .prepare("SELECT state,checksum FROM photo_outbox ORDER BY CAST(client_id AS INTEGER)")
+            .prepare(
+                "SELECT state,checksum,CASE WHEN media_metadata IS NULL AND parameters_hash IS NULL
+                    THEN parameters END FROM photo_outbox ORDER BY CAST(client_id AS INTEGER)",
+            )
             .unwrap();
         let rows = read
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
             })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(rows.len(), expected_attempts);
-        for (index, (state, checksum)) in rows.iter().enumerate() {
+        for (index, (state, checksum, anchor)) in rows.iter().enumerate() {
             assert_eq!(state, expected_states[index]);
-            assert_eq!(checksum, &format!("{:x}", Md5::digest(&previews[index])));
+            if mode == ALBUM_RECALL_FIRST && index == 0 {
+                assert_eq!(checksum, &"0".repeat(32));
+                assert_eq!(
+                    anchor.as_deref(),
+                    Some(format!("album-photo:{layout_id}/0/3").as_bytes())
+                );
+            } else {
+                assert_eq!(checksum, &format!("{:x}", Md5::digest(&previews[index])));
+            }
         }
     }
 }

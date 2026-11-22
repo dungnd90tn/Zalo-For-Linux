@@ -4,9 +4,10 @@ use super::*;
 pub(super) const ALBUM_ACCEPT: u8 = 20;
 pub(super) const ALBUM_REJECT_SECOND: u8 = 21;
 pub(super) const ALBUM_LOSE_SECOND_ACK: u8 = 22;
+pub(super) const ALBUM_RECALL_FIRST: u8 = 23;
 
 fn album_mode(mode: u8) -> bool {
-    (ALBUM_ACCEPT..=ALBUM_LOSE_SECOND_ACK).contains(&mode)
+    (ALBUM_ACCEPT..=ALBUM_RECALL_FIRST).contains(&mode)
 }
 
 fn album_photo_id(parameters: &Value) -> String {
@@ -96,6 +97,7 @@ pub(super) fn socket(mut ws: Socket, state: Arc<State>, mode: u8, photo: bool) {
         .set_read_timeout(Some(Duration::from_millis(20)))
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut album_recall_sent = false;
     while std::time::Instant::now() < deadline {
         if transfer.control_pending.swap(false, Ordering::SeqCst) {
             let mut controls = json!({"error_code":0,"data":{"controls":[{"controlId":"1","content":{"act_type":"other_control","data":{}}},{"controlId":"2","content":{"act_type":"file_done","fileId":"wrong-file","data":{"url":"https://files.example.test/wrong"}}},{"controlId":"3","content":{"act_type":"file_done","fileId":"987","data":"{\"url\":\"https://files.example.test/uploaded\"}"}}]}});
@@ -190,6 +192,25 @@ pub(super) fn socket(mut ws: Socket, state: Arc<State>, mode: u8, photo: bool) {
                         if mode == 8 && count == 0 {
                             transfer.stalled.store(true, Ordering::SeqCst);
                             continue;
+                        }
+                        if mode == ALBUM_RECALL_FIRST && !album_recall_sent {
+                            let client_id = transfer
+                                .finals
+                                .lock()
+                                .unwrap()
+                                .first()
+                                .map(|parameters| parameters["clientId"].clone());
+                            if let Some(client_id) = client_id {
+                                let notice = json!({"uidFrom":"0","idTo":"22","msgId":"999",
+                                    "ts":"1760000000002","msgType":"chat.undo",
+                                    "content":{"globalMsgId":"901","cliMsgId":client_id,
+                                        "srcId":"11","destId":"22"}});
+                                let payload = json!({"error_code":0,"data":{"msgs":[notice]}});
+                                if !send(&mut ws, 501, 0, payload) {
+                                    break;
+                                }
+                                album_recall_sent = true;
+                            }
                         }
                         let mut page = json!({"err":0,"hasMore":false,"uids":[],"threads":[],"waitUids":[],"pendingUids":[]});
                         if state.eligibility_mode.load(Ordering::SeqCst) == 21 {

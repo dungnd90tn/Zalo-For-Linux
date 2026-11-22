@@ -1889,3 +1889,27 @@ schema 24 startup and restart smoke test. A disposable schema 23 profile
 kept all 19 synthetic messages on upgrade, and the previous binary
 refused the upgraded profile. Phone-to-Linux verification on a real Zalo
 account remains pending.
+
+## Recalling photos and files sent from Linux
+
+Scope is one ordinary photo or file with a matching accepted upload receipt
+in a direct chat or an eligible group. Each album member is an independent
+target. The storage fixtures cover an exact recall received before the typed
+echo, a late upload acknowledgement, and a neighboring album image that
+remains visible. A recall notice arriving while history is present and the
+typed receipt is still unavailable can require a later verified notice.
+
+The default checks passed 318 Rust and 19 Python tests. The all-feature
+checks passed 173 store tests, five targeted UI and cache tests, and strict
+Clippy. Three exact loopback tests passed. They cover
+direct photo and group file recall, a lost reply without redispatch on
+restart, recalling the first photo while the rest of its album is still
+uploading, and cancellation of a stalled download.
+The optimized live binary passed the offline startup, restart and profile
+compatibility smoke checks at schema 24.
+
+The ignored X11 fixture supports `ZALO_UI_FIXTURE_RECALL=photo-confirm`,
+`group-photo-confirm`, `group-file-confirm` and `photo-recalled`. Sixteen
+offline captures cover both themes at 640×480 and 1200×780. The confirmation
+identifies the chosen item and conversation scope. The recalled row shows
+only the recall label. Real-service testing with Linux and a phone is pending.

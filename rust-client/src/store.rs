@@ -1078,7 +1078,7 @@ impl MessageStore {
         #[cfg(feature = "messaging")]
         let mut changed_reactions = std::collections::BTreeSet::new();
         #[cfg(feature = "messaging")]
-        let changes = {
+        let mut changes = {
             if extras.notices.len() > MAX_PAGE_SIZE {
                 bail!(FailureReason::Validation);
             }
@@ -1092,6 +1092,8 @@ impl MessageStore {
         };
         #[cfg(not(feature = "messaging"))]
         let changes = Vec::new();
+        #[cfg(feature = "messaging")]
+        let mut early_media_recalls = std::collections::BTreeSet::new();
         let mut unread = Vec::new();
         let mut result = Vec::with_capacity(message_count);
         for (source, client_id, info, media, quote, _marker) in messages {
@@ -1338,7 +1340,31 @@ impl MessageStore {
             let forward_enriched = false;
             let quote_enriched = message_reply::persist(&tx, m, quote)?;
             #[cfg(feature = "messaging")]
-            if has_pending_reactions
+            let early_media_recall = if m.sender == account
+                && media
+                    .is_some_and(|media| matches!(media.kind(), MediaKind::Photo | MediaKind::File))
+            {
+                recall::materialize_pending_media(&tx, m)?
+            } else {
+                None
+            };
+            #[cfg(feature = "messaging")]
+            if let Some(change) = early_media_recall {
+                if let Some(recalled) = &change.message {
+                    *m = recalled.clone();
+                }
+                early_media_recalls.insert(m.thread_id.clone());
+                changes.retain(|pending| {
+                    pending.message.is_some()
+                        || pending.thread_id != change.thread_id
+                        || pending.message_id != change.message_id
+                        || pending.actor_id != change.actor_id
+                });
+                changes.push(change);
+            }
+            #[cfg(feature = "messaging")]
+            if !m.recalled
+                && has_pending_reactions
                 && (m.source_client_id.is_some()
                     || previous_reply.source_client_id.is_some()
                     || m.reply_blocked)
@@ -1370,6 +1396,19 @@ impl MessageStore {
                 hydrated.media = message_media::projection(&tx, m)?;
                 message_reply::hydrate(&tx, &mut hydrated)?;
                 result.push((hydrated, c));
+            }
+        }
+        #[cfg(feature = "messaging")]
+        for (message, conversation) in &mut result {
+            if early_media_recalls.contains(&message.thread_id) {
+                // A sibling may have been projected before the typed media
+                // supplied the evidence needed to confirm its early recall.
+                message_reply::hydrate(&tx, message)?;
+                *conversation = tx.query_row(
+                    CONVERSATION_SQL,
+                    params![account, message.thread_id, MAX_PREVIEW_CHARS as i64],
+                    conversation_row,
+                )?;
             }
         }
         #[cfg(feature = "messaging")]
@@ -1496,6 +1535,20 @@ impl MessageStore {
             )
             .optional()?
             .unwrap_or_else(|| "1".into()))
+    }
+
+    #[cfg(feature = "messaging")]
+    pub(crate) fn upload_conversation(&self, account: &str, thread: &str) -> Result<Conversation> {
+        validate_id(account)?;
+        validate_id(thread)?;
+        if !self.live_thread_visible(account, thread)? {
+            bail!(FailureReason::Validation);
+        }
+        Ok(self.conn.query_row(
+            CONVERSATION_SQL,
+            params![account, thread, MAX_PREVIEW_CHARS as i64],
+            conversation_row,
+        )?)
     }
 
     pub fn open_conversation(

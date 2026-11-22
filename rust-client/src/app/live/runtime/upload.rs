@@ -118,13 +118,17 @@ impl Drop for PendingAuthorization {
 }
 struct Outcome {
     phase: FileTransferPhase,
-    accepted: Vec<(Message, Conversation)>,
+    accepted: Vec<String>,
     message: Option<String>,
 }
 struct SingleOutcome {
     phase: FileTransferPhase,
-    accepted: Option<(Message, Conversation)>,
+    accepted: Option<AcceptedUpload>,
     message: Option<&'static str>,
+}
+struct AcceptedUpload {
+    client_id: u64,
+    message_id: String,
 }
 struct ResourceCache<T = String> {
     entries: VecDeque<(String, Option<T>, tokio::time::Instant)>,
@@ -787,17 +791,42 @@ impl Uploads {
                 accepted: Vec::new(),
                 message: Some("Tác vụ gửi đã dừng. Kiểm tra hội thoại trước khi gửi lại.".into()),
             });
-            for (message, conversation) in outcome.accepted {
-                events
-                    .emit(LiveEvent::FileAccepted {
-                        kind: job.kind,
-                        account_id: events.account.clone(),
-                        thread: job.thread.clone(),
-                        request_id: job.request_id,
-                        message,
-                        conversation,
+            if !outcome.accepted.is_empty() {
+                // Album members can be recalled while the later members are uploading.
+                // Publish the canonical committed rows from the runtime turn that also owns receive.
+                let account = events.account.clone();
+                let thread = job.thread.clone();
+                let ids = outcome.accepted;
+                let snapshot = db
+                    .call_with(StorageOperation::LoadHistory, move |store| {
+                        let messages = store.refresh_messages(&account, &thread, &ids)?;
+                        if messages.is_empty() {
+                            return Ok(None);
+                        }
+                        let conversation = store.upload_conversation(&account, &thread)?;
+                        Ok(Some((messages, conversation)))
                     })
-                    .await?;
+                    .await;
+                match snapshot {
+                    Ok(Some((messages, conversation))) => {
+                        for message in messages {
+                            events
+                                .emit(LiveEvent::FileAccepted {
+                                    kind: job.kind,
+                                    account_id: events.account.clone(),
+                                    thread: job.thread.clone(),
+                                    request_id: job.request_id,
+                                    message,
+                                    conversation: conversation.clone(),
+                                })
+                                .await?;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = diagnostic(&error, LiveStage::Storage);
+                    }
+                }
             }
             emit(
                 events,
@@ -997,7 +1026,11 @@ async fn run(
             .await;
             return Outcome {
                 phase: result.phase,
-                accepted: result.accepted.into_iter().collect(),
+                accepted: result
+                    .accepted
+                    .into_iter()
+                    .map(|accepted| accepted.message_id)
+                    .collect(),
                 message: result.message.map(str::to_owned),
             };
         }
@@ -1053,14 +1086,9 @@ async fn run(
             (offset, total),
         )
         .await;
-        if let Some((message, conversation)) = result.accepted {
-            if layout_id.is_none() {
-                layout_id = message
-                    .source_client_id
-                    .as_deref()
-                    .and_then(|id| id.parse().ok());
-            }
-            accepted.push((message, conversation));
+        if let Some(upload) = result.accepted {
+            layout_id.get_or_insert(upload.client_id);
+            accepted.push(upload.message_id);
             offset += size;
         }
         if result.phase != FileTransferPhase::Accepted || layout_id.is_none() {
@@ -1309,7 +1337,7 @@ async fn run_one(
             total: progress_total,
         });
     };
-    let result:Result<(Message,Conversation)>=async {
+    let result: Result<AcceptedUpload> = async {
         let name=input.name();
         let original=matches!(&input, UploadInput::Photo{photo,..} if photo.resolution()==PhotoResolution::Original);
         if original {
@@ -1410,7 +1438,8 @@ async fn run_one(
         dispatched=true;
         let payload=tokio::select!{biased;r=authenticated_request(&client,&session,final_url,Some(body))=>r?,_=cancelled(&cancel)=>anyhow::bail!("Upload cancelled after dispatch")};
         let ack=wire::send_ack(&payload)?;acknowledged=true;let account=session.account_id().to_owned();
-        db.call_with(StorageOperation::PersistAck,move|s|match kind{TransferKind::File=>{s.record_attachment_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_attachment(&account,id)},TransferKind::Photo | TransferKind::Album=>{s.record_photo_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_photo(&account,id)},TransferKind::Voice => unreachable!("Voice has a separate dispatch")}).await
+        let (message, _) = db.call_with(StorageOperation::PersistAck,move|s|match kind{TransferKind::File=>{s.record_attachment_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_attachment(&account,id)},TransferKind::Photo | TransferKind::Album=>{s.record_photo_ack(&account,id,&ack.server_id,ack.timestamp_ms)?;s.accept_photo(&account,id)},TransferKind::Voice => unreachable!("Voice has a separate dispatch")}).await?;
+        Ok(AcceptedUpload { client_id: id, message_id: message.id })
     }.await;
     match result {
         Ok(accepted) => SingleOutcome {
@@ -1479,10 +1508,13 @@ async fn run_one(
                     })
                     .await;
                 match confirmed {
-                    Ok(Some(Ok(accepted))) => {
+                    Ok(Some(Ok((message, _)))) => {
                         return SingleOutcome {
                             phase: FileTransferPhase::Accepted,
-                            accepted: Some(accepted),
+                            accepted: Some(AcceptedUpload {
+                                client_id: id,
+                                message_id: message.id,
+                            }),
                             message: None,
                         }
                     }

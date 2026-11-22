@@ -225,6 +225,24 @@ redacted rows. These are logical storage changes. Separately forwarded
 messages remain independent. Group, media and E2EE recall and local deletion
 are outside this slice.
 
+## Ordinary photo and file recall
+
+The ordinary client dispatches both text and media through the existing
+undo request. The direct endpoint is `/api/message/undo` and the group
+endpoint is `/api/group/undomsg`. Native scopes the target to an accepted
+PHOTO or FILE record for this account and thread, matching the actor, server
+message ID and original client ID. Each album image has its own target.
+The normal capability, group membership and recall deadline checks apply.
+
+An authenticated own-account notice with the original client ID can wait
+for the typed receipt and be applied in the same transaction as acceptance.
+The local projection clears resource URLs and display metadata. Late typed
+receipts and history copies use the redacted projection. Native retains the
+receipt identity and scoped tombstone in schema 24. A recalled first album
+member retains its layout ID, index and count so the remaining images can
+finish sending. Previously saved local downloads and media sent from other
+clients are outside this implementation.
+
 ## Deleting one ordinary text message for the account
 
 The session must affirm `settings.features.sync_del_msg_or_conv.enable_sync_del_msg`

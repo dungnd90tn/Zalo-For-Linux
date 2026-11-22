@@ -11,6 +11,7 @@ Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) đ�
 - Ghim và bỏ ghim tin văn bản trong nhóm thường theo quyền Zalo. Xem danh sách trong **Thông tin hội thoại** và bấm để mở tin đã lưu. Nếu ghim trên thiết bị khác, dùng **Cập nhật tin ghim** để tải trạng thái mới.
 - Chuyển tiếp một tin văn bản cá nhân đến tối đa 10 bạn bè. Giữ lựa chọn khi tìm kiếm, hiển thị kết quả từng người và chỉ cho thử lại các lượt bị từ chối hoặc xác định chưa gửi.
 - Thu hồi tin văn bản do bạn gửi trong nhóm thường tối đa 100 thành viên khi còn trong thời hạn. Khi xác nhận thu hồi, ứng dụng cập nhật bong bóng và bỏ nội dung gốc khỏi trích dẫn, kết quả tìm kiếm và bản xem trước tin ghim trên máy.
+- Thu hồi ảnh hoặc tệp do bạn gửi từ Linux và đã được xác nhận trong chat cá nhân hoặc nhóm thường đủ điều kiện. Với album, chọn từng ảnh. Khi thu hồi thành công, ứng dụng đóng khung xem và dừng lượt tải của tin đã chọn.
 - Duyệt các bộ nhãn dán công khai được trả trực tiếp từ danh mục Zalo. Mở một bộ, cuộn xem và gửi sticker đủ điều kiện vào hội thoại hiện tại. Phần chữ, trích dẫn và tệp đang soạn được giữ lại.
 - Tải từng trang tin văn bản cũ trong nhóm thường đủ điều kiện khi Zalo bật dịch vụ lịch sử nhóm. Ứng dụng giữ nguyên trang đang đọc và bản nháp, rồi mở phần đã lưu qua **Xem trang trước**.
 - Gửi một ảnh gốc JPEG tối đa 5 MiB và 2560 px mỗi chiều khi tài khoản có quyền Zalo Cloud. Ảnh có xem trước và chú thích. Ứng dụng bỏ metadata APP1 mà không nén lại ảnh. JPEG cần xoay hoặc lật theo EXIF có thể gửi dưới dạng tệp.

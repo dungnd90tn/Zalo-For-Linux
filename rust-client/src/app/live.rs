@@ -2173,8 +2173,8 @@ impl super::Model {
                         self.upsert_live_conversation(conversation);
                     }
                 }
+                self.remove_search_message(&thread, &message_id, &actor_id);
                 if self.selected.as_deref() == Some(&thread) {
-                    self.clear_search();
                     for visible in &mut self.messages {
                         if visible.account_id != account_id || visible.thread_id != thread {
                             continue;

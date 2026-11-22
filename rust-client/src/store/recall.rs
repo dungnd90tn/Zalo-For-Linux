@@ -59,6 +59,46 @@ pub(super) fn redact(message: &mut Message) {
     message.media = None;
 }
 
+/// Late upload acknowledgments reuse the scrubbed accepted ledger and the
+/// matching canonical message without reopening the original media payload.
+pub(super) fn accepted_media_replay(
+    conn: &Connection,
+    account: &str,
+    thread: &str,
+    server: &str,
+    client: u64,
+) -> Result<(Message, Conversation)> {
+    let sent_at_ms = conn.query_row(
+        "SELECT m.sent_at_ms FROM messages m JOIN recall_tombstones t
+         USING(account_id,thread_id,message_id)
+         WHERE m.account_id=?1 AND m.thread_id=?2 AND m.message_id=?3
+           AND m.sender=?1 AND t.actor_id=?1 AND t.source_client_id=?4 AND t.materialized=1",
+        params![account, thread, server, client.to_string()],
+        |row| row.get(0),
+    )?;
+    let message = Message {
+        account_id: account.into(),
+        thread_id: thread.into(),
+        id: server.into(),
+        sender: account.into(),
+        text: crate::domain::RECALLED_TEXT.into(),
+        sent_at_ms,
+        source_client_id: None,
+        mentions: Vec::new(),
+        reply_blocked: true,
+        recalled: true,
+        quote: None,
+        sticker: None,
+        media: None,
+    };
+    let conversation = conn.query_row(
+        CONVERSATION_SQL,
+        params![account, thread, MAX_PREVIEW_CHARS as i64],
+        conversation_row,
+    )?;
+    Ok((message, conversation))
+}
+
 pub(crate) struct RecallChange {
     #[cfg(feature = "messaging")]
     pub thread_id: String,
@@ -185,10 +225,98 @@ mod live {
         Ok(allowed)
     }
 
+    fn owned_media(conn: &Connection, message: &Message) -> Result<Option<MediaKind>> {
+        let Some(client) = message
+            .source_client_id
+            .as_deref()
+            .filter(|id| valid_source_id(id))
+        else {
+            return Ok(None);
+        };
+        if message.sender != message.account_id
+            || message.quote.is_some()
+            || !message.mentions.is_empty()
+        {
+            return Ok(None);
+        }
+        let (kind, ledger) = match message.text.as_str() {
+            text if text == MediaKind::Photo.legacy_placeholder() => {
+                (MediaKind::Photo, "photo_outbox")
+            }
+            text if text == MediaKind::File.legacy_placeholder() => {
+                (MediaKind::File, "attachment_outbox")
+            }
+            _ => return Ok(None),
+        };
+        if !message_media::projection(conn, message)?.is_some_and(|media| media.kind() == kind) {
+            return Ok(None);
+        }
+        let accepted = conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {ledger} WHERE account_id=?1 AND thread_id=?2
+              AND server_id=?3 AND client_id=?4 AND state='accepted' AND media_metadata IS NOT NULL)
+              AND NOT EXISTS(SELECT 1 FROM message_forward WHERE account_id=?1 AND thread_id=?2
+                  AND message_id=?3 AND kind='forwarded')"
+            ),
+            params![message.account_id, message.thread_id, message.id, client],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(accepted.then_some(kind))
+    }
+
+    fn scrub_owned_media(conn: &Connection, message: &Message, kind: MediaKind) -> Result<()> {
+        let scrubbed = match kind {
+            MediaKind::Photo => photos::scrub_recalled(conn, message)?,
+            MediaKind::File => conn.execute(
+                "UPDATE attachment_outbox SET file_name='',file_id=NULL,file_url=NULL,
+                    parameters=NULL,parameters_hash=NULL,media_metadata=NULL,checksum='00000000000000000000000000000000'
+                 WHERE account_id=?1 AND thread_id=?2 AND server_id=?3 AND client_id=?4 AND state='accepted'",
+                params![message.account_id, message.thread_id, message.id, message.source_client_id],
+            )?,
+            _ => bail!(FailureReason::ConflictingEcho),
+        };
+        ensure!(scrubbed == 1, FailureReason::ConflictingEcho);
+        conn.execute(
+            "DELETE FROM message_media WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
+            params![message.account_id, message.thread_id, message.id],
+        )?;
+        Ok(())
+    }
+
+    pub(in super::super) fn materialize_pending_media(
+        conn: &Connection,
+        message: &Message,
+    ) -> Result<Option<RecallChange>> {
+        let Some(client) = message.source_client_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(prior) = tombstone(conn, &message.account_id, &message.thread_id, &message.id)?
+        else {
+            return Ok(None);
+        };
+        if prior.materialized
+            || prior.actor != message.sender
+            || prior.source_client.as_deref() != Some(client)
+            || owned_media(conn, message)?.is_none()
+        {
+            return Ok(None);
+        }
+        write(
+            conn,
+            &message.account_id,
+            &message.thread_id,
+            &message.id,
+            &prior.actor,
+            Some(client),
+            prior.occurred_at_ms,
+        )
+    }
+
     struct Tombstone {
         actor: String,
         source_client: Option<String>,
         materialized: bool,
+        occurred_at_ms: i64,
     }
 
     fn tombstone(
@@ -199,7 +327,7 @@ mod live {
     ) -> Result<Option<Tombstone>> {
         Ok(conn
             .query_row(
-                "SELECT actor_id,source_client_id,materialized FROM recall_tombstones
+                "SELECT actor_id,source_client_id,materialized,occurred_at_ms FROM recall_tombstones
              WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
                 params![account, thread, id],
                 |row| {
@@ -207,6 +335,7 @@ mod live {
                         actor: row.get(0)?,
                         source_client: row.get(1)?,
                         materialized: row.get(2)?,
+                        occurred_at_ms: row.get(3)?,
                     })
                 },
             )
@@ -447,6 +576,7 @@ mod live {
         }
         let mut previous = tombstone(conn, account, thread, id)?;
         let mut original = original(conn, account, thread, id)?;
+        let mut media = None;
         if group
             && original.is_none()
             && (client.is_none()
@@ -458,8 +588,16 @@ mod live {
             if message.sender != actor || !same_cli(message.source_client_id.as_deref(), client) {
                 return Ok(None);
             }
+            media = owned_media(conn, message)?;
+            if media.is_none()
+                && previous.as_ref().is_none_or(|prior| !prior.materialized)
+                && message_media::exists(conn, message)?
+            {
+                return Ok(None);
+            }
             if group
                 && previous.as_ref().is_none_or(|prior| !prior.materialized)
+                && media.is_none()
                 && !ordinary(conn, message)?
             {
                 return Ok(None);
@@ -480,7 +618,7 @@ mod live {
             // replace it. Never change an already materialized tombstone.
             let bound_original = match &original {
                 Some(_) if group => previous.as_ref().is_some_and(|prior| !prior.materialized),
-                Some(message) => ordinary(conn, message)?,
+                Some(message) => media.is_some() || ordinary(conn, message)?,
                 None => false,
             };
             if !bound_original {
@@ -493,7 +631,7 @@ mod live {
             previous = None;
         }
         if let Some(message) = &original {
-            if !group && previous.is_none() && !ordinary(conn, message)? {
+            if !group && previous.is_none() && media.is_none() && !ordinary(conn, message)? {
                 return Ok(None);
             }
         }
@@ -519,6 +657,9 @@ mod live {
             redact_copies(conn, account, thread, id, actor)?;
         }
         if let Some(message) = &mut original {
+            if let Some(kind) = media {
+                scrub_owned_media(conn, message, kind)?;
+            }
             conn.execute(
                 "UPDATE messages SET body=?5 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND sender=?4",
                 params![account,thread,id,actor,PLACEHOLDER],
@@ -657,12 +798,21 @@ mod live {
                 RecallFailure::Unresolved
             );
             let original = original(&tx, account, thread, id)?.ok_or(RecallFailure::Unavailable)?;
-            ensure!(
-                original.sender == account && ordinary(&tx, &original)?,
-                RecallFailure::Unavailable
-            );
-            let reference = RecallReference::from_source(account, &original)
-                .map_err(|_| RecallFailure::Unavailable)?;
+            ensure!(original.sender == account, RecallFailure::Unavailable);
+            let reference = if owned_media(&tx, &original)?.is_some() {
+                ensure!(original.sent_at_ms > 0, RecallFailure::Unavailable);
+                RecallReference {
+                    message_id: original.id,
+                    client_id: original
+                        .source_client_id
+                        .ok_or(RecallFailure::Unavailable)?,
+                    sent_at_ms: original.sent_at_ms,
+                }
+            } else {
+                ensure!(ordinary(&tx, &original)?, RecallFailure::Unavailable);
+                RecallReference::from_source(account, &original)
+                    .map_err(|_| RecallFailure::Unavailable)?
+            };
             let age = now
                 .checked_sub(reference.sent_at_ms)
                 .ok_or(RecallFailure::Unavailable)?;
@@ -795,8 +945,8 @@ mod live {
 
 #[cfg(feature = "messaging")]
 pub(super) use live::{
-    apply_notice, history_redacted_copy, redact_quote, redact_replay, redacted_copy,
-    settle_recalled_own_echo,
+    apply_notice, history_redacted_copy, materialize_pending_media, redact_quote, redact_replay,
+    redacted_copy, settle_recalled_own_echo,
 };
 #[cfg(feature = "messaging")]
 pub(crate) use live::{RecallFailure, RecallOutcome};

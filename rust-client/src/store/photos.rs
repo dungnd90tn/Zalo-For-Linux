@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 pub const MAX_PHOTO_BYTES: u64 = 5 * 1024 * 1024;
 pub const MAX_ALBUM_PHOTOS: usize = 6;
 const MAX_FINAL_BYTES: usize = 128 * 1024;
-// Before a final resource exists, this mode marker is the only permitted
-// non-null parameters value. Ready rows carry the sealed final JSON instead.
+// Pending rows keep only a mode marker. Ready rows carry sealed final JSON.
+// A recalled first member retains only its layout marker for the album tail.
 const ORIGINAL_RESERVATION: &[u8] = b"original-photo";
 const ALBUM_RESERVATION: &[u8] = b"album-photo:";
 
@@ -496,6 +496,25 @@ fn final_resource(conn: &Connection, account: &str, client: u64) -> Result<Final
     })
 }
 
+#[cfg(feature = "messaging")]
+pub(super) fn scrub_recalled(conn: &Connection, message: &Message) -> Result<usize> {
+    let client = message
+        .source_client_id
+        .as_deref()
+        .ok_or(FailureReason::ConflictingEcho)?;
+    let anchor = final_resource(conn, &message.account_id, client.parse()?)?
+        .content
+        .album_member()
+        .filter(|member| member.index() == 0)
+        .map(album_reservation);
+    Ok(conn.execute(
+        "UPDATE photo_outbox SET caption='',photo_id=NULL,parameters=?5,parameters_hash=NULL,
+          media_metadata=NULL,checksum='00000000000000000000000000000000'
+         WHERE account_id=?1 AND thread_id=?2 AND server_id=?3 AND client_id=?4 AND state='accepted'",
+        params![message.account_id, message.thread_id, message.id, client, anchor],
+    )?)
+}
+
 fn check_reservations(
     conn: &Connection,
     account: &str,
@@ -614,16 +633,24 @@ impl MessageStore {
                     FailureReason::Validation
                 );
                 if let Some(layout_id) = position.layout_id {
-                    let accepted: bool = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM photo_outbox WHERE account_id=?1 AND thread_id=?2 AND client_id=?3 AND state='accepted')",
+                    let marker: Option<Vec<u8>> = tx.query_row(
+                        "SELECT CASE WHEN p.media_metadata IS NULL AND p.parameters_hash IS NULL
+                            AND EXISTS(SELECT 1 FROM recall_tombstones r
+                                WHERE r.account_id=p.account_id AND r.thread_id=p.thread_id
+                                  AND r.message_id=p.server_id AND r.actor_id=p.account_id
+                                  AND r.source_client_id=p.client_id AND r.materialized=1)
+                            THEN p.parameters END FROM photo_outbox p
+                         WHERE p.account_id=?1 AND p.thread_id=?2 AND p.client_id=?3 AND p.state='accepted'",
                         params![account, thread, layout_id.to_string()],
                         |row| row.get(0),
-                    )?;
-                    ensure!(accepted, FailureReason::ConflictingMetadata);
-                    let first = final_resource(&tx, account, layout_id)?;
+                    ).optional()?.ok_or(FailureReason::ConflictingMetadata)?;
+                    let first = if let Some(marker) = marker {
+                        parse_album_reservation(&marker)
+                    } else {
+                        final_resource(&tx, account, layout_id)?.content.album_member()
+                    };
                     ensure!(
-                        first.content.album_member()
-                            == PhotoAlbumMember::new(layout_id, 0, position.count),
+                        first == PhotoAlbumMember::new(layout_id, 0, position.count),
                         FailureReason::ConflictingMetadata
                     );
                 }
@@ -771,7 +798,10 @@ impl MessageStore {
     pub fn accept_photo(&mut self, account: &str, client: u64) -> Result<(Message, Conversation)> {
         validate_id(account)?;
         let tx = self.conn.transaction()?;
-        let (thread,server,created,timestamp,raw):(String,String,i64,Option<i64>,String)=tx.query_row("SELECT thread_id,server_id,created_at_ms,server_ts,media_metadata FROM photo_outbox WHERE account_id=?1 AND client_id=?2 AND state IN ('acknowledged','accepted')",params![account,client.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        let (thread,server,created,timestamp,raw):(String,String,i64,Option<i64>,Option<String>)=tx.query_row("SELECT thread_id,server_id,created_at_ms,server_ts,media_metadata FROM photo_outbox WHERE account_id=?1 AND client_id=?2 AND state IN ('acknowledged','accepted')",params![account,client.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        let Some(raw) = raw else {
+            return super::recall::accepted_media_replay(&tx, account, &thread, &server, client);
+        };
         ensure!(raw.len() <= MAX_FINAL_BYTES, "Photo echo exceeds limit");
         ensure!(
             !super::forward::server_reserved(&tx, account, &thread, &server)?,
@@ -807,6 +837,15 @@ impl MessageStore {
         insert_validated_with_media(&tx, std::iter::once((&message, None, Some(&content))))?;
         super::message_reply::hydrate(&tx, &mut message)?;
         ensure!(tx.execute("UPDATE photo_outbox SET state='accepted' WHERE account_id=?1 AND client_id=?2 AND state IN ('acknowledged','accepted')",params![account,client.to_string()])?==1,"Photo acceptance conflict");
+        #[cfg(feature = "messaging")]
+        if let Some(change) = super::recall::materialize_pending_media(&tx, &message)? {
+            let recalled = change
+                .message
+                .zip(change.conversation)
+                .ok_or(FailureReason::ConflictingEcho)?;
+            tx.commit()?;
+            return Ok(recalled);
+        }
         let conversation = tx.query_row(
             CONVERSATION_SQL,
             params![account, thread, MAX_PREVIEW_CHARS as i64],
@@ -958,6 +997,64 @@ mod tests {
         assert!(reopened
             .preflight_album("11", "d:22", &[spec.clone(), spec])
             .is_err());
+
+        // The desktop can receive recall before the typed echo that proves
+        // which locally submitted album member the notice names.
+        let second_resource = resource(second, other);
+        let echo = Message {
+            account_id: "11".into(),
+            thread_id: "d:22".into(),
+            id: "903".into(),
+            sender: "11".into(),
+            text: MediaKind::Photo.legacy_placeholder().into(),
+            sent_at_ms: 1040,
+            source_client_id: None,
+            mentions: Vec::new(),
+            reply_blocked: true,
+            recalled: false,
+            quote: None,
+            sticker: None,
+            media: Some(second_resource.content.descriptor().clone()),
+        };
+        let notice = crate::protocol::recall::RecallNotice {
+            thread_id: "d:22".into(),
+            message_id: "903".into(),
+            actor_id: "11".into(),
+            client_id: Some(second.to_string()),
+            event_id: "904".into(),
+            occurred_at_ms: 1050,
+        };
+        let (stored, _, recalls) = reopened
+            .receive_batch_with_recalls(
+                "11",
+                &[(
+                    (
+                        echo,
+                        Some(second.to_string()),
+                        None,
+                        Some(second_resource.content),
+                        None,
+                    ),
+                    None,
+                )],
+                Some(("510:1", "904")),
+                &[],
+                ReceiveContext::OfflineSync,
+                &[notice],
+            )
+            .unwrap();
+        assert!(stored[0].0.is_recalled());
+        assert_eq!(recalls.len(), 1);
+        assert!(recalls[0].message.as_ref().unwrap().is_recalled());
+        assert_eq!(reopened.receive_cursor("11", "510:1").unwrap(), "904");
+        reopened
+            .record_photo_ack("11", second, "903", Some(1040))
+            .unwrap();
+        assert!(reopened.accept_photo("11", second).unwrap().0.is_recalled());
+        let saved = reopened.page("11", "d:22", None, 10).unwrap();
+        assert!(saved[0].media.is_some());
+        assert!(saved[1].is_recalled());
+        assert!(saved[1].media.is_none());
     }
     #[test]
     fn final_photo_dispatch_rechecks_private_visibility_and_encryption() {
