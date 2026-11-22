@@ -217,6 +217,15 @@ pub enum RemoteHistoryOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollVoteOutcome {
+    Accepted,
+    Joined,
+    Rejected,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StickerOutcome {
     Accepted,
     Rejected,
@@ -324,6 +333,16 @@ pub enum LiveCommand {
         thread: String,
         message_id: String,
         privacy_revision: u64,
+    },
+    VotePoll {
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        message_id: String,
+        privacy_revision: u64,
+        poll_id: u64,
+        option_id: u64,
+        option_text: String,
     },
     Forward {
         request_id: u64,
@@ -655,6 +674,17 @@ pub enum LiveEvent {
         detail: Option<crate::domain::poll::PollDetails>,
         notice: Option<&'static str>,
     },
+    PollVoteFinished {
+        account_id: String,
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        message_id: String,
+        privacy_revision: u64,
+        poll_id: Option<u64>,
+        outcome: PollVoteOutcome,
+        detail: Option<crate::domain::poll::PollDetails>,
+    },
     Recalled {
         account_id: String,
         thread: String,
@@ -952,6 +982,7 @@ impl LiveEvent {
             | Self::RemoteHistoryFinished { account_id, .. }
             | Self::PollDetailCapability { account_id, .. }
             | Self::PollDetail { account_id, .. }
+            | Self::PollVoteFinished { account_id, .. }
             | Self::Recalled { account_id, .. }
             | Self::ForwardFinished { account_id, .. }
             | Self::ForwardBatchFinished { account_id, .. }
@@ -1251,6 +1282,25 @@ impl LiveWorker {
                     && Target::from_thread(thread)
                         .is_ok_and(|target| target.kind == ThreadKind::Group)
                     && crate::protocol::messaging::numeric_id(message_id).is_ok()
+            }
+            LiveCommand::VotePoll {
+                request_id,
+                thread,
+                message_id,
+                poll_id,
+                option_id,
+                option_text,
+                ..
+            } => {
+                use crate::domain::poll::{MAX_POLL_ID, MAX_POLL_OPTION_BYTES};
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+                    && crate::protocol::messaging::numeric_id(message_id).is_ok()
+                    && (1..=MAX_POLL_ID).contains(poll_id)
+                    && (1..=MAX_POLL_ID).contains(option_id)
+                    && !option_text.is_empty()
+                    && option_text.len() <= MAX_POLL_OPTION_BYTES
             }
             LiveCommand::Forward {
                 request_id,
@@ -2413,6 +2463,7 @@ impl super::Model {
             | LiveEvent::GroupPinFinished { .. }
             | LiveEvent::PollDetailCapability { .. }
             | LiveEvent::PollDetail { .. }
+            | LiveEvent::PollVoteFinished { .. }
             | LiveEvent::RecallFinished { .. }
             | LiveEvent::DeleteForMeCapability { .. }
             | LiveEvent::DeleteForMeFinished { .. }

@@ -493,8 +493,8 @@ fn poll_card(
             super::polls::metadata(ui, privacy);
         }
     }
-    if let Some(detail) = detail {
-        super::polls::options(ui, detail);
+    if let Some(access) = access.as_mut() {
+        access.options(ui, message);
     }
     if !access
         .as_mut()

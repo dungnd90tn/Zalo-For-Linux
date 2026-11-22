@@ -401,7 +401,8 @@ impl Privacy {
             | LiveEvent::ReactionsChanged { thread, .. }
             | LiveEvent::GroupPins { thread, .. }
             | LiveEvent::GroupPinFinished { thread, .. }
-            | LiveEvent::PollDetail { thread, .. } => {
+            | LiveEvent::PollDetail { thread, .. }
+            | LiveEvent::PollVoteFinished { thread, .. } => {
                 if !self.list_visible(thread) {
                     return None;
                 }

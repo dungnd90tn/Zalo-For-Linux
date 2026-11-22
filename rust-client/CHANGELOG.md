@@ -7,6 +7,7 @@ Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) đ�
 ## Chưa phát hành — nhánh 2.0.6
 
 - Xem câu hỏi, các lựa chọn và số phiếu được Zalo cho phép hiển thị ngay trên thẻ bình chọn trong nhóm thường đủ điều kiện. Bấm **Cập nhật bình chọn** để đọc kết quả mới nhất.
+- Chọn một phương án rồi bấm **Gửi phiếu** để tham gia lần đầu vào bình chọn đang mở và chỉ cho chọn một phương án. Ứng dụng giữ trạng thái chưa xác nhận qua lần mở lại để tránh gửi lặp. Hồ sơ nâng lên schema 25 và bản cũ dùng schema 24 không mở được hồ sơ đã nâng cấp.
 
 - Gõ `@` để chọn và nhắc từng thành viên trong nhóm thường có tối đa 100 người. Chọn bằng chuột hoặc phím ↑/↓ và Enter. Ứng dụng giữ bản nháp khi lượt gửi bị từ chối hoặc chưa xác định được kết quả.
 - Làm nổi bật phần nhắc tên đã xác minh trong tin nhắn nhóm, kể cả khi mở lại lịch sử.

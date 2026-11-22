@@ -38,8 +38,20 @@ account, group, message and privacy revision before applying the reply. The
 response must match the requested poll and any explicit group ID. It provides
 up to 30 options, the explicit closed and anonymous flags, and counts when
 the preview is public or the viewer has joined a restricted poll. The
-detail projection is transient and omits voter identities. Creation, voting
-and background updates remain outside the read-only flow.
+detail projection is transient and omits voter identities.
+
+A separate explicit action casts a first vote. The source uses GET
+`/api/poll/vote` with encrypted `poll_id`, one numeric ID in `option_ids`,
+and `imei` (N490401–490408). Native reads details again to confirm the
+poll is open, unexpired, single-choice and unjoined, and that the exact
+option ID and displayed text still match. It records one guard per
+account and poll in schema 25 before dispatch. The guard contains the
+bound group and message and omits the selected option. The vote transport
+uses a fresh connection without automatic retry. A fresh detail read
+confirms participation and confirms the selected option only when the
+server explicitly reports the viewer's selection. An uncertain vote
+remains blocked across restart. Creation, changing or withdrawing a vote,
+multi-choice voting and background updates remain outside this flow.
 
 `share.file` maps to the original file type. Its card reads `content.title`,
 `content.href` and string/object `params.fileSize`, `fileExt`, `fType`; `fType=2`

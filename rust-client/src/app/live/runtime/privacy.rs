@@ -160,6 +160,22 @@ impl Projection {
                 *poll_id = None;
                 *detail = None;
             }
+            LiveEvent::PollVoteFinished {
+                thread,
+                privacy_revision,
+                poll_id,
+                detail,
+                outcome,
+                ..
+            } if !self.confirmed
+                || self.status != LivePrivacyStatus::Ready
+                || *privacy_revision != self.revision
+                || self.hidden.contains(thread) =>
+            {
+                *poll_id = None;
+                *detail = None;
+                *outcome = PollVoteOutcome::Unavailable;
+            }
             LiveEvent::Avatars { avatars, .. } => {
                 avatars.retain(|entry| self.permits(&entry.thread_id))
             }

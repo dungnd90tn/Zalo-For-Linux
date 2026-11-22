@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import tempfile
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 def require(condition, message):
     if not condition:
@@ -59,6 +59,15 @@ def main():
             originals = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()
         require((count, accounts, threads) == (19, 1, 6), "repeated demo startup changed seeded message identity/count")
         require(len(originals) == 3, "legacy demo messages disappeared")
+        with sqlite3.connect(data / "messages.sqlite3") as conn:
+            conn.execute("DROP TABLE poll_vote_guards")
+            conn.execute("PRAGMA user_version=24")
+        require(json.loads(run("--demo", "--headless").stdout)["messages_loaded"] == 2, "schema 24 upgrade lost demo history")
+        with sqlite3.connect(f"file:{data / 'messages.sqlite3'}?mode=ro", uri=True) as conn:
+            require(conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION, "profile did not upgrade from schema 24")
+            guard_count = conn.execute("SELECT count(*) FROM poll_vote_guards").fetchone()[0]
+            preserved = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()
+        require(guard_count == 0 and preserved == originals, "poll vote upgrade changed existing history or created vote guards")
         # Recreate schema 19 without the new pin ledger and retain a local
         # message to detect data loss during the upgrade.
         with sqlite3.connect(data / "messages.sqlite3") as conn:

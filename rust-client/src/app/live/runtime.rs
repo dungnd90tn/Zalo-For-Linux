@@ -1032,6 +1032,7 @@ impl Events {
 }
 struct Transports {
     http: reqwest::Client,
+    poll_vote_http: reqwest::Client,
     #[cfg(test)]
     local: Option<(std::net::SocketAddr, Arc<rustls::ClientConfig>)>,
 }
@@ -1064,8 +1065,17 @@ pub(super) async fn run(
     repaint: Arc<dyn Fn() + Send + Sync>,
     cancel: watch::Receiver<bool>,
 ) {
-    let http = match client(session.client_type()) {
-        Ok(client) => client,
+    let clients = (|| {
+        Ok::<_, anyhow::Error>((
+            client(session.client_type())?,
+            client_builder(session.client_type())?
+                .retry(reqwest::retry::never())
+                .pool_max_idle_per_host(0)
+                .build()?,
+        ))
+    })();
+    let (http, poll_vote_http) = match clients {
+        Ok(clients) => clients,
         Err(_) => {
             let _ = events.try_send(LiveEvent::Fault {
                 account_id: session.account_id().into(),
@@ -1077,6 +1087,7 @@ pub(super) async fn run(
     };
     let transports = Transports {
         http,
+        poll_vote_http,
         #[cfg(test)]
         local: None,
     };
@@ -1131,6 +1142,11 @@ fn now_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 fn client(client_type: crate::protocol::client::ClientType) -> Result<reqwest::Client> {
+    Ok(client_builder(client_type)?.build()?)
+}
+fn client_builder(
+    client_type: crate::protocol::client::ClientType,
+) -> Result<reqwest::ClientBuilder> {
     Ok(reqwest::Client::builder()
         .no_proxy()
         .http1_only()
@@ -1138,8 +1154,7 @@ fn client(client_type: crate::protocol::client::ClientType) -> Result<reqwest::C
         .https_only(true)
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(15))
-        .user_agent(client_type.user_agent().ok_or(WireError::Unsupported)?)
-        .build()?)
+        .user_agent(client_type.user_agent().ok_or(WireError::Unsupported)?))
 }
 fn root_for(session: &VerifiedSession, name: &str) -> Result<Url> {
     session
@@ -2110,6 +2125,7 @@ async fn handle_command(
         | LiveCommand::DeleteForMe { .. }
         | LiveCommand::LoadRemoteHistory { .. }
         | LiveCommand::LoadPollDetail { .. }
+        | LiveCommand::VotePoll { .. }
         | LiveCommand::Forward { .. }
         | LiveCommand::ForwardBatch { .. }
         | LiveCommand::ForwardTargets { .. } => {
@@ -2858,7 +2874,7 @@ async fn run_inner(
                 let Some(command) = groups.command(command, online, &db, events, &session, &client).await? else { continue; };
                 let Some(command) = attention.command(command, &db, events).await? else { continue; };
                 let Some(command) = history.command(command, remote_history::epoch(connection.as_ref()), &db, events, &session, &client).await? else { continue; };
-                let Some(command) = polls.command(command, original_epoch, &db, events, &session, &client).await? else { continue; };
+                let Some(command) = polls.command(command, original_epoch, &db, events, &session, transports).await? else { continue; };
                 let Some(command) = forwards.command(command, connection.as_ref(), &db, events, &session, &client).await? else { continue; };
                 let sticker_session = sticker_catalog::authenticated_at(connection.as_ref());
                 if let Some(request) = sticker_catalog::Request::from_command(&command) {
@@ -3041,7 +3057,7 @@ async fn run_inner(
                             let Some(command) = groups.command(command, false, &db, events, &session, &client).await? else { continue; };
                             let Some(command) = attention.command(command, &db, events).await? else { continue; };
                             let Some(command) = history.command(command, None, &db, events, &session, &client).await? else { continue; };
-                            let Some(command) = polls.command(command, None, &db, events, &session, &client).await? else { continue; };
+                            let Some(command) = polls.command(command, None, &db, events, &session, transports).await? else { continue; };
                             let Some(command) = forwards.command(command, None, &db, events, &session, &client).await? else { continue; };
                             if let Some(request) = sticker_catalog::Request::from_command(&command) {
                                 sticker_search.start(request, None, events, &session, &client).await?;

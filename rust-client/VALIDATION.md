@@ -1929,3 +1929,21 @@ smoke checks at schema 24. Twelve offline X11 captures show the summary, results
 and hidden counts in both themes at 640×480 and 1200×780. At 640×480 the
 expanded card can extend above the visible chat area. Real-service
 comparison with a second device remains pending.
+
+## First vote in a single-choice group poll
+
+The synthetic TLS/WSS cases reject a stale option label, confirm a matching
+first vote, and keep an interrupted dispatch blocked after restart. They
+observe one mutation request for each synthetic poll and exercise the
+existing read-only result and privacy behavior. The store regression covers
+upgrade from schema 24, same-poll notice aliases and account isolation.
+
+Three focused UI tests, three protocol tests and 175 all-feature store
+tests passed. Eight X11 captures cover the selected option and the
+uncertain outcome at 640×480 and 1200×780 in both themes. The interaction
+test verifies selection alone queues nothing and confirmation queues one
+vote. The default checks passed 319 Rust and 19 Python tests, and strict
+all-feature Clippy passed. An offline release smoke and a separate migration
+from the previous binary preserved all 19 synthetic messages at schema 25.
+The previous binary refused the upgraded profile. Real-service verification
+remains pending.

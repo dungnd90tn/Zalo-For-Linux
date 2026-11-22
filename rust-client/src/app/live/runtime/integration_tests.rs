@@ -57,6 +57,7 @@ enum Reply {
     SyncDeleteForMe,
     GroupHistory,
     GroupPoll,
+    GroupPollVote(group_poll_tests::VoteReply),
     Reactions,
     ReactionReplay,
     GroupActions(bool),
@@ -179,6 +180,9 @@ impl Fixture {
         Arc::new(synthetic_session(self.profile.clone(), config))
     }
     fn client(&self) -> reqwest::Client {
+        self.client_builder().build().unwrap()
+    }
+    fn client_builder(&self) -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -188,8 +192,6 @@ impl Fixture {
             .resolve("wpa.zaloapp.com", self.addr)
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(3))
-            .build()
-            .unwrap()
     }
     fn transports(&self) -> Transports {
         let mut roots = rustls::RootCertStore::empty();
@@ -205,6 +207,11 @@ impl Fixture {
         .with_no_client_auth();
         Transports {
             http: self.client(),
+            poll_vote_http: self
+                .client_builder()
+                .retry(reqwest::retry::never())
+                .build()
+                .unwrap(),
             local: Some((self.addr, Arc::new(tls))),
         }
     }
@@ -826,7 +833,7 @@ fn serve(
                 })).unwrap(),
             )).unwrap();
         }
-        if matches!(reply, Reply::GroupPoll) {
+        if matches!(reply, Reply::GroupPoll | Reply::GroupPollVote(_)) {
             ws.send(tungstenite::Message::Binary(
                 wire::encode_frame(521, 0, &group_poll_tests::poll_notice()).unwrap(),
             ))
@@ -1450,10 +1457,34 @@ fn serve(
             return;
         }
     }
-    if matches!(reply, Reply::GroupPoll)
-        && group_poll_tests::respond(&mut stream, &state, &cipher, &path, &headers, &body)
-    {
-        return;
+    match reply {
+        Reply::GroupPoll
+            if group_poll_tests::respond(
+                &mut stream,
+                &state,
+                &cipher,
+                &path,
+                &headers,
+                &body,
+                None,
+            ) =>
+        {
+            return
+        }
+        Reply::GroupPollVote(mode)
+            if group_poll_tests::respond(
+                &mut stream,
+                &state,
+                &cipher,
+                &path,
+                &headers,
+                &body,
+                Some(mode),
+            ) =>
+        {
+            return
+        }
+        _ => {}
     }
     if matches!(reply, Reply::Reactions) {
         assert!(headers.starts_with("POST "));

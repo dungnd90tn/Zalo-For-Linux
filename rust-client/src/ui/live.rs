@@ -875,7 +875,9 @@ impl NativeApp {
         };
         if matches!(
             &event,
-            LiveEvent::PollDetail { .. } | LiveEvent::PollDetailCapability { .. }
+            LiveEvent::PollDetail { .. }
+                | LiveEvent::PollDetailCapability { .. }
+                | LiveEvent::PollVoteFinished { .. }
         ) {
             let scope = self.poll_scope(state);
             state
@@ -2678,7 +2680,10 @@ pub(in crate::ui) mod tests {
         let album_scene = std::env::var("ZALO_UI_FIXTURE_ALBUM").ok();
         let voice_scene = std::env::var("ZALO_UI_FIXTURE_VOICE").ok();
         let media_mode = std::env::var("ZALO_UI_FIXTURE_MEDIA").ok();
-        let poll_details = matches!(media_mode.as_deref(), Some("poll-detail" | "poll-hidden"));
+        let poll_details = matches!(
+            media_mode.as_deref(),
+            Some("poll-detail" | "poll-hidden" | "poll-vote" | "poll-vote-unknown")
+        );
         let attention_scene = std::env::var("ZALO_UI_FIXTURE_ATTENTION").ok();
         let forward_scene = std::env::var("ZALO_UI_FIXTURE_FORWARD").ok();
         let recall_scene = std::env::var("ZALO_UI_FIXTURE_RECALL").ok();
@@ -3701,7 +3706,7 @@ pub(in crate::ui) mod tests {
                 }),
                 false,
             )],
-            "poll" | "poll-detail" | "poll-hidden" => vec![(
+            "poll" | "poll-detail" | "poll-hidden" | "poll-vote" | "poll-vote-unknown" => vec![(
                 MediaKind::Poll,
                 serde_json::json!({"params":{
                     "msg":{"vi":"Đã tạo bình chọn mới cho nhóm"},
@@ -3740,7 +3745,10 @@ pub(in crate::ui) mod tests {
             ],
             _ => vec![(MediaKind::Photo, content("photo_object"), false)],
         };
-        let thread = if matches!(mode, "poll" | "poll-detail" | "poll-hidden" | "files") {
+        let thread = if matches!(
+            mode,
+            "poll" | "poll-detail" | "poll-hidden" | "poll-vote" | "poll-vote-unknown" | "files"
+        ) {
             "g:90"
         } else {
             "d:22"
@@ -3805,7 +3813,10 @@ pub(in crate::ui) mod tests {
         app.model.messages = store.page("11", thread, None, 50).unwrap();
         app.drafts.select(thread).unwrap();
         app.compact_list = false;
-        if matches!(mode, "poll-detail" | "poll-hidden") {
+        if matches!(
+            mode,
+            "poll-detail" | "poll-hidden" | "poll-vote" | "poll-vote-unknown"
+        ) {
             use crate::domain::poll::{PollDetails, PollOption};
             let group = app
                 .model
@@ -3831,17 +3842,27 @@ pub(in crate::ui) mod tests {
                 ("Sáng thứ Sáu", 0),
             ]
             .into_iter()
-            .map(|(text, votes)| PollOption {
+            .enumerate()
+            .map(|(index, (text, votes))| PollOption {
+                option_id: index as u64 + 1,
                 text: text.into(),
                 votes: counts_visible.then_some(votes),
+                voted: false,
             })
             .collect();
-            app.live.as_mut().unwrap().polls.fixture(scope, &app.model.messages[0], PollDetails {
+            let polls = &mut app.live.as_mut().unwrap().polls;
+            polls.fixture(scope, &app.model.messages[0], PollDetails {
                 question: "Mọi người muốn tổ chức buổi trao đổi kế hoạch vào thời gian nào trong tuần tới?".into(),
                 options,
                 closed: counts_visible,
                 anonymous: true,
+                can_vote: mode == "poll-vote",
+                joined: Some(false),
+                vote_pending: mode == "poll-vote-unknown",
             });
+            if mode == "poll-vote" {
+                polls.fixture_choice(1);
+            }
         }
         let (width, height, rgba) = std::thread::spawn(|| {
             crate::app::media::decode_fixture(include_bytes!(

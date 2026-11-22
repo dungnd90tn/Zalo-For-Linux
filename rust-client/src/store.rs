@@ -30,6 +30,7 @@ mod message_media;
 mod message_reply;
 mod overview;
 pub mod photos;
+mod poll_votes;
 mod privacy;
 mod reactions;
 mod read_state;
@@ -41,7 +42,7 @@ mod voices;
 pub(crate) use sticker_send::Reservation as StickerReservation;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// One received message with optional outbox hint and complete rich sidecars.
 /// The immutable metadata commits with its message and receive cursor.
@@ -480,6 +481,7 @@ impl MessageStore {
         delete_for_me::initialize(&conn)?;
         group_actions::initialize(&conn)?;
         group_pins::initialize(&conn)?;
+        poll_votes::initialize(&conn)?;
         sticker_send::initialize(&conn)?;
         reactions::initialize(&conn)?;
         message_media::reproject(&conn)?;
