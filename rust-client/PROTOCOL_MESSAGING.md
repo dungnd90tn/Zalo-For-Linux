@@ -218,6 +218,21 @@ The original reference builder (N480089–480156) uses the group source type
 Native uses that reference with the existing direct or group destination
 route and the account/thread-scoped forward outbox. Schema 25 is compatible.
 
+## Mentioning all members in an ordinary group
+
+The picker creates a single typed `@All` span on explicit selection. The
+PC bundle uses `uid: "-1"` and `type: 1` for this span (N57897–57899 and
+N321604–321608). Native sends UTF-16 offsets through the existing authenticated
+POST `/api/group/mention` (N489237–489258). The typed outbox binds the span to
+the exact message and recipient group.
+
+Native requires an explicitly advertised positive `max_member_mention_all`
+(N263600). It rechecks current visibility, plaintext capability, membership,
+send permission, the advertised size limit and disabled auto-delete before
+sending. Only authenticated ordinary group messages with the exact type and
+sentinel pair can project the broadcast. Schema 26 marks compatibility with
+the persisted sentinel while preserving earlier individual mentions.
+
 ## Ordinary direct text recall (2026-11-19)
 
 The original direct composer checks message age at N136319. N401877–401897

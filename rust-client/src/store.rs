@@ -42,7 +42,7 @@ mod voices;
 pub(crate) use sticker_send::Reservation as StickerReservation;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 
 /// One received message with optional outbox hint and complete rich sidecars.
 /// The immutable metadata commits with its message and receive cursor.
@@ -560,6 +560,10 @@ impl MessageStore {
             || mentions.iter().any(|mention| mention.uid == account)
         {
             bail!(FailureReason::Validation);
+        }
+        if mentions.iter().any(crate::domain::mention::Mention::is_all) {
+            self.validate_group_scope(account, thread)
+                .map_err(|_| FailureReason::Validation)?;
         }
         self.prepare_outgoing_inner(account, thread, text, None, mentions, now_ms)
     }

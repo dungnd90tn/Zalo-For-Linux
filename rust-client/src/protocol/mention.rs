@@ -1,10 +1,11 @@
 //! Ordinary group mention wire payload from PC bundle N399977–399996.
 use super::messaging::{id_string, Target, ThreadKind, WireError};
-use crate::domain::mention::{self, Mention, MAX_MENTIONS};
+use crate::domain::mention::{self, Mention, ALL_ID, MAX_MENTIONS};
 use serde_json::{json, Value};
 
 pub(crate) const PATH: &str = "/api/group/mention";
 const INDIVIDUAL: u64 = 0;
+const ALL: u64 = 1;
 
 pub(crate) fn parameters(
     target: &Target,
@@ -24,8 +25,9 @@ pub(crate) fn parameters(
     let mention_info = mentions
         .iter()
         .map(|mention| {
+            let kind = if mention.is_all() { ALL } else { INDIVIDUAL };
             json!({
-                "pos": mention.pos, "len": mention.len, "uid": mention.uid, "type": INDIVIDUAL
+                "pos": mention.pos, "len": mention.len, "uid": mention.uid, "type": kind
             })
         })
         .collect::<Vec<_>>();
@@ -46,14 +48,15 @@ pub(crate) fn incoming(text: &str, raw: Option<&Value>) -> Vec<Mention> {
     let mentions: Option<Vec<_>> = entries
         .iter()
         .map(|entry| {
-            // Individual group mentions use type 0. Old messages may omit it.
-            let uid = id_string(&entry["uid"]).ok()?;
-            if entry
-                .get("type")
-                .is_some_and(|kind| kind.as_u64() != Some(INDIVIDUAL))
-            {
-                return None;
-            }
+            let uid = match entry.get("type") {
+                Some(kind) if kind.as_u64() == Some(ALL) => {
+                    (entry["uid"].as_str() == Some(ALL_ID)).then(|| ALL_ID.to_owned())?
+                }
+                // Individual group mentions use type 0. Old messages may omit it.
+                None => id_string(&entry["uid"]).ok()?,
+                Some(kind) if kind.as_u64() == Some(INDIVIDUAL) => id_string(&entry["uid"]).ok()?,
+                _ => return None,
+            };
             Some(Mention {
                 uid,
                 pos: u32::try_from(entry["pos"].as_u64()?).ok()?,
@@ -76,7 +79,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_ordinary_group_payload_retains_utf16_spans_and_rejects_all() {
+    fn source_ordinary_group_payload_retains_utf16_spans() {
         let text = "😀 @Ánh";
         let mentions = [Mention {
             uid: "22".into(),
@@ -100,5 +103,40 @@ mod tests {
         assert!(incoming(text, Some(&json!([{"pos":3,"len":4,"uid":"-1","type":1}]))).is_empty());
         assert!(parameters(&target, text, 101, &mentions, 256).is_err());
         assert!(parameters(&target, " 😀 @Ánh", 101, &mentions, 0).is_err());
+    }
+
+    #[test]
+    fn broadcast_metadata_binds_explicit_type_sentinel_and_span() {
+        let text = "😀 @All @Ánh";
+        let mentions = [
+            Mention {
+                uid: ALL_ID.into(),
+                pos: 3,
+                len: 4,
+            },
+            Mention {
+                uid: "22".into(),
+                pos: 8,
+                len: 4,
+            },
+        ];
+        let target = Target::new(ThreadKind::Group, "33").unwrap();
+        let payload = parameters(&target, text, 101, &mentions, 0).unwrap();
+        let wire: Value = serde_json::from_str(payload["mentionInfo"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            wire,
+            json!([
+                {"pos":3,"len":4,"uid":"-1","type":1},
+                {"pos":8,"len":4,"uid":"22","type":0}
+            ])
+        );
+        assert_eq!(incoming(text, Some(&wire)), mentions);
+        for forged in [
+            json!({"pos":3,"len":4,"uid":"-1"}),
+            json!({"pos":3,"len":4,"uid":"-1","type":0}),
+            json!({"pos":3,"len":4,"uid":"22","type":1}),
+        ] {
+            assert!(incoming(text, Some(&json!([forged]))).is_empty());
+        }
     }
 }

@@ -2,7 +2,7 @@
 use super::{group_members::Scope, visuals, NativeApp};
 use crate::{
     app::live::{GroupMemberPage, LiveCommand, LiveConnection, LiveEvent, LivePrivacyStatus},
-    domain::fold_search,
+    domain::{fold_search, mention},
 };
 use eframe::egui::{self, vec2, Align2, Rect, RichText, Stroke};
 use std::ops::Range;
@@ -63,6 +63,25 @@ struct Member {
     folded: String,
 }
 
+impl Member {
+    fn everyone() -> Self {
+        let name = mention::ALL_LABEL.trim_start_matches('@');
+        Self {
+            id: mention::ALL_ID.into(),
+            name: name.into(),
+            folded: fold_search(name),
+        }
+    }
+
+    fn title(&self) -> &str {
+        if self.id == mention::ALL_ID {
+            "Nhắc tất cả · @All"
+        } else {
+            &self.name
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Picker {
     scope: Option<Scope>,
@@ -73,6 +92,7 @@ pub(super) struct Picker {
     failed: bool,
     next: Option<String>,
     members: Vec<Member>,
+    everyone: Option<Member>,
     token: Option<Token>,
     dismissed: Option<Token>,
     highlighted: Option<usize>,
@@ -121,6 +141,8 @@ impl Picker {
         self.pages += 1;
         let Some(page) = page else {
             self.next = None;
+            self.everyone = None;
+            self.highlighted = None;
             return;
         };
         let own = scope.account.clone();
@@ -131,7 +153,13 @@ impl Picker {
         if page.members.len() > super::group_members::PAGE_SIZE {
             self.next = None;
             self.failed = true;
+            self.everyone = None;
+            self.highlighted = None;
             return;
+        }
+        if page.mention_all != self.everyone.is_some() {
+            self.everyone = page.mention_all.then(Member::everyone);
+            self.highlighted = None;
         }
         for member in &page.members {
             let Some(name) = member.name.as_deref().map(str::trim).filter(|name| {
@@ -178,11 +206,18 @@ impl Picker {
         self.token = token;
     }
 
-    fn results(&self) -> impl Iterator<Item = &Member> {
+    fn results(&self, allow_all: bool) -> impl Iterator<Item = &Member> {
         let query = self.token.as_ref().map(|token| fold_search(&token.query));
-        self.members
+        self.everyone
             .iter()
-            .filter(move |member| query.as_ref().is_some_and(|q| member.folded.contains(q)))
+            .filter(move |_| allow_all)
+            .chain(self.members.iter())
+            .filter(move |member| {
+                query.as_ref().is_some_and(|q| {
+                    member.folded.contains(q)
+                        || (member.id == mention::ALL_ID && "nhac tat ca".contains(q))
+                })
+            })
             .take(RESULT_LIMIT)
     }
 
@@ -205,8 +240,20 @@ impl Picker {
     }
 
     #[cfg(test)]
+    pub(super) fn fixture_everyone(&mut self, scope: Scope) {
+        self.fixture(scope);
+        self.everyone = Some(Member::everyone());
+    }
+
+    #[cfg(test)]
     pub(super) fn fixture_shown(&self) -> bool {
-        self.rect.is_some() && self.results().count() == 2
+        self.rect.is_some()
+            && if self.everyone.is_some() {
+                self.results(true)
+                    .any(|member| member.id == mention::ALL_ID)
+            } else {
+                self.results(true).count() == 2
+            }
     }
 }
 
@@ -262,6 +309,7 @@ impl NativeApp {
         ime_active: bool,
     ) -> Option<Choice> {
         let scope = enabled.then(|| self.mention_scope()).flatten();
+        let allow_all = !self.drafts.active.has_all_mention();
         let state = self.live.as_mut()?;
         let picker = &mut state.mention_picker;
         picker.set_scope(scope);
@@ -282,7 +330,7 @@ impl NativeApp {
         if !ctx.memory(|memory| memory.has_focus(id)) {
             return None;
         }
-        let len = picker.results().count();
+        let len = picker.results(allow_all).count();
         if len == 0 {
             return None;
         }
@@ -298,7 +346,7 @@ impl NativeApp {
                 (None, false) => len - 1,
             });
         }
-        let member = picker.results().nth(picker.highlighted?)?.clone();
+        let member = picker.results(allow_all).nth(picker.highlighted?)?.clone();
         let select = ctx.input_mut(|input| {
             let mut select = false;
             input.events.retain(|event| {
@@ -332,6 +380,7 @@ impl NativeApp {
         choice: Option<Choice>,
         ime_active: bool,
     ) {
+        let allow_all = !self.drafts.active.has_all_mention();
         let current = editor
             .caret
             .and_then(|caret| Token::at(&self.drafts.active.text, caret));
@@ -381,7 +430,10 @@ impl NativeApp {
                 picker.next = None;
             }
         }
-        let mut chosen = choice.filter(|choice| choice.token == *token);
+        let mut chosen = choice.filter(|choice| {
+            choice.token == *token
+                && (choice.member.id != mention::ALL_ID || (allow_all && picker.everyone.is_some()))
+        });
         let width = editor.rect.width().clamp(200.0, 304.0);
         let mut retry = false;
         let response = egui::Area::new(egui::Id::new(("mention_members", editor.id)))
@@ -403,11 +455,11 @@ impl NativeApp {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.label(RichText::new("Nhắc thành viên").strong());
                         let mut seen = false;
-                        for (i, member) in picker.results().enumerate() {
+                        for (i, member) in picker.results(allow_all).enumerate() {
                             seen = true;
                             let row = super::message_actions::action_row_height(
                                 ui,
-                                &member.name,
+                                member.title(),
                                 "fa-tab-contact",
                                 true,
                                 false,
@@ -426,7 +478,7 @@ impl NativeApp {
                                     member: member.clone(),
                                 });
                             }
-                            row.on_hover_text(&member.name);
+                            row.on_hover_text(member.title());
                         }
                         if picker.failed {
                             retry = super::message_actions::action_row_height(
@@ -462,6 +514,7 @@ impl NativeApp {
             picker.failed = false;
             picker.next = None;
             picker.members.clear();
+            picker.everyone = None;
             picker.highlighted = None;
             ctx.memory_mut(|memory| memory.request_focus(editor.id));
             ctx.request_repaint();
@@ -568,6 +621,109 @@ mod tests {
             thread, mentions, ..
         } if thread == "g:44" && mentions.len() == 1
             && mentions[0].uid == "22" && mentions[0].pos == 3));
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn everyone_is_a_scoped_explicit_choice() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = live::tests::fixture(&ctx);
+        let (worker, mut commands, _events) = LiveWorker::presentation_fixture("11");
+        app.model.selected = Some("g:44".into());
+        app.drafts.select("g:44").unwrap();
+        app.drafts.active.text = "👋 @all".into();
+        app.focus_composer = true;
+        let auth = app.auth_generation();
+        let state = app.live.as_mut().unwrap();
+        state.connection = LiveConnection::Online;
+        state.worker = Some(worker);
+        let scope = Scope {
+            account: "11".into(),
+            auth,
+            thread: "g:44".into(),
+            generation: app.model.generation,
+            privacy_revision: state.privacy.revision,
+        };
+        state.mention_picker.fixture_everyone(scope.clone());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.live.as_ref().unwrap().mention_picker.fixture_shown());
+        assert!(
+            !app.drafts.active.has_mentions(),
+            "typing must stay plain text"
+        );
+        frame(&mut app, &ctx, key(egui::Key::ArrowDown));
+        frame(&mut app, &ctx, key(egui::Key::Enter));
+        assert_eq!(app.drafts.active.text, "👋 @All ");
+        assert!(app.drafts.active.has_all_mention());
+        assert!(commands.try_recv().is_err(), "selection must not send");
+        frame(&mut app, &ctx, key(egui::Key::Enter));
+        let command = commands.try_recv().unwrap();
+        assert!(matches!(command, LiveCommand::SendMentions {
+            thread, mentions, ..
+        } if thread == "g:44" && mentions.len() == 1
+            && mentions[0].is_all() && mentions[0].pos == 3 && mentions[0].len == 4));
+
+        let picker = &mut app.live.as_mut().unwrap().mention_picker;
+        let next_scope = Scope {
+            generation: scope.generation + 1,
+            ..scope
+        };
+        picker.set_scope(Some(next_scope.clone()));
+        picker.pending = Some(REQUEST_BIT | 1);
+        picker.observe(&LiveEvent::GroupMembers {
+            account_id: "11".into(),
+            request_id: REQUEST_BIT | 2,
+            thread: next_scope.thread.clone(),
+            privacy_revision: next_scope.privacy_revision,
+            page: Some(GroupMemberPage {
+                members: vec![],
+                total: Some(3),
+                restricted: false,
+                next: None,
+                permissions: Default::default(),
+                mention_all: true,
+            }),
+        });
+        assert!(
+            picker.everyone.is_none(),
+            "old roster response must not restore capability"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enter_without_choosing_everyone_sends_plain_text() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = live::tests::fixture(&ctx);
+        let (worker, mut commands, _events) = LiveWorker::presentation_fixture("11");
+        app.model.selected = Some("g:44".into());
+        app.drafts.select("g:44").unwrap();
+        app.drafts.active.text = "@All".into();
+        app.focus_composer = true;
+        let auth = app.auth_generation();
+        let state = app.live.as_mut().unwrap();
+        state.connection = LiveConnection::Online;
+        state.worker = Some(worker);
+        state.mention_picker.fixture_everyone(Scope {
+            account: "11".into(),
+            auth,
+            thread: "g:44".into(),
+            generation: app.model.generation,
+            privacy_revision: state.privacy.revision,
+        });
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.live.as_ref().unwrap().mention_picker.fixture_shown());
+        frame(&mut app, &ctx, key(egui::Key::Enter));
+        assert!(matches!(commands.try_recv().unwrap(), LiveCommand::Send {
+            thread, text, ..
+        } if thread == "g:44" && text == "@All"));
+        assert!(!app.drafts.active.has_mentions());
         drop(app);
         let _ = std::fs::remove_dir_all(root);
     }

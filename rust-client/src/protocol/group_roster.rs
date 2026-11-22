@@ -30,6 +30,7 @@ pub struct Page {
     pub restricted: bool,
     pub next: Option<String>,
     pub permissions: GroupPermissions,
+    pub mention_all: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,10 +46,15 @@ pub(crate) struct VerifiedGroup {
     restricted: bool,
     pub(crate) can_pin: bool,
     pub(crate) can_forward: bool,
+    can_post: bool,
     pub permissions: GroupPermissions,
 }
 
 impl VerifiedGroup {
+    pub(crate) fn allows_mention_all(&self, limit: u32) -> bool {
+        self.can_post && self.versions.len() <= limit as usize
+    }
+
     pub(crate) fn fits_forwarding_group(&self) -> bool {
         self.versions.len() < MAX_MEMBERS
     }
@@ -248,8 +254,9 @@ pub(crate) fn verify_group(
     };
     // The source's ordinary multi-forward path falls back at 100 members.
     // An absent send lock defaults to open in the original settings reader.
-    let can_forward = total < MAX_MEMBERS as u64
-        && (privileged || row.pointer("/setting/lockSendMsg").is_none() || disabled("lockSendMsg"));
+    let can_post =
+        privileged || row.pointer("/setting/lockSendMsg").is_none() || disabled("lockSendMsg");
+    let can_forward = total < MAX_MEMBERS as u64 && can_post;
     Ok(VerifiedGroup {
         versions,
         owner,
@@ -257,6 +264,7 @@ pub(crate) fn verify_group(
         restricted,
         can_pin,
         can_forward,
+        can_post,
         permissions,
     })
 }
@@ -339,6 +347,7 @@ pub(crate) fn project_page(
         restricted: group.restricted,
         next,
         permissions: group.permissions,
+        mention_all: false,
     })
 }
 

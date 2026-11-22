@@ -86,8 +86,11 @@ pub(super) async fn handle(
     let Ok(target) = roster_request.target() else {
         return request.unavailable(events).await;
     };
+    let mention_all = request.mentions.iter().any(Mention::is_all);
+    let all_limit = session.config().mention_all_limit;
     if !online
         || request.request_id == 0
+        || (mention_all && all_limit.is_none())
         || request
             .mentions
             .iter()
@@ -106,9 +109,10 @@ pub(super) async fn handle(
         return request.unavailable(events).await;
     }
 
-    let cached = cache
-        .as_ref()
-        .is_some_and(|proof| proof.applies(&roster_request, &events.account));
+    let cached = !mention_all
+        && cache
+            .as_ref()
+            .is_some_and(|proof| proof.applies(&roster_request, &events.account));
     let roster = async {
         if cached {
             Ok(None)
@@ -137,10 +141,13 @@ pub(super) async fn handle(
             && ttl.applies(&target)
             && cache.as_ref().is_some_and(|proof| {
                 proof.applies(&roster_request, &events.account)
-                    && request
-                        .mentions
-                        .iter()
-                        .all(|mention| proof.member_visible(&mention.uid))
+                    && request.mentions.iter().all(|mention| {
+                        if mention.is_all() {
+                            visibility == 0 && proof.allows_mention_all(all_limit)
+                        } else {
+                            proof.member_visible(&mention.uid)
+                        }
+                    })
             })
     };
     if !still_verified() {

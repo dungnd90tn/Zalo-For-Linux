@@ -1,6 +1,6 @@
 [package]
 name = "zalo-linux-native-preview"
-version = "2.0.5"
+version = "2.0.6"
 edition = "2021"
 rust-version = "1.99"
 description = "Independent native Linux chat migration prototype"
@@ -8,7 +8,7 @@ default-run = "zalo-rust"
 autobins = false
 
 [package.metadata.zalo]
-package-release = 2
+package-release = 1
 
 [lib]
 name = "zalo_rust"

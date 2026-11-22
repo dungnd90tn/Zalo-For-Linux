@@ -26,7 +26,7 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 - **Theo dõi tin mới:** lọc hội thoại **Chưa đọc** theo các tin mới nhận trên máy này. Tin gửi hiện trạng thái chuyển/đã xem khi có dữ liệu xác nhận.
 - **Thông báo Linux:** mặc định chỉ báo **Bạn có tin nhắn mới**. Bật xem trước nội dung ở **bánh răng → Thông báo**. Hội thoại ẩn hoặc đang tắt thông báo không phát cảnh báo.
 - **Thành viên nhóm:** mở **Thông tin hội thoại → Thành viên** để xem danh sách theo quyền của bạn, tối đa 50 người mỗi trang. Với nhóm thường tối đa 100 thành viên, bạn có thể mời một người bạn hoặc rời nhóm nếu quyền hiện tại cho phép. Hội thoại đã rời vẫn mở được để đọc lịch sử đã lưu.
-- **Nhắc tên trong nhóm** (bản đang phát triển). Gõ `@` rồi chọn thành viên bằng chuột hoặc phím ↑/↓ và Enter. Ứng dụng hỗ trợ nhóm thường tối đa 100 thành viên khi đã xác minh được danh sách theo quyền hiện tại.
+- **Nhắc tên trong nhóm.** Gõ `@` rồi chọn thành viên bằng chuột hoặc phím ↑/↓ và Enter. Chọn **Nhắc tất cả · @All** khi nhóm nằm trong giới hạn Zalo xác nhận và bạn có quyền gửi. Gõ `@All` mà chưa chọn gợi ý chỉ gửi văn bản thường.
 - **Ghim tin nhắn nhóm** (bản đang phát triển). Bấm chuột phải vào tin văn bản để ghim hoặc bỏ ghim nếu có quyền. Mở **Thông tin hội thoại → Tin nhắn đã ghim** để cập nhật danh sách và đi đến tin đã lưu trên máy. Tính năng cần dịch vụ bảng nhóm v2 của Zalo.
 - **Tải tin cũ trong nhóm** (bản đang phát triển). Khi tới đầu lịch sử đã lưu, chọn **Tải tin cũ từ Zalo**, rồi **Xem trang trước** để đọc phần vừa lưu. Tính năng tải từng trang tin văn bản trong nhóm thường đủ điều kiện và cần phiên Zalo bật lịch sử nhóm.
 - **Thông tin hội thoại:** số tin và khoảng thời gian đã lưu, cùng danh sách ảnh, tệp và liên kết từng xuất hiện trong lịch sử; bấm một mục để mở trong trình duyệt.
@@ -55,14 +55,14 @@ Các ảnh dưới đây là **ảnh giả lập**: chụp từ chế độ `--d
 
 ## Cài đặt nhanh bằng gói `.deb` / `.rpm`
 
-Gói thử **2.0.5-2** dành cho x86_64, cần glibc 2.31 trở lên. Đã thử nâng cấp trên Ubuntu 20.04 và cài/gỡ trên Ubuntu 22.04/24.04, Debian 12, Fedora 42 và AlmaLinux 9. [Ghi chú 2.0.5](changelogs/RELEASE-v2.0.5.md)
+Gói **2.0.6-1** dành cho Linux x86_64, dựng trên Ubuntu 20.04 với glibc 2.31. Khi mở hồ sơ bằng bản này, ứng dụng nâng cơ sở dữ liệu lên schema 26. [Ghi chú 2.0.6](changelogs/RELEASE-v2.0.6.md)
 
 ```bash
 # Ubuntu / Debian
-sudo apt install ./zalo-native_2.0.5-2_amd64.deb
+sudo apt install ./zalo-native_2.0.6-1_amd64.deb
 
 # Fedora / RHEL / AlmaLinux / Rocky (yum dùng cùng lệnh)
-sudo dnf install ./zalo-native-2.0.5-2.x86_64.rpm
+sudo dnf install ./zalo-native-2.0.6-1.x86_64.rpm
 ```
 
 Mở **Zalo Native** từ menu ứng dụng hoặc chạy `zalo-native --live`; `zalo-native --demo` mở bản dùng thử. Gỡ cài đặt bằng `sudo apt remove zalo-native` hoặc `sudo dnf remove zalo-native`. Gói độc lập với gói Electron `zalo` và có thể cài cùng lúc. Hiện chưa có kho `apt`/`dnf` để tự cập nhật: muốn nâng cấp, cài gói mới hơn theo cùng lệnh.
@@ -182,7 +182,7 @@ Sau mỗi lần biên dịch bản mới, chạy lại trình cài đặt để 
 | Nhắn tin | Xác nhận đầy đủ gửi–nhận cá nhân/nhóm với tài khoản thực, kết nối lại và vận hành lâu dài |
 | Đồng bộ | Lịch sử chat cá nhân, lịch sử ngoài phần văn bản nhóm được hỗ trợ, thành viên nhóm lớn và cộng đồng, xác nhận tải ảnh đại diện trên tài khoản thực |
 | Nội dung | Gửi ảnh gốc ngoài phạm vi JPEG hiện tại, gửi nhiều tệp, tin thoại mã hóa, tiếp tục lượt tải dở và các mẫu thẻ OA còn lại |
-| Thao tác tin nhắn | Ghim trong chat cá nhân, cập nhật tin ghim theo thời gian thực, chuyển tiếp ảnh/tệp, nhắc cả nhóm, thu hồi ảnh và tệp gửi từ thiết bị khác, xác nhận chuyển tiếp/thu hồi/đồng bộ xóa trên thiết bị thật, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
+| Thao tác tin nhắn | Ghim trong chat cá nhân, cập nhật tin ghim theo thời gian thực, chuyển tiếp ảnh/tệp, thu hồi ảnh và tệp gửi từ thiết bị khác, xác nhận nhắc tất cả/chuyển tiếp/thu hồi/đồng bộ xóa trên thiết bị thật, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
 | Quản lý nhóm | Tạo nhóm, xóa thành viên, chuyển quyền trưởng nhóm, mời nhiều người và tham gia lại nhóm đã rời |
 | Bình chọn và tìm kiếm | Tạo bình chọn, chọn nhiều phương án, đổi hoặc rút phiếu, cập nhật kết quả tự động, xác nhận trên tài khoản thật và tìm kiếm toàn bộ tin nhắn |
 | Tích hợp Linux | Khay hệ thống, thông báo sau khi thoát hẳn, chụp màn hình và kiểm tra trên nhiều môi trường desktop |
@@ -275,7 +275,7 @@ Xử lý mạng, truy cập dữ liệu và giải mã ảnh phải chạy ngoà
 - [Quy ước nội dung đa phương tiện](rust-client/PROTOCOL_MEDIA.md): định dạng hỗ trợ, giải mã và giới hạn tài nguyên.
 - [Kiểm chứng](rust-client/VALIDATION.md): lệnh kiểm thử và bằng chứng kiểm tra trên desktop.
 - [Tiến độ phát triển](rust-client/MIGRATION_STATUS.md): các mốc triển khai và lịch sử kiểm chứng.
-- [Nhật ký thay đổi](rust-client/CHANGELOG.md) và [ghi chú 2.0.5](changelogs/RELEASE-v2.0.5.md).
+- [Nhật ký thay đổi](rust-client/CHANGELOG.md) và [ghi chú 2.0.6](changelogs/RELEASE-v2.0.6.md).
 - [Hướng dẫn áp dụng thiết kế mới](rust-client/UI_REDESIGN_GUIDE.md): màu, kích thước và các điểm lệch có chủ ý so với bản thiết kế.
 
 Thương hiệu Zalo và tài nguyên đi kèm thuộc về chủ sở hữu tương ứng. Việc tích hợp không thể hiện sự liên kết hay bảo chứng; mã bên thứ ba giữ nguyên các thông báo bản quyền/giấy phép của mình.

@@ -376,6 +376,7 @@ pub struct ServerConfig {
     pub voice_recording_allowed: bool,
     pub seen_v2: bool,
     pub group_board_v2: bool,
+    pub mention_all_limit: Option<u32>,
     pub delete_for_me_sync: bool,
     pub recall_max_age_ms: Option<i64>,
     pub chat_poll: Vec<Url>,
@@ -764,6 +765,19 @@ impl ServerConfig {
                 .and_then(|v| v.get("v2_enable"))
                 .is_none_or(|v| v.is_null() || v.as_bool() == Some(true) || v.as_i64() == Some(1))
         });
+        // The PC bundle reads max_member_mention_all from feature settings. This
+        // optional action needs a positive advertised limit under either spelling.
+        let mention_all_limit = match [
+            value.pointer("/settings/features/max_member_mention_all"),
+            value.pointer("/setttings/features/max_member_mention_all"),
+        ] {
+            [Some(a), Some(b)] if a != b => None,
+            [Some(limit), _] | [_, Some(limit)] => limit
+                .as_u64()
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit.min(100) as u32),
+            _ => None,
+        };
         let delete_for_me_sync = feature_config(value, "sync_del_msg_or_conv")
             .ok()
             .flatten()
@@ -800,6 +814,7 @@ impl ServerConfig {
             voice_recording_allowed,
             seen_v2,
             group_board_v2,
+            mention_all_limit,
             delete_for_me_sync,
             recall_max_age_ms,
             file_chunk_size,
@@ -1280,6 +1295,34 @@ mod tests {
             "https://groupboard-wpa.zaloapp.com/"
         );
     }
+    #[test]
+    fn mention_all_limit_requires_a_positive_consistent_feature_value() {
+        let limit = |value: Value| ServerConfig::parse(&value).unwrap().mention_all_limit;
+        assert_eq!(limit(json!({})), None);
+        for spelling in ["settings", "setttings"] {
+            for (raw, expected) in [
+                (json!(0), None),
+                (json!(false), None),
+                (json!(null), None),
+                (json!("42"), None),
+                (json!(42), Some(42)),
+                (json!(120), Some(100)),
+            ] {
+                assert_eq!(
+                    limit(json!({(spelling): {"features": {"max_member_mention_all": raw}}})),
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            limit(json!({
+                "settings":{"features":{"max_member_mention_all":42}},
+                "setttings":{"features":{"max_member_mention_all":43}}
+            })),
+            None
+        );
+    }
+
     #[test]
     fn delete_for_me_sync_needs_affirmative_consistent_server_config() {
         let mut value = json!({});

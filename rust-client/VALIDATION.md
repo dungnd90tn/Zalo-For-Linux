@@ -1981,3 +1981,32 @@ Default checks passed 319 Rust and 19 Python tests. The all-feature checks
 passed 177 store tests, five picker tests, seven protocol and roster tests,
 and strict Clippy. The optimized live build passed the schema 25 offline
 startup and restart smoke. Real-service confirmation remains pending.
+
+## Mentioning everyone in a group
+
+The TLS/WSS fixture tests an absent limit, an advertised limit below the
+verified member count, and an eligible group. Only the eligible case sends
+an authenticated mention request with UTF-16 position `3`, length `4`,
+`uid: "-1"` and `type: 1`. A stale privacy revision sends nothing. The
+selected span persists after reopening the profile. The earlier individual
+mention TLS fixture also passed.
+
+Four offline X11 captures show the picker at 640×480 and 1200×780 in both
+themes. Keyboard regression tests distinguish Enter used to send plain
+`@All` from explicit selection in the picker. The schema 25 upgrade test
+preserves previously saved individual mentions.
+
+Default verification passed 321 Rust and 19 Python tests. The targeted
+all-feature cases passed 179 store tests, five picker tests, three draft
+tests and 22 protocol/configuration tests. Strict all-feature Clippy passed.
+
+The stripped Ubuntu-built 2.0.6 executable passed the offline release smoke.
+An independent upgrade from the previous schema 25 binary preserved all 19
+synthetic messages. The older binary refused the upgraded schema 26 profile.
+
+The 2.0.6-1 DEB passed package installation, offline startup, desktop and
+icon checks, and removal on Ubuntu 20.04, 22.04, 24.04 and Debian 12. The RPM
+passed the same checks on Fedora 42 and AlmaLinux 9. Both packages contain
+the same executable. Ubuntu 20.04 also upgraded the previous published
+2.0.5-2 DEB from schema 18 while preserving its synthetic history. Both
+installer SHA-256 hashes verified. Real-service verification remains pending.

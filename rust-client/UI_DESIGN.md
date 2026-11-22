@@ -134,6 +134,8 @@ Toàn vùng nhập của composer nhận focus; nội dung nhiều dòng cuộn 
 
 Trong nhóm thường đang kết nối, gõ `@` ở đầu từ để mở danh sách thành viên theo quyền xem. Gõ tên để lọc, rồi bấm tên hoặc dùng ↑/↓ và Enter để chọn. Enter khi đang chốt chữ vẫn dành cho bộ gõ. Tên nhập tay là văn bản thường. Chọn từ danh sách giữ phần chữ xung quanh và gắn đúng thành viên vào bản nháp. Danh sách hỗ trợ nhóm tối đa 100 thành viên và mỗi tin văn bản tối đa 32 lượt nhắc tên. Escape đóng gợi ý. Đổi hội thoại, tài khoản hoặc quyền xem sẽ làm mới phạm vi.
 
+Với nhóm được xác minh có quyền nhắc cả nhóm, danh sách có mục **Nhắc tất cả · @All**. Chọn mục bằng chuột hoặc dùng phím mũi tên rồi Enter để gắn một lượt nhắc cả nhóm vào bản nháp. Gõ `@All` rồi Enter mà không chọn mục chỉ gửi văn bản thường.
+
 Lịch sử nhấn đậm đúng phần nhắc tên đã xác minh. Tin đến dùng màu nhấn của theme, tin gửi dùng màu chữ hiện có của bong bóng xanh. Toàn bộ văn bản vẫn xuống dòng, chọn và sao chép như tin thường.
 
 Bản vá [egui-winit](vendor/egui-winit/LINUX_IME_PATCH.md) nhận preedit/commit Linux, không để context Enabled khóa Backspace/phím mũi tên; đổi editor tạo lại context. Không gửi trong composition, frame commit hoặc do phím giữ lặp sau commit.

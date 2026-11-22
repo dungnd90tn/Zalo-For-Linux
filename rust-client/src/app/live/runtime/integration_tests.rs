@@ -38,6 +38,7 @@ enum Reply {
     Stickers,
     StickerSend(u8),
     Mentions,
+    MentionAll,
     RuntimeStall,
     ControlHeartbeats,
     OfflinePages,
@@ -1459,8 +1460,16 @@ fn serve(
             return;
         }
     }
-    if matches!(reply, Reply::Mentions)
-        && mention_tests::respond(&mut stream, &state, &cipher, &path, &headers, &body)
+    if matches!(reply, Reply::Mentions | Reply::MentionAll)
+        && mention_tests::respond(
+            &mut stream,
+            &state,
+            &cipher,
+            &path,
+            &headers,
+            &body,
+            matches!(reply, Reply::MentionAll),
+        )
     {
         return;
     }

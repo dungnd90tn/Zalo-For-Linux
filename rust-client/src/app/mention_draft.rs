@@ -19,13 +19,19 @@ impl Composer {
         !self.mentions.is_empty()
     }
 
+    pub fn has_all_mention(&self) -> bool {
+        self.mentions.iter().any(|span| span.uid == mention::ALL_ID)
+    }
+
     pub fn apply_mention(
         &mut self,
         replace: Range<usize>,
         display_name: &str,
         uid: &str,
     ) -> Result<usize> {
-        crate::protocol::messaging::numeric_id(uid)?;
+        if uid != mention::ALL_ID {
+            crate::protocol::messaging::numeric_id(uid)?;
+        }
         ensure!(
             self.reply().is_none() && self.attachment().is_none() && !self.has_photo_intent(),
             "Bỏ trích dẫn hoặc tệp đính kèm trước khi nhắc tên."
@@ -39,6 +45,12 @@ impl Composer {
             "Không thể chèn tên thành viên vào bản nháp."
         );
         let token = format!("@{display_name}");
+        if uid == mention::ALL_ID {
+            ensure!(
+                token == mention::ALL_LABEL && !self.has_all_mention(),
+                "Chỉ có thể nhắc tất cả một lần trong mỗi tin nhắn."
+            );
+        }
         let token_end = replace.start + token.len();
         let append_space = !self.text[replace.end..].starts_with(char::is_whitespace);
         let new_end = token_end + usize::from(append_space);
@@ -180,6 +192,35 @@ mod tests {
         draft.apply_mention(end..end, "An", "33").unwrap();
         let previous = draft.text.clone();
         draft.text = "@An ".into();
+        draft.edit_with_mentions(&previous);
+        assert!(!draft.has_mentions());
+    }
+
+    #[test]
+    fn only_explicit_group_selection_creates_one_broadcast_annotation() {
+        let mut draft = Composer {
+            text: "😀 @all".into(),
+            ..Default::default()
+        };
+        assert!(!draft.has_mentions());
+        let start = draft.text.find('@').unwrap();
+        let end = draft.text.len();
+        assert!(draft
+            .apply_mention(start..end, "all", mention::ALL_ID)
+            .is_err());
+        draft
+            .apply_mention(start..end, "All", mention::ALL_ID)
+            .unwrap();
+        assert!(draft.has_all_mention());
+        let mentions = draft.wire_mentions().unwrap();
+        assert!(mentions[0].is_all());
+        assert_eq!((mentions[0].pos, mentions[0].len), (3, 4));
+        let end = draft.text.len();
+        assert!(draft
+            .apply_mention(end..end, "All", mention::ALL_ID)
+            .is_err());
+        let previous = draft.text.clone();
+        draft.text.replace_range(start..start + 4, "@all");
         draft.edit_with_mentions(&previous);
         assert!(!draft.has_mentions());
     }

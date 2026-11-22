@@ -1398,6 +1398,7 @@ pub(in crate::ui) mod tests {
                 voice_recording_allowed: false,
                 seen_v2: true,
                 group_board_v2: false,
+                mention_all_limit: None,
                 recall_max_age_ms: Some(300_000),
                 delete_for_me_sync: true,
                 chat_poll: vec![],
@@ -2853,7 +2854,7 @@ pub(in crate::ui) mod tests {
                         app.model.messages.push(last);
                         app.start_message_selection("fixture-1");
                     }
-                    Some("mentions") => {
+                    Some("mentions" | "mention-all") => {
                         let group = "g:44";
                         app.model.conversations[0].id = group.into();
                         app.model.conversations[0].title = "Nhóm kiểm thử nhắc tên".into();
@@ -2867,19 +2868,28 @@ pub(in crate::ui) mod tests {
                         }];
                         app.model.selected = Some(group.into());
                         app.drafts.select(group).unwrap();
-                        app.drafts.active.text = "Chào @nguy".into();
+                        let everyone = interactions_scene.as_deref() == Some("mention-all");
+                        app.drafts.active.text = if everyone {
+                            "Chào @all"
+                        } else {
+                            "Chào @nguy"
+                        }
+                        .into();
                         app.focus_composer = true;
                         let auth = app.auth_generation();
                         let state = app.live.as_mut().unwrap();
-                        state
-                            .mention_picker
-                            .fixture(super::super::group_members::Scope {
-                                account: "11".into(),
-                                auth,
-                                thread: group.into(),
-                                generation: app.model.generation,
-                                privacy_revision: state.privacy.revision,
-                            });
+                        let scope = super::super::group_members::Scope {
+                            account: "11".into(),
+                            auth,
+                            thread: group.into(),
+                            generation: app.model.generation,
+                            privacy_revision: state.privacy.revision,
+                        };
+                        if everyone {
+                            state.mention_picker.fixture_everyone(scope);
+                        } else {
+                            state.mention_picker.fixture(scope);
+                        }
                     }
                     Some("group-pins" | "group-pin-menu") => {
                         use crate::app::live::{GroupPinEntry, GroupPinSnapshot};
@@ -3678,7 +3688,10 @@ pub(in crate::ui) mod tests {
                     geometry: None,
                     grab: Default::default(),
                     menu_opened: false,
-                    mention_scene: interactions_scene.as_deref() == Some("mentions"),
+                    mention_scene: matches!(
+                        interactions_scene.as_deref(),
+                        Some("mentions" | "mention-all")
+                    ),
                     mention_caret_seeded: false,
                 }))
             }),

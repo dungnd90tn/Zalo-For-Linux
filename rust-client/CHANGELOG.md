@@ -4,12 +4,13 @@ Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-clie
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
 Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) để đối chiếu khi nâng cấp.
 
-## Chưa phát hành — nhánh 2.0.6
+## 2.0.6 — gói 2.0.6-1
 
 - Xem câu hỏi, các lựa chọn và số phiếu được Zalo cho phép hiển thị ngay trên thẻ bình chọn trong nhóm thường đủ điều kiện. Bấm **Cập nhật bình chọn** để đọc kết quả mới nhất.
-- Chọn một phương án rồi bấm **Gửi phiếu** để tham gia lần đầu vào bình chọn đang mở và chỉ cho chọn một phương án. Ứng dụng giữ trạng thái chưa xác nhận qua lần mở lại để tránh gửi lặp. Hồ sơ nâng lên schema 25 và bản cũ dùng schema 24 không mở được hồ sơ đã nâng cấp.
+- Chọn một phương án rồi bấm **Gửi phiếu** để tham gia lần đầu vào bình chọn đang mở và chỉ cho chọn một phương án. Ứng dụng giữ trạng thái chưa xác nhận qua lần mở lại để tránh gửi lặp.
 
 - Gõ `@` để chọn và nhắc từng thành viên trong nhóm thường có tối đa 100 người. Chọn bằng chuột hoặc phím ↑/↓ và Enter. Ứng dụng giữ bản nháp khi lượt gửi bị từ chối hoặc chưa xác định được kết quả.
+- Chọn **Nhắc tất cả · @All** trong danh sách gợi ý khi nhóm có quyền gửi và nằm trong giới hạn Zalo xác nhận. Gõ `@All` rồi Enter mà chưa chọn mục này sẽ gửi văn bản thường.
 - Làm nổi bật phần nhắc tên đã xác minh trong tin nhắn nhóm, kể cả khi mở lại lịch sử.
 - Ghim và bỏ ghim tin văn bản trong nhóm thường theo quyền Zalo. Xem danh sách trong **Thông tin hội thoại** và bấm để mở tin đã lưu. Nếu ghim trên thiết bị khác, dùng **Cập nhật tin ghim** để tải trạng thái mới.
 - Chuyển tiếp một tin văn bản cá nhân đến tối đa 10 bạn bè. Giữ lựa chọn khi tìm kiếm, hiển thị kết quả từng người và chỉ cho thử lại các lượt bị từ chối hoặc xác định chưa gửi.
@@ -24,7 +25,7 @@ Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) đ�
 - Thu, nghe lại và gửi tin nhắn thoại MP3 tối đa 60 giây qua chat cá nhân và nhóm đủ điều kiện. Có nút phát tin thoại nhận được và giữ bản nháp chữ khi gửi hoặc hủy bản ghi.
 - Xóa một tin văn bản thường ở phía mình. Hộp xác nhận nêu phạm vi thiết bị hoặc tài khoản. Tin đã xóa được bỏ khỏi lịch sử, tìm kiếm và xem trước hội thoại.
 - Nhận sự kiện xóa tin văn bản ở phía mình từ thiết bị khác. Nếu sự kiện đến trước tin gốc, ứng dụng lưu chờ đến khi có tin khớp để đối chiếu.
-- Hồ sơ nâng lên **schema 24** để giữ các sự kiện xóa đang chờ đối chiếu. Quá trình nâng cấp giữ lịch sử, album và thông tin tin thoại đã lưu. Bản cũ dùng schema 23 trở xuống sẽ từ chối mở hồ sơ đã nâng cấp.
+- Hồ sơ nâng lên **schema 26** để hỗ trợ lưu nhắc tất cả, giữ dấu chống gửi lặp phiếu và các sự kiện xóa đang chờ đối chiếu. Quá trình nâng cấp giữ lịch sử đã lưu. Bản cũ dùng schema 25 trở xuống sẽ từ chối mở hồ sơ đã nâng cấp.
 
 ## 2.0.5 — gói thử 2.0.5-2
 

@@ -33,6 +33,10 @@ impl Proof {
         uid != self.account && self.roster.contains(uid) && self.roster.can_view(&self.account, uid)
     }
 
+    pub(super) fn allows_mention_all(&self, limit: Option<u32>) -> bool {
+        limit.is_some_and(|limit| self.roster.allows_mention_all(limit))
+    }
+
     pub(super) fn allows_forward(&self, request: &Request, account: &str) -> bool {
         self.applies(request, account) && self.roster.can_forward
     }
@@ -110,18 +114,27 @@ pub(super) async fn load_page(
     if !request.permits(policy) {
         return Err(WireError::Unsupported.into());
     }
-    if !page.members.is_empty() {
-        let parameters = roster::profile_parameters(&page.members)?;
-        // Optional photos and names are deliberately not persisted. If the
-        // profile endpoint is unavailable the verified roster is usable.
-        let profiles = post(client, session, "profile", roster::PROFILE_PATH, parameters).await;
-        if let Ok(profiles) = profiles {
-            let _ = roster::apply_profiles(&profiles, &mut page.members);
+    let load_profiles = async {
+        if !page.members.is_empty() {
+            let parameters = roster::profile_parameters(&page.members)?;
+            // Verified member IDs remain usable without optional profile metadata.
+            let profiles = post(client, session, "profile", roster::PROFILE_PATH, parameters).await;
+            if let Ok(profiles) = profiles {
+                let _ = roster::apply_profiles(&profiles, &mut page.members);
+            }
         }
-    }
+        Ok::<(), WireError>(())
+    };
+    let load_mention_all = async {
+        proof.allows_mention_all(session.config().mention_all_limit)
+            && matches!(verify_group(client, session, &target).await, Ok(0))
+    };
+    let (profiles, mention_all) = tokio::join!(load_profiles, load_mention_all);
+    profiles?;
     if !request.permits(policy) {
         return Err(WireError::Unsupported.into());
     }
+    page.mention_all = mention_all && proof.applies(request, session.account_id());
     Ok((page, proof))
 }
 

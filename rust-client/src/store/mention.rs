@@ -243,6 +243,101 @@ mod tests {
     }
 
     #[test]
+    fn group_broadcast_is_bound_to_visible_group_and_typed_echo() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let text = "😀 @All";
+        let all = Mention {
+            uid: mention::ALL_ID.into(),
+            pos: 3,
+            len: 4,
+        };
+        let mentions = std::slice::from_ref(&all);
+        store.open_conversation("11", "g:33", "Nhóm").unwrap();
+        assert!(store
+            .prepare_outgoing_mention("11", "g:33", text, mentions, 5_000)
+            .is_err());
+        store
+            .replace_live_privacy("11", &["g:33".into()], Some("g:33"))
+            .unwrap();
+        assert!(store
+            .prepare_outgoing_mention("11", "g:33", text, mentions, 5_000)
+            .is_err());
+        store.replace_live_privacy("11", &[], None).unwrap();
+        assert!(store
+            .prepare_outgoing_mention("11", "d:33", text, mentions, 5_000)
+            .is_err());
+
+        let client = store
+            .prepare_outgoing_mention("11", "g:33", text, mentions, 5_000)
+            .unwrap();
+        store.fail_outgoing("11", client, true).unwrap();
+        let mut reopened = MessageStore::initialize(store.conn).unwrap();
+        let mut plain = group_message("910", client, vec![]);
+        plain.text = text.into();
+        reopened
+            .receive_batch("11", &[(plain.clone(), Some(client.to_string()))], None)
+            .unwrap();
+        assert_eq!(state(&reopened, client), "unknown");
+        let typed = Message {
+            mentions: vec![all],
+            reply_blocked: true,
+            ..plain
+        };
+        let wrong_thread = Message {
+            thread_id: "d:33".into(),
+            ..typed.clone()
+        };
+        assert!(wrong_thread.validate().is_err());
+        reopened
+            .receive_batch("11", &[(typed.clone(), Some(client.to_string()))], None)
+            .unwrap();
+        assert_eq!(state(&reopened, client), "accepted");
+        assert_eq!(reopened.page("11", "g:33", None, 10).unwrap(), [typed]);
+        assert_eq!(
+            reopened
+                .search_messages("11", "g:33", "@All", 10)
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        assert!(reopened
+            .search_messages("12", "g:33", "@All", 10)
+            .unwrap()
+            .hits
+            .is_empty());
+        reopened
+            .replace_live_privacy("11", &["g:33".into()], None)
+            .unwrap();
+        assert!(reopened
+            .search_messages("11", "g:33", "@All", 10)
+            .unwrap()
+            .hits
+            .is_empty());
+    }
+
+    #[test]
+    fn version_twenty_five_upgrade_keeps_existing_member_annotations() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let client = store
+            .prepare_outgoing_mention("11", "g:33", TEXT, &[alice()], 5_000)
+            .unwrap();
+        store.accept_outgoing("11", client, "910", None).unwrap();
+        store.conn.pragma_update(None, "user_version", 25).unwrap();
+
+        let reopened = MessageStore::initialize(store.conn).unwrap();
+        let schema: i64 = reopened
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema, crate::store::SCHEMA_VERSION);
+        assert_eq!(
+            reopened.page("11", "g:33", None, 10).unwrap(),
+            [group_message("910", client, vec![alice()])]
+        );
+    }
+
+    #[test]
     fn version_eighteen_upgrade_preserves_unresolved_and_persists_new_annotation_ack() {
         let mut original = MessageStore::in_memory().unwrap();
         let pending = original
