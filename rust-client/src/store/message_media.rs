@@ -373,6 +373,7 @@ mod tests {
         let content = media_content(kind, 1);
         (
             Message {
+                expires_at_ms: None,
                 mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
@@ -466,6 +467,7 @@ mod tests {
         }))
         .unwrap();
         let m = Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,

@@ -526,6 +526,7 @@ mod tests {
             quote: None,
             mentions: Vec::new(),
             reply_blocked: true,
+            expires_at_ms: None,
             recalled: false,
             sticker: None,
             media: Some(MediaDescriptor::Poll(PollDescriptor {

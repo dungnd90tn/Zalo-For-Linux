@@ -1284,6 +1284,7 @@ pub struct QueueEnvelope {
     pub more: bool,
     pub last_action_id: Option<Cursor>,
     pub sessions: Vec<SessionEvent>,
+    omitted_sessions: bool,
     // Retain complete records for the typed message adapter; never plaintext/UI.
     records: Vec<Value>,
 }
@@ -1304,6 +1305,149 @@ fn session_command(command: u64) -> Result<Command> {
         _ => Err(SignalError::Unsupported),
     }
 }
+/// Decode unsolicited personal session events. Correlated command replies carry no
+/// `eesession` array and are handled by the request router instead.
+pub fn personal_session_push(
+    scope: &Scope,
+    active: &Scope,
+    command: u16,
+    reply: &Value,
+) -> Result<Vec<SessionEvent>> {
+    scope.require(active)?;
+    bounded_json(reply)?;
+    service_code(reply.get("error_code").ok_or(SignalError::Invalid)?)?;
+    if !matches!(command, 543..=545) {
+        return Err(SignalError::Unsupported);
+    }
+    Ok(session_events(scope, &reply["data"], Some(command), false)?.0)
+}
+
+fn canonical_session_command(command: u16) -> u16 {
+    if command == 545 {
+        543
+    } else {
+        command
+    }
+}
+
+fn session_events(
+    scope: &Scope,
+    data: &Value,
+    push_command: Option<u16>,
+    partial_desktop: bool,
+) -> Result<(Vec<SessionEvent>, bool)> {
+    let mut events = Vec::new();
+    let mut ids = BTreeSet::new();
+    let mut omitted = false;
+    if partial_desktop && data["eesession"].is_null() {
+        return Ok((events, false));
+    }
+    for item in bounded_array(&data["eesession"], MAX_PAGE_ITEMS)? {
+        let source_command = match item.get("cmd") {
+            Some(command) => u16::try_from(number(command)?).map_err(|_| SignalError::Invalid)?,
+            None => push_command.ok_or(SignalError::Invalid)?,
+        };
+        if push_command.is_some_and(|push| {
+            canonical_session_command(push) != canonical_session_command(source_command)
+        }) {
+            return Err(SignalError::Correlation);
+        }
+        // These desktop queue controls have independent semantics. A read-only
+        // personal receiver must leave them in the server queue.
+        if partial_desktop && matches!(source_command, 546 | 548 | 549 | 559 | 561 | 580..=582) {
+            omitted = true;
+            continue;
+        }
+        let event = match parse_session_event(scope, item, source_command) {
+            Ok(event) => event,
+            Err(_) if partial_desktop && matches!(source_command, 543..=545) => {
+                omitted = true;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if !ids.insert(event.server_id.clone()) {
+            return Err(SignalError::Duplicate);
+        }
+        events.push(event);
+    }
+    Ok((events, omitted))
+}
+
+fn parse_session_event(scope: &Scope, item: &Value, source_command: u16) -> Result<SessionEvent> {
+    let command = session_command(source_command.into())?;
+    let server_id = item["msgId"].as_str().ok_or(SignalError::Invalid)?;
+    uid(server_id)?;
+    let payload = item
+        .get("sessionData")
+        .filter(|value| value.is_object())
+        .ok_or(SignalError::Invalid)?;
+    let sender = payload["uidFrom"].as_str().ok_or(SignalError::Invalid)?;
+    uid(sender)?;
+    if let Some(recipient) = payload.get("uidTo") {
+        if recipient.as_str() != Some(scope.account()) {
+            return Err(SignalError::Scope);
+        }
+    } else if matches!(
+        command,
+        Command::Init | Command::InitAck | Command::InitGroup
+    ) {
+        return Err(SignalError::Scope);
+    }
+    let device = DevicePlatform::parse(&payload["deviceId"])?;
+    let timestamp = payload
+        .get("reqServerTs")
+        .map(number)
+        .transpose()?
+        .filter(|timestamp| *timestamp > 0)
+        .or(payload.get("ts").map(number).transpose()?)
+        .unwrap_or(0);
+    match command {
+        Command::Init | Command::InitAck => match (command, payload["type"].as_i64()) {
+            (Command::InitAck, Some(0)) => {
+                registration(&payload["iid"])?;
+            }
+            (Command::Init, _) | (Command::InitAck, Some(1)) => {
+                let value = payload["data"].as_str().ok_or(SignalError::Invalid)?;
+                let bytes = base64_bytes(value, MAX_CIPHER_BYTES)?;
+                if bytes.len() < 11 || bytes.get(1) != Some(&0x33) {
+                    return Err(SignalError::Invalid);
+                }
+                match (command, bytes[0]) {
+                    (Command::Init, 3) | (Command::InitAck, 1..=3) => {}
+                    _ => return Err(SignalError::OutOfOrder),
+                }
+            }
+            _ => return Err(SignalError::Unsupported),
+        },
+        Command::InitGroup => {
+            let group = payload["threadId"].as_str().ok_or(SignalError::Invalid)?;
+            uid(group)?;
+            validate_cipher(payload["data"].as_str().ok_or(SignalError::Invalid)?, false)?;
+        }
+        Command::RequestPrekeys => {
+            if !matches!(payload["type"].as_u64(), Some(1 | 2)) {
+                return Err(SignalError::Unsupported);
+            }
+        }
+        Command::DeleteNotice => {
+            if !matches!(payload["deleteType"].as_u64(), Some(0 | 1 | 3)) {
+                return Err(SignalError::Unsupported);
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(SessionEvent {
+        server_id: server_id.into(),
+        source_command,
+        command,
+        sender: sender.into(),
+        device,
+        timestamp,
+        payload: payload.clone(),
+    })
+}
+
 /// Input must be the decoded inner-success envelope of the authenticated socket.
 /// No cursor is committed and no receipt/ACK is constructed by this parser.
 pub fn queue_envelope(
@@ -1311,6 +1455,16 @@ pub fn queue_envelope(
     active: &Scope,
     command: u16,
     reply: &Value,
+) -> Result<QueueEnvelope> {
+    queue_envelope_with(scope, active, command, reply, false)
+}
+
+fn queue_envelope_with(
+    scope: &Scope,
+    active: &Scope,
+    command: u16,
+    reply: &Value,
+    partial_desktop: bool,
 ) -> Result<QueueEnvelope> {
     scope.require(active)?;
     bounded_json(reply)?;
@@ -1323,92 +1477,23 @@ pub fn queue_envelope(
     let more = match data.get("more") {
         None => false,
         Some(Value::Bool(value)) => *value,
+        Some(Value::Null) if partial_desktop => false,
+        Some(value) if partial_desktop && value.as_u64() == Some(0) => false,
+        Some(value) if partial_desktop && value.as_u64() == Some(1) => true,
         _ => return Err(SignalError::Invalid),
     };
-    let last_action_id = data.get("lastActionId").map(Cursor::parse).transpose()?;
+    let last_action_id = data
+        .get("lastActionId")
+        .filter(|value| !partial_desktop || !value.is_null())
+        .map(Cursor::parse)
+        .transpose()?;
     let mut sessions = Vec::new();
+    let mut omitted_sessions = false;
     let mut records = Vec::new();
     let mut ids = BTreeSet::new();
     match kind {
         QueueKind::SessionsPc | QueueKind::SessionsWeb => {
-            for item in bounded_array(&data["eesession"], MAX_PAGE_ITEMS)? {
-                let event_command = session_command(number(&item["cmd"])?)?;
-                let server_id = item["msgId"].as_str().ok_or(SignalError::Invalid)?;
-                uid(server_id)?;
-                if !ids.insert(server_id.to_owned()) {
-                    return Err(SignalError::Duplicate);
-                }
-                let payload = item
-                    .get("sessionData")
-                    .filter(|v| v.is_object())
-                    .ok_or(SignalError::Invalid)?;
-                let sender = payload["uidFrom"].as_str().ok_or(SignalError::Invalid)?;
-                uid(sender)?;
-                if let Some(recipient) = payload.get("uidTo") {
-                    if recipient.as_str() != Some(scope.account()) {
-                        return Err(SignalError::Scope);
-                    }
-                } else if matches!(
-                    event_command,
-                    Command::Init | Command::InitAck | Command::InitGroup
-                ) {
-                    return Err(SignalError::Scope);
-                }
-                let device = DevicePlatform::parse(&payload["deviceId"])?;
-                let timestamp = payload
-                    .get("reqServerTs")
-                    .or_else(|| payload.get("ts"))
-                    .map(number)
-                    .transpose()?
-                    .unwrap_or(0);
-                match event_command {
-                    Command::Init => {
-                        let value = payload["data"].as_str().ok_or(SignalError::Invalid)?;
-                        validate_cipher(value, false)?;
-                        if base64_bytes(value, MAX_CIPHER_BYTES)?[0] != 3 {
-                            return Err(SignalError::OutOfOrder);
-                        }
-                    }
-                    Command::InitAck => match payload["type"].as_i64() {
-                        Some(1) => validate_cipher(
-                            payload["data"].as_str().ok_or(SignalError::Invalid)?,
-                            false,
-                        )?,
-                        Some(0) => {
-                            registration(&payload["iid"])?;
-                        }
-                        _ => return Err(SignalError::Unsupported),
-                    },
-                    Command::InitGroup => {
-                        let group = payload["threadId"].as_str().ok_or(SignalError::Invalid)?;
-                        uid(group)?;
-                        validate_cipher(
-                            payload["data"].as_str().ok_or(SignalError::Invalid)?,
-                            false,
-                        )?;
-                    }
-                    Command::RequestPrekeys => {
-                        if !matches!(payload["type"].as_u64(), Some(1 | 2)) {
-                            return Err(SignalError::Unsupported);
-                        }
-                    }
-                    Command::DeleteNotice => {
-                        if !matches!(payload["deleteType"].as_u64(), Some(0 | 1 | 3)) {
-                            return Err(SignalError::Unsupported);
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-                sessions.push(SessionEvent {
-                    server_id: server_id.into(),
-                    source_command: number(&item["cmd"])? as u16,
-                    command: event_command,
-                    sender: sender.into(),
-                    device,
-                    timestamp,
-                    payload: payload.clone(),
-                });
-            }
+            (sessions, omitted_sessions) = session_events(scope, data, None, partial_desktop)?;
         }
         QueueKind::DeliveryDirect | QueueKind::DeliveryGroup => {
             for item in bounded_array(&data["delivereds"], MAX_PAGE_ITEMS)? {
@@ -1471,6 +1556,7 @@ pub fn queue_envelope(
         more,
         last_action_id,
         sessions,
+        omitted_sessions,
         records,
     })
 }
@@ -1994,6 +2080,7 @@ pub struct SessionPages {
     pages: usize,
     cursor: Option<Cursor>,
     complete: bool,
+    omitted_sessions: bool,
     events: Vec<SessionEvent>,
     ids: BTreeMap<String, (u16, Value)>,
 }
@@ -2008,15 +2095,37 @@ impl SessionPages {
             pages: 0,
             cursor: None,
             complete: false,
+            omitted_sessions: false,
             events: Vec::new(),
             ids: BTreeMap::new(),
         })
     }
     pub fn accept(&mut self, active: &Scope, reply: &Value) -> Result<bool> {
+        self.accept_with(active, reply, false)
+    }
+    /// The desktop personal receiver has no cursor or ACK side effects. This
+    /// permits safe processing of well-formed personal rows beside optional or
+    /// invalid rows, without authorizing those other rows.
+    pub fn accept_desktop_receive(&mut self, active: &Scope, reply: &Value) -> Result<bool> {
+        if self.command != 516 {
+            return Err(SignalError::Unsupported);
+        }
+        self.accept_with(active, reply, true)
+    }
+    pub fn had_omissions(&self) -> bool {
+        self.omitted_sessions
+    }
+    fn accept_with(
+        &mut self,
+        active: &Scope,
+        reply: &Value,
+        partial_desktop: bool,
+    ) -> Result<bool> {
         if self.complete || self.pages >= MAX_PAGES {
             return Err(SignalError::OutOfOrder);
         }
-        let parsed = queue_envelope(&self.scope, active, self.command, reply)?;
+        let parsed =
+            queue_envelope_with(&self.scope, active, self.command, reply, partial_desktop)?;
         if parsed.more && parsed.last_action_id.is_none() {
             return Err(SignalError::Incomplete);
         }
@@ -2058,6 +2167,7 @@ impl SessionPages {
         self.pages += 1;
         self.complete = !parsed.more;
         self.cursor = parsed.last_action_id;
+        self.omitted_sessions |= parsed.omitted_sessions;
         Ok(self.complete)
     }
     pub fn finish(self, active: &Scope) -> Result<Vec<SessionEvent>> {
@@ -2099,6 +2209,48 @@ mod queue_tests {
         assert!(SessionPages::new(&s, 516).unwrap().finish(&s).is_err());
         assert!(SessionPages::new(&s, 551).is_err());
     }
+
+    #[test]
+    fn desktop_catchup_reads_empty_pages_and_isolates_unusable_session_rows() {
+        let scope = scope();
+        for payload in [
+            json!({"error_code":0,"data":{}}),
+            json!({"error_code":0,"data":{"eesession":null,"more":null,"lastActionId":null}}),
+            json!({"error_code":0,"data":{"more":0}}),
+        ] {
+            let mut pages = SessionPages::new(&scope, 516).unwrap();
+            assert!(pages.accept_desktop_receive(&scope, &payload).unwrap());
+            assert!(!pages.had_omissions());
+            assert!(pages.finish(&scope).unwrap().is_empty());
+        }
+
+        let mut first = fixture()["first"].clone();
+        first["data"]["more"] = json!(1);
+        let mut pages = SessionPages::new(&scope, 516).unwrap();
+        assert!(!pages.accept_desktop_receive(&scope, &first).unwrap());
+        let mut wrong_account = first["data"]["eesession"][0].clone();
+        wrong_account["msgId"] = json!("102");
+        wrong_account["sessionData"]["uidTo"] = json!("44");
+        let mut malformed = first["data"]["eesession"][0].clone();
+        malformed["msgId"] = json!("103");
+        malformed["sessionData"]["data"] = json!("invalid ciphertext");
+        let last = json!({"error_code":0,"data":{"eesession":[
+            {"cmd":580,"msgId":"101"}, wrong_account, malformed
+        ],"more":0,"lastActionId":null}});
+        assert!(pages.accept_desktop_receive(&scope, &last).unwrap());
+        assert!(pages.had_omissions());
+        let events = pages.finish(&scope).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].server_id, "100");
+
+        let mut wrong_envelope = SessionPages::new(&scope, 516).unwrap();
+        assert_eq!(
+            wrong_envelope
+                .accept_desktop_receive(&scope, &json!({"error_code":0,"data":{"eesession":{}}})),
+            Err(SignalError::Invalid)
+        );
+    }
+
     #[test]
     fn queue_routes_sessions_cipher_messages_and_delivery_descriptors_without_plaintext_or_success_inference(
     ) {
@@ -2143,6 +2295,40 @@ mod queue_tests {
             Err(SignalError::Scope)
         ));
     }
+    #[test]
+    fn online_session_push_uses_socket_command_and_checks_recipient() {
+        let f = fixture();
+        let scope = scope();
+        let mut init = f["first"]["data"]["eesession"][0].clone();
+        init.as_object_mut().unwrap().remove("cmd");
+        init["sessionData"]["reqServerTs"] = json!("1700000000123");
+        let mut push = json!({"error_code":0,"data":{"eesession":[init]}});
+        let parsed = personal_session_push(&scope, &scope, 543, &push).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].source_command, 543);
+        assert_eq!(parsed[0].timestamp, 1_700_000_000_123);
+        push["data"]["eesession"][0]["cmd"] = json!(544);
+        assert!(matches!(
+            personal_session_push(&scope, &scope, 543, &push),
+            Err(SignalError::Correlation)
+        ));
+        push["data"]["eesession"][0]["cmd"] = json!(545);
+        push["data"]["eesession"][0]["sessionData"]["uidTo"] = json!("44");
+        assert!(matches!(
+            personal_session_push(&scope, &scope, 543, &push),
+            Err(SignalError::Scope)
+        ));
+        assert!(personal_session_push(
+            &scope,
+            &scope,
+            543,
+            &json!({
+                "error_code":0, "data":{"reqId":"signal_req_1","err":0}
+            })
+        )
+        .is_err());
+    }
+
     #[test]
     fn duplicate_cursor_conflict_oversize_and_out_of_order_init_never_mutate_pending_pages() {
         let f = fixture();

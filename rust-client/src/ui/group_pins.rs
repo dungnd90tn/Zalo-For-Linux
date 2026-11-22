@@ -650,6 +650,7 @@ mod tests {
         app.model.messages.push(Message {
             mentions: Vec::new(),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             source_client_id: Some("1901".into()),
             quote: None,

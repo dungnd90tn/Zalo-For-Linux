@@ -35,6 +35,8 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub(super) hydration: super::hydration::Hydration,
     #[cfg(feature = "messaging")]
+    latest_refresh: Option<(u64, String)>,
+    #[cfg(feature = "messaging")]
     pub privacy: super::privacy::Privacy,
     #[cfg(feature = "messaging")]
     pub worker: Option<LiveWorker>,
@@ -123,6 +125,8 @@ impl LiveState {
             sender_names: Default::default(),
             #[cfg(feature = "messaging")]
             hydration: Default::default(),
+            #[cfg(feature = "messaging")]
+            latest_refresh: None,
             #[cfg(feature = "messaging")]
             privacy: Default::default(),
             #[cfg(feature = "messaging")]
@@ -611,6 +615,7 @@ impl NativeApp {
                         state.avatars = Default::default();
                         state.sender_names = Default::default();
                         state.hydration = Default::default();
+                        state.latest_refresh = None;
                         state.session = Some(session);
                         state.ensure_worker(self._profile.clone());
                     }
@@ -647,6 +652,7 @@ impl NativeApp {
                         state.avatars = Default::default();
                         state.sender_names = Default::default();
                         state.hydration = Default::default();
+                        state.latest_refresh = None;
                         state.privacy.reset_worker();
                         state.review_dialog = false;
                     }
@@ -674,6 +680,10 @@ impl NativeApp {
             remaining -= 1;
             self.apply_live_event(&mut state, event, ctx);
         }
+        #[cfg(feature = "messaging")]
+        self.prune_expiring_messages(ctx);
+        #[cfg(feature = "messaging")]
+        self.refresh_synced_page(&mut state, ctx);
         #[cfg(feature = "messaging")]
         if state.privacy.ready() {
             state.sender_names.poll(state.worker.as_ref(), ctx);
@@ -873,6 +883,24 @@ impl NativeApp {
         let Some(event) = state.privacy.project(event) else {
             return;
         };
+        if let LiveEvent::MessagesExpired { expired, .. } = &event {
+            for message in expired {
+                self.drafts.remove_message_reply(
+                    &account_id,
+                    &message.thread_id,
+                    &message.message_id,
+                    &message.sender_id,
+                );
+                state
+                    .group_pins
+                    .remove_preview(&message.thread_id, &message.message_id);
+                if self.model.selected.as_deref() == Some(&message.thread_id) {
+                    self.message_menu = None;
+                    self.message_selection = None;
+                    state.hydration.invalidate(&account_id, &self.model, ctx);
+                }
+            }
+        }
         if matches!(
             &event,
             LiveEvent::PollDetail { .. }
@@ -931,9 +959,31 @@ impl NativeApp {
         state
             .hydration
             .apply(&event, &account_id, &mut self.model, ctx);
-        if matches!(&event, LiveEvent::DirectoryChanged { .. }) {
+        if let LiveEvent::DirectoryChanged { conversations, .. } = &event {
             state.avatars.invalidate_metadata();
             state.hydration.invalidate(&account_id, &self.model, ctx);
+            if self.latest_page {
+                if let Some(updated) = self.model.selected.as_ref().and_then(|thread| {
+                    conversations
+                        .iter()
+                        .find(|conversation| conversation.id == *thread)
+                }) {
+                    let previous = self.model.conversations.iter().find(|c| c.id == updated.id);
+                    let last_loaded = self.model.messages.last().map_or(0, |m| m.sent_at_ms);
+                    let activity_changed = previous.is_none_or(|previous| {
+                        updated.last_message_at_ms != previous.last_message_at_ms
+                            || updated.last_sender != previous.last_sender
+                            || updated.last_text != previous.last_text
+                    });
+                    if updated.last_message_at_ms > last_loaded
+                        || (activity_changed
+                            && updated.last_message_at_ms > 0
+                            && updated.last_message_at_ms == last_loaded)
+                    {
+                        state.latest_refresh = Some((self.model.generation, updated.id.clone()));
+                    }
+                }
+            }
         }
         let refresh_senders = matches!(
             &event,
@@ -953,8 +1003,15 @@ impl NativeApp {
             } if *generation == self.model.generation => Some(conversation.id.clone()),
             _ => None,
         };
-        let deleted_selected = matches!(&event, LiveEvent::DeletedForMe { thread, .. }
-            if self.model.selected.as_deref() == Some(thread));
+        let removed_selected = match &event {
+            LiveEvent::DeletedForMe { thread, .. } => {
+                self.model.selected.as_deref() == Some(thread)
+            }
+            LiveEvent::MessagesExpired { expired, .. } => expired
+                .iter()
+                .any(|message| self.model.selected.as_deref() == Some(&message.thread_id)),
+            _ => false,
+        };
         if self.model.apply_live(event, &account_id, self.latest_page) {
             if refresh_senders {
                 state
@@ -962,7 +1019,7 @@ impl NativeApp {
                     .prepare(&account_id, &self.model, force_names, ctx);
             }
             // An empty page has no keyset cursor for the older-page control.
-            if deleted_selected
+            if removed_selected
                 && self.model.messages.is_empty()
                 && self.model.has_older
                 && !self.model.pending
@@ -1006,6 +1063,61 @@ impl NativeApp {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "messaging")]
+    fn refresh_synced_page(&mut self, state: &mut LiveState, ctx: &egui::Context) {
+        let Some((generation, thread)) = state.latest_refresh.take() else {
+            return;
+        };
+        if !self.latest_page
+            || self.model.generation != generation
+            || self.model.selected.as_deref() != Some(thread.as_str())
+            || !state.privacy.visible(&thread)
+        {
+            return;
+        }
+        if self.model.pending {
+            state.latest_refresh = Some((generation, thread));
+            return;
+        }
+        if let Some(worker) = &state.worker {
+            if let Err(crate::app::SubmitError::Busy) = worker.submit(LiveCommand::Load {
+                generation,
+                thread: thread.clone(),
+                before: None,
+            }) {
+                state.latest_refresh = Some((generation, thread));
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+    }
+
+    #[cfg(feature = "messaging")]
+    fn prune_expiring_messages(&mut self, ctx: &egui::Context) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                elapsed.as_millis().min(i64::MAX as u128) as i64
+            });
+        let mut next = None;
+        let before = self.model.messages.len();
+        self.model.messages.retain(|message| {
+            if let Some(expiry) = message.expires_at_ms {
+                if expiry <= now_ms {
+                    return false;
+                }
+                next = Some(next.map_or(expiry, |deadline: i64| deadline.min(expiry)));
+            }
+            true
+        });
+        if self.model.messages.len() != before {
+            self.message_menu = None;
+            self.message_selection = None;
+        }
+        if let Some(next) = next {
+            ctx.request_repaint_after(Duration::from_millis((next - now_ms) as u64));
         }
     }
 
@@ -1368,6 +1480,41 @@ pub(in crate::ui) mod tests {
         domain::Conversation,
         protocol::{bootstrap::ServerConfig, session::synthetic_session},
     };
+
+    #[test]
+    fn expired_text_is_removed_from_the_open_timeline_before_paint() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        let message = crate::domain::Message {
+            account_id: "11".into(),
+            thread_id: "d:22".into(),
+            id: "1".into(),
+            sender: "22".into(),
+            text: "Synthetic expiring text".into(),
+            source_client_id: None,
+            mentions: Vec::new(),
+            reply_blocked: true,
+            recalled: false,
+            quote: None,
+            sticker: None,
+            media: None,
+            sent_at_ms: 1,
+            expires_at_ms: Some(2),
+        };
+        app.model.messages = vec![
+            message.clone(),
+            crate::domain::Message {
+                id: "2".into(),
+                expires_at_ms: None,
+                ..message
+            },
+        ];
+        app.prune_expiring_messages(&ctx);
+        assert_eq!(app.model.messages.len(), 1);
+        assert_eq!(app.model.messages[0].id, "2");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     pub(in crate::ui) fn fixture(ctx: &egui::Context) -> (NativeApp, PathBuf) {
         let root = std::env::temp_dir().join(format!(
@@ -1789,6 +1936,7 @@ pub(in crate::ui) mod tests {
             sent_at_ms,
             source_client_id: None,
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             mentions: vec![],
             quote: None,
@@ -2057,6 +2205,7 @@ pub(in crate::ui) mod tests {
         let original = crate::domain::Message {
             mentions: Vec::new(),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             source_client_id: None,
             quote: None,
@@ -2096,6 +2245,84 @@ pub(in crate::ui) mod tests {
         assert_eq!(app.drafts.active.text, "Bản nháp không đổi");
         drop(app);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_preview_refreshes_only_the_current_latest_page() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        let (worker, mut commands, _) = LiveWorker::presentation_fixture("11");
+        let mut state = app.live.take().unwrap();
+        state.worker = Some(worker);
+        app.model.selected = Some("g:22".into());
+        app.model.generation = 4;
+        app.drafts.select("g:22").unwrap();
+        app.drafts.active.text = "Bản nháp đang soạn".into();
+        let snapshot = |timestamp| LiveEvent::DirectoryChanged {
+            account_id: "11".into(),
+            conversations: vec![Conversation {
+                id: "g:22".into(),
+                title: "Nhóm thử".into(),
+                last_message_at_ms: timestamp,
+                last_text: "Tin mới từ bản xem trước".into(),
+                last_sender: "22".into(),
+                group_left: false,
+            }],
+        };
+        app.apply_live_event(&mut state, snapshot(100), &ctx);
+        app.refresh_synced_page(&mut state, &ctx);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            LiveCommand::Load { generation: 4, thread, before: None } if thread == "g:22"
+        ));
+        assert_eq!(app.drafts.active.text, "Bản nháp đang soạn");
+        assert!(app.model.apply_live(
+            LiveEvent::Page {
+                account_id: "11".into(),
+                generation: 4,
+                thread: "g:22".into(),
+                messages: vec![crate::domain::Message {
+                    account_id: "11".into(),
+                    thread_id: "g:22".into(),
+                    id: "100".into(),
+                    sender: "22".into(),
+                    text: "Tin mới từ bản xem trước".into(),
+                    source_client_id: None,
+                    mentions: Vec::new(),
+                    reply_blocked: false,
+                    recalled: false,
+                    quote: None,
+                    sticker: None,
+                    media: None,
+                    sent_at_ms: 100,
+                    expires_at_ms: None,
+                }],
+                has_older: true,
+            },
+            "11",
+            true,
+        ));
+        app.apply_live_event(&mut state, snapshot(100), &ctx);
+        app.refresh_synced_page(&mut state, &ctx);
+        assert!(commands.try_recv().is_err());
+
+        // An intervening socket event can already carry the updated sidebar
+        // snapshot without including the message that advanced its timestamp.
+        app.model.conversations[0].last_message_at_ms = 101;
+        app.apply_live_event(&mut state, snapshot(101), &ctx);
+        app.refresh_synced_page(&mut state, &ctx);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(LiveCommand::Load { generation: 4, .. })
+        ));
+
+        app.latest_page = false;
+        app.apply_live_event(&mut state, snapshot(102), &ctx);
+        app.refresh_synced_page(&mut state, &ctx);
+        assert!(commands.try_recv().is_err());
+        drop(state);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2233,6 +2460,7 @@ pub(in crate::ui) mod tests {
                 let message = crate::domain::Message {
                     mentions: Vec::new(),
                     reply_blocked: false,
+                    expires_at_ms: None,
                     recalled: false,
                     source_client_id: None,
                     quote: None,
@@ -2771,6 +2999,7 @@ pub(in crate::ui) mod tests {
                     .map(|(i, (thread, sender, text))| crate::domain::Message {
                         mentions: Vec::new(),
                         reply_blocked: false,
+                        expires_at_ms: None,
                         recalled: false,
                         source_client_id: None,
                         quote: None,
@@ -3142,6 +3371,7 @@ pub(in crate::ui) mod tests {
                         .map(|(i, sticker)| Message {
                             mentions: Vec::new(),
                             reply_blocked: false,
+                            expires_at_ms: None,
                             recalled: false,
                             source_client_id: None,
                             quote: None,
@@ -3266,6 +3496,7 @@ pub(in crate::ui) mod tests {
                     .map(|(i, (sender, text))| Message {
                         mentions: Vec::new(),
                         reply_blocked: false,
+                        expires_at_ms: None,
                         recalled: false,
                         source_client_id: None,
                         quote: None,
@@ -3387,6 +3618,7 @@ pub(in crate::ui) mod tests {
                     let original = Message {
                         mentions: Vec::new(),
                         reply_blocked: false,
+                        expires_at_ms: None,
                         recalled: false,
                         account_id: "11".into(),
                         thread_id: "d:22".into(),
@@ -3407,6 +3639,7 @@ pub(in crate::ui) mod tests {
                         Message {
                             mentions: Vec::new(),
                             reply_blocked: false,
+                            expires_at_ms: None,
                             recalled: false,
                             account_id: "11".into(),
                             thread_id: "d:22".into(),
@@ -3422,6 +3655,7 @@ pub(in crate::ui) mod tests {
                         Message {
                             mentions: Vec::new(),
                             reply_blocked: false,
+                            expires_at_ms: None,
                             recalled: false,
                             account_id: "11".into(),
                             thread_id: "d:22".into(),
@@ -3586,6 +3820,7 @@ pub(in crate::ui) mod tests {
                         quote: None,
                         mentions: Vec::new(),
                         reply_blocked: true,
+                        expires_at_ms: None,
                         recalled: false,
                         sticker: None,
                         text: "Báo cáo.pdf".into(),
@@ -3784,6 +4019,7 @@ pub(in crate::ui) mod tests {
                 let message = Message {
                     mentions: Vec::new(),
                     reply_blocked: false,
+                    expires_at_ms: None,
                     recalled: false,
                     source_client_id: None,
                     quote: None,
@@ -3811,6 +4047,7 @@ pub(in crate::ui) mod tests {
                 Message {
                     mentions: Vec::new(),
                     reply_blocked: false,
+                    expires_at_ms: None,
                     recalled: false,
                     source_client_id: None,
                     quote: None,

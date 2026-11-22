@@ -51,6 +51,7 @@ fn seed_v7(path: &std::path::Path) {
         let message = Message {
             mentions: Vec::new(),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             source_client_id: None,
             quote: None,
@@ -126,6 +127,7 @@ fn populated_v7_keeps_exact_bytes_pending_state_and_cascades_then_accepts_files(
     let message = Message {
         mentions: Vec::new(),
         reply_blocked: false,
+        expires_at_ms: None,
         recalled: false,
         source_client_id: None,
         quote: None,

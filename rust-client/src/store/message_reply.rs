@@ -79,6 +79,13 @@ pub(super) fn merge_quote(old: &MessageQuote, incoming: &MessageQuote) -> Result
     merged.client_id = incoming.client_id.clone().or_else(|| old.client_id.clone());
     let mut previous = old.clone();
     previous.client_id = merged.client_id.clone();
+    if previous.message_type == 0
+        && previous.text == expiration::PREVIEW
+        && merged.message_type == 0
+        && merged.text == expiration::PREVIEW
+    {
+        previous.ttl = merged.ttl;
+    }
     if !previous.same_reference(&merged)
         || old
             .client_id
@@ -100,13 +107,15 @@ pub(super) fn redact_quote(
     if delete_for_me::redact_quote(conn, account, thread, quote)? {
         return Ok(true);
     }
+    if expiration::redact_quote(conn, account, thread, quote)? {
+        return Ok(true);
+    }
     #[cfg(feature = "messaging")]
     return recall::redact_quote(conn, account, thread, quote);
     #[cfg(not(feature = "messaging"))]
     Ok(false)
 }
 
-#[cfg(feature = "messaging")]
 pub(super) fn redact_copies(
     conn: &Connection,
     account: &str,
@@ -221,20 +230,37 @@ pub(super) fn hydrate(conn: &Connection, message: &mut Message) -> Result<()> {
     let mut statement = conn.prepare_cached(
         "SELECT r.source_client_id,r.quote_projection,r.reply_blocked,
             EXISTS(SELECT 1 FROM recall_tombstones t WHERE t.account_id=?1 AND t.thread_id=?2
-                 AND t.message_id=?3 AND t.actor_id=?4 AND t.materialized=1)
+                 AND t.message_id=?3 AND t.actor_id=?4 AND t.materialized=1),
+            (SELECT e.deadline_ms FROM message_expirations e
+                WHERE e.account_id=?1 AND e.thread_id=?2 AND e.message_id=?3 AND e.sender_id=?4)
          FROM (SELECT 1) LEFT JOIN message_reply r
          ON r.account_id=?1 AND r.thread_id=?2 AND r.message_id=?3",
     )?;
-    let (client, quote, blocked, recalled): (Option<String>, Option<String>, Option<bool>, bool) =
-        statement.query_row(
-            params![
-                message.account_id,
-                message.thread_id,
-                message.id,
-                message.sender
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
+    let (client, quote, blocked, recalled, deadline): (
+        Option<String>,
+        Option<String>,
+        Option<bool>,
+        bool,
+        Option<i64>,
+    ) = statement.query_row(
+        params![
+            message.account_id,
+            message.thread_id,
+            message.id,
+            message.sender
+        ],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    message.expires_at_ms = expiration::earliest(message.expires_at_ms, deadline);
+    message.reply_blocked |= message.expires_at_ms.is_some();
     if recalled {
         super::recall::redact(message);
     } else if let Some(blocked) = blocked {
@@ -305,6 +331,7 @@ mod tests {
     use super::*;
     fn source() -> Message {
         Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,

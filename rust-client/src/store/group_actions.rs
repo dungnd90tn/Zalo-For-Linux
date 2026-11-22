@@ -482,6 +482,7 @@ mod tests {
     fn left_state_is_atomic_scoped_and_keeps_existing_history() {
         let mut store = fixture();
         let original = Message {
+            expires_at_ms: None,
             account_id: "11".into(),
             thread_id: "g:22".into(),
             id: "60".into(),

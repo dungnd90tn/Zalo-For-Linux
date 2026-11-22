@@ -2713,6 +2713,17 @@ fn message_bubble(
     let max_bubble = (available * if compact { 0.82 } else { 0.76 })
         .min(490.0)
         .min((available - outside).max(1.0));
+    let expiry_label = message.expires_at_ms.map(|_| {
+        ui.painter().layout_no_wrap(
+            "Tin nhắn tự xóa".into(),
+            FontId::proportional(visuals::TEXT_SMALL),
+            if accent {
+                colors.on_color
+            } else {
+                colors.text_secondary
+            },
+        )
+    });
     let body = (message.media.is_none() && message.sticker.is_none()).then(|| {
         message_body(
             ui,
@@ -2784,6 +2795,9 @@ fn message_bubble(
         });
     if message.quote.is_some() {
         content_width = content_width.max(240.0_f32.min(max_bubble));
+    }
+    if let Some(label) = &expiry_label {
+        content_width = content_width.max(label.size().x.min(max_bubble));
     }
     ui.with_layout(
         if own {
@@ -2931,6 +2945,9 @@ fn message_bubble(
                                 )
                                 .wrap(),
                             );
+                        }
+                        if let Some(label) = expiry_label {
+                            ui.add(egui::Label::new(label));
                         }
                         message_status(ui, message.sent_at_ms, status, accent);
                     });

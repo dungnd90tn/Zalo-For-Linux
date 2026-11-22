@@ -77,6 +77,7 @@ pub(super) fn accepted_media_replay(
         |row| row.get(0),
     )?;
     let message = Message {
+        expires_at_ms: None,
         account_id: account.into(),
         thread_id: thread.into(),
         id: server.into(),
@@ -198,6 +199,7 @@ mod live {
             "SELECT sender,body,sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
             params![account,thread,id],
             |row| Ok(Message {
+                expires_at_ms: None,
                 account_id:account.into(),thread_id:thread.into(),id:id.into(),sender:row.get(0)?,
                 text:row.get(1)?,sent_at_ms:row.get(2)?,source_client_id:None,mentions: Vec::new(), reply_blocked:false,recalled:false,
                 quote:None,sticker:None,media:None,
@@ -962,6 +964,7 @@ mod tests {
 
     fn message(thread: &str, id: &str, sender: &str, body: &str) -> Message {
         Message {
+            expires_at_ms: None,
             account_id: "11".into(),
             thread_id: thread.into(),
             id: id.into(),

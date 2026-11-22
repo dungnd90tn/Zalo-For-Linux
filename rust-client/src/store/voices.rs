@@ -268,6 +268,7 @@ mod tests {
         )
         .unwrap();
         let mut message = Message {
+            expires_at_ms: None,
             account_id: "11".into(),
             thread_id: "d:33".into(),
             id: "501".into(),

@@ -69,16 +69,32 @@ never proves a peer is eligible for legacy plaintext.
 N103388–103425, N165791–165812 and N404551–404625 define:
 
 - **516 / 517**: PC/web offline `eesession` pages. Hold sessions while `more` is true;
-  process initialization before dependent encrypted messages.
+  process initialization before dependent encrypted messages. The Signal-enabled
+  desktop client reads advertised `516/0` pages before `513/0`. It applies
+  supported session events after the final page and proceeds to `513/0` if
+  the session queue fails or times out. Empty session arrays may be omitted.
+  The reader leaves unsupported controls and invalid individual personal events
+  in the queue and replays the pages on reconnect.
 - **543 / 545 / 544 / 561** session events: preserve original command, message ID,
   sender/device and timestamp. `545` has direction-dependent meaning; never derive
-  an outgoing ACK from its numeric value alone.
+  an outgoing ACK from its numeric value alone. Personal prekey initialization
+  (543/545) and encrypted replies (544 type 1) can update the current PC session.
+  The SQLite transaction stores the verified session and replay receipt without
+  creating a chat message. A changed trusted identity still requires verification.
 - **548**: `sessionData.deleteType` 0 stale, 1 downgrade request, 3 force reinit
   (N165654–165691). Parsing does not delete keys or approve a downgrade.
 - **549**: `sessionData.type` 1 requests one-time prekeys, 2 requests a bundle
   (N165172–165196). No replenishment occurs until generated private state is durable.
 - **518 / 519**: `delivereds` receipt queues. Entries remain opaque descriptors;
   parsing them does not imply success or authorize resend/deletion.
+- **513/0** is the desktop personal message queue. The Signal-enabled client reads
+  its advertised pages with the current PC key. For an authenticated incoming
+  record, `idTo: "0"` or `idTo: 0` denotes the current account, and `uidFrom`
+  identifies the peer. Records from another device of the same account use zero
+  in `uidFrom` and must name the peer in `idTo`. A first-contact prekey can
+  establish trust in the same transaction as the message and ratchet update.
+  The reader advances the local cursor only across a contiguous prefix of
+  durable or verified duplicate messages and sends no server acknowledgement.
 - **551 / 552 / 514**: personal/group/group-offline encrypted message records.
   Preserve full records, routing, platform and timestamp for the engine adapter;
   ciphertext is never a UI text value.

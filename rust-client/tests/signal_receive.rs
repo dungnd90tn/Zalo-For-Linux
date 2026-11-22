@@ -257,6 +257,7 @@ async fn a_first_contact_prekey_message_is_decrypted_and_committed_once_with_its
     let message = Message {
         mentions: Vec::new(),
         reply_blocked: false,
+        expires_at_ms: None,
         recalled: false,
         source_client_id: None,
         quote: None,

@@ -358,6 +358,7 @@ mod tests {
             quote: None,
             mentions: Vec::new(),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             sticker: None,
             text: "Tin đã lưu".into(),

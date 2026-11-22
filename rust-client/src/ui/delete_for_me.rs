@@ -442,6 +442,7 @@ mod tests {
             sent_at_ms: 1,
             source_client_id: Some("900".into()),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             mentions: vec![],
             quote: None,

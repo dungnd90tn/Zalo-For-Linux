@@ -370,9 +370,9 @@ impl Drop for Worker {
 
 pub fn seed_demo(store: &mut MessageStore) -> Result<()> {
     let messages=[
-        Message{mentions: Vec::new(), reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-1".into(),sender:"Demo guide".into(),text:"Offline native client. These messages are synthetic and stay in this demo profile.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_000},
-        Message{mentions: Vec::new(), reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-2".into(),sender:"Demo guide".into(),text:"Try writing a message. The button stores it locally; it does not send to Zalo.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_001},
-        Message{mentions: Vec::new(), reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"architecture".into(),id:"demo-3".into(),sender:"Demo guide".into(),text:"The UI uses bounded queues. SQLite runs on a dedicated worker, and conversation pages use indexed cursors.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_002},
+        Message{mentions: Vec::new(), reply_blocked: false, expires_at_ms: None, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-1".into(),sender:"Demo guide".into(),text:"Offline native client. These messages are synthetic and stay in this demo profile.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_000},
+        Message{mentions: Vec::new(), reply_blocked: false, expires_at_ms: None, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-2".into(),sender:"Demo guide".into(),text:"Try writing a message. The button stores it locally; it does not send to Zalo.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_001},
+        Message{mentions: Vec::new(), reply_blocked: false, expires_at_ms: None, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"architecture".into(),id:"demo-3".into(),sender:"Demo guide".into(),text:"The UI uses bounded queues. SQLite runs on a dedicated worker, and conversation pages use indexed cursors.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_002},
     ];
     store.insert_batch(&messages)?;
     store.set_title(DEMO_ACCOUNT, "welcome", "Getting started")?;
@@ -411,6 +411,7 @@ pub fn seed_demo(store: &mut MessageStore) -> Result<()> {
             additional.push(Message {
                 mentions: Vec::new(),
                 reply_blocked: false,
+                expires_at_ms: None,
                 recalled: false,
                 source_client_id: None,
                 quote: None,
@@ -451,6 +452,7 @@ fn store_demo_file(
     let message = Message {
         mentions: Vec::new(),
         reply_blocked: false,
+        expires_at_ms: None,
         recalled: false,
         source_client_id: None,
         quote: None,
@@ -490,6 +492,7 @@ fn store_demo_message(
     let conversation = store.insert_with_conversation(&Message {
         mentions: Vec::new(),
         reply_blocked: false,
+        expires_at_ms: None,
         recalled: false,
         source_client_id: None,
         quote: None,
@@ -1276,6 +1279,7 @@ mod tests {
             .map(|i| Message {
                 mentions: Vec::new(),
                 reply_blocked: false,
+                expires_at_ms: None,
                 recalled: false,
                 source_client_id: None,
                 quote: None,
@@ -1551,6 +1555,7 @@ mod tests {
         Message {
             mentions: Vec::new(),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             source_client_id: None,
             quote: None,

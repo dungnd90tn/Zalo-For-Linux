@@ -36,6 +36,24 @@ fn verify_anchor(conn: &Connection, account: &str, thread: &str, anchor: &Cursor
     Ok(())
 }
 
+fn permits_newest(conn: &Connection, account: &str, thread: &str) -> Result<()> {
+    ensure!(
+        Target::from_thread(thread).is_ok_and(|target| target.kind == ThreadKind::Group)
+            && numeric_id(account).is_ok()
+            && !group_actions::write_blocked(conn, account, thread)?,
+        FailureReason::Validation
+    );
+    let visible = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM temp.live_privacy WHERE account_id=?1 AND ready=1)
+          AND NOT EXISTS(SELECT 1 FROM temp.live_hidden WHERE account_id=?1 AND thread_id=?2)
+          AND NOT EXISTS(SELECT 1 FROM e2ee_threads WHERE account_id=?1 AND thread_id=?2)",
+        params![account, thread],
+        |row| row.get::<_, bool>(0),
+    )?;
+    ensure!(visible, FailureReason::Validation);
+    Ok(())
+}
+
 impl MessageStore {
     pub(crate) fn group_history_anchor(
         &self,
@@ -55,6 +73,27 @@ impl MessageStore {
         thread: &str,
         anchor: &Cursor,
         batch: IncomingBatch,
+    ) -> Result<(usize, Vec<delete_for_me::DeleteForMeChange>)> {
+        self.ingest_group_history_window(account, thread, anchor, batch, false)
+    }
+
+    pub(crate) fn ingest_newest_group_history(
+        &mut self,
+        account: &str,
+        thread: &str,
+        batch: IncomingBatch,
+    ) -> Result<(usize, Vec<delete_for_me::DeleteForMeChange>)> {
+        let upper = crate::protocol::remote_history::newest_anchor();
+        self.ingest_group_history_window(account, thread, &upper, batch, true)
+    }
+
+    fn ingest_group_history_window(
+        &mut self,
+        account: &str,
+        thread: &str,
+        anchor: &Cursor,
+        batch: IncomingBatch,
+        newest: bool,
     ) -> Result<(usize, Vec<delete_for_me::DeleteForMeChange>)> {
         ensure!(
             batch.messages.len() <= MAX_PAGE_SIZE
@@ -99,7 +138,21 @@ impl MessageStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        verify_anchor(&tx, account, thread, anchor)?;
+        if newest {
+            permits_newest(&tx, account, thread)?;
+        } else {
+            verify_anchor(&tx, account, thread, anchor)?;
+        }
+        let now = expiration::now_ms();
+        if batch
+            .messages
+            .iter()
+            .any(|row| row.quote_content.is_some() || row.message.quote.is_some())
+        {
+            for row in &batch.messages {
+                expiration::record(&tx, &row.message)?;
+            }
+        }
         let mut deleted_changes = Vec::new();
         if !batch.messages.is_empty() && delete_for_me::has_pending(&tx, account)? {
             for row in &batch.messages {
@@ -120,6 +173,19 @@ impl MessageStore {
         for row in &batch.messages {
             let source = &row.message;
             if delete_for_me::suppresses(&tx, source)? {
+                continue;
+            }
+            let expiry = expiration::record(&tx, source)?;
+            if expiration::expired(expiry, now)
+                || (expiry.is_some()
+                    && !expiration::supports_text(
+                        source,
+                        row.info.is_some()
+                            || row.media.is_some()
+                            || row.quote_content.is_some()
+                            || expiration::structured_forward(row.forward.as_ref()),
+                    ))
+            {
                 continue;
             }
             if structured_webchat_conflicts_with_send_echo(&tx, source, row.forward.as_ref())? {
@@ -145,7 +211,11 @@ impl MessageStore {
                     row.media.as_ref().filter(|_| !recalled),
                 )),
             )?;
-            if let Some(marker) = row.forward.as_ref().filter(|_| !recalled) {
+            if let Some(marker) = row
+                .forward
+                .as_ref()
+                .filter(|_| !recalled && expiry.is_none())
+            {
                 forward::persist(&tx, message, marker)?;
             }
             message_reply::persist(
@@ -190,6 +260,7 @@ mod tests {
             forward: Some(ForwardMarker::Ordinary),
             receipt: None,
             message: Message {
+                expires_at_ms: None,
                 account_id: "11".into(),
                 thread_id: "g:77".into(),
                 id: id.into(),

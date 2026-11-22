@@ -24,6 +24,7 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 pub const MAX_INFLATED: usize = 4 * 1024 * 1024;
 pub const MAX_BATCH: usize = 200;
 pub const API_VERSION: &str = "681";
+const MAX_DISAPPEARING_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThreadKind {
@@ -118,7 +119,7 @@ pub fn text_parameters(
     if text.is_empty() {
         return Err(WireError::Invalid);
     }
-    let mut v = json!({"message":text,"clientId":client_id,"imei":imei});
+    let mut v = json!({"message":text,"clientId":client_id,"imei":imei,"ttl":0});
     match target.kind {
         ThreadKind::Direct => v["toid"] = json!(target.remote_id),
         ThreadKind::Group => {
@@ -128,6 +129,40 @@ pub fn text_parameters(
     }
     Ok(v)
 }
+
+pub fn is_disappearing_duration(ttl_ms: u64) -> bool {
+    (1..=MAX_DISAPPEARING_TTL_MS).contains(&ttl_ms)
+}
+
+pub fn disappearing_text_parameters(
+    target: &Target,
+    text: &str,
+    client_id: u64,
+    imei: &str,
+    ttl_ms: u64,
+) -> Result<Value, WireError> {
+    if !is_disappearing_duration(ttl_ms) {
+        return Err(WireError::Unsupported);
+    }
+    let mut params = text_parameters(target, text, client_id, imei)?;
+    params["ttl"] = json!(ttl_ms);
+    Ok(params)
+}
+
+pub(crate) fn message_ttl(value: Option<&Value>) -> Option<u64> {
+    let ttl = match value {
+        None | Some(Value::Null) => 0,
+        Some(value) => value.as_u64().or_else(|| {
+            let digits = value.as_str()?;
+            if digits.len() > 10 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            digits.parse().ok()
+        })?,
+    };
+    (ttl == 0 || is_disappearing_duration(ttl)).then_some(ttl)
+}
+
 pub fn send_url(root: &Url, kind: ThreadKind, client_type: ClientType) -> Result<Url, WireError> {
     validate_origin(root, "https")?;
     let mut url = root.clone();
@@ -798,6 +833,25 @@ fn incoming_with_reason(
                 }
                 continue;
             }
+            // TTL is a millisecond offset from the wire's server send time.
+            // An invalid TTL must never import content as a persistent row.
+            let Some(ttl) = message_ttl(v.get("ttl")) else {
+                continue;
+            };
+            let legacy = v.get("e2eeExt").is_none()
+                && ["isE2EE", "isE2ee", "e2ee"].iter().all(|key| {
+                    v.get(key).is_none_or(|value| {
+                        value.is_null() || value == &Value::Bool(false) || value.as_u64() == Some(0)
+                    })
+                });
+            if ttl > 0
+                && (message_type != "webchat"
+                    || !legacy
+                    || !v.get("content").is_some_and(Value::is_string))
+            {
+                // Disappearing attachments and rich cards need their own cache lifetime.
+                continue;
+            }
             context.message_kind = Some(match message_type {
                 "webchat"
                     if v.pointer("/content/action").and_then(Value::as_str)
@@ -854,15 +908,20 @@ fn incoming_with_reason(
             let thread = Target::new(kind, &peer)?.thread_id();
             *reason = FrameReason::MessageTimestamp;
             context.field_type = Some(FrameValueType::of(v.get("ts")));
-            let ts = v.get("ts").ok_or(WireError::Invalid)?;
-            let ts = if let Some(s) = ts.as_str() {
-                s.parse().map_err(|_| WireError::Invalid)?
-            } else {
-                ts.as_i64().ok_or(WireError::Invalid)?
+            let ts = v
+                .get("ts")
+                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()));
+            let (ts, expires_at_ms) = match (ts, ttl) {
+                (Some(ts), 0) if ts >= 0 => (ts, None),
+                (None | Some(_), 0) => return Err(WireError::Invalid),
+                (Some(ts), ttl) if ts > 0 => {
+                    let Some(deadline) = ts.checked_add(ttl as i64) else {
+                        continue;
+                    };
+                    (ts, Some(deadline))
+                }
+                _ => continue,
             };
-            if ts < 0 {
-                return Err(WireError::Invalid);
-            }
             *reason = FrameReason::MessageId;
             context.field_type = Some(FrameValueType::of(v.get("msgId")));
             let id = id_string(v.get("msgId").ok_or(WireError::Invalid)?)?;
@@ -895,12 +954,6 @@ fn incoming_with_reason(
             // object. Other object shapes remain opaque. An authenticated
             // queue/preview may still commit the row and its cursor; the generic
             // recipient-checked parser and encrypted-content rules stay strict.
-            let legacy = v.get("e2eeExt").is_none()
-                && ["isE2EE", "isE2ee", "e2ee"].iter().all(|key| {
-                    v.get(key).is_none_or(|value| {
-                        value.is_null() || value == &Value::Bool(false) || value.as_u64() == Some(0)
-                    })
-                });
             let content = v.get("content");
             let structured_webchat = scope != IncomingScope::RecipientChecked
                 && message_type == "webchat"
@@ -966,19 +1019,26 @@ fn incoming_with_reason(
                 && v.get("content").is_some_and(|content| {
                     crate::domain::system::list_silent(message_type, content)
                 });
-            let quote_content = v
+            let raw_quote = v
                 .get("quote")
-                .filter(|value| !structured_webchat && !value.is_null())
+                .filter(|value| !structured_webchat && !value.is_null());
+            let disappearing_quote =
+                raw_quote.is_some_and(|value| message_ttl(value.get("ttl")) != Some(0));
+            let quote_content = raw_quote
+                .filter(|_| !disappearing_quote)
                 .and_then(|value| crate::domain::QuoteContent::new(account, value).ok());
-            let quote = v
-                .get("quote")
-                .filter(|value| !structured_webchat && !value.is_null())
-                .map(|_| {
+            let quote = raw_quote.map(|_| {
+                if disappearing_quote {
+                    let mut quote = crate::domain::MessageQuote::unsupported();
+                    "[Trích dẫn từ tin nhắn tự xóa]".clone_into(&mut quote.text);
+                    quote
+                } else {
                     quote_content
                         .as_ref()
                         .and_then(|content| content.projection(account).ok())
                         .unwrap_or_else(crate::domain::MessageQuote::unsupported)
-                });
+                }
+            });
             info_bytes = info_bytes.saturating_add(
                 quote_content
                     .as_ref()
@@ -993,8 +1053,7 @@ fn incoming_with_reason(
                 && legacy
                 && v.get("textProperties")
                     .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
-                && v.get("ttl")
-                    .is_none_or(|value| value.is_null() || value.as_u64() == Some(0));
+                && expires_at_ms.is_none();
             let has_mentions = v.get("mentions").is_some_and(|value| {
                 !value.is_null() && !value.as_array().is_some_and(|items| items.is_empty())
             });
@@ -1012,7 +1071,10 @@ fn incoming_with_reason(
                 Vec::new()
             };
             let reply_blocked = !ordinary_text || has_mentions;
-            let source_client_id = if !reply_blocked || !mentions.is_empty() {
+            let source_client_id = if !reply_blocked
+                || !mentions.is_empty()
+                || (expires_at_ms.is_some() && sender == account)
+            {
                 v.get("cliMsgId").and_then(|value| id_string(value).ok())
             } else {
                 None
@@ -1048,6 +1110,7 @@ fn incoming_with_reason(
                 sticker,
                 media: media.as_ref().map(|content| content.descriptor().clone()),
                 sent_at_ms: ts,
+                expires_at_ms,
             };
             *reason = FrameReason::MessageValidation;
             message.validate().map_err(|_| WireError::Invalid)?;
@@ -1096,11 +1159,12 @@ fn incoming_with_reason(
                         || (message_type == "chat.voice" && media.is_some())
                         || (sticker.is_some_and(StickerDescriptor::can_send)
                             && legacy
-                            && v.get("ttl")
-                                .is_none_or(|value| value.is_null() || value.as_u64() == Some(0))))
+                            && expires_at_ms.is_none()))
             });
             let reference = v.get("reference").filter(|value| !value.is_null());
-            let forward = if structured_webchat {
+            let forward = if expires_at_ms.is_some() {
+                None
+            } else if structured_webchat {
                 Some(super::forward::ForwardMarker::StructuredWebchat)
             } else {
                 reference
@@ -1432,6 +1496,78 @@ pub fn legacy_group_allowed_detailed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disappearing_text_uses_the_same_scoped_payload_with_a_numeric_duration() {
+        for kind in [ThreadKind::Direct, ThreadKind::Group] {
+            let target = Target::new(kind, "22").unwrap();
+            let ordinary = text_parameters(&target, "Nội dung", 7001, "device").unwrap();
+            assert_eq!(ordinary["ttl"], 0);
+            let mut timed =
+                disappearing_text_parameters(&target, "Nội dung", 7001, "device", 86_400_000)
+                    .unwrap();
+            assert_eq!(timed["ttl"], 86_400_000);
+            timed["ttl"] = json!(0);
+            assert_eq!(timed, ordinary);
+            for duration in [0, MAX_DISAPPEARING_TTL_MS + 1] {
+                assert_eq!(
+                    disappearing_text_parameters(&target, "Nội dung", 7001, "device", duration),
+                    Err(WireError::Unsupported)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn timed_text_preserves_expiration_and_bad_ttl_does_not_drop_the_rest_of_the_batch() {
+        let payload = json!({"error_code":0,"data":{
+            "msgs":[
+                {"msgType":"webchat","uidFrom":"0","idTo":"22","msgId":"700","cliMsgId":"800",
+                    "ts":"1760000000000","ttl":"60000","content":"Timed direct"},
+                {"msgType":"webchat","uidFrom":"22","idTo":"11","msgId":"701",
+                    "ts":1760000000001_i64,"ttl":false,"content":"Discard malformed timed text"},
+                {"msgType":"webchat","uidFrom":"22","idTo":"11","msgId":"702",
+                    "ts":i64::MAX,"ttl":60000,"content":"Discard invalid deadline"},
+                {"msgType":"chat.photo","uidFrom":"22","idTo":"11","msgId":"703",
+                    "ts":1760000000002_i64,"ttl":60000,"content":{"url":"Timed attachment"}},
+                {"msgType":"webchat","uidFrom":"22","idTo":"11","msgId":"704",
+                    "ts":1760000000003_i64,"ttl":"0","content":"Ordinary text",
+                    "quote":{"ownerId":"22","msgId":"700","cliMsgType":1,
+                        "ts":"1760000000000","ttl":"60000","msg":"Timed quoted content"}}
+            ],
+            "groupMsgs":[{"msgType":"webchat","uidFrom":"22","idTo":"77","msgId":"705",
+                "ts":1760000000004_i64,"ttl":60000,"content":"Timed group"}]
+        }});
+        for scope in [
+            IncomingScope::AuthenticatedQueue,
+            IncomingScope::AuthenticatedPreview,
+        ] {
+            let batch = incoming_with_scope("11", &payload, scope).unwrap();
+            assert_eq!(batch.messages.len(), 3);
+            let timed_direct = &batch.messages[0];
+            assert_eq!(timed_direct.message.expires_at_ms, Some(1_760_000_060_000));
+            assert_eq!(
+                timed_direct.message.source_client_id.as_deref(),
+                Some("800")
+            );
+            assert_eq!(timed_direct.client_id.as_deref(), Some("800"));
+            assert!(timed_direct.message.reply_reference().is_none());
+            assert!(timed_direct.forward.is_none());
+
+            let ordinary = &batch.messages[1];
+            assert_eq!(ordinary.message.expires_at_ms, None);
+            assert_eq!(ordinary.message.text, "Ordinary text");
+            assert!(ordinary.quote_content.is_none());
+            assert_eq!(
+                ordinary.message.quote.as_ref().unwrap().text,
+                "[Trích dẫn từ tin nhắn tự xóa]"
+            );
+
+            let timed_group = &batch.messages[2].message;
+            assert_eq!(timed_group.thread_id, "g:77");
+            assert_eq!(timed_group.expires_at_ms, Some(1_760_000_060_004));
+        }
+    }
 
     #[test]
     fn account_delete_controls_have_only_authenticated_message_queue_authority() {

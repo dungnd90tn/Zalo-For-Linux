@@ -33,6 +33,7 @@ enum Reply {
     Oversize,
     Stall,
     Runtime,
+    Disappearing(bool),
     EchoAfterAck(bool),
     ConflictingReceive,
     Stickers,
@@ -481,9 +482,10 @@ async fn device_readiness_incoming_storage_failure_escapes_command_and_never_dis
         .unwrap();
     let mut connection = Connection::connected(socket, "11");
     connection.next().await.unwrap();
-    let config = ServerConfig::parse(
-        &json!({"zpw_service_map_v3":{"chat_e2e":["https://wpa.zaloapp.com"]},"zpw_ws":[]}),
-    )
+    let config = ServerConfig::parse(&json!({"zpw_service_map_v3":{
+            "chat_e2e":["https://wpa.zaloapp.com"],
+            "conversation":["https://wpa.zaloapp.com"]
+        },"zpw_ws":[]}))
     .unwrap();
     let session = Arc::new(synthetic_session(fixture.profile.clone(), config));
     connection.e2ee_http = Some(super::e2ee_send::E2eeHttp {
@@ -542,7 +544,12 @@ async fn device_readiness_incoming_storage_failure_escapes_command_and_never_dis
         "No queue ACK or initialization can follow the failed write"
     );
     assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 0);
-    assert!(fixture.state.requests.lock().unwrap().is_empty());
+    let requests = fixture.state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .0
+        .starts_with("/api/conv/autodelete/getConvers?"));
+    assert!(requests[0].1.is_empty());
     assert_eq!(
         rusqlite::Connection::open(&path)
             .unwrap()
@@ -1357,7 +1364,15 @@ fn serve(
                 json!({"groups":if rich{json!([{"groupId":"22","name":"Nhóm Linux","totalMember":3}])}else{json!([])},"hasMore":0})
             }
             _ => {
-                assert_eq!(parameters["threadIdLocalMsgId"], "{}");
+                let cursors: std::collections::BTreeMap<String, String> =
+                    serde_json::from_str(parameters["threadIdLocalMsgId"].as_str().unwrap())
+                        .unwrap();
+                assert!(cursors.len() <= crate::protocol::directory::MAX_PREVIEW_CURSORS);
+                assert!(cursors.iter().all(|(key, id)| {
+                    key.rsplit_once('_').is_some_and(|(thread, kind)| {
+                        matches!(kind, "0" | "1") && wire::numeric_id(thread).is_ok()
+                    }) && wire::numeric_id(id).is_ok()
+                }));
                 // A generic session advertises conversation solely for mandatory privacy checks.
                 // Only an explicitly requested directory fixture seeds preview history/sidecars.
                 if !state.directory_enabled.load(Ordering::SeqCst) {
@@ -1431,7 +1446,9 @@ fn serve(
         }
         return;
     }
-    if matches!(reply, Reply::Stall | Reply::RuntimeStall) {
+    if matches!(reply, Reply::Stall)
+        || (matches!(reply, Reply::RuntimeStall) && route != "/api/conv/autodelete/getConvers")
+    {
         let mut byte = [0];
         let _ = stream.read(&mut byte);
         state.closed.fetch_add(1, Ordering::SeqCst);
@@ -1716,7 +1733,7 @@ fn serve(
         return;
     }
     #[cfg(feature = "signal-crypto")]
-    if matches!(reply, Reply::EncryptedSend) {
+    if matches!(reply, Reply::EncryptedSend) && route != "/api/conv/autodelete/getConvers" {
         assert_eq!(route, "/api/e2ee/pc/message/sms");
         let params = url::form_urlencoded::parse(&body)
             .find(|(name, _)| name == "params")
@@ -1752,7 +1769,26 @@ fn serve(
         stream.flush().unwrap();
         return;
     }
-    let inner = if route == "/api/group/getgi/v2" {
+    let inner = if route == "/api/conv/autodelete/getConvers" {
+        assert!(headers.starts_with("GET "));
+        assert!(body.is_empty());
+        let ciphertext = url::form_urlencoded::parse(path.split_once('?').unwrap().1.as_bytes())
+            .find(|(key, _)| key == "params")
+            .unwrap()
+            .1;
+        assert_eq!(cipher.decrypt(&ciphertext).unwrap().as_slice(), b"{}");
+        match reply {
+            Reply::Disappearing(false) => json!({"error_code":0,"data":{"convers":[
+                {"destId":"22","isGroup":false,"ttl":1_500},
+                {"destId":"22","isGroup":true,"ttl":2_000}
+            ]}}),
+            Reply::Disappearing(true) => json!({"error_code":0,"data":{"convers":[
+                {"destId":"22","isGroup":false,"ttl":1_500},
+                {"destId":"22","isGroup":false,"ttl":0}
+            ]}}),
+            _ => json!({"error_code":0,"data":{"convers":[]}}),
+        }
+    } else if route == "/api/group/getgi/v2" {
         json!({"error_code":0,"data":{"groupId":"22","e2ee":false}})
     } else {
         let params = url::form_urlencoded::parse(&body)
@@ -1799,6 +1835,17 @@ fn serve(
                     .lock()
                     .unwrap()
                     .push(parameters.clone());
+            } else {
+                assert_eq!(
+                    parameters["ttl"],
+                    match (reply, route) {
+                        (Reply::Disappearing(false), "/api/group/sendmsg") => 2_000,
+                        (Reply::Disappearing(false), "/api/message/sms") => 1_500,
+                        (Reply::Disappearing(true), _) =>
+                            panic!("ambiguous setting must prevent dispatch"),
+                        _ => 0,
+                    }
+                );
             }
             let server_id = if matches!(reply, Reply::EchoAfterAck(_)) {
                 if state.http_sends.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1811,7 +1858,13 @@ fn serve(
             } else {
                 "901"
             };
-            json!({"error_code":0,"data":{"msgId":server_id,"ts":"1760000000001"}})
+            let timestamp = if matches!(reply, Reply::Disappearing(false)) {
+                state.http_sends.fetch_add(1, Ordering::SeqCst);
+                now_ms().to_string()
+            } else {
+                "1760000000001".into()
+            };
+            json!({"error_code":0,"data":{"msgId":server_id,"ts":timestamp}})
         }
     };
     let response=serde_json::to_vec(&json!({"error_code":0,"data":cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()})).unwrap();
@@ -2007,6 +2060,127 @@ async fn real_https_refuses_redirect_and_oversize_without_logging_tokens() {
         assert_eq!(f.state.requests.lock().unwrap().len(), 1);
     }
 }
+
+#[tokio::test]
+async fn disappearing_text_uses_scoped_server_duration_and_expires_after_ack() {
+    for ambiguous in [false, true] {
+        let fixture = Fixture::new(Reply::Disappearing(ambiguous));
+        let (commands, inbox) = mpsc::channel(8);
+        let (outbox, mut events) = mpsc::channel(16);
+        let (stop, cancel) = watch::channel(false);
+        let worker = tokio::spawn(run_with_transports(
+            fixture.profile.clone(),
+            fixture.session(),
+            inbox,
+            outbox,
+            Arc::new(|| {}),
+            cancel,
+            fixture.transports(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    events.recv().await,
+                    Some(LiveEvent::Connection {
+                        state: LiveConnection::Online,
+                        ..
+                    })
+                ) {
+                    break;
+                }
+            }
+            let mut expired = std::collections::HashSet::new();
+            for (request_id, thread, ttl_ms) in [(1, "d:22", 1_500), (2, "g:22", 2_000)] {
+                commands
+                    .send(LiveCommand::Send {
+                        generation: 1,
+                        thread: thread.into(),
+                        text: "Xin chào Linux".into(),
+                        reply_to: None,
+                        request_id,
+                    })
+                    .await
+                    .unwrap();
+                loop {
+                    match events.recv().await.unwrap() {
+                        LiveEvent::Sent {
+                            request_id: actual,
+                            message,
+                            ..
+                        } => {
+                            assert!(!ambiguous);
+                            assert_eq!(actual, request_id);
+                            assert_eq!(message.thread_id, thread);
+                            assert_eq!(message.expires_at_ms, Some(message.sent_at_ms + ttl_ms));
+                            break;
+                        }
+                        LiveEvent::SendFailed {
+                            request_id: actual,
+                            error,
+                            unknown_delivery,
+                            server_accepted,
+                            ..
+                        } => {
+                            assert!(ambiguous, "unexpected rejection: {error}");
+                            assert_eq!(actual, request_id);
+                            assert!(!unknown_delivery && !server_accepted);
+                            assert!(error.contains("Bản nháp được giữ lại"));
+                            break;
+                        }
+                        LiveEvent::MessagesExpired {
+                            expired: changes, ..
+                        } => {
+                            expired.extend(changes.into_iter().map(|change| change.thread_id));
+                        }
+                        LiveEvent::Fault { error, .. } => panic!("worker fault: {error}"),
+                        _ => {}
+                    }
+                }
+                if ambiguous {
+                    break;
+                }
+            }
+            if !ambiguous {
+                while expired.len() < 2 {
+                    if let LiveEvent::MessagesExpired {
+                        expired: changes, ..
+                    } = events.recv().await.unwrap()
+                    {
+                        expired.extend(changes.into_iter().map(|change| change.thread_id));
+                    }
+                }
+                assert!(expired.contains("d:22") && expired.contains("g:22"));
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture.state.http_sends.load(Ordering::SeqCst),
+            if ambiguous { 0 } else { 2 }
+        );
+        let state = rusqlite::Connection::open_with_flags(
+            fixture.profile.paths.data_dir.join("messages.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        for table in ["outgoing", "messages"] {
+            let bodies: i64 = state
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE body=?1"),
+                    ["Xin chào Linux"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(bodies, 0);
+        }
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn stalled_real_tls_request_and_websocket_read_are_dropped_on_cancellation() {
     let f = Fixture::new(Reply::Stall);
@@ -4147,6 +4321,7 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
             sticker: None,
             media: None,
             sent_at_ms: 1,
+            expires_at_ms: None,
         };
         {
             let mut store =
@@ -4407,9 +4582,14 @@ async fn actual_runtime_discovers_named_cached_directory_and_previews_without_we
             LiveEvent::DirectoryChanged{account_id,conversations}=>{
                 assert_eq!(account_id,"11");
                 let observer=rusqlite::Connection::open_with_flags(f.profile.paths.data_dir.join("messages.sqlite"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-                let count:i64=observer.query_row("SELECT count(*) FROM directory_entries WHERE account_id='11'",[],|row|row.get(0)).unwrap();
-                assert!(count>=200,"publication must follow incremental durable commit");
-                for conversation in conversations{let durable:String=observer.query_row("SELECT title FROM conversations WHERE account_id='11' AND thread_id=?1",[&conversation.id],|row|row.get(0)).unwrap();assert_eq!(durable,conversation.title);}
+                for conversation in conversations {
+                    let durable: String = observer.query_row(
+                        "SELECT body FROM messages WHERE account_id='11' AND thread_id=?1 AND message_id='910'",
+                        [&conversation.id],
+                        |row| row.get(0),
+                    ).unwrap();
+                    assert_eq!(durable, conversation.last_text);
+                }
             },
             LiveEvent::Connection{state:LiveConnection::Online,..}=>panic!("missing WebSocket cannot be online"),
             LiveEvent::Fault{error,..}=>panic!("discovery must preserve local worker: {error}"),_=>{},
@@ -4569,6 +4749,13 @@ async fn actual_runtime_receives_and_serves_partial_directory_during_stalled_syn
         if received.len()==2&&f.state.directory_stalled.load(Ordering::SeqCst){break;}
         tokio::select!{event=events.recv()=>match event.unwrap(){LiveEvent::Received{message,..}=>{received.insert(message.id);},LiveEvent::Fault{error,..}=>panic!("stalled directory blocked worker: {error}"),_=>{}},_=tokio::time::sleep(Duration::from_millis(5))=>{}}
     }}).await.unwrap();
+    let store = MessageStore::open(&f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+    assert!(store
+        .page("11", "d:22", None, 10)
+        .unwrap()
+        .iter()
+        .any(|message| message.id == "910"));
+    drop(store);
     commands
         .send(LiveCommand::Directory {
             generation: 5,
@@ -4627,6 +4814,23 @@ async fn actual_runtime_receives_and_serves_partial_directory_during_stalled_syn
     .unwrap();
 }
 
+#[test]
+fn disappearing_message_rejection_keeps_the_service_code_without_exposing_remote_text() {
+    let response = json!({
+        "error_code": 800,
+        "error_message": "Không thể gửi tin nhắn do phiên bản bạn đang dùng chưa hỗ trợ tính năng \"Tin nhắn tự xóa\". Nội dung phụ từ máy chủ.",
+    });
+    let error = check_messaging_response(&response).unwrap_err();
+    assert!(error.is::<DisappearingMessagesRequired>());
+    assert_eq!(wire_error(&error), Some(&WireError::Service(800)));
+    assert!(!format!("{error:#}").contains("Nội dung phụ"));
+
+    let unrelated = json!({"error_code": 800, "error_message": "Yêu cầu bị từ chối"});
+    let error = check_messaging_response(&unrelated).unwrap_err();
+    assert!(!error.is::<DisappearingMessagesRequired>());
+    assert_eq!(wire_error(&error), Some(&WireError::Service(800)));
+}
+
 #[tokio::test]
 async fn delayed_directory_notification_reads_after_received_commit_instead_of_replaying_a_stale_snapshot(
 ) {
@@ -4675,6 +4879,7 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
         sticker: None,
         media: None,
         sent_at_ms: 100,
+        expires_at_ms: None,
     };
     let stored = message.clone();
     let conversation = db
@@ -5472,6 +5677,7 @@ async fn hidden_policy_real_tls_search_pin_cancel_scope_and_remote_revoke() {
                 sticker: None,
                 media: None,
                 sent_at_ms: 1,
+                expires_at_ms: None,
             }])?;
         }
         s.set_title("11", "d:22", "Nguyễn An")?;
@@ -6013,6 +6219,7 @@ async fn ordinary_reply_actual_tls_uses_canonical_scoped_target_and_retains_quot
                 sticker: None,
                 media: None,
                 sent_at_ms: 1_700_000_000_123,
+                expires_at_ms: None,
             },
         )
         .collect::<Vec<_>>();
@@ -6202,21 +6409,34 @@ async fn opening_a_conversation_refreshes_names_and_avatars_at_most_every_two_mi
             .count()
     };
     let mut directory = DirectorySync::new();
-    directory.refresh_on_open(session.clone(), db.handle().unwrap(), &transports);
+    directory.refresh_if_due(session.clone(), db.handle().unwrap(), &transports);
     let result = (&mut directory.running.as_mut().unwrap().task).await;
     directory.completed(result, session.clone(), db.handle().unwrap(), &transports);
     assert_eq!(friend_lists(), 1);
     // Opening again right away does not fetch the lists again.
-    directory.refresh_on_open(session.clone(), db.handle().unwrap(), &transports);
+    directory.refresh_if_due(session.clone(), db.handle().unwrap(), &transports);
     assert!(directory.running.is_none());
     assert_eq!(friend_lists(), 1);
     // After the window it does.
     directory.last_started =
-        Some(tokio::time::Instant::now() - DIRECTORY_REFRESH_ON_OPEN - Duration::from_secs(1));
-    directory.refresh_on_open(session.clone(), db.handle().unwrap(), &transports);
+        Some(tokio::time::Instant::now() - DIRECTORY_REFRESH_COOLDOWN - Duration::from_secs(1));
+    directory.refresh_if_due(session.clone(), db.handle().unwrap(), &transports);
     let result = (&mut directory.running.as_mut().unwrap().task).await;
-    directory.completed(result, session, db.handle().unwrap(), &transports);
+    directory.completed(result, session.clone(), db.handle().unwrap(), &transports);
     assert_eq!(friend_lists(), 2);
+    let requests = f.state.requests.lock().unwrap();
+    let previews: Vec<Value> = requests
+        .iter()
+        .filter_map(|(path, _)| path.strip_prefix("/api/preloadconvers/get-last-msgs?"))
+        .map(|query| {
+            let (_, params) = url::form_urlencoded::parse(query.as_bytes())
+                .find(|(name, _)| name == "params")
+                .unwrap();
+            serde_json::from_slice(&session.decrypt_payload(&params).unwrap()).unwrap()
+        })
+        .collect();
+    assert_eq!(previews[0]["threadIdLocalMsgId"], "{}");
+    assert_eq!(previews[1]["threadIdLocalMsgId"], r#"{"22_0":"910"}"#);
 }
 
 mod delete_for_me_tests;

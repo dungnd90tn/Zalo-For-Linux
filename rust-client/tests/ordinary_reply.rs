@@ -34,6 +34,7 @@ fn message(
     Message {
         mentions: Vec::new(),
         reply_blocked: false,
+        expires_at_ms: None,
         recalled: false,
         account_id: account.into(),
         thread_id: thread.into(),

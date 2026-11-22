@@ -495,6 +495,7 @@ mod tests {
         id: &str,
     ) -> (ReceivedReply, ReceiptBinding) {
         let message = Message {
+            expires_at_ms: None,
             account_id: account.into(),
             thread_id: thread.into(),
             id: id.into(),

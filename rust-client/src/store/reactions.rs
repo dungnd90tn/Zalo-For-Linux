@@ -444,6 +444,7 @@ mod tests {
 
     fn source() -> Message {
         Message {
+            expires_at_ms: None,
             account_id: "11".into(),
             thread_id: "d:22".into(),
             id: "910".into(),

@@ -12,6 +12,9 @@ pub mod attachments;
 pub(crate) mod delete_for_me;
 pub mod directory;
 pub mod e2ee;
+mod expiration;
+#[cfg(feature = "messaging")]
+pub use expiration::ExpiredMessage;
 pub mod forward;
 #[cfg(feature = "messaging")]
 pub(crate) use group_actions::GroupActionFailure;
@@ -42,7 +45,7 @@ mod voices;
 pub(crate) use sticker_send::Reservation as StickerReservation;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
-pub const SCHEMA_VERSION: i64 = 26;
+pub const SCHEMA_VERSION: i64 = 27;
 
 /// One received message with optional outbox hint and complete rich sidecars.
 /// The immutable metadata commits with its message and receive cursor.
@@ -200,12 +203,16 @@ const CURSOR_PAGE_SQL: &str =
     CASE WHEN length(CAST(content.metadata AS BLOB))<=256 THEN content.metadata ELSE NULL END FROM messages m
     LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
     WHERE m.account_id=?1 AND m.thread_id=?2 AND (m.sent_at_ms,m.message_id)<(?3,?4)
+    AND NOT EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=m.account_id AND e.thread_id=m.thread_id
+                    AND e.message_id=m.message_id AND (e.purged=1 OR e.deadline_ms<=CAST(unixepoch('subsec')*1000 AS INTEGER)))
     ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?5";
 const CONVERSATIONS_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
-    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,''),EXISTS(SELECT 1 FROM group_left l WHERE l.account_id=c.account_id AND l.thread_id=c.thread_id) FROM conversations c
+    CASE WHEN EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=m.account_id AND e.thread_id=m.thread_id AND e.message_id=m.message_id) THEN '[Tin nhắn tự xóa]' WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,''),EXISTS(SELECT 1 FROM group_left l WHERE l.account_id=c.account_id AND l.thread_id=c.thread_id) FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
         AND NOT EXISTS(SELECT 1 FROM list_silent_messages q WHERE q.account_id=recent.account_id AND q.thread_id=recent.thread_id AND q.message_id=recent.message_id)
+        AND NOT EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=recent.account_id AND e.thread_id=recent.thread_id
+            AND e.message_id=recent.message_id AND (e.purged=1 OR e.deadline_ms<=CAST(unixepoch('subsec')*1000 AS INTEGER)))
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
     LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
     LEFT JOIN message_media media ON media.account_id=m.account_id AND media.thread_id=m.thread_id AND media.message_id=m.message_id
@@ -215,10 +222,12 @@ const CONVERSATIONS_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms
     AND (m.rowid IS NOT NULL OR NOT EXISTS(SELECT 1 FROM messages x WHERE x.account_id=c.account_id AND x.thread_id=c.thread_id))
     ORDER BY c.last_message_at_ms DESC,c.thread_id LIMIT ?2";
 const CONVERSATION_SQL: &str = "SELECT c.thread_id,c.title,c.last_message_at_ms,
-    CASE WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,''),EXISTS(SELECT 1 FROM group_left l WHERE l.account_id=c.account_id AND l.thread_id=c.thread_id) FROM conversations c
+    CASE WHEN EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=m.account_id AND e.thread_id=m.thread_id AND e.message_id=m.message_id) THEN '[Tin nhắn tự xóa]' WHEN media.message_id IS NOT NULL THEN CASE WHEN length(CAST(media.preview AS BLOB))<=1024 THEN media.preview END WHEN content.kind='sticker' THEN '[Nhãn dán]' ELSE COALESCE(substr(m.body,1,?3),CASE WHEN EXISTS(SELECT 1 FROM e2ee_threads t WHERE t.account_id=c.account_id AND t.thread_id=c.thread_id) THEN '[Cuộc trò chuyện mã hóa đầu cuối]' ELSE '' END) END,COALESCE(m.sender,''),EXISTS(SELECT 1 FROM group_left l WHERE l.account_id=c.account_id AND l.thread_id=c.thread_id) FROM conversations c
     LEFT JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
         WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
         AND NOT EXISTS(SELECT 1 FROM list_silent_messages q WHERE q.account_id=recent.account_id AND q.thread_id=recent.thread_id AND q.message_id=recent.message_id)
+        AND NOT EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=recent.account_id AND e.thread_id=recent.thread_id
+            AND e.message_id=recent.message_id AND (e.purged=1 OR e.deadline_ms<=CAST(unixepoch('subsec')*1000 AS INTEGER)))
         ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
     LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
     LEFT JOIN message_media media ON media.account_id=m.account_id AND media.thread_id=m.thread_id AND media.message_id=m.message_id
@@ -257,6 +266,7 @@ fn insert_validated_with_media<'a>(
         ),
     >,
 ) -> Result<usize> {
+    let now = expiration::now_ms();
     let mut inserted = 0;
     {
         let mut thread = conn.prepare_cached(
@@ -274,6 +284,13 @@ fn insert_validated_with_media<'a>(
         )?;
         for (m, info, media) in messages {
             if delete_for_me::suppresses(conn, m)? {
+                continue;
+            }
+            let expiration = expiration::record(conn, m)?;
+            if expiration::expired(expiration, now)
+                || (expiration.is_some()
+                    && !expiration::supports_text(m, info.is_some() || media.is_some()))
+            {
                 continue;
             }
             if (info.is_some() && (media.is_some() || m.media.is_some() || !m.mentions.is_empty()))
@@ -479,6 +496,7 @@ impl MessageStore {
         forward::initialize(&conn)?;
         recall::initialize(&conn)?;
         delete_for_me::initialize(&conn)?;
+        expiration::initialize(&conn)?;
         group_actions::initialize(&conn)?;
         group_pins::initialize(&conn)?;
         poll_votes::initialize(&conn)?;
@@ -532,7 +550,22 @@ impl MessageStore {
         text: &str,
         now_ms: i64,
     ) -> Result<u64> {
-        self.prepare_outgoing_inner(account, thread, text, None, &[], now_ms)
+        self.prepare_outgoing_inner(account, thread, text, None, &[], now_ms, None)
+    }
+
+    #[cfg(feature = "messaging")]
+    pub(crate) fn prepare_outgoing_disappearing(
+        &mut self,
+        account: &str,
+        thread: &str,
+        text: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<u64> {
+        if !u64::try_from(ttl_ms).is_ok_and(crate::protocol::messaging::is_disappearing_duration) {
+            bail!(FailureReason::Validation);
+        }
+        self.prepare_outgoing_inner(account, thread, text, None, &[], now_ms, Some(ttl_ms))
     }
     pub fn prepare_outgoing_reply(
         &mut self,
@@ -542,7 +575,7 @@ impl MessageStore {
         reply_to: &str,
         now_ms: i64,
     ) -> Result<u64> {
-        self.prepare_outgoing_inner(account, thread, text, Some(reply_to), &[], now_ms)
+        self.prepare_outgoing_inner(account, thread, text, Some(reply_to), &[], now_ms, None)
     }
     #[cfg(feature = "messaging")]
     pub(crate) fn prepare_outgoing_mention(
@@ -565,8 +598,9 @@ impl MessageStore {
             self.validate_group_scope(account, thread)
                 .map_err(|_| FailureReason::Validation)?;
         }
-        self.prepare_outgoing_inner(account, thread, text, None, mentions, now_ms)
+        self.prepare_outgoing_inner(account, thread, text, None, mentions, now_ms, None)
     }
+    #[allow(clippy::too_many_arguments)]
     fn prepare_outgoing_inner(
         &mut self,
         account: &str,
@@ -575,6 +609,7 @@ impl MessageStore {
         reply_to: Option<&str>,
         mentions: &[crate::domain::mention::Mention],
         now_ms: i64,
+        ttl_ms: Option<i64>,
     ) -> Result<u64> {
         validate_id(account)?;
         validate_id(thread)?;
@@ -614,7 +649,7 @@ impl MessageStore {
             if encrypted {
                 bail!(crate::domain::reply::ReplyUnavailable);
             }
-            let mut source = tx.query_row("SELECT sender,body,sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND NOT EXISTS(SELECT 1 FROM message_content WHERE account_id=?1 AND thread_id=?2 AND message_id=?3) AND NOT EXISTS(SELECT 1 FROM message_info WHERE account_id=?1 AND thread_id=?2 AND message_id=?3) AND NOT EXISTS(SELECT 1 FROM message_media WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)", params![account,thread,target], |row| Ok(Message {mentions: Vec::new(), reply_blocked: false, recalled: false,
+            let mut source = tx.query_row("SELECT sender,body,sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND NOT EXISTS(SELECT 1 FROM message_content WHERE account_id=?1 AND thread_id=?2 AND message_id=?3) AND NOT EXISTS(SELECT 1 FROM message_info WHERE account_id=?1 AND thread_id=?2 AND message_id=?3) AND NOT EXISTS(SELECT 1 FROM message_media WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)", params![account,thread,target], |row| Ok(Message {expires_at_ms: None,mentions: Vec::new(), reply_blocked: false, recalled: false,
                 account_id:account.into(),thread_id:thread.into(),id:target.into(),sender:row.get(0)?,text:row.get(1)?,sent_at_ms:row.get(2)?,source_client_id:None,quote:None,sticker:None,media:None,
             })).optional()?.ok_or(crate::domain::reply::ReplyUnavailable)?;
             message_reply::hydrate(&tx, &mut source)?;
@@ -676,6 +711,12 @@ impl MessageStore {
         }
         tx.execute("INSERT INTO outgoing_counters(account_id,last_id) VALUES(?1,?2) ON CONFLICT(account_id) DO UPDATE SET last_id=excluded.last_id",params![account,next])?;
         tx.execute("INSERT INTO outgoing(account_id,thread_id,client_id,body,created_at_ms,state) VALUES(?1,?2,?3,?4,?5,'sending')",params![account,thread,next.to_string(),text,now_ms])?;
+        if let Some(ttl_ms) = ttl_ms {
+            tx.execute(
+                "INSERT INTO outgoing_expirations(account_id,client_id,ttl_ms) VALUES(?1,?2,?3)",
+                params![account, next.to_string(), ttl_ms],
+            )?;
+        }
         if let Some(quote) = quote {
             tx.execute("INSERT INTO outgoing_reply(account_id,client_id,quote_metadata,quote_projection) VALUES(?1,?2,?3,?4)",params![account,next.to_string(),message_reply::synthetic(&quote)?.as_json(),serde_json::to_string(&quote)?])?;
         }
@@ -767,6 +808,12 @@ impl MessageStore {
             Vec::new()
         };
         let mut message = Message {
+            expires_at_ms: expiration::deadline_for_outgoing(
+                &tx,
+                account,
+                &client_id.to_string(),
+                existing_ts.or(timestamp).unwrap_or(created),
+            )?,
             reply_blocked: !mentions.is_empty(),
             mentions,
             recalled: false,
@@ -784,6 +831,33 @@ impl MessageStore {
         if delete_for_me::suppresses(&tx, &message)? {
             bail!(FailureReason::ConflictingEcho);
         }
+        let expiry = expiration::record(&tx, &message)?;
+        if expiration::expired(expiry, expiration::now_ms()) {
+            let conversation = tx
+                .query_row(
+                    CONVERSATION_SQL,
+                    params![account, thread, MAX_PREVIEW_CHARS as i64],
+                    conversation_row,
+                )
+                .optional()?
+                .unwrap_or_else(|| Conversation {
+                    id: thread.clone(),
+                    title: thread.clone(),
+                    last_message_at_ms: 0,
+                    last_text: String::new(),
+                    last_sender: String::new(),
+                    group_left: false,
+                });
+            tx.execute("UPDATE outgoing SET state='expired',body=?4,server_id=?3 WHERE account_id=?1 AND client_id=?2",
+                       params![account,client_id.to_string(),server_id,expiration::PREVIEW])?;
+            expiration::PREVIEW.clone_into(&mut message.text);
+            message.reply_blocked = true;
+            message.expires_at_ms = expiry.map(|(deadline, _)| deadline);
+            tx.commit()?;
+            return Ok((message, conversation));
+        }
+        message.expires_at_ms = expiry.map(|(deadline, _)| deadline);
+        message.reply_blocked |= expiry.is_some();
         if existing_ts.is_some() {
             mention::check_existing_ack(&tx, &message)?;
         }
@@ -1047,6 +1121,16 @@ impl MessageStore {
             .attention
             .is_some_and(|(_, context)| context == ReceiveContext::LiveFresh);
         let tx = self.conn.transaction()?;
+        let receipt_time = expiration::now_ms();
+        // Bind deadlines before processing any sibling that may quote a timed message.
+        if messages
+            .clone()
+            .any(|(source, _, _, _, quote, _)| source.quote.is_some() || quote.is_some())
+        {
+            for (source, ..) in messages.clone() {
+                expiration::record(&tx, source)?;
+            }
+        }
         #[cfg(feature = "messaging")]
         let (mut deleted_changes, delete_output) = {
             let (notices, result) = extras
@@ -1106,6 +1190,19 @@ impl MessageStore {
             if delete_for_me::suppresses(&tx, source)? {
                 continue;
             }
+            let expiry = expiration::record(&tx, source)?;
+            if expiration::expired(expiry, receipt_time)
+                || (expiry.is_some()
+                    && !expiration::supports_text(
+                        source,
+                        info.is_some()
+                            || media.is_some()
+                            || quote.is_some()
+                            || expiration::structured_forward(_marker),
+                    ))
+            {
+                continue;
+            }
             #[cfg(feature = "messaging")]
             if structured_webchat_conflicts_with_send_echo(&tx, source, _marker)? {
                 continue;
@@ -1129,6 +1226,9 @@ impl MessageStore {
             };
             let mut message = source.clone();
             let m = &mut message;
+            m.expires_at_ms = expiry.map(|(deadline, _)| deadline);
+            m.reply_blocked |= expiry.is_some();
+            let _marker = _marker.filter(|_| expiry.is_none());
             #[cfg(feature = "messaging")]
             let recalled = {
                 let plain = info.is_none()
@@ -1392,6 +1492,7 @@ impl MessageStore {
                 || media_enriched
                 || reply_enriched
                 || forward_enriched
+                || expiry.is_some()
             {
                 let c = tx.query_row(
                     CONVERSATION_SQL,
@@ -1450,6 +1551,9 @@ impl MessageStore {
             return Ok(None);
         }
         validate_id(id).map_err(|_| FailureReason::Validation)?;
+        if expiration::exists(&self.conn, account, thread, id)? {
+            return Ok(None);
+        }
         message_info::load(&self.conn, account, thread, id)
     }
 
@@ -1467,6 +1571,9 @@ impl MessageStore {
             return Ok(None);
         }
         validate_id(id).map_err(|_| FailureReason::Validation)?;
+        if expiration::exists(&self.conn, account, thread, id)? {
+            return Ok(None);
+        }
         message_media::load(&self.conn, account, thread, id)
     }
     /// Rehydrate only the caller's bounded displayed IDs. Missing rows never
@@ -1495,12 +1602,15 @@ impl MessageStore {
         let mut statement=self.conn.prepare_cached("SELECT m.account_id,m.thread_id,m.message_id,m.sender,m.body,m.sent_at_ms,
             CASE WHEN length(CAST(content.metadata AS BLOB))<=256 THEN content.metadata ELSE NULL END FROM messages m
             LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
-            WHERE m.account_id=?1 AND m.thread_id=?2 AND m.message_id=?3")?;
+            WHERE m.account_id=?1 AND m.thread_id=?2 AND m.message_id=?3
+            AND NOT EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=m.account_id AND e.thread_id=m.thread_id
+                    AND e.message_id=m.message_id AND (e.purged=1 OR e.deadline_ms<=CAST(unixepoch('subsec')*1000 AS INTEGER)))")?;
         let mut result = Vec::with_capacity(message_ids.len());
         for id in message_ids {
             let message = statement
                 .query_row(params![account, thread, id], |row| {
                     Ok(Message {
+                        expires_at_ms: None,
                         mentions: Vec::new(),
                         reply_blocked: false,
                         recalled: false,
@@ -1610,6 +1720,7 @@ impl MessageStore {
         }
         let row = |r: &rusqlite::Row<'_>| {
             Ok(Message {
+                expires_at_ms: None,
                 mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
@@ -1636,7 +1747,10 @@ impl MessageStore {
             let mut stmt = self.conn.prepare_cached("SELECT m.account_id,m.thread_id,m.message_id,m.sender,m.body,m.sent_at_ms,
                 CASE WHEN length(CAST(content.metadata AS BLOB))<=256 THEN content.metadata ELSE NULL END FROM messages m
                 LEFT JOIN message_content content ON content.account_id=m.account_id AND content.thread_id=m.thread_id AND content.message_id=m.message_id
-                WHERE m.account_id=?1 AND m.thread_id=?2 ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?3")?;
+                WHERE m.account_id=?1 AND m.thread_id=?2
+                AND NOT EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=m.account_id AND e.thread_id=m.thread_id
+                    AND e.message_id=m.message_id AND (e.purged=1 OR e.deadline_ms<=CAST(unixepoch('subsec')*1000 AS INTEGER)))
+                ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?3")?;
             let mapped = stmt.query_map(params![account, thread, limit as i64], row)?;
             mapped.collect::<rusqlite::Result<_>>()?
         };
@@ -1771,6 +1885,7 @@ mod tests {
     use super::*;
     fn m(account: &str, thread: &str, id: &str, ts: i64) -> Message {
         Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
@@ -2032,6 +2147,7 @@ mod list_silence_tests {
     use super::*;
     fn incoming(thread: &str, id: &str, text: &str, ts: i64) -> Message {
         Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
@@ -2176,6 +2292,7 @@ mod live_storage_tests {
     }
     fn echo(id: &str, ts: i64) -> Message {
         Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
@@ -2305,6 +2422,7 @@ mod live_storage_tests {
             assert_eq!(
                 s.page("11", "d:22", None, 10).unwrap(),
                 vec![Message {
+                    expires_at_ms: None,
                     source_client_id: Some("1700000000000".into()),
                     ..received.clone()
                 }]
@@ -2673,6 +2791,7 @@ mod live_storage_tests {
                 "11",
                 &[(
                     Message {
+                        expires_at_ms: None,
                         mentions: Vec::new(),
                         reply_blocked: false,
                         recalled: false,
@@ -2722,6 +2841,7 @@ mod file_plaintext_ack_tests {
             .unwrap();
         store.record_outgoing_ack("11", client, "992").unwrap();
         let row = |id: &str, sender: &str, text: &str| Message {
+            expires_at_ms: None,
             account_id: "11".into(),
             thread_id: "d:22".into(),
             id: id.into(),

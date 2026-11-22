@@ -742,6 +742,7 @@ mod tests {
                 source_client_id: Some("9002".into()),
                 mentions: Vec::new(),
                 reply_blocked: true,
+                expires_at_ms: None,
                 recalled: false,
                 quote: None,
                 sticker: None,

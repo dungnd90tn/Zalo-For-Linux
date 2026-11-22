@@ -116,6 +116,14 @@ impl Privacy {
             LiveEvent::Opened { conversation, .. }
             | LiveEvent::Received { conversation, .. }
             | LiveEvent::Sent { conversation, .. } => conversation,
+            LiveEvent::MessagesExpired { expired, .. } => {
+                let Some(message) = expired.iter().rev().find(|message| {
+                    self.active_unlocked.as_deref() == Some(message.thread_id.as_str())
+                }) else {
+                    return;
+                };
+                &message.conversation
+            }
             _ => return,
         };
         if self.active_unlocked.as_deref() == Some(conversation.id.as_str())
@@ -352,6 +360,12 @@ impl Privacy {
                     return None;
                 }
                 conversations.retain(|thread| self.list_visible(&thread.id));
+            }
+            LiveEvent::MessagesExpired { expired, .. } => {
+                expired.retain(|message| self.visible(&message.thread_id));
+                if expired.is_empty() {
+                    return None;
+                }
             }
             LiveEvent::DirectoryPage { entries, .. } => {
                 if !self.ready() {

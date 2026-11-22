@@ -93,7 +93,7 @@ impl MessageQuote {
         };
         let ttl = match value.get("ttl") {
             None | Some(Value::Null) => Some(0),
-            Some(value) => value.as_u64(),
+            Some(value) => value.as_u64().or_else(|| value.as_str()?.parse().ok()),
         };
         let quote = Self {
             owner_id,
@@ -153,6 +153,7 @@ impl Message {
         }
         if self.recalled
             || self.reply_blocked
+            || self.expires_at_ms.is_some()
             || !self.mentions.is_empty()
             || self.sticker.is_some()
             || self.media.is_some()

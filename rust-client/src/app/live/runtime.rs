@@ -27,6 +27,8 @@ mod e2ee_init_devices;
 mod e2ee_init_peer;
 mod e2ee_probe;
 #[cfg(feature = "signal-crypto")]
+mod e2ee_queue;
+#[cfg(feature = "signal-crypto")]
 mod e2ee_readiness;
 #[cfg(feature = "signal-crypto")]
 mod e2ee_receive;
@@ -76,6 +78,7 @@ fn outgoing_mismatch_diagnostics_report_only_closed_field_flags() {
         sticker: None,
         media: None,
         sent_at_ms: 1001,
+        expires_at_ms: None,
     };
     let error = store
         .receive_batch("11", &[(message, None)], None)
@@ -553,10 +556,12 @@ type Job = Box<dyn FnOnce(&mut MessageStore) + Send>;
 struct Database {
     jobs: Option<mpsc::Sender<Job>>,
     thread: Option<JoinHandle<()>>,
+    expiry_changed: watch::Sender<()>,
 }
 #[derive(Clone)]
 struct DatabaseHandle {
     jobs: mpsc::Sender<Job>,
+    expiry_changed: watch::Sender<()>,
 }
 impl Database {
     async fn open(profile: Arc<Profile>, account: String) -> Result<Self> {
@@ -609,6 +614,7 @@ impl Database {
         Ok(Self {
             jobs: Some(tx),
             thread: Some(thread),
+            expiry_changed: watch::channel(()).0,
         })
     }
     async fn call<T: Send + 'static>(
@@ -631,8 +637,35 @@ impl Database {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Storage stopped"))?
                 .clone(),
+            expiry_changed: self.expiry_changed.clone(),
         })
     }
+}
+
+async fn sweep_message_expiry(
+    db: &Database,
+    events: &Events,
+) -> Result<Option<tokio::time::Instant>> {
+    let account = events.account.clone();
+    let (expired, next) = db
+        .call_with(StorageOperation::ExpireMessages, move |store| {
+            let expired = store.expire_messages(&account, now_ms())?;
+            Ok((expired, store.next_message_expiry(&account)?))
+        })
+        .await?;
+    if !expired.is_empty() {
+        events
+            .emit(LiveEvent::MessagesExpired {
+                account_id: events.account.clone(),
+                expired,
+            })
+            .await?;
+    }
+    // Recalculate against the wall clock after a suspend or clock adjustment.
+    Ok(next.map(|at| {
+        let delay = at.saturating_sub(now_ms()).clamp(0, 60_000) as u64;
+        tokio::time::Instant::now() + Duration::from_millis(delay)
+    }))
 }
 impl DatabaseHandle {
     async fn call_with<T: Send + 'static>(
@@ -677,6 +710,18 @@ enum DirectoryMessageChange {
     DeleteForMe(crate::store::delete_for_me::DeleteForMeChange),
 }
 impl DirectorySink for RuntimeDirectorySink {
+    async fn preview_cursors(
+        &mut self,
+    ) -> std::result::Result<std::collections::BTreeMap<String, String>, DirectoryFailure> {
+        let account = self.account.clone();
+        self.db
+            .call_with(StorageOperation::DirectoryRead, move |store| {
+                store.preview_cursors(&account)
+            })
+            .await
+            .map_err(|_| directory_failure(DirectoryCategory::Storage))
+    }
+
     async fn apply(&mut self, batch: DirectoryBatch) -> std::result::Result<(), DirectoryFailure> {
         self.apply_preview(batch, Vec::new(), Vec::new(), Vec::new())
             .await
@@ -692,6 +737,10 @@ impl DirectorySink for RuntimeDirectorySink {
         if batch.account_id != self.account {
             return Err(directory_failure(DirectoryCategory::Storage));
         }
+        let may_expire = batch
+            .messages
+            .iter()
+            .any(|message| message.expires_at_ms.is_some());
         let (_, recalls, deletions) = self
             .db
             .call_with(StorageOperation::DirectoryWrite, move |store| {
@@ -701,6 +750,9 @@ impl DirectorySink for RuntimeDirectorySink {
             })
             .await
             .map_err(|_| directory_failure(DirectoryCategory::Storage))?;
+        if may_expire {
+            self.db.expiry_changed.send_replace(());
+        }
         // Coalesce durable changes while the UI is slow. The directory task
         // never reserves critical WebSocket event capacity.
         self.updates
@@ -758,7 +810,7 @@ impl Drop for DirectoryRun {
     }
 }
 /// Opening a conversation refreshes names and avatars (friends and groups) at most this often.
-const DIRECTORY_REFRESH_ON_OPEN: Duration = Duration::from_secs(120);
+const DIRECTORY_REFRESH_COOLDOWN: Duration = Duration::from_secs(120);
 struct DirectorySync {
     last_started: Option<tokio::time::Instant>,
     running: Option<DirectoryRun>,
@@ -802,9 +854,8 @@ impl DirectorySync {
         }
         self.start(generation, session, db, transports);
     }
-    /// A changed group name, group photo or contact avatar shows up when its conversation is opened: the same
-    /// friend and group lists as the startup sync, skipped while one runs or one started recently.
-    fn refresh_on_open(
+    /// Refresh recent messages and directory metadata within the same bounded cooldown.
+    fn refresh_if_due(
         &mut self,
         session: Arc<VerifiedSession>,
         db: DatabaseHandle,
@@ -812,7 +863,7 @@ impl DirectorySync {
     ) {
         let recent = self
             .last_started
-            .is_some_and(|at| at.elapsed() < DIRECTORY_REFRESH_ON_OPEN);
+            .is_some_and(|at| at.elapsed() < DIRECTORY_REFRESH_COOLDOWN);
         if self.running.is_none() && !recent {
             self.start(0, session, db, transports);
         }
@@ -1199,6 +1250,10 @@ struct Connection {
     #[cfg(feature = "signal-crypto")]
     e2ee_receive: Option<e2ee_receive::Receiver>,
     #[cfg(feature = "signal-crypto")]
+    e2ee_catchup: Option<e2ee_queue::Catchup>,
+    #[cfg(feature = "signal-crypto")]
+    e2ee_sessions: Option<e2ee_queue::SessionCatchup>,
+    #[cfg(feature = "signal-crypto")]
     e2ee_http: Option<e2ee_send::E2eeHttp>,
 }
 impl Connection {
@@ -1221,6 +1276,19 @@ impl Connection {
                     Err(failure)
                         if self.decoder.authenticated()
                             && self.reaction_catchup.discard_optional_frame(&failure) =>
+                    {
+                        let _ = diagnostic(&failure.into(), LiveStage::Synchronization);
+                        Ok(None)
+                    }
+                    #[cfg(feature = "signal-crypto")]
+                    Err(failure)
+                        if self.decoder.authenticated()
+                            && failure.context.command == Some(e2ee_queue::SESSION_COMMAND)
+                            && failure.context.subcommand == Some(0)
+                            && !matches!(
+                                failure.error,
+                                WireError::Authentication | WireError::Crypto
+                            ) =>
                     {
                         let _ = diagnostic(&failure.into(), LiveStage::Synchronization);
                         Ok(None)
@@ -1252,6 +1320,19 @@ impl Connection {
             .into()),
             Some(Err(error)) => Err(NetworkFailure::socket(LiveStage::Receive, error).into()),
         }
+    }
+    async fn next_messaging(&mut self) -> Result<Option<DecodedFrame>> {
+        #[cfg(feature = "signal-crypto")]
+        if let Some(deadline) = self.e2ee_session_deadline() {
+            if deadline <= tokio::time::Instant::now() {
+                return Ok(None);
+            }
+            match tokio::time::timeout_at(deadline, self.next()).await {
+                Ok(frame) => return frame,
+                Err(_) => return Ok(None),
+            }
+        }
+        self.next().await
     }
     fn handshake_request(
         session: &VerifiedSession,
@@ -1331,6 +1412,10 @@ impl Connection {
             e2ee_receive_report: None,
             #[cfg(feature = "signal-crypto")]
             e2ee_receive: None,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_catchup: None,
+            #[cfg(feature = "signal-crypto")]
+            e2ee_sessions: None,
             #[cfg(feature = "signal-crypto")]
             e2ee_http: None,
         }
@@ -1498,6 +1583,8 @@ impl Connection {
                         .await?;
                 }
                 reactions::start_catchup(self, db, &frame.payload).await?;
+                #[cfg(feature = "signal-crypto")]
+                self.start_e2ee_catchup(db, events, commands).await?;
             }
             2 => {
                 if frame
@@ -1556,6 +1643,9 @@ impl Connection {
                     .iter()
                     .filter_map(|message| message.receipt.clone())
                     .collect();
+                let may_expire = parsed
+                    .iter()
+                    .any(|message| message.message.expires_at_ms.is_some());
                 let messages: Vec<_> = parsed
                     .into_iter()
                     .map(|i| {
@@ -1741,11 +1831,19 @@ impl Connection {
                 }
                 reactions::emit_changed(events, changed_reactions).await?;
                 let mut notification_threads = std::collections::HashSet::new();
+                if may_expire
+                    || stored
+                        .iter()
+                        .any(|(message, _)| message.expires_at_ms.is_some())
+                {
+                    db.expiry_changed.send_replace(());
+                }
                 for (message, _) in stored.iter().rev() {
                     if let Some(queue) = &events.unread {
-                        if new_unread
-                            .iter()
-                            .any(|(thread, id)| thread == &message.thread_id && id == &message.id)
+                        if message.expires_at_ms.is_none()
+                            && new_unread.iter().any(|(thread, id)| {
+                                thread == &message.thread_id && id == &message.id
+                            })
                             && notification_threads.insert(message.thread_id.clone())
                             && attention::permits_normal(events, &message.thread_id, true)
                         {
@@ -1788,13 +1886,20 @@ impl Connection {
             }
             // Encrypted chat messages: decrypt with the engine and store them (needs this client's E2EE key).
             #[cfg(feature = "signal-crypto")]
-            551 => {
-                self.e2ee_receive_push(&frame, db, events).await;
+            543..=545 | 551 => {
+                self.receive_e2ee_push(&frame, db, events).await;
             }
-            // These encrypted queues are intentionally not consumed or acknowledged.
+            #[cfg(feature = "signal-crypto")]
+            e2ee_queue::COMMAND => {
+                self.process_e2ee_catchup(frame, db, events).await?;
+            }
+            #[cfg(feature = "signal-crypto")]
+            e2ee_queue::SESSION_COMMAND => {
+                self.process_e2ee_session_page(frame, db, events).await?;
+            }
             #[cfg(not(feature = "signal-crypto"))]
-            551 => {}
-            552 | 535 | 543 | 544 | 548 | 561 | 580 | 581 | 582 => {}
+            543..=545 | 551 => {}
+            552 | 535 | 548 | 561 | 580 | 581 | 582 => {}
             _ => {}
         }
         Ok(())
@@ -1869,13 +1974,16 @@ impl Connection {
                     }
                 }
                 // Process all intervening data before checking the final capability snapshot.
-                if [551, 552, 535, 543, 544, 548, 561, 580, 581, 582].contains(&frame.cmd) {
+                if matches!(frame.cmd, 513 | 516 | 535 | 543..=545 | 548 | 551 | 552 | 561 | 580..=582)
+                {
+                    let command = frame.cmd;
+                    self.process(frame, db, events).await?;
                     let mut failure = wire::EligibilityFailure::new(
                         wire::EligibilityReason::StateChanged,
                         None,
                         None,
                     );
-                    failure.command = Some(frame.cmd);
+                    failure.command = Some(command);
                     return Err(failure.into());
                 }
                 self.process(frame, db, events).await?;
@@ -1890,6 +1998,32 @@ impl Connection {
         Err(failure.into())
     }
 }
+#[derive(Debug)]
+struct DisappearingMessagesRequired;
+
+impl std::fmt::Display for DisappearingMessagesRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Conversation requires disappearing-message support")
+    }
+}
+
+fn check_messaging_response(payload: &Value) -> Result<()> {
+    let Err(error) = wire::service_code(payload) else {
+        return Ok(());
+    };
+    let error_message = payload.get("error_message").and_then(Value::as_str);
+    if error == WireError::Service(800)
+        && error_message.is_some_and(|text| {
+            text.len() <= 1024
+                && text.contains("chưa hỗ trợ tính năng")
+                && text.contains("Tin nhắn tự xóa")
+        })
+    {
+        return Err(anyhow::Error::new(error).context(DisappearingMessagesRequired));
+    }
+    Err(error.into())
+}
+
 async fn read_response(
     mut response: reqwest::Response,
     session: &VerifiedSession,
@@ -1915,7 +2049,7 @@ async fn read_response(
         bytes.extend_from_slice(&chunk)
     }
     let outer: Value = serde_json::from_slice(&bytes).map_err(|_| WireError::Invalid)?;
-    wire::service_code(&outer)?;
+    check_messaging_response(&outer)?;
     let encrypted = outer
         .get("data")
         .and_then(Value::as_str)
@@ -1925,7 +2059,7 @@ async fn read_response(
         return Err(WireError::Oversize.into());
     }
     let inner = serde_json::from_slice(&bytes).map_err(|_| WireError::Invalid)?;
-    wire::service_code(&inner)?;
+    check_messaging_response(&inner)?;
     Ok(inner)
 }
 async fn authenticated_request(
@@ -1992,7 +2126,10 @@ async fn send_text(
     client_id: u64,
     visibility: Option<u64>,
 ) -> Result<wire::SendAck> {
-    send_text_reply(client, session, target, text, client_id, visibility, None).await
+    send_text_reply(
+        client, session, target, text, client_id, visibility, None, 0,
+    )
+    .await
 }
 #[allow(clippy::too_many_arguments)]
 async fn send_text_reply(
@@ -2003,6 +2140,7 @@ async fn send_text_reply(
     client_id: u64,
     visibility: Option<u64>,
     quote: Option<&crate::domain::MessageQuote>,
+    ttl_ms: u64,
 ) -> Result<wire::SendAck> {
     let root = root_for(
         session,
@@ -2017,7 +2155,12 @@ async fn send_text_reply(
         wire::send_url(&root, target.kind, session.client_type())?
     };
     let mut parameters = if let Some(quote) = quote {
+        if ttl_ms != 0 {
+            return Err(WireError::Unsupported.into());
+        }
         wire::quote_parameters(target, text, client_id, session.imei(), quote, visibility)?
+    } else if ttl_ms != 0 {
+        wire::disappearing_text_parameters(target, text, client_id, session.imei(), ttl_ms)?
     } else {
         wire::text_parameters(target, text, client_id, session.imei())?
     };
@@ -2053,7 +2196,12 @@ async fn persist_ack(
             })
             .await;
         match result {
-            Ok(value) => return Ok(value),
+            Ok((message, conversation)) => {
+                if message.expires_at_ms.is_some() {
+                    db.expiry_changed.send_replace(());
+                }
+                return Ok((message, conversation));
+            }
             Err(error) => {
                 let _ = diagnostic(&error, LiveStage::Storage);
                 last = Some(error)
@@ -2504,32 +2652,88 @@ async fn handle_command(
                 },
                 _ => Err(anyhow::anyhow!("offline")),
             };
-            // An end-to-end encrypted 1-1 conversation: the original's `sendE2eeMsg` (handshake when a device has
-            // no session yet, then the encrypted send). Needs the crypto engine; without it the draft is kept.
-            #[cfg(feature = "signal-crypto")]
-            if let Err(error) = &eligible {
-                if error
-                    .downcast_ref::<wire::EligibilityFailure>()
-                    .is_some_and(|f| f.reason == wire::EligibilityReason::EncryptedTarget)
-                    && target.kind == ThreadKind::Direct
-                    && reply_to.is_none()
-                {
-                    if let Some(c) = connection.as_mut() {
-                        if let Err(error) = c
-                            .send_e2ee(db, events, generation, thread, request_id, &text)
-                            .await
-                        {
-                            if wire_error(&error) == Some(&WireError::Authentication) {
-                                events
-                                    .diagnostic(diagnostic(&error, LiveStage::Authentication))
-                                    .await?;
-                                events.connection(LiveConnection::Expired).await?;
-                                return Ok(CommandOutcome::PauseTransport);
+            let encrypted_send = cfg!(feature = "signal-crypto")
+                && target.kind == ThreadKind::Direct
+                && reply_to.is_none()
+                && eligible.as_ref().err().is_some_and(|error| {
+                    error
+                        .downcast_ref::<wire::EligibilityFailure>()
+                        .is_some_and(|failure| {
+                            failure.reason == wire::EligibilityReason::EncryptedTarget
+                        })
+                });
+            let ttl_ms = if eligible.is_ok() || encrypted_send {
+                let ttl = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    forward::target_ttl_ms(client, session, &target),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(NetworkFailure::new(LiveStage::Send, LiveCategory::Timeout).into())
+                });
+                match ttl {
+                    Ok(0) => 0,
+                    Ok(ttl_ms)
+                        if !encrypted_send
+                            && reply_to.is_none()
+                            && wire::is_disappearing_duration(ttl_ms) =>
+                    {
+                        ttl_ms
+                    }
+                    other => {
+                        let (error, expires_session) = match other {
+                            Ok(_) => (
+                                "Kiểu gửi này chưa hỗ trợ Tin nhắn tự xóa. Bản nháp được giữ lại.",
+                                false,
+                            ),
+                            Err(error) => {
+                                let detail = diagnostic(&error, LiveStage::Send);
+                                (
+                                    "Chưa xác minh được cài đặt Tin nhắn tự xóa. Bản nháp được giữ lại.",
+                                    detail.category == LiveCategory::Authentication,
+                                )
                             }
-                            return Err(error);
+                        };
+                        events
+                            .emit(LiveEvent::SendFailed {
+                                account_id: events.account.clone(),
+                                generation,
+                                thread,
+                                request_id,
+                                error: error.into(),
+                                unknown_delivery: false,
+                                server_accepted: false,
+                            })
+                            .await?;
+                        if expires_session {
+                            events.connection(LiveConnection::Expired).await?;
+                            return Ok(CommandOutcome::PauseTransport);
                         }
                         return Ok(CommandOutcome::Continue);
                     }
+                }
+            } else {
+                0
+            };
+            // An end-to-end encrypted 1-1 conversation: the original's `sendE2eeMsg` (handshake when a device has
+            // no session yet, then the encrypted send). Needs the crypto engine; without it the draft is kept.
+            #[cfg(feature = "signal-crypto")]
+            if encrypted_send {
+                if let Some(c) = connection.as_mut() {
+                    if let Err(error) = c
+                        .send_e2ee(db, events, generation, thread, request_id, &text)
+                        .await
+                    {
+                        if wire_error(&error) == Some(&WireError::Authentication) {
+                            events
+                                .diagnostic(diagnostic(&error, LiveStage::Authentication))
+                                .await?;
+                            events.connection(LiveConnection::Expired).await?;
+                            return Ok(CommandOutcome::PauseTransport);
+                        }
+                        return Err(error);
+                    }
+                    return Ok(CommandOutcome::Continue);
                 }
             }
             let visibility = match eligible {
@@ -2590,6 +2794,14 @@ async fn handle_command(
                             &reply_to,
                             now_ms(),
                         )?
+                    } else if ttl_ms != 0 {
+                        s.prepare_outgoing_disappearing(
+                            &account,
+                            &thread_copy,
+                            &text_copy,
+                            now_ms(),
+                            ttl_ms as i64,
+                        )?
                     } else {
                         s.prepare_outgoing(&account, &thread_copy, &text_copy, now_ms())?
                     };
@@ -2607,6 +2819,9 @@ async fn handle_command(
                     return Ok(CommandOutcome::Continue);
                 }
             };
+            if ttl_ms != 0 {
+                db.expiry_changed.send_replace(());
+            }
             match send_text_reply(
                 client,
                 session,
@@ -2615,6 +2830,7 @@ async fn handle_command(
                 id,
                 visibility,
                 quote.as_ref(),
+                ttl_ms,
             )
             .await
             {
@@ -2665,7 +2881,9 @@ async fn handle_command(
                             generation,
                             thread,
                             request_id,
-                            error: if known {
+                            error: if error.is::<DisappearingMessagesRequired>() {
+                                "Hội thoại yêu cầu hỗ trợ Tin nhắn tự xóa. Bản nháp được giữ lại."
+                            } else if known {
                                 "Zalo từ chối lượt gửi này. Bản nháp được giữ lại."
                             } else {
                                 "Chưa có xác nhận từ Zalo. Không tự gửi lại."
@@ -2710,6 +2928,7 @@ async fn run_inner(
     desktop: Option<&desktop::DesktopNotifications>,
 ) -> Result<()> {
     let db = Database::open(profile.clone(), events.account.clone()).await?;
+    let mut expiry_updates = db.expiry_changed.subscribe();
     // Repair only durable, already accepted local sends before any history projection.
     echo_recovery::repair(&db, &events.account).await?;
     let account = events.account.clone();
@@ -2719,6 +2938,7 @@ async fn run_inner(
         .await?;
     privacy::Privacy::provisional(events, remembered, LivePrivacyStatus::Ready)?;
     privacy::Privacy::announce(events).await?;
+    let mut expiry_deadline = sweep_message_expiry(&db, events).await?;
     let mut privacy = privacy::Privacy::new();
     privacy.start(session.clone(), transports);
     let client = transports.http.clone();
@@ -2796,11 +3016,13 @@ async fn run_inner(
     let mut backoff = crate::reconnect::Backoff::default();
     let mut next_connect = tokio::time::Instant::now();
     let mut next_ping = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut authenticated_before = false;
     loop {
         let original_epoch = connection
             .as_ref()
             .filter(|socket| socket.decoder.authenticated())
             .and_then(|socket| socket.authenticated_at);
+        history.start_newest(original_epoch, events, &session, &client);
         polls.retain(original_epoch, events);
         uploads
             .check_original_entitlement(original_epoch, &session, &client, events)
@@ -2814,6 +3036,8 @@ async fn run_inner(
             .is_ok_and(|state| state.status != LivePrivacyStatus::Checking);
         tokio::select! {
             biased;
+            _ = expiry_updates.changed() => { expiry_deadline = sweep_message_expiry(&db, events).await?; },
+            _ = attention::wait_until(expiry_deadline) => { expiry_deadline = sweep_message_expiry(&db, events).await?; },
             result = async { (&mut directory.running.as_mut().expect("guarded directory sync").task).await }, if directory.running.is_some() => {
                 directory.completed(result,session.clone(),db.handle()?,transports);
             },
@@ -2962,8 +3186,8 @@ async fn run_inner(
                     directory.request(generation,session.clone(),db.handle()?,transports);
                     continue;
                 }
-                if matches!(command, LiveCommand::Open { .. }) {
-                    directory.refresh_on_open(session.clone(),db.handle()?,transports);
+                if matches!(command, LiveCommand::Open { .. } | LiveCommand::Load { before: None, .. }) {
+                    directory.refresh_if_due(session.clone(),db.handle()?,transports);
                 }
                 if matches!(command, LiveCommand::Reconnect) {
                     trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
@@ -3009,6 +3233,8 @@ async fn run_inner(
                     let attention_deadline = attention.next_wake(None, events, &session);
                     tokio::select! {
                         biased;
+                        _ = expiry_updates.changed() => { expiry_deadline = sweep_message_expiry(&db, events).await?; },
+                        _ = attention::wait_until(expiry_deadline) => { expiry_deadline = sweep_message_expiry(&db, events).await?; },
                         result = async { (&mut directory.running.as_mut().expect("guarded directory sync").task).await }, if directory.running.is_some() => {
                             directory.completed(result,session.clone(),db.handle()?,transports);
                         },
@@ -3094,8 +3320,8 @@ async fn run_inner(
                                 directory.request(generation,session.clone(),db.handle()?,transports);
                                 continue;
                             }
-                            if matches!(command, LiveCommand::Open { .. }) {
-                                directory.refresh_on_open(session.clone(),db.handle()?,transports);
+                            if matches!(command, LiveCommand::Open { .. } | LiveCommand::Load { before: None, .. }) {
+                                directory.refresh_if_due(session.clone(),db.handle()?,transports);
                             }
                             if matches!(command, LiveCommand::Reconnect) {
                                 trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
@@ -3156,12 +3382,22 @@ async fn run_inner(
                     }
                 }
             },
-            frame = async { connection.as_mut().expect("guarded connection").next().await }, if connection.is_some() => {
-                let stage = if frame.as_ref().ok().and_then(Option::as_ref).is_some_and(|frame| frame.cmd == 1) || !connection.as_ref().is_some_and(|c| c.decoder.authenticated()) {LiveStage::Authentication} else {LiveStage::Synchronization};
+            frame = async { connection.as_mut().expect("guarded connection").next_messaging().await }, if connection.is_some() => {
+                let auth_frame = frame.as_ref().ok().and_then(Option::as_ref).is_some_and(|frame| frame.cmd == 1);
+                let stage = if auth_frame || !connection.as_ref().is_some_and(|c| c.decoder.authenticated()) {LiveStage::Authentication} else {LiveStage::Synchronization};
                 let refresh_ping = frame.as_ref().ok().and_then(Option::as_ref).is_some_and(|frame| frame.cmd == 1 || (frame.cmd == 2 && frame.payload.get("eventId").and_then(Value::as_i64).is_some_and(|id| connection.as_ref().is_some_and(|c| c.last_ping == Some(id)))));
                 let result = match frame {
                     Ok(Some(frame)) => { uploads.observe(&frame, connection.as_mut().unwrap()).await?; connection.as_mut().unwrap().process(frame, &db, events).await },
-                    Ok(None) => Ok(()),
+                    Ok(None) => {
+                        #[cfg(feature = "signal-crypto")]
+                        if let Some(c) = connection.as_mut().filter(|c| c.e2ee_session_deadline().is_some_and(|deadline| deadline <= tokio::time::Instant::now())) {
+                            c.expire_e2ee_sessions().await
+                        } else {
+                            Ok(())
+                        }
+                        #[cfg(not(feature = "signal-crypto"))]
+                        Ok(())
+                    },
                     Err(error) => Err(error),
                 };
                 if let Err(error) = result {
@@ -3187,23 +3423,33 @@ async fn run_inner(
                     connection = None;
                     retries = retries.saturating_add(1);
                     events.connection(LiveConnection::Reconnecting).await?;
-                } else if refresh_ping && connection.as_ref().is_some_and(|c|c.last_ping.is_none()) {
-                    next_ping = tokio::time::Instant::now() + Duration::from_secs(30);
+                } else {
+                    if auth_frame {
+                        if authenticated_before {
+                            directory.refresh_if_due(session.clone(),db.handle()?,transports);
+                        }
+                        authenticated_before = true;
+                    }
+                    if refresh_ping && connection.as_ref().is_some_and(|c|c.last_ping.is_none()) {
+                        next_ping = tokio::time::Instant::now() + Duration::from_secs(30);
+                    }
                 }
             },
             _ = tokio::time::sleep_until(next_ping), if connection.is_some() => {
-                trace(crate::diagnostics::Stage::Heartbeat,crate::diagnostics::Reason::Requested);
                 let c = connection.as_mut().unwrap();
                 if !c.decoder.authenticated() || c.last_ping.is_some() {
                     uploads.invalidate();
                     let stage=if c.decoder.authenticated(){LiveStage::Heartbeat}else{LiveStage::Authentication};
-                    events.diagnostic(NetworkFailure::new(stage,LiveCategory::Timeout).0).await?;
+                    let failure = NetworkFailure::new(stage, LiveCategory::Timeout).0;
+                    record_failure(failure, None);
+                    events.diagnostic(failure).await?;
                     next_connect = tokio::time::Instant::now() + retry_delay(connection.as_ref(), &mut backoff);
                     connection = None;
                     retries = retries.saturating_add(1);
                     events.connection(LiveConnection::Reconnecting).await?;
                     continue;
                 }
+                trace(crate::diagnostics::Stage::Heartbeat,crate::diagnostics::Reason::Requested);
                 let now = now_ms();
                 c.last_ping = Some(now);
                 if let Err(error)=c.send(2, 1, json!({"eventId": now})).await {

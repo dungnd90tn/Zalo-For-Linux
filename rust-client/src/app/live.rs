@@ -877,6 +877,10 @@ pub enum LiveEvent {
         account_id: String,
         conversations: Vec<Conversation>,
     },
+    MessagesExpired {
+        account_id: String,
+        expired: Vec<crate::store::ExpiredMessage>,
+    },
     DirectoryFailed {
         account_id: String,
         generation: u64,
@@ -1013,6 +1017,7 @@ impl LiveEvent {
             | Self::DirectoryPage { account_id, .. }
             | Self::DirectoryStatus { account_id, .. }
             | Self::DirectoryChanged { account_id, .. }
+            | Self::MessagesExpired { account_id, .. }
             | Self::DirectoryFailed { account_id, .. }
             | Self::Diagnostic { account_id, .. }
             | Self::Ready { account_id, .. }
@@ -2171,6 +2176,41 @@ impl super::Model {
                 self.conversations = conversations;
                 true
             }
+            LiveEvent::MessagesExpired { expired, .. } => {
+                for expired in expired {
+                    if expired.conversation.id != expired.thread_id {
+                        continue;
+                    }
+                    self.remove_search_message(
+                        &expired.thread_id,
+                        &expired.message_id,
+                        &expired.sender_id,
+                    );
+                    if self.selected.as_deref() == Some(&expired.thread_id) {
+                        self.overview = Default::default();
+                        self.messages.retain(|message| {
+                            message.account_id != account_id
+                                || message.thread_id != expired.thread_id
+                                || message.id != expired.message_id
+                                || message.sender != expired.sender_id
+                        });
+                        for message in &mut self.messages {
+                            if message.quote.as_ref().is_some_and(|quote| {
+                                quote.message_id == expired.message_id
+                                    && quote.owner_id == expired.sender_id
+                            }) {
+                                message.quote = None;
+                            }
+                        }
+                    }
+                    if expired.conversation.last_message_at_ms > 0
+                        || self.conversations.iter().any(|c| c.id == expired.thread_id)
+                    {
+                        self.upsert_live_conversation(expired.conversation);
+                    }
+                }
+                true
+            }
             LiveEvent::Overview {
                 generation,
                 thread,
@@ -2561,6 +2601,7 @@ mod tests {
         Message {
             mentions: Vec::new(),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             source_client_id: None,
             quote: None,
@@ -2665,6 +2706,7 @@ mod tests {
             message: Message {
                 mentions: Vec::new(),
                 reply_blocked: false,
+                expires_at_ms: None,
                 recalled: false,
                 source_client_id: None,
                 quote: None,

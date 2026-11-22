@@ -639,6 +639,7 @@ mod tests {
 
     fn text(account: &str, thread: &str, id: &str, sender: &str) -> Message {
         Message {
+            expires_at_ms: None,
             account_id: account.into(),
             thread_id: thread.into(),
             id: id.into(),

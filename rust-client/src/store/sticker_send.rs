@@ -128,6 +128,7 @@ mod live {
                 FailureReason::ConflictingEcho
             );
             let mut message = Message {
+                expires_at_ms: None,
                 account_id: account.into(),
                 thread_id: row.thread,
                 id: ack.server_id.clone(),
@@ -322,6 +323,7 @@ mod tests {
 
     fn echo(thread: &str, id: &str, sticker: StickerDescriptor, stamp: i64) -> Message {
         Message {
+            expires_at_ms: None,
             account_id: "11".into(),
             thread_id: thread.into(),
             id: id.into(),
@@ -351,6 +353,7 @@ mod tests {
             echo("g:22", "900", sticker, 5050),
             echo("d:22", "901", StickerDescriptor::builtin(9), 5051),
             Message {
+                expires_at_ms: None,
                 sender: "22".into(),
                 ..echo("d:22", "902", sticker, 5052)
             },

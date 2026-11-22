@@ -6,6 +6,7 @@ use crate::{
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use std::{
+    collections::BTreeMap,
     future::Future,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -109,6 +110,12 @@ pub trait DirectorySink: Send {
         batch: DirectoryBatch,
     ) -> impl Future<Output = Result<(), DirectoryFailure>> + Send;
 
+    fn preview_cursors(
+        &mut self,
+    ) -> impl Future<Output = Result<BTreeMap<String, String>, DirectoryFailure>> + Send {
+        std::future::ready(Ok(BTreeMap::new()))
+    }
+
     fn apply_preview(
         &mut self,
         batch: DirectoryBatch,
@@ -178,26 +185,44 @@ impl DirectoryFetcher {
             .get(request.service.name())
             .and_then(|list| list.first())
             .ok_or_else(|| failure(stage, DirectoryCategory::Unavailable))?;
-        let plaintext = serde_json::to_vec(&request.parameters).map_err(|_| {
-            schema_failure(
-                stage,
-                wire::PreviewField::EncryptedData,
-                crate::protocol::messaging::FrameReason::OuterData,
-                Some(&request.parameters),
-            )
-        })?;
-        let encrypted = session
-            .encrypt_payload(&plaintext)
-            .map_err(|_| failure(stage, DirectoryCategory::Crypto))?;
-        let url = request
-            .encrypted_url(root, &encrypted, session.client_type())
-            .map_err(|e| wire_failure(stage, e))?;
+        let request_url = |request: &wire::DirectoryRequest| {
+            request
+                .request_url(root, session.client_type())
+                .map_err(|e| wire_failure(stage, e))
+        };
+        let (url, form) = if request.path == wire::GROUP_VERSIONS_PATH {
+            (request_url(&request)?, None)
+        } else {
+            let plaintext = serde_json::to_vec(&request.parameters).map_err(|_| {
+                schema_failure(
+                    stage,
+                    wire::PreviewField::EncryptedData,
+                    crate::protocol::messaging::FrameReason::OuterData,
+                    Some(&request.parameters),
+                )
+            })?;
+            let encrypted = session
+                .encrypt_payload(&plaintext)
+                .map_err(|_| failure(stage, DirectoryCategory::Crypto))?;
+            if request.path == wire::GROUP_DETAILS_PATH {
+                (request_url(&request)?, Some(encrypted))
+            } else {
+                (
+                    request
+                        .encrypted_url(root, &encrypted, session.client_type())
+                        .map_err(|e| wire_failure(stage, e))?,
+                    None,
+                )
+            }
+        };
         let cookie = session
             .authorization_cookie(&url)
             .ok_or_else(|| failure(stage, DirectoryCategory::Unavailable))?;
-        let mut response = self
-            .client
-            .get(url)
+        let request = match form {
+            Some(encrypted) => self.client.post(url).form(&[("params", encrypted)]),
+            None => self.client.get(url),
+        };
+        let mut response = request
             .header(reqwest::header::COOKIE, cookie)
             .send()
             .await
@@ -325,6 +350,47 @@ impl DirectoryFetcher {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
             .unwrap_or(0);
+        // Catch up recent messages before optional contact and group metadata can consume the deadline.
+        let previews = async {
+            let cursors = sink.preview_cursors().await?;
+            let request = wire::previews_request_with_cursors(session.imei(), &cursors)
+                .map_err(|e| wire_failure(DirectoryStage::Previews, e))?;
+            let data = self
+                .fetch(session, request, DirectoryStage::Previews)
+                .await?;
+            let previews =
+                wire::parse_verified_previews(session, &data).map_err(preview_failure)?;
+            let count = previews.messages.len();
+            let unsupported = previews.unsupported_encrypted;
+            let batches = preview_batches(session.account_id(), previews, observed_at_ms)?;
+            for (batch, receipts, forwards, recalls) in batches {
+                sink.apply_preview(batch, receipts, forwards, recalls)
+                    .await?;
+            }
+            let statuses =
+                crate::protocol::read_state::statuses_from_data(session.account_id(), &data);
+            if !statuses.deliveries.is_empty() || !statuses.watermarks.is_empty() {
+                sink.apply_preview_status(statuses.deliveries, statuses.watermarks)
+                    .await?;
+            }
+            Ok::<(usize, usize), DirectoryFailure>((count, unsupported))
+        }
+        .await;
+        match previews {
+            Ok((count, unsupported)) => {
+                report.preview_messages = count;
+                report.unsupported_encrypted = unsupported;
+                report.completed_previews = unsupported == 0;
+            }
+            Err(error) => report.failures.push(error),
+        }
+        if report
+            .failures
+            .iter()
+            .any(|f| f.category == DirectoryCategory::Storage)
+        {
+            return report;
+        }
         let contacts = async {
             let request = wire::friends_request(session.imei())
                 .map_err(|e| wire_failure(DirectoryStage::Friends, e))?;
@@ -377,7 +443,15 @@ impl DirectoryFetcher {
             loop {
                 let request = wire::groups_request(session.imei(), page)
                     .map_err(|e| wire_failure(DirectoryStage::Groups, e))?;
-                let data = self.fetch(session, request, DirectoryStage::Groups).await?;
+                let data = match self.fetch(session, request, DirectoryStage::Groups).await {
+                    Err(error) if page == 1 && error.server_code == Some(604) => {
+                        let groups = self
+                            .fetch_group_details(session, sink, observed_at_ms, &mut report.groups)
+                            .await?;
+                        return Ok::<_, DirectoryFailure>(groups);
+                    }
+                    result => result?,
+                };
                 let parsed = wire::parse_groups(&data, page)
                     .map_err(|e| wire_failure(DirectoryStage::Groups, e))?;
                 let entries: Vec<_> = parsed
@@ -413,38 +487,6 @@ impl DirectoryFetcher {
         {
             return report;
         }
-        let previews = async {
-            let request = wire::previews_request(session.imei())
-                .map_err(|e| wire_failure(DirectoryStage::Previews, e))?;
-            let data = self
-                .fetch(session, request, DirectoryStage::Previews)
-                .await?;
-            let previews =
-                wire::parse_verified_previews(session, &data).map_err(preview_failure)?;
-            let count = previews.messages.len();
-            let unsupported = previews.unsupported_encrypted;
-            let batches = preview_batches(session.account_id(), previews, observed_at_ms)?;
-            for (batch, receipts, forwards, recalls) in batches {
-                sink.apply_preview(batch, receipts, forwards, recalls)
-                    .await?;
-            }
-            let statuses =
-                crate::protocol::read_state::statuses_from_data(session.account_id(), &data);
-            if !statuses.deliveries.is_empty() || !statuses.watermarks.is_empty() {
-                sink.apply_preview_status(statuses.deliveries, statuses.watermarks)
-                    .await?;
-            }
-            Ok::<(usize, usize), DirectoryFailure>((count, unsupported))
-        }
-        .await;
-        match previews {
-            Ok((count, unsupported)) => {
-                report.preview_messages = count;
-                report.unsupported_encrypted = unsupported;
-                report.completed_previews = unsupported == 0;
-            }
-            Err(error) => report.failures.push(error),
-        }
         // Independent optional metadata: a profile failure must never stop messaging
         // or turn a verified hidden policy into an unknown policy.
         if !report
@@ -469,6 +511,34 @@ impl DirectoryFetcher {
             }
         }
         report
+    }
+
+    async fn fetch_group_details<S: DirectorySink>(
+        &self,
+        session: &VerifiedSession,
+        sink: &mut S,
+        observed_at_ms: i64,
+        committed: &mut usize,
+    ) -> Result<usize, DirectoryFailure> {
+        let stage = DirectoryStage::Groups;
+        let data = self
+            .fetch(session, wire::group_versions_request(), stage)
+            .await?;
+        let ids = wire::parse_group_versions(&data).map_err(|e| wire_failure(stage, e))?;
+        let mut complete = true;
+        for chunk in ids.chunks(wire::GROUP_PAGE_SIZE as usize) {
+            let request = wire::group_details_request(chunk).map_err(|e| wire_failure(stage, e))?;
+            let data = self.fetch(session, request, stage).await?;
+            let entries =
+                wire::parse_group_details(&data, chunk).map_err(|e| wire_failure(stage, e))?;
+            complete &= entries.len() == chunk.len();
+            apply_entries(sink, session, entries, observed_at_ms, committed).await?;
+        }
+        if complete {
+            Ok(*committed)
+        } else {
+            Err(failure(stage, DirectoryCategory::Schema))
+        }
     }
 }
 /// Match full scoped identities before any sink call, then move metadata with

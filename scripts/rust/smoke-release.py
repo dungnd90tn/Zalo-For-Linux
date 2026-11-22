@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import tempfile
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 def require(condition, message):
     if not condition:
@@ -22,7 +22,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[2] / "rust-client/target/release/zalo-rust")
     parser.add_argument("--expect-live", action="store_true", help="require optional login/messaging features, while exercising only diagnostics and offline demo")
+    parser.add_argument("--expect-signal-crypto", action="store_true", help="also require the personal E2EE engine to be compiled")
     args = parser.parse_args()
+    expect_live = args.expect_live or args.expect_signal_crypto
+    expected_features = (7 if expect_live else 0) | (24 if args.expect_signal_crypto else 0)
     binary = args.binary.resolve(strict=True)
     env = os.environ.copy()
     env.pop("DISPLAY", None)
@@ -42,8 +45,9 @@ def main():
         require(Path(doctor["diagnostic_log_path"]).is_absolute() and Path(doctor["diagnostic_log_path"]) == log_path, "doctor did not report the selected profile's absolute log path")
         require(not any(doctor[name] for name in ("live_auth_available", "live_send_available", "history_import_available", "display_available")), "capability diagnostics falsely claim availability")
         require(not doctor["authenticated"] and not doctor["network_started"], "diagnostics activated a session or network")
-        require(doctor["live_auth_compiled"] == doctor["live_messaging_compiled"] == args.expect_live, "binary feature configuration differs from the expected build")
-        if not args.expect_live:
+        require(doctor["live_auth_compiled"] == doctor["live_messaging_compiled"] == expect_live, "binary feature configuration differs from the expected build")
+        require(doctor["live_e2ee_compiled"] == args.expect_signal_crypto, "binary E2EE feature differs from the expected build")
+        if not expect_live:
             unsupported = run("--live", check=False)
             require(unsupported.returncode != 0 and "does not include live login" in unsupported.stderr, "default binary accepted live mode")
             require(not any(root.iterdir()), "unsupported live mode created a profile")
@@ -59,6 +63,12 @@ def main():
             originals = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()
         require((count, accounts, threads) == (19, 1, 6), "repeated demo startup changed seeded message identity/count")
         require(len(originals) == 3, "legacy demo messages disappeared")
+        with sqlite3.connect(data / "messages.sqlite3") as conn:
+            conn.executescript("DROP TABLE message_expirations; DROP TABLE outgoing_expirations; PRAGMA user_version=26;")
+        require(json.loads(run("--demo", "--headless").stdout)["messages_loaded"] == 2, "schema 26 upgrade lost demo history")
+        with sqlite3.connect(f"file:{data / 'messages.sqlite3'}?mode=ro", uri=True) as conn:
+            require(conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION, "profile did not upgrade from schema 26")
+            require(conn.execute("SELECT count(*) FROM message_expirations").fetchone()[0] == 0, "schema upgrade assigned deadlines to existing messages")
         with sqlite3.connect(data / "messages.sqlite3") as conn:
             conn.execute("PRAGMA user_version=25")
         require(json.loads(run("--demo", "--headless").stdout)["messages_loaded"] == 2, "schema 25 upgrade lost demo history")
@@ -128,7 +138,7 @@ def main():
             for chunk in iter(lambda: executable.read(1024 * 1024), b""):
                 executable_hash.update(chunk)
         digest = executable_hash.hexdigest()
-        require(all(set(event["build"]) == expected_build and event["build"]["executable_bytes"] == binary.stat().st_size and event["build"]["executable_sha256"] == digest and event["build"]["features"] == (7 if args.expect_live else 0) for event in startup), "diagnostic executable identity does not match the actual build")
+        require(all(set(event["build"]) == expected_build and event["build"]["executable_bytes"] == binary.stat().st_size and event["build"]["executable_sha256"] == digest and event["build"]["features"] == expected_features for event in startup), "diagnostic executable identity does not match the actual build")
         require(all("Existing local history" not in path.read_text() for path in slots), "diagnostics leaked synthetic message contents")
         # Verify main's fallback, not merely the logger's refusal of unsafe paths.
         # The sentinel contains no account data and must never be replaced.
@@ -139,7 +149,7 @@ def main():
         require(json.loads(unavailable.stdout)["network_used"] is False, "unavailable logging prevented local operation")
         require("Diagnostic log unavailable: private path or I/O failure. Intended log: " + str(log_path) in unavailable.stderr, "unavailable logging did not report its fixed warning and intended path")
         require(log_path.parent.read_bytes() == sentinel and sentinel.decode() not in unavailable.stderr, "logger fallback exposed or changed the obstructing path contents")
-        print(json.dumps({"binary_bytes": binary.stat().st_size, "live_features_compiled": args.expect_live, "informational_commands_no_writes": True, "diagnostic_log_path_absolute": True, "diagnostic_lifecycle_and_build_identity": True, "diagnostic_files_private_and_bounded": True, "diagnostic_failure_keeps_local_app_usable": True, "schema_version": SCHEMA_VERSION, "restart_idempotent": True, "seeded_messages": count, "conversations": threads, "legacy_upgrade_preserved_originals_and_local_history": True, "external_lock_refused": True, "profile_permissions_private": True, "network_used": False}))
+        print(json.dumps({"binary_bytes": binary.stat().st_size, "live_features_compiled": expect_live, "live_e2ee_compiled": args.expect_signal_crypto, "informational_commands_no_writes": True, "diagnostic_log_path_absolute": True, "diagnostic_lifecycle_and_build_identity": True, "diagnostic_files_private_and_bounded": True, "diagnostic_failure_keeps_local_app_usable": True, "schema_version": SCHEMA_VERSION, "restart_idempotent": True, "seeded_messages": count, "conversations": threads, "legacy_upgrade_preserved_originals_and_local_history": True, "external_lock_refused": True, "profile_permissions_private": True, "network_used": False}))
 
 
 if __name__ == "__main__":

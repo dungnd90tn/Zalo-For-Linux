@@ -7,6 +7,7 @@ use serde_json::json;
 
 fn message(account: &str, thread: &str, id: &str, time: i64) -> Message {
     Message {
+        expires_at_ms: None,
         mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,

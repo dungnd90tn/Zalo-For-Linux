@@ -283,6 +283,7 @@ impl Drop for CommitLease<'_> {
 #[serde(rename_all = "snake_case")]
 pub enum TargetKind {
     Personal,
+    PersonalSession,
     Group,
 }
 /// Authenticated delivery identity; queue is deliberately not part of it.
@@ -307,7 +308,7 @@ impl InputContext {
         epoch(&self.sender.epoch)?;
         ensure!(
             match self.kind {
-                TargetKind::Personal => self.thread.starts_with("d:"),
+                TargetKind::Personal | TargetKind::PersonalSession => self.thread.starts_with("d:"),
                 TargetKind::Group => self.thread.starts_with("g:"),
             },
             "Input target kind mismatch"
@@ -349,7 +350,8 @@ pub struct InputLocator<'a> {
     pub server_id: &'a str,
     pub sender_uid: &'a str,
     pub sender_platform: Platform,
-    pub registration_id: u16,
+    /// A prekey header exposes this value. Ordinary ciphertext does not.
+    pub registration_id: Option<u16>,
 }
 /// Constructed only after SQL COMMIT. Fields are private; it cannot be forged or
 /// deserialized by protocol callers. Only this receipt may authorize publication/ACK.
@@ -1454,7 +1456,7 @@ impl MessageStore {
         validate_id(locator.thread)?;
         validate_id(locator.server_id)?;
         ensure!(
-            locator.registration_id <= 16383,
+            locator.registration_id.is_none_or(|id| id <= 16383),
             "Invalid input registration ID"
         );
         let row: Option<String> = self
@@ -1474,7 +1476,9 @@ impl MessageStore {
                     && context.server_id == locator.server_id
                     && context.sender.uid == locator.sender_uid
                     && context.sender.platform == locator.sender_platform
-                    && context.registration_id == locator.registration_id,
+                    && locator
+                        .registration_id
+                        .is_none_or(|id| context.registration_id == id),
                 "Ciphertext replay has a different authenticated input context"
             );
             Ok(context)
@@ -1654,6 +1658,10 @@ impl MessageStore {
             ensure!(
                 message.account_id == delta.account && message.thread_id == receive.context.thread,
                 "Crypto receive account mismatch"
+            );
+            ensure!(
+                receive.context.kind != TargetKind::PersonalSession,
+                "Session initialization never publishes chat history"
             );
             message_bytes += message.text.len();
             ensure!(
@@ -2225,6 +2233,7 @@ impl MessageStore {
         );
         let existing:Option<i64>=tx.query_row("SELECT sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",params![owner,thread,server_id],|r|r.get(0)).optional()?;
         let message = Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
@@ -2643,6 +2652,7 @@ mod tests {
     }
     fn message(id: &str) -> Message {
         Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
@@ -2978,7 +2988,7 @@ mod tests {
             server_id: &context.server_id,
             sender_uid: "456",
             sender_platform: Platform::Mobile,
-            registration_id: 0,
+            registration_id: Some(0),
         };
         let restored = store
             .e2ee_lookup_committed_input("123", locator, &cipher)
