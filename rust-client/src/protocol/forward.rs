@@ -278,6 +278,7 @@ mod tests {
                 sender: if owner == "0" { "11" } else { owner }.into(),
                 text: original["message"].as_str().unwrap().into(),
                 sent_at_ms: original["sendDttm"].as_i64().unwrap(),
+                expires_at_ms: None,
                 source_client_id: original["cliMsgId"].as_str().map(str::to_owned),
                 quote: None,
                 media: None,

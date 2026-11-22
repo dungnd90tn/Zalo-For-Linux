@@ -449,7 +449,7 @@ impl Connection {
             report.line("peer: given as a numeric id");
             return Ok(vec![text.to_owned()]);
         }
-        let mut candidates = self.encrypted_peers().await?;
+        let mut candidates = self.encrypted_peers(None).await?;
         // The list repeats a contact (it is in `threads` and in `uids`); each is one contact.
         let mut unique = std::collections::HashSet::new();
         candidates.retain(|uid| unique.insert(uid.clone()));

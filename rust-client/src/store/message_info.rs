@@ -84,6 +84,7 @@ mod tests {
 
     fn message(account: &str, thread: &str, id: &str) -> Message {
         Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,

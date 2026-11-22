@@ -239,6 +239,12 @@ impl Projection {
             LiveEvent::Received { message, .. } if !self.permits(&message.thread_id) => {
                 return None
             }
+            LiveEvent::MessagesExpired { expired, .. } => {
+                expired.retain(|message| self.permits(&message.thread_id));
+                if expired.is_empty() {
+                    return None;
+                }
+            }
             LiveEvent::Opened { conversation, .. } if !self.permits(&conversation.id) => {
                 return None
             }

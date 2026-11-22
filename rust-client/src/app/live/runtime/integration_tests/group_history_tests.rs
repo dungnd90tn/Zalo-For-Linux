@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::Cursor;
+use crate::{domain::Cursor, protocol::remote_history as cloud};
 
 pub(super) fn respond(
     stream: &mut impl Write,
@@ -34,6 +34,13 @@ pub(super) fn respond(
                 None,
             )
         }
+        "/api/cm/getrecentv2" if parameters["src"] == 1 => (
+            json!({"groupId":"22","isOld":false,"hasMore":false,"lastMsgId":"920","groupMsgs":[
+                {"uidFrom":"33","msgId":"920","cliMsgId":"990",
+                 "ts":1760000000920_i64,"msgType":"webchat","content":"Tin mới từ bộ nhớ nhóm"}
+            ]}),
+            Some(10_000_000_000_000_000_u64),
+        ),
         "/api/cm/getrecentv2" => (
             json!({"isOld":1,"hasMore":1,"lastMsgId":"890","groupMsgs":[
                 {"uidFrom":"33","msgId":"900","cliMsgId":"980",
@@ -53,11 +60,16 @@ pub(super) fn respond(
         _ => panic!("unexpected fixture route {route}"),
     };
     let data = if let Some(global_id) = next {
+        let source = if global_id == 10_000_000_000_000_000 {
+            1
+        } else {
+            3
+        };
         assert_eq!(
             parameters,
             json!({
                 "groupId":"22","globalMsgId":global_id,"count":50,"msgIds":[],
-                "imei":"native-fixture","src":3
+                "imei":"native-fixture","src":source
             })
         );
         state.http_sends.fetch_add(1, Ordering::SeqCst);
@@ -76,6 +88,75 @@ pub(super) fn respond(
     .unwrap();
     stream.write_all(&body).unwrap();
     stream.flush().unwrap();
+}
+
+#[tokio::test]
+async fn selected_group_loads_newest_cloud_page_after_authentication() {
+    let fixture = Fixture::new(Reply::GroupHistory);
+    let origin = json!(["https://wpa.zaloapp.com"]);
+    let config = ServerConfig::parse(&json!({
+        "zpw_service_map_v3": {
+            "group":origin,"chat":origin,"conversation":origin,"group_cloud_message":origin
+        },
+        "zpw_ws":["wss://wpa.zaloapp.com"],
+        "settings":{"features":{"cloud_setting":{"enable":true,"load_last_msg_enable":1}}}
+    }))
+    .unwrap();
+    assert!(config.services.contains_key(cloud::LATEST_SERVICE));
+    assert!(!config.services.contains_key(cloud::SERVICE));
+    let session = Arc::new(synthetic_session(fixture.profile.clone(), config));
+    let (commands, requests) = mpsc::channel(16);
+    let (events, mut incoming) = mpsc::channel(64);
+    let (stop, cancel) = watch::channel(false);
+    commands
+        .send(LiveCommand::Load {
+            generation: 7,
+            thread: "g:22".into(),
+            before: None,
+        })
+        .await
+        .unwrap();
+    let task = tokio::spawn(run_with_transports(
+        fixture.profile.clone(),
+        session,
+        requests,
+        events,
+        Arc::new(|| {}),
+        cancel,
+        fixture.transports(),
+    ));
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while let Some(event) = incoming.recv().await {
+            if let LiveEvent::Page {
+                generation: 7,
+                thread,
+                messages,
+                ..
+            } = event
+            {
+                assert_eq!(thread, "g:22");
+                if messages.iter().any(|message| message.id == "920") {
+                    return;
+                }
+            }
+        }
+        panic!("selected group never received its new cloud history");
+    })
+    .await
+    .unwrap();
+    stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 1);
+    let store =
+        MessageStore::open(&fixture.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+    assert!(store
+        .page("11", "g:22", None, 50)
+        .unwrap()
+        .iter()
+        .any(|message| message.id == "920"));
 }
 
 #[tokio::test]

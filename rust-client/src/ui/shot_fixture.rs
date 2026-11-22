@@ -9,7 +9,7 @@
 //!   ZALO_UI_SHOT_SIZE=1200x780 cargo test --locked --offline --lib -- --ignored --exact ui::shot_fixture::demo_screenshot
 //! ```
 //!
-//! Optional: `ZALO_UI_SHOT_SCENE=settings|info|attach|search` (`search` types `ZALO_UI_SHOT_QUERY`,
+//! Optional: `ZALO_UI_SHOT_SCENE=settings|info|attach|search|disappearing` (`search` types `ZALO_UI_SHOT_QUERY`,
 //! default `demo`; `ZALO_UI_SHOT_JUMP=1` opens the oldest hit). `search-pages` seeds 75 matches;
 //! `ZALO_UI_SHOT_OLDER=1` loads its second page. `ZALO_UI_SHOT_POINTER=x,y` (hover),
 //! `ZALO_UI_SHOT_PRESS=1` (hold the press at that point) and `ZALO_UI_SHOT_TABS=n` (keyboard focus).
@@ -89,6 +89,12 @@ impl eframe::App for Shot {
                         .selected
                         .clone()
                         .map(|thread| (crate::app::DEMO_ACCOUNT.into(), thread));
+                }
+                "disappearing" => {
+                    if let Some(message) = self.app.model.messages.last_mut() {
+                        message.expires_at_ms = Some(i64::MAX);
+                        message.reply_blocked = true;
+                    }
                 }
                 _ => {}
             }
@@ -206,6 +212,7 @@ fn demo_screenshot() {
                     .map(|i| Message {
                         mentions: Vec::new(),
                         reply_blocked: false,
+                        expires_at_ms: None,
                         recalled: false,
                         source_client_id: None,
                         quote: None,
@@ -299,6 +306,7 @@ fn seed_shared_items(profile: &Profile) -> anyhow::Result<()> {
             crate::domain::Message {
                 mentions: Vec::new(),
                 reply_blocked: false,
+                expires_at_ms: None,
                 recalled: false,
                 source_client_id: None,
                 quote: None,
@@ -326,6 +334,7 @@ fn seed_shared_items(profile: &Profile) -> anyhow::Result<()> {
         let message = crate::domain::Message {
             mentions: Vec::new(),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             source_client_id: None,
             quote: None,

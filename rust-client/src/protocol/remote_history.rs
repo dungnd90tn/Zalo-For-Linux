@@ -8,7 +8,10 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 pub(crate) const SERVICE: &str = "group_cloud_message";
+pub(crate) const LATEST_SERVICE: &str = "group_cloud_latest";
 const PAGE_SIZE: usize = 50;
+// The PC newest-page MAX_MSG_ID (N398225) passes through JavaScript parseInt (N302120).
+const LATEST_BOUND: u64 = 10_000_000_000_000_000;
 const RECENT: &str = "/api/cm/getrecentv2";
 const OLD: &str = "/api/cm/getoldv2";
 
@@ -19,6 +22,13 @@ pub(crate) struct RemoteCursor {
 }
 
 impl RemoteCursor {
+    pub fn newest() -> Self {
+        Self {
+            id: LATEST_BOUND,
+            old: false,
+        }
+    }
+
     pub fn from_anchor(anchor: &Cursor) -> Result<Self, WireError> {
         if anchor.sent_at_ms <= 0 {
             return Err(WireError::Invalid);
@@ -38,11 +48,24 @@ impl RemoteCursor {
     }
 
     pub fn parameters(self, target: &Target, imei: &str) -> Result<Value, WireError> {
+        self.parameters_with_source(target, imei, 3)
+    }
+
+    pub fn newest_parameters(target: &Target, imei: &str) -> Result<Value, WireError> {
+        Self::newest().parameters_with_source(target, imei, 1)
+    }
+
+    fn parameters_with_source(
+        self,
+        target: &Target,
+        imei: &str,
+        source: u8,
+    ) -> Result<Value, WireError> {
         if target.kind != ThreadKind::Group || self.id == 0 || imei.is_empty() {
             return Err(WireError::Invalid);
         }
         Ok(json!({"groupId":target.remote_id,"globalMsgId":self.id,
-            "count":PAGE_SIZE,"msgIds":[],"imei":imei,"src":3}))
+            "count":PAGE_SIZE,"msgIds":[],"imei":imei,"src":source}))
     }
 }
 
@@ -134,6 +157,35 @@ pub(crate) fn page(
     requested: RemoteCursor,
 ) -> Result<Page, WireError> {
     let (rows, next) = parse_page(session.account_id(), payload, target, anchor, requested)?;
+    Ok(Page {
+        batch: decode_rows(session, rows)?,
+        next,
+    })
+}
+
+pub(crate) fn newest_anchor() -> Cursor {
+    Cursor {
+        id: LATEST_BOUND.to_string(),
+        sent_at_ms: LATEST_BOUND as i64,
+    }
+}
+
+pub(crate) fn newest_page(
+    session: &VerifiedSession,
+    payload: &Value,
+    target: &Target,
+) -> Result<IncomingBatch, WireError> {
+    let (rows, _) = parse_page(
+        session.account_id(),
+        payload,
+        target,
+        &newest_anchor(),
+        RemoteCursor::newest(),
+    )?;
+    decode_rows(session, rows)
+}
+
+fn decode_rows(session: &VerifiedSession, rows: Vec<Value>) -> Result<IncomingBatch, WireError> {
     let batch = wire::incoming_verified_preview(
         session,
         &json!({
@@ -141,7 +193,7 @@ pub(crate) fn page(
         }),
     )
     .map_err(|failure| failure.error)?;
-    Ok(Page { batch, next })
+    Ok(batch)
 }
 
 fn parse_page(
@@ -245,7 +297,9 @@ fn parse_page(
     if last.is_some_and(|id| id > smallest) {
         return Err(WireError::Invalid);
     }
-    let next = if rows.is_empty() && !requested.old && old {
+    let next = if requested == RemoteCursor::newest() {
+        None
+    } else if rows.is_empty() && !requested.old && old {
         // Empty recent→archive changes the endpoint and keeps the same start.
         (requested.id > cutoff).then_some(RemoteCursor {
             id: requested.id,

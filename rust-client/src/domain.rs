@@ -234,6 +234,8 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaDescriptor>,
     pub sent_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
 }
 
 impl Message {
@@ -246,6 +248,12 @@ impl Message {
         validate_id(&self.thread_id)?;
         validate_id(&self.id)?;
         validate_id(&self.sender)?;
+        if self
+            .expires_at_ms
+            .is_some_and(|deadline| self.sent_at_ms <= 0 || deadline <= self.sent_at_ms)
+        {
+            bail!("Invalid message expiration");
+        }
         if self
             .source_client_id
             .as_deref()
@@ -405,6 +413,7 @@ mod tests {
     #[test]
     fn rejects_oversized_text_and_invalid_ids() {
         let mut m = Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,

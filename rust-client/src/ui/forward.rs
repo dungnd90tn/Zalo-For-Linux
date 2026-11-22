@@ -884,6 +884,7 @@ mod tests {
             source_client_id: Some("900".into()),
             mentions: Vec::new(),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             quote: None,
             sticker: None,

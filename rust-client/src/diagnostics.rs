@@ -53,7 +53,7 @@ pub enum Stage {
     Heartbeat,
     Parser,
 }
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
     ResourceLimit,
@@ -85,6 +85,12 @@ pub enum Reason {
     CapabilityTimeout,
     CapabilityChanged,
     CapabilityPagination,
+    EncryptedKeyUnavailable,
+    EncryptedKeyMismatch,
+    EncryptedSessionMissing,
+    EncryptedIdentityChanged,
+    EncryptedContentUnsupported,
+    EncryptedReceiveFailed,
     MessageType,
     FrameLength,
     OuterJson,
@@ -184,6 +190,7 @@ pub enum StorageOperation {
     Conversations,
     ReceiveCursor,
     ReceiveBatch,
+    ExpireMessages,
     ReceiveCursorWrite,
     PersistAck,
     DirectoryRead,
@@ -712,7 +719,8 @@ fn build_identity() -> BuildIdentity {
         features: u8::from(cfg!(feature = "network"))
             | u8::from(cfg!(feature = "live-login")) << 1
             | u8::from(cfg!(feature = "messaging")) << 2
-            | u8::from(cfg!(feature = "signal-store")) << 3,
+            | u8::from(cfg!(feature = "signal-store")) << 3
+            | u8::from(cfg!(feature = "signal-crypto")) << 4,
         executable_bytes: None,
         executable_mtime_s: None,
         executable_sha256: None,

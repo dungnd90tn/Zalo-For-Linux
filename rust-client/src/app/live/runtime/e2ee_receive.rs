@@ -1,10 +1,10 @@
-//! Passive live receive of end-to-end encrypted chat messages (stage 4b of `E2EE_LIVE_PLAN.md`).
+//! Durable receive of personal end-to-end encrypted text, from push or catch-up.
 //!
-//! Opt-in: `ZALO_E2EE_RECEIVE` is an absolute report path. Each pushed `551` message from a peer is
-//! decrypted with the engine and stored in one SQL transaction, then shown like any received message.
+//! An optional report can be written to an absolute `ZALO_E2EE_RECEIVE` path. Each supported
+//! message is decrypted and stored in one SQL transaction, then shown in the conversation.
 //! This code **never acknowledges anything** (no 544, no 545/1): the service keeps redelivering, and a
-//! redelivered ciphertext is recognised and skipped. Own-device messages, non-text messages and a peer whose
-//! identity differs from the trusted one are reported and left alone.
+//! redelivered ciphertext is recognised and skipped. Unsupported content and a peer whose identity differs
+//! from the trusted one remain outside the durable frontier.
 use super::e2ee_send_probe::{convert, platform, GENERATION};
 use super::signal_transport::Report;
 use super::*;
@@ -13,16 +13,31 @@ use crate::{
         personal_ciphertext_digest, personal_ciphertext_from_wire, prekey_sender,
         stored_peer_identity, Cancellation, Coordinator,
     },
+    diagnostics::{self, Kind, Reason, Stage},
     domain::Message,
-    protocol::signal::DevicePlatform,
+    protocol::signal::{Command, DevicePlatform, SessionEvent},
     store::e2ee::{self, GenerationGate, Receive, VerifiedBinding},
 };
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::Arc;
 use zalo_signal_engine as engine;
 
 const QUEUE: &str = "signal-personal";
+const SESSION_RECEIPTS: &str = "signal-personal-session";
+
+struct PersonalInput {
+    kind: e2ee::TargetKind,
+    uid: String,
+    thread: String,
+    server_id: String,
+    device: DevicePlatform,
+    cipher: engine::PersonalCiphertext,
+    target_iid: Option<u16>,
+    sent_ms: u64,
+    cursor: u64,
+}
 
 pub(super) fn target() -> Option<std::path::PathBuf> {
     let path = std::path::PathBuf::from(std::env::var_os("ZALO_E2EE_RECEIVE")?);
@@ -71,8 +86,15 @@ fn describe(message: &Value) -> String {
         "message: msgType {} | sender id {} chars{} | platform {} | content {} chars, {cipher} | e2ee ext [{ext}] | fields {}",
         text("msgType").unwrap_or("?"),
         sender.len(),
-        if sender.starts_with('0') { ", leading zero" } else { "" },
-        message.pointer("/paramsExt/platformType").map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
+        if sender.starts_with('0') {
+            ", leading zero"
+        } else {
+            ""
+        },
+        message
+            .pointer("/paramsExt/platformType")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".into()),
         text("content").map(str::len).unwrap_or(0),
         message.as_object().map(|m| m.len()).unwrap_or(0)
     )
@@ -80,10 +102,86 @@ fn describe(message: &Value) -> String {
 
 enum Outcome {
     Stored,
-    Skipped(String),
+    Duplicate,
+    Skipped(Reason, &'static str),
+}
+
+#[derive(Debug)]
+enum ReceiveError {
+    KeyUnavailable,
+    SessionMissing,
+    IdentityChanged,
+}
+
+impl std::fmt::Display for ReceiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::KeyUnavailable => "this client holds no E2EE key yet",
+            Self::SessionMissing => {
+                "no session with this device and the message does not start one"
+            }
+            Self::IdentityChanged => {
+                "this device presents a different identity than the trusted one"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ReceiveError {}
+
+fn failure_reason(error: &anyhow::Error) -> Reason {
+    match error.downcast_ref::<ReceiveError>() {
+        Some(ReceiveError::KeyUnavailable) => Reason::EncryptedKeyUnavailable,
+        Some(ReceiveError::SessionMissing) => Reason::EncryptedSessionMissing,
+        Some(ReceiveError::IdentityChanged) => Reason::EncryptedIdentityChanged,
+        None => Reason::EncryptedReceiveFailed,
+    }
 }
 
 impl Connection {
+    /// Applies authenticated pairwise session events without publishing or acknowledging them.
+    pub(super) async fn e2ee_receive_session_events(
+        &mut self,
+        records: &[SessionEvent],
+        db: &Database,
+        events: &Events,
+    ) -> bool {
+        if records.is_empty() {
+            return true;
+        }
+        let trace = |command, reason| {
+            diagnostics::record(
+                diagnostics::Event::new(Kind::Debug, Stage::Receive, reason)
+                    .frame(command, 0, None),
+            );
+        };
+        let mut receiver = match self.e2ee_receive.take() {
+            Some(receiver) => receiver,
+            None => {
+                match Receiver::open(self.e2ee_receive_report.as_deref(), db, &self.account).await {
+                    Ok(receiver) => receiver,
+                    Err(error) => {
+                        trace(records[0].source_command, failure_reason(&error));
+                        return false;
+                    }
+                }
+            }
+        };
+        let mut failures = HashSet::new();
+        for event in records {
+            let reason = match receiver.handle_session(event, db, events).await {
+                Ok(Outcome::Stored | Outcome::Duplicate) => continue,
+                Ok(Outcome::Skipped(reason, _)) => reason,
+                Err(error) => failure_reason(&error),
+            };
+            if failures.insert(reason) {
+                trace(event.source_command, reason);
+            }
+        }
+        self.e2ee_receive = Some(receiver);
+        failures.is_empty()
+    }
+
     /// Handles the `msgs[]` of one pushed 551 frame. Best effort: every outcome is a report line.
     pub(super) async fn e2ee_receive_push(
         &mut self,
@@ -91,8 +189,6 @@ impl Connection {
         db: &Database,
         events: &Events,
     ) {
-        // A report file is optional (`ZALO_E2EE_RECEIVE`); without one the work is the same and nothing is logged.
-        let path = self.e2ee_receive_report.clone();
         let Some(messages) = frame
             .payload
             .pointer("/data/msgs")
@@ -100,35 +196,69 @@ impl Connection {
         else {
             return;
         };
+        self.e2ee_receive_batch(messages, db, events, frame.cmd)
+            .await;
+    }
+
+    /// A complete batch is a sequence of committed messages or exact committed replays.
+    /// The caller owns the offline page cursor and may advance it only for a complete batch.
+    pub(super) async fn e2ee_receive_batch(
+        &mut self,
+        messages: &[Value],
+        db: &Database,
+        events: &Events,
+        command: u16,
+    ) -> bool {
         if messages.is_empty() {
-            return;
+            return true;
         }
+        let trace = |reason| {
+            diagnostics::record(
+                diagnostics::Event::new(Kind::Debug, Stage::Receive, reason)
+                    .frame(command, 0, None),
+            );
+        };
+        // A report file is optional (`ZALO_E2EE_RECEIVE`).
+        let path = self.e2ee_receive_report.clone();
         let mut receiver = match self.e2ee_receive.take() {
             Some(receiver) => receiver,
             None => match Receiver::open(path.as_deref(), db, &self.account).await {
                 Ok(receiver) => receiver,
                 Err(error) => {
+                    trace(failure_reason(&error));
                     if let Some(mut report) = path.as_deref().and_then(Report::open) {
                         report.line(&format!("receive: cannot start: {error}"));
                     }
-                    return;
+                    return false;
                 }
             },
         };
+        let mut failures = HashSet::new();
         for message in messages {
             receiver.report.line(&describe(message));
             match receiver.handle(message, db, events).await {
                 Ok(Outcome::Stored) => receiver.report.line("message decrypted and stored"),
-                Ok(Outcome::Skipped(why)) => {
-                    receiver.report.line(&format!("message skipped: {why}"))
+                Ok(Outcome::Duplicate) => receiver.report.line("already stored (redelivery)"),
+                Ok(Outcome::Skipped(reason, why)) => {
+                    if failures.insert(reason) {
+                        trace(reason);
+                    }
+                    receiver.report.line(&format!("message skipped: {why}"));
                 }
                 // `{:#}` prints the whole chain: which step failed, then why.
-                Err(error) => receiver
-                    .report
-                    .line(&format!("message not decrypted: {error:#}")),
+                Err(error) => {
+                    let reason = failure_reason(&error);
+                    if failures.insert(reason) {
+                        trace(reason);
+                    }
+                    receiver
+                        .report
+                        .line(&format!("message not decrypted: {error:#}"));
+                }
             }
         }
         self.e2ee_receive = Some(receiver);
+        failures.is_empty()
     }
 }
 
@@ -142,7 +272,7 @@ impl Receiver {
         let epoch = db
             .call(move |s| s.e2ee_current_local(&owner))
             .await?
-            .ok_or_else(|| anyhow::anyhow!("this client holds no E2EE key yet"))?;
+            .ok_or(ReceiveError::KeyUnavailable)?;
         let local = e2ee::LocalNamespace {
             epoch: epoch.to_string(),
             platform: e2ee::Platform::Pc,
@@ -170,76 +300,224 @@ impl Receiver {
         let text = |name: &str| message.get(name).and_then(Value::as_str);
         // `uidFrom: "0"` marks a message this account sent from another of its own devices (the phone):
         // the sender is then this account, and the conversation is the peer in `idTo`.
-        let from = text("uidFrom").ok_or_else(|| anyhow::anyhow!("no valid sender"))?;
-        let digits = |value: &str| {
-            !value.is_empty()
-                && value.len() <= 24
-                && !value.starts_with('0')
-                && value.bytes().all(|b| b.is_ascii_digit())
-        };
-        let own_device = from == "0";
+        let from = message
+            .get("uidFrom")
+            .ok_or_else(|| anyhow::anyhow!("no valid sender"))?;
+        let own_device = from.as_str() == Some("0") || from.as_u64() == Some(0);
         let uid = if own_device {
             owner.clone()
         } else {
-            from.to_owned()
+            wire::id_string(from).context("invalid encrypted sender")?
         };
+        let raw_to = message
+            .get("idTo")
+            .ok_or_else(|| anyhow::anyhow!("no recipient"))?;
+        // An authenticated inbound personal row may use 0 for the current
+        // account. A row from another own device must name its peer explicitly.
+        let to_self = raw_to.as_str() == Some("0") || raw_to.as_u64() == Some(0);
         let conversation = if own_device {
-            text("idTo")
-                .ok_or_else(|| anyhow::anyhow!("no recipient"))?
-                .to_owned()
+            wire::id_string(raw_to).context("invalid own-device destination")?
         } else {
+            if !to_self {
+                let recipient = wire::id_string(raw_to).context("invalid inbound recipient")?;
+                anyhow::ensure!(recipient == owner, "message targets a different account");
+            }
             uid.clone()
         };
-        anyhow::ensure!(
-            digits(&uid) && digits(&conversation),
-            "no valid sender or conversation"
-        );
         let thread = format!("d:{conversation}");
         let Some(ext) = text("e2ee") else {
             return Ok(Outcome::Skipped(
-                "not an end-to-end encrypted message".into(),
+                Reason::EncryptedContentUnsupported,
+                "not an end-to-end encrypted message",
             ));
         };
         if text("msgType") != Some("webchat") {
             return Ok(Outcome::Skipped(
-                "not a text message (not handled yet)".into(),
+                Reason::EncryptedContentUnsupported,
+                "not a text message (not handled yet)",
+            ));
+        }
+        if wire::message_ttl(message.get("ttl")) != Some(0) {
+            return Ok(Outcome::Skipped(
+                Reason::EncryptedContentUnsupported,
+                "encrypted disappearing message (not handled yet)",
             ));
         }
         // `iid` in the extension is the registration id of the *recipient's* key (this device), as this
         // client also writes it; it is not the sender's. It tells which of our keys the message targets.
-        let target_iid = serde_json::from_str::<Value>(ext)
-            .ok()
-            .and_then(|v| v["iid"].as_u64())
-            .and_then(|v| u16::try_from(v).ok());
+        anyhow::ensure!(ext.len() <= 1024, "invalid E2EE extension");
+        let extension: Value = serde_json::from_str(ext).context("invalid E2EE extension")?;
+        let extension = extension
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("invalid E2EE extension"))?;
+        let target_iid = extension
+            .get("iid")
+            .map(|iid| {
+                iid.as_u64()
+                    .and_then(|value| u16::try_from(value).ok())
+                    .filter(|id| *id <= 16383)
+                    .ok_or_else(|| anyhow::anyhow!("invalid recipient registration"))
+            })
+            .transpose()?;
         let device = DevicePlatform::parse(
             message
                 .pointer("/paramsExt/platformType")
                 .ok_or_else(|| anyhow::anyhow!("no sender device"))?,
         )?;
         let cipher = personal_ciphertext_from_wire(text("content").unwrap_or(""))?;
-        let digest = personal_ciphertext_digest(&cipher);
-        let server_id = text("msgId")
-            .ok_or_else(|| anyhow::anyhow!("no message id"))?
-            .to_owned();
-        let sent_ms: u64 = text("ts").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let cursor: u64 = text("actionId")
-            .or_else(|| text("msgId"))
-            .and_then(|v| v.parse().ok())
-            .filter(|v| *v > 0 && *v <= 9_007_199_254_740_991)
+        let server_id = wire::id_string(
+            message
+                .get("msgId")
+                .ok_or_else(|| anyhow::anyhow!("no message id"))?,
+        )
+        .context("invalid encrypted message id")?;
+        let positive = |value: &Value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str()?.parse().ok())
+                .filter(|value| *value > 0 && *value <= 9_007_199_254_740_991)
+        };
+        let sent_ms = message
+            .get("ts")
+            .and_then(positive)
+            .ok_or_else(|| anyhow::anyhow!("invalid message timestamp"))?;
+        let cursor = message
+            .get("actionId")
+            .or_else(|| message.get("msgId"))
+            .and_then(positive)
             .unwrap_or(1);
+        self.decrypt(
+            PersonalInput {
+                kind: e2ee::TargetKind::Personal,
+                uid,
+                thread,
+                server_id,
+                device,
+                cipher,
+                target_iid,
+                sent_ms,
+                cursor,
+            },
+            db,
+            events,
+        )
+        .await
+    }
+
+    async fn handle_session(
+        &mut self,
+        event: &SessionEvent,
+        db: &Database,
+        events: &Events,
+    ) -> Result<Outcome> {
+        let payload = event.payload();
+        if !(event.command == Command::Init
+            || (event.command == Command::InitAck && payload["type"].as_u64() == Some(1)))
+        {
+            return Ok(Outcome::Skipped(
+                Reason::EncryptedContentUnsupported,
+                "unsupported personal session event",
+            ));
+        }
+        anyhow::ensure!(
+            payload["uidTo"].as_str() == Some(events.account.as_str())
+                && payload["uidFrom"].as_str() == Some(event.sender.as_str())
+                && DevicePlatform::parse(&payload["deviceId"])? == event.device,
+            "Session event account or device scope does not match"
+        );
+        let cipher = personal_ciphertext_from_wire(payload["data"].as_str().unwrap_or(""))?;
+        if !matches!(
+            (event.command, &cipher.message_type),
+            (Command::Init, engine::PersonalMessageType::PreKey)
+                | (Command::InitAck, engine::PersonalMessageType::Whisper)
+        ) {
+            return Ok(Outcome::Skipped(
+                Reason::EncryptedContentUnsupported,
+                "unsupported personal session ciphertext",
+            ));
+        }
+        self.decrypt(
+            PersonalInput {
+                kind: e2ee::TargetKind::PersonalSession,
+                uid: event.sender.clone(),
+                thread: format!("d:{}", event.sender),
+                // A queued/live copy of the same init shares a durable identity.
+                server_id: format!(
+                    "{}:{}:{}",
+                    self.epoch, event.command as u16, event.server_id
+                ),
+                device: event.device,
+                cipher,
+                target_iid: None,
+                sent_ms: event.timestamp,
+                // This is an internal receipt marker. The queue owns its page frontier.
+                cursor: 1,
+            },
+            db,
+            events,
+        )
+        .await
+    }
+
+    async fn decrypt(
+        &mut self,
+        input: PersonalInput,
+        db: &Database,
+        events: &Events,
+    ) -> Result<Outcome> {
+        let PersonalInput {
+            kind,
+            uid,
+            thread,
+            server_id,
+            device,
+            cipher,
+            target_iid,
+            sent_ms,
+            cursor,
+        } = input;
+        let owner = events.account.clone();
+        let session = kind == e2ee::TargetKind::PersonalSession;
+        let queue = if session { SESSION_RECEIPTS } else { QUEUE };
+        let digest = personal_ciphertext_digest(&cipher);
+        let header = matches!(cipher.message_type, engine::PersonalMessageType::PreKey)
+            .then(|| prekey_sender(&cipher.body))
+            .transpose()?;
         let seen = {
             let owner = owner.clone();
-            db.call(move |s| s.e2ee_ciphertext_seen(&owner, &digest))
-                .await?
+            let (thread, server_id, uid) = (thread.clone(), server_id.clone(), uid.clone());
+            db.call(move |s| {
+                Ok(s.e2ee_lookup_committed_input(
+                    &owner,
+                    e2ee::InputLocator {
+                        kind,
+                        thread: &thread,
+                        server_id: &server_id,
+                        sender_uid: &uid,
+                        sender_platform: platform(device),
+                        registration_id: header.map(|(registration, _)| registration),
+                    },
+                    &digest,
+                )?
+                .is_some())
+            })
+            .await?
         };
         if seen {
-            return Ok(Outcome::Skipped("already stored (redelivery)".into()));
+            return Ok(Outcome::Duplicate);
         }
         // The local epoch may have been rotated meanwhile; rebuild the engine for the new one.
         let (current, local_registration) = {
             let owner = owner.clone();
             let epoch = self.epoch;
             db.call(move |s| {
+                if session {
+                    let registered_at = s.e2ee_local_session_timestamp(&owner, epoch)?;
+                    anyhow::ensure!(
+                        sent_ms >= registered_at && sent_ms > 0,
+                        "Session event predates this key"
+                    );
+                }
                 Ok((
                     s.e2ee_current_local(&owner)?,
                     s.e2ee_local_registration(&owner, epoch)?,
@@ -255,7 +533,8 @@ impl Receiver {
         if let (Some(target), Some(ours)) = (target_iid, local_registration) {
             if target != ours {
                 return Ok(Outcome::Skipped(
-                    "encrypted for a different key of this device (the sender used an older registration)".into(),
+                    Reason::EncryptedKeyMismatch,
+                    "encrypted for a different key of this device (the sender used an older registration)",
                 ));
             }
         }
@@ -283,54 +562,59 @@ impl Receiver {
                 },
                 body: cipher.body.clone(),
             };
-            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+            let now_ms = if session {
+                sent_ms
+            } else {
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64
+            };
             db.call(move |store| {
-                let header = matches!(cipher_for_plan.message_type, engine::PersonalMessageType::PreKey)
-                    .then(|| prekey_sender(&cipher_for_plan.body))
-                    .transpose()?;
-                let (namespace, registration, identity, session_ts) =
-                    match store
+                let (namespace, registration, identity, session_ts, first_use) = match store
                     .e2ee_active_peer(&o, &l, &u, platform(device))
                     .context("reading the sender's trusted binding")?
                 {
-                        Some(active) => {
-                            let identity = match header {
-                                Some((_, identity)) => identity,
-                                None => stored_peer_identity(store, &o, &l, &active.namespace)
-                                    .context("reading the sender's stored identity")?,
-                            };
-                            // A prekey header carries the sender's registration id; an ordinary message
-                            // relies on the stored binding.
-                            let sender_registration =
-                                header.map(|(registration, _)| registration).unwrap_or(active.registration_id);
-                            anyhow::ensure!(
-                                active.registration_id == sender_registration
-                                    && active.fingerprint == Sha256::digest(identity).to_vec(),
-                                "this device presents a different identity than the trusted one (identity change is not handled yet)"
-                            );
-                            (active.namespace, active.registration_id, identity, active.session_timestamp)
-                        }
-                        None => {
-                            let (registration, identity) = header.ok_or_else(|| {
-                                anyhow::anyhow!("no session with this device and the message does not start one")
-                            })?;
-                            let namespace = store
-                                .e2ee_register_peer(
+                    Some(active) => {
+                        let identity = match header {
+                            Some((_, identity)) => identity,
+                            None => stored_peer_identity(store, &o, &l, &active.namespace)
+                                .context("reading the sender's stored identity")?,
+                        };
+                        // A prekey header carries the sender's registration id; an ordinary message
+                        // relies on the stored binding.
+                        let sender_registration = header
+                            .map(|(registration, _)| registration)
+                            .unwrap_or(active.registration_id);
+                        anyhow::ensure!(
+                            active.registration_id == sender_registration
+                                && active.fingerprint == Sha256::digest(identity).to_vec(),
+                            ReceiveError::IdentityChanged
+                        );
+                        (
+                            active.namespace,
+                            active.registration_id,
+                            identity,
+                            active.session_timestamp,
+                            false,
+                        )
+                    }
+                    None => {
+                        let (registration, identity) =
+                            header.ok_or(ReceiveError::SessionMissing)?;
+                        let (namespace, session_ts) = store
+                            .e2ee_reserve_first_use_peer(
                                 &o,
                                 &l,
                                 &u,
-                                None,
                                 &VerifiedBinding {
                                     platform: platform(device),
                                     registration_id: registration,
                                     identity_key: identity,
                                     session_timestamp: now_ms,
                                 },
-                                )
-                                .context("recording the sender")?;
-                            (namespace, registration, identity, now_ms)
-                        }
-                    };
+                            )
+                            .context("reserving the sender's untrusted binding")?;
+                        (namespace, registration, identity, session_ts, true)
+                    }
+                };
                 let trust = engine::TrustDecision {
                     peer: convert(&namespace).context("building the trust decision")?,
                     registration_id: registration,
@@ -338,8 +622,45 @@ impl Receiver {
                     session_timestamp: session_ts,
                     basis: engine::TrustBasis::AuthenticatedFirstUse,
                 };
-                co.plan_receive(store, trust, cipher_for_plan, sent_ms, &th, &sid, QUEUE, &g, &c)
-                    .context("planning the decryption")
+                let plan = if session {
+                    co.plan_receive_session(
+                        store,
+                        trust,
+                        cipher_for_plan,
+                        sent_ms,
+                        &th,
+                        &sid,
+                        queue,
+                        &g,
+                        &c,
+                        first_use,
+                    )
+                } else if first_use {
+                    co.plan_receive_first_use(
+                        store,
+                        trust,
+                        cipher_for_plan,
+                        sent_ms,
+                        &th,
+                        &sid,
+                        queue,
+                        &g,
+                        &c,
+                    )
+                } else {
+                    co.plan_receive(
+                        store,
+                        trust,
+                        cipher_for_plan,
+                        sent_ms,
+                        &th,
+                        &sid,
+                        queue,
+                        &g,
+                        &c,
+                    )
+                };
+                plan.context("planning the decryption")
             })
             .await
         };
@@ -357,30 +678,37 @@ impl Receiver {
             .await;
         self.coordinator = Some(coordinator);
         let verified = verified?;
-        let plaintext = String::from_utf8(verified.plaintext().to_vec())
-            .map_err(|_| anyhow::anyhow!("the decrypted message is not text"))?;
-        let stored = Message {
-            mentions: Vec::new(),
-            reply_blocked: false,
-            recalled: false,
-            source_client_id: None,
-            quote: None,
-            account_id: owner.clone(),
-            thread_id: thread,
-            id: server_id,
-            sender: uid,
-            text: plaintext,
-            sticker: None,
-            media: None,
-            sent_at_ms: i64::try_from(sent_ms).unwrap_or(0),
+        let stored = if session {
+            validate_session_plaintext(verified.plaintext())?;
+            None
+        } else {
+            let plaintext = String::from_utf8(verified.plaintext().to_vec())
+                .map_err(|_| anyhow::anyhow!("the decrypted message is not text"))?;
+            Some(Message {
+                mentions: Vec::new(),
+                reply_blocked: false,
+                recalled: false,
+                source_client_id: None,
+                quote: None,
+                account_id: owner.clone(),
+                thread_id: thread,
+                id: server_id,
+                sender: uid,
+                text: plaintext,
+                sticker: None,
+                media: None,
+                sent_at_ms: i64::try_from(sent_ms).unwrap_or(0),
+                expires_at_ms: None,
+            })
         };
         let gate = self.gate.clone();
         let published = db
             .call(move |store| {
+                verified.check_preparation()?;
                 let receipt = store.e2ee_commit_receive(
                     Receive {
                         delta: verified.delta(),
-                        messages: std::slice::from_ref(&stored),
+                        messages: stored.as_slice(),
                         queue: verified.queue(),
                         cursor,
                         context: verified.context().clone(),
@@ -400,9 +728,31 @@ impl Receiver {
                 })
                 .await?;
         }
-        (events.repaint)();
+        if !session {
+            (events.repaint)();
+        }
         Ok(Outcome::Stored)
     }
+}
+
+fn validate_session_plaintext(bytes: &[u8]) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Init {
+        #[serde(rename = "subDevice")]
+        devices: Vec<u8>,
+    }
+    anyhow::ensure!(bytes.len() <= 128, "Invalid session plaintext length");
+    let init: Init = serde_json::from_slice(bytes).context("Invalid session plaintext")?;
+    let mut seen = [false; 3];
+    for device in init.devices {
+        let flag = seen
+            .get_mut(usize::from(device))
+            .context("Invalid session platform")?;
+        anyhow::ensure!(!*flag, "Duplicate session platform");
+        *flag = true;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -703,13 +1053,326 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("already stored (redelivery)"), "{text}");
-        // Both repeated ciphertexts (even under another sender id) are recognised and skipped.
+        // Redelivery is durable only for the original authenticated scope.
         assert_eq!(
             text.matches("already stored (redelivery)").count(),
-            2,
+            1,
+            "{text}"
+        );
+        assert!(
+            text.contains("different authenticated input context"),
             "{text}"
         );
         assert!(text.contains("not a text message"), "{text}");
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_first_use_does_not_activate_peer_or_advance_the_cursor() {
+        let scratch =
+            std::env::temp_dir().join(format!("zalo-recv-first-use-{:x}", rand::random::<u64>()));
+        std::fs::create_dir(&scratch).unwrap();
+        let profile = Arc::new(crate::profile::Profile::at_root(&scratch, "fixture").unwrap());
+        let db_path = profile.paths.data_dir.join("messages.sqlite");
+        let db = Database::open(profile.clone(), "11".into()).await.unwrap();
+        assert!(Receiver::open(None, &db, "11").await.is_err());
+        drop(db);
+        let bundle = install_receiver(&db_path).await;
+        let wires = peer_sends(&scratch.join("peer.sqlite"), "101", &["Tin thử"], &bundle).await;
+        let mut row = msg(7001, &wires[0], "101", "webchat", bundle.registration_id);
+        row["idTo"] = json!("0");
+        let db = Database::open(profile, "11".into()).await.unwrap();
+        let mut receiver = Receiver::open(None, &db, "11").await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let events = Events {
+            unread: None,
+            account: "11".into(),
+            tx,
+            repaint: Arc::new(|| {}),
+            privacy: Default::default(),
+        };
+        let observer = rusqlite::Connection::open(&db_path).unwrap();
+        observer.execute_batch("CREATE TRIGGER block_chat BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT,'synthetic commit rejection'); END;").unwrap();
+        assert!(receiver.handle(&row, &db, &events).await.is_err());
+        assert!(rx.try_recv().is_err());
+        let local = receiver.local.clone();
+        db.call(move |store| {
+            assert!(store
+                .e2ee_active_peer("11", &local, "101", e2ee::Platform::Mobile)?
+                .is_none());
+            assert_eq!(store.receive_cursor("11", QUEUE)?, "1");
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        observer.execute_batch("DROP TRIGGER block_chat").unwrap();
+        assert!(matches!(
+            receiver.handle(&row, &db, &events).await.unwrap(),
+            Outcome::Stored
+        ));
+        assert!(
+            matches!(rx.try_recv(), Ok(LiveEvent::Received { message, .. }) if message.id == "7001")
+        );
+        assert!(matches!(
+            receiver.handle(&row, &db, &events).await.unwrap(),
+            Outcome::Duplicate
+        ));
+        row["idTo"] = json!(0);
+        assert!(matches!(
+            receiver.handle(&row, &db, &events).await.unwrap(),
+            Outcome::Duplicate
+        ));
+        row["uidFrom"] = json!("0");
+        assert!(receiver.handle(&row, &db, &events).await.is_err());
+        row["uidFrom"] = json!("101");
+        let mut wrong_recipient = row.clone();
+        wrong_recipient["idTo"] = json!("33");
+        assert!(receiver
+            .handle(&wrong_recipient, &db, &events)
+            .await
+            .is_err());
+        assert!(rx.try_recv().is_err());
+        drop(observer);
+        drop(db);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_personal_catchup_commits_only_the_durable_prefix_without_ack() {
+        let scratch =
+            std::env::temp_dir().join(format!("zalo-recv-catchup-{:x}", rand::random::<u64>()));
+        std::fs::create_dir(&scratch).unwrap();
+        let profile = Arc::new(crate::profile::Profile::at_root(&scratch, "fixture").unwrap());
+        let db_path = profile.paths.data_dir.join("messages.sqlite");
+        let bundle = install_receiver(&db_path).await;
+        let wires = peer_sends(
+            &scratch.join("peer.sqlite"),
+            "101",
+            &["Tin trước", "Tin sau"],
+            &bundle,
+        )
+        .await;
+        let iid = bundle.registration_id;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            z.write_all(br#"{"error_code":0,"data":{"qCmds":[{"cmd":513,"subCmd":0}]}}"#)
+                .unwrap();
+            socket.send(tungstenite::Message::Binary(wire::encode_frame(1, 0, &json!({
+                "error_code":0,"key":STANDARD.encode([7u8;32]),"encrypt":1,"data":STANDARD.encode(z.finish().unwrap())
+            })).unwrap())).await.unwrap();
+
+            for (first, requested, next, rows) in [
+                (
+                    true,
+                    1,
+                    8002,
+                    vec![msg(8001, &wires[0], "101", "webchat", iid)],
+                ),
+                (
+                    false,
+                    8002,
+                    8006,
+                    vec![
+                        msg(8003, &wires[1], "101", "webchat", iid),
+                        msg(8005, "", "101", "chat.sticker", iid),
+                    ],
+                ),
+            ] {
+                let Some(Ok(tungstenite::Message::Binary(request))) = socket.next().await else {
+                    panic!("expected encrypted catch-up request");
+                };
+                assert_eq!(&request[..4], &[1, 1, 2, 0]);
+                let request: Value = serde_json::from_slice(&request[4..]).unwrap();
+                assert_eq!(request["first"], first);
+                assert_eq!(request["lastId"], requested);
+                let response = wire::encode_frame(
+                    513,
+                    0,
+                    &json!({
+                        "error_code":0,"encrypt":0,"data": {"error_code":0,"data": {
+                            "msgs":rows,"more":first,"lastActionId":next,"reqId":request["reqId"]
+                        }}
+                    }),
+                )
+                .unwrap();
+                socket
+                    .send(tungstenite::Message::Binary(response))
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err()
+            );
+        });
+        let db = Database::open(profile, "11".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let events = Events {
+            unread: None,
+            account: "11".into(),
+            tx,
+            repaint: Arc::new(|| {}),
+            privacy: Default::default(),
+        };
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let mut connection = Connection::connected(socket, "11");
+        for _ in 0..3 {
+            let frame = connection.next().await.unwrap().unwrap();
+            connection.process(frame, &db, &events).await.unwrap();
+        }
+        service.await.unwrap();
+        let mut ids = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let LiveEvent::Received { message, .. } = event {
+                ids.push(message.id);
+            }
+        }
+        assert_eq!(ids, ["8001", "8003"]);
+        db.call(move |store| {
+            let epoch = store.e2ee_current_local("11")?.unwrap();
+            assert_eq!(
+                store.receive_cursor("11", &format!("signal-pc-513_0-{epoch}"))?,
+                "8002"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(db);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_session_catchup_unlocks_ordinary_incoming_message_without_ack() {
+        let scratch =
+            std::env::temp_dir().join(format!("zalo-recv-session-{:x}", rand::random::<u64>()));
+        std::fs::create_dir(&scratch).unwrap();
+        let profile = Arc::new(crate::profile::Profile::at_root(&scratch, "fixture").unwrap());
+        let db_path = profile.paths.data_dir.join("messages.sqlite");
+        let bundle = install_receiver(&db_path).await;
+        let wires = peer_sends(
+            &scratch.join("peer.sqlite"),
+            "101",
+            &[super::super::e2ee_init_devices::INIT_TEXT, "Tin đến từ bạn"],
+            &bundle,
+        )
+        .await;
+        let ordinary = crate::app::live::signal_crypto::ordinary_fixture_from_prekey(&wires[1]);
+        let session = json!({
+            "cmd":543,"msgId":"8010",
+            "sessionData":{
+                "uidFrom":"101","uidTo":"11","deviceId":0,"reqServerTs":1700000000000u64,
+                "data":wires[0]
+            }
+        });
+        let personal = msg(8011, &ordinary, "101", "webchat", bundle.registration_id);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            z.write_all(br#"{"error_code":0,"data":{"qCmds":[{"cmd":513,"subCmd":0},{"cmd":516,"subCmd":0}]}}"#)
+                .unwrap();
+            let auth = wire::encode_frame(
+                1,
+                0,
+                &json!({
+                    "error_code":0,"key":STANDARD.encode([7u8;32]),"encrypt":1,
+                    "data":STANDARD.encode(z.finish().unwrap())
+                }),
+            )
+            .unwrap();
+            socket
+                .send(tungstenite::Message::Binary(auth))
+                .await
+                .unwrap();
+            for (command, mut page) in [
+                (
+                    516u16,
+                    json!({"eesession":[session],"lastActionId":"8010","more":false}),
+                ),
+                (
+                    513,
+                    json!({"msgs":[personal],"lastActionId":"8012","more":false}),
+                ),
+            ] {
+                let Some(Ok(tungstenite::Message::Binary(request))) = socket.next().await else {
+                    panic!("expected encrypted catch-up request");
+                };
+                assert_eq!(&request[1..3], &command.to_le_bytes());
+                let request: Value = serde_json::from_slice(&request[4..]).unwrap();
+                page["reqId"] = request["reqId"].clone();
+                let reply = wire::encode_frame(
+                    command,
+                    0,
+                    &json!({
+                        "error_code":0,"encrypt":0,"data":{"error_code":0,"data":page}
+                    }),
+                )
+                .unwrap();
+                socket
+                    .send(tungstenite::Message::Binary(reply))
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .is_err()
+            );
+        });
+        let db = Database::open(profile, "11".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let events = Events {
+            unread: None,
+            account: "11".into(),
+            tx,
+            repaint: Arc::new(|| {}),
+            privacy: Default::default(),
+        };
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let mut connection = Connection::connected(socket, "11");
+        for _ in 0..3 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), connection.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            connection.process(frame, &db, &events).await.unwrap();
+        }
+        service.await.unwrap();
+        let received: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                LiveEvent::Received { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].thread_id, "d:101");
+        assert_eq!(received[0].sender, "101");
+        assert_eq!(received[0].text, "Tin đến từ bạn");
+        db.call(|store| {
+            let epoch = store.e2ee_current_local("11")?.unwrap();
+            assert_eq!(
+                store.receive_cursor("11", &format!("signal-pc-513_0-{epoch}"))?,
+                "8012"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(db);
         std::fs::remove_dir_all(scratch).unwrap();
     }
 

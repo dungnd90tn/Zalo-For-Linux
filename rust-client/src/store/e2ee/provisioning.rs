@@ -687,6 +687,21 @@ impl MessageStore {
             )
             .optional()?)
     }
+    pub(crate) fn e2ee_local_session_timestamp(
+        &self,
+        owner: &str,
+        local_epoch: u64,
+    ) -> Result<u64> {
+        account(owner)?;
+        self.conn
+            .query_row(
+                "SELECT session_ts FROM e2ee_local_epochs WHERE account=?1 AND epoch=?2",
+                params![owner, integer(local_epoch)?],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     /// The current local epoch, if any. Read-only.
     pub fn e2ee_current_local(&self, owner: &str) -> Result<Option<u64>> {
         account(owner)?;
@@ -1171,6 +1186,7 @@ mod tests {
             .unwrap();
         store
             .insert_batch(&[Message {
+                expires_at_ms: None,
                 mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,

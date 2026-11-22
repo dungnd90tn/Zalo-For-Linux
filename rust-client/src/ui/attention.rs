@@ -165,7 +165,8 @@ impl Attention {
             LiveEvent::NotificationOpen { thread, .. } => self.activation = Some(thread.clone()),
             LiveEvent::ReadStateChanged { .. }
             | LiveEvent::Recalled { .. }
-            | LiveEvent::DeletedForMe { .. } => self.dirty = true,
+            | LiveEvent::DeletedForMe { .. }
+            | LiveEvent::MessagesExpired { .. } => self.dirty = true,
             LiveEvent::ReadState {
                 generation,
                 unread,

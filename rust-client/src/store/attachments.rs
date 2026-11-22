@@ -602,6 +602,7 @@ impl MessageStore {
         }
         let existing:Option<i64>=tx.query_row("SELECT sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",params![account,thread,server],|row|row.get(0)).optional()?;
         let mut message = Message {
+            expires_at_ms: None,
             account_id: account.into(),
             thread_id: thread.clone(),
             id: server,

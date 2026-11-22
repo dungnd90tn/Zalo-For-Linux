@@ -135,6 +135,7 @@ fn seed(fixture: &Fixture) -> PathBuf {
             sender: "33".into(),
             text: TEXT.into(),
             sent_at_ms: 1760000000079,
+            expires_at_ms: None,
             source_client_id: Some("990".into()),
             mentions: Vec::new(),
             reply_blocked: false,

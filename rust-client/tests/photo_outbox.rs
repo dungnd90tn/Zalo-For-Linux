@@ -66,6 +66,7 @@ fn own(server: &str, content: &MediaMessageContent, ts: i64) -> Message {
         source_client_id: None,
         mentions: Vec::new(),
         reply_blocked: true,
+        expires_at_ms: None,
         recalled: false,
         quote: None,
         sticker: None,

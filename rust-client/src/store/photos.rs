@@ -819,6 +819,7 @@ impl MessageStore {
         }
         let existing:Option<i64>=tx.query_row("SELECT sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",params![account,thread,server],|row|row.get(0)).optional()?;
         let mut message = Message {
+            expires_at_ms: None,
             account_id: account.into(),
             thread_id: thread.clone(),
             id: server,
@@ -1002,6 +1003,7 @@ mod tests {
         // which locally submitted album member the notice names.
         let second_resource = resource(second, other);
         let echo = Message {
+            expires_at_ms: None,
             account_id: "11".into(),
             thread_id: "d:22".into(),
             id: "903".into(),

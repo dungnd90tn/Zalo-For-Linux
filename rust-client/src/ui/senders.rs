@@ -261,6 +261,7 @@ mod cache {
                 .map(|i| Message {
                     mentions: Vec::new(),
                     reply_blocked: false,
+                    expires_at_ms: None,
                     recalled: false,
                     source_client_id: None,
                     quote: None,
@@ -372,6 +373,7 @@ mod tests {
         Message {
             mentions: Vec::new(),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             source_client_id: None,
             quote: None,

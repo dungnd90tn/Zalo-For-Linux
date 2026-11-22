@@ -109,6 +109,46 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
     Ok(())
 }
 impl MessageStore {
+    #[cfg(feature = "messaging")]
+    pub(crate) fn preview_cursors(
+        &self,
+        account: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        use crate::protocol::{directory::MAX_PREVIEW_CURSORS, messaging};
+
+        validate_id(account)?;
+        let mut query = self.conn.prepare_cached(
+            "SELECT c.thread_id, m.message_id FROM conversations c
+             JOIN messages m ON m.rowid=(SELECT recent.rowid FROM messages recent
+                 WHERE recent.account_id=c.account_id AND recent.thread_id=c.thread_id
+                 AND length(recent.message_id) BETWEEN 1 AND 24
+                 AND substr(recent.message_id,1,1) BETWEEN '1' AND '9'
+                 AND recent.message_id NOT GLOB '*[^0-9]*'
+                 AND NOT EXISTS(SELECT 1 FROM message_expirations expiry
+                     WHERE expiry.account_id=recent.account_id AND expiry.thread_id=recent.thread_id
+                     AND expiry.message_id=recent.message_id)
+                 ORDER BY recent.sent_at_ms DESC,recent.message_id DESC LIMIT 1)
+             WHERE c.account_id=?1 AND c.thread_id GLOB '[dg]:[1-9]*'
+             AND NOT EXISTS(SELECT 1 FROM temp.live_privacy p WHERE p.account_id=c.account_id AND p.ready=0)
+             AND NOT EXISTS(SELECT 1 FROM temp.live_hidden h WHERE h.account_id=c.account_id AND h.thread_id=c.thread_id)
+             AND NOT EXISTS(SELECT 1 FROM e2ee_threads e WHERE e.account_id=c.account_id AND e.thread_id=c.thread_id)
+             AND NOT EXISTS(SELECT 1 FROM group_left l WHERE l.account_id=c.account_id AND l.thread_id=c.thread_id)
+             ORDER BY c.last_message_at_ms DESC,c.thread_id LIMIT ?2",
+        )?;
+        let rows = query.query_map(params![account, MAX_PREVIEW_CURSORS as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut cursors = std::collections::BTreeMap::new();
+        for row in rows {
+            let (thread, id) = row?;
+            if let Ok(target) = messaging::Target::from_thread(&thread) {
+                let group = u8::from(target.kind == messaging::ThreadKind::Group);
+                cursors.insert(format!("{}_{}", target.remote_id, group), id);
+            }
+        }
+        Ok(cursors)
+    }
+
     /// Direct contacts whose (alias-aware) display name contains `query`, accent- and case-insensitive,
     /// limited to `among`. Used to pick a peer by the name the user knows, not by UID.
     #[cfg(feature = "messaging")]
@@ -375,6 +415,14 @@ impl MessageStore {
             result
         };
         let tx = self.conn.transaction()?;
+        let now = super::expiration::now_ms();
+        if !batch.message_quotes.is_empty()
+            || batch.messages.iter().any(|message| message.quote.is_some())
+        {
+            for message in &batch.messages {
+                super::expiration::record(&tx, message)?;
+            }
+        }
         #[cfg(feature = "messaging")]
         let changes = {
             if _notices.len() > MAX_PAGE_SIZE {
@@ -487,6 +535,23 @@ impl MessageStore {
             let info = infos.get(&key).copied();
             let media = media_map.get(&key).copied();
             let quote = quotes.get(&key).copied();
+            let expiry = super::expiration::record(&tx, source)?;
+            #[cfg(feature = "messaging")]
+            let forward = forwards.get(&key).copied();
+            #[cfg(not(feature = "messaging"))]
+            let forward = None;
+            if super::expiration::expired(expiry, now)
+                || (expiry.is_some()
+                    && !super::expiration::supports_text(
+                        source,
+                        info.is_some()
+                            || media.is_some()
+                            || quote.is_some()
+                            || super::expiration::structured_forward(forward),
+                    ))
+            {
+                continue;
+            }
             #[cfg(feature = "messaging")]
             let redacted = {
                 let plain = info.is_none()
@@ -515,7 +580,7 @@ impl MessageStore {
                 )),
             )?;
             #[cfg(feature = "messaging")]
-            if let Some(marker) = forwards.get(&key).filter(|_| !recalled) {
+            if let Some(marker) = forward.filter(|_| !recalled && expiry.is_none()) {
                 super::forward::persist(&tx, message, marker)?;
             }
             super::message_reply::persist(&tx, message, quote.filter(|_| !recalled))?;
@@ -770,6 +835,7 @@ mod tests {
     }
     fn message(account: &str, id: &str, text: &str) -> Message {
         Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
@@ -784,6 +850,35 @@ mod tests {
             media: None,
             sent_at_ms: 100,
         }
+    }
+
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn preview_cursors_use_latest_scoped_ids_and_omit_hidden_threads() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let mut direct = message("11", "12345678901234567890", "Tin riêng");
+        direct.sent_at_ms = 10;
+        let mut local = message("11", "local-draft", "Tin mẫu");
+        local.sent_at_ms = 11;
+        let mut group = message("11", "98765432109876543210", "Tin nhóm");
+        group.thread_id = "g:12".into();
+        let mut hidden = message("11", "90", "Tin ẩn");
+        hidden.thread_id = "d:13".into();
+        let other_account = message("33", "91", "Tài khoản khác");
+        store
+            .insert_batch(&[direct, local, group, hidden, other_account])
+            .unwrap();
+        store
+            .replace_live_privacy("11", &["d:13".into()], None)
+            .unwrap();
+        assert_eq!(
+            store.preview_cursors("11").unwrap(),
+            [
+                ("12_0".into(), "12345678901234567890".into()),
+                ("12_1".into(), "98765432109876543210".into()),
+            ]
+            .into()
+        );
     }
     fn batch(account: &str, name: &str) -> DirectoryBatch {
         DirectoryBatch {

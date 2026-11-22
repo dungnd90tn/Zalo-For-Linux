@@ -170,6 +170,7 @@ mod tests {
 
     fn group_message(id: &str, client: u64, mentions: Vec<Mention>) -> Message {
         Message {
+            expires_at_ms: None,
             account_id: "11".into(),
             thread_id: "g:33".into(),
             id: id.into(),
@@ -279,11 +280,13 @@ mod tests {
             .unwrap();
         assert_eq!(state(&reopened, client), "unknown");
         let typed = Message {
+            expires_at_ms: None,
             mentions: vec![all],
             reply_blocked: true,
             ..plain
         };
         let wrong_thread = Message {
+            expires_at_ms: None,
             thread_id: "d:33".into(),
             ..typed.clone()
         };

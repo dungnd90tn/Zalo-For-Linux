@@ -21,6 +21,7 @@ fn fixture(ctx: &egui::Context) -> (NativeApp, std::path::PathBuf) {
     app.model.messages = vec![Message {
         mentions: Vec::new(),
         reply_blocked: false,
+        expires_at_ms: None,
         recalled: false,
         source_client_id: None,
         quote: None,

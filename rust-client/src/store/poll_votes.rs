@@ -129,6 +129,7 @@ mod tests {
         )
         .unwrap();
         let message = Message {
+            expires_at_ms: None,
             account_id: account.into(),
             thread_id: thread.into(),
             id: id.into(),

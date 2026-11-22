@@ -143,7 +143,7 @@ Chế độ demo dùng hội thoại giả lập, không kết nối đến Zalo
 ./scripts/rust/run.sh --live
 ```
 
-Script biên dịch với các tính năng kết nối rồi mở ứng dụng. Ở lần đầu, quét mã QR và xác nhận đăng nhập trên điện thoại; những lần sau ứng dụng tự kiểm tra phiên đã lưu. Tab số điện thoại hiện chỉ cung cấp thông tin: **chưa hỗ trợ đăng nhập bằng số điện thoại**.
+Script biên dịch với các tính năng kết nối và bộ giải mã Signal rồi mở ứng dụng. Ở lần đầu, quét mã QR và xác nhận đăng nhập trên điện thoại. Những lần sau ứng dụng tự kiểm tra phiên đã lưu. Đăng nhập bằng số điện thoại chưa khả dụng.
 
 Sau khi biên dịch bản live, có thể chạy trực tiếp mà không cần Cargo:
 
@@ -151,7 +151,7 @@ Sau khi biên dịch bản live, có thể chạy trực tiếp mà không cần
 ./rust-client/target/release/zalo-rust --live
 ```
 
-Chế độ live kết nối đến Zalo bằng hồ sơ đã chọn. Bản mặc định/demo không bao gồm các thành phần HTTP, WebSocket và mô-đun xác thực tùy chọn. Bản live cũng chưa kích hoạt thành phần Signal đang thử nghiệm.
+Để tự biên dịch bản live có hỗ trợ nhận văn bản mã hóa đầu cuối ở chat riêng, dùng `./scripts/rust/build.sh --offline --features live,signal-crypto`. Lệnh `--doctor` báo `live_e2ee_compiled` để xác nhận bản đang chạy có bộ giải mã. Việc tải bù cần khóa PC đang hoạt động và tin Zalo còn giữ cho thiết bị đó.
 
 ### Mở hội thoại đã ẩn
 
@@ -164,7 +164,7 @@ Nhập tên trong ô tìm kiếm, chọn kết quả hội thoại ẩn rồi nh
 Biên dịch bản live ngay trước khi cài: mục trong menu chạy với `--live`, trong khi một lần biên dịch mặc định/demo sau đó có thể ghi đè tệp thực thi trong thư mục mã nguồn.
 
 ```bash
-./scripts/rust/build.sh --offline --features live
+./scripts/rust/build.sh --offline --features live,signal-crypto
 python3 scripts/rust/install-desktop.py --dry-run
 python3 scripts/rust/install-desktop.py
 ```

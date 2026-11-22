@@ -141,6 +141,7 @@ fn short_bubbles_hug_content_and_long_messages_stay_inside_wide_and_compact_boun
                                 &Message {
                                     mentions: Vec::new(),
                                     reply_blocked: false,
+                                    expires_at_ms: None,
                                     recalled: false,
                                     source_client_id: None,
                                     quote: None,
@@ -265,6 +266,7 @@ fn sticker_messages_have_no_bubble_and_fit_the_picture() {
                             &Message {
                                 mentions: Vec::new(),
                                 reply_blocked: false,
+                                expires_at_ms: None,
                                 recalled: false,
                                 source_client_id: None,
                                 quote: None,

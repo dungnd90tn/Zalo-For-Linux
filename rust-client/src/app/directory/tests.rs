@@ -53,6 +53,7 @@ enum Scenario {
     Normal,
     LargeMetadata,
     PartialMetadata,
+    GroupsV4,
     UnsafeRedirect,
     Oversize,
     Stall,
@@ -212,13 +213,50 @@ fn serve(
                 .map(|(_, value)| value.trim().to_owned())
         })
         .unwrap_or_default();
-    let ciphertext = url
-        .query_pairs()
-        .find(|(key, _)| key == "params")
-        .unwrap()
-        .1
-        .into_owned();
-    let parameters = String::from_utf8(oracle("decrypt", &ciphertext)).unwrap();
+    let parameters = match url.path() {
+        wire::GROUP_VERSIONS_PATH => {
+            assert!(head.starts_with("GET "));
+            assert!(url
+                .query_pairs()
+                .all(|(key, _)| key == "zpw_ver" || key == "zpw_type"));
+            "null".to_owned()
+        }
+        wire::GROUP_DETAILS_PATH => {
+            assert!(head.starts_with("POST "));
+            assert!(head
+                .to_ascii_lowercase()
+                .contains("content-type: application/x-www-form-urlencoded"));
+            assert!(url
+                .query_pairs()
+                .all(|(key, _)| key == "zpw_ver" || key == "zpw_type"));
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (field, value) = line.split_once(':')?;
+                    field
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            assert!(length <= 16 * 1024);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let form = url::form_urlencoded::parse(&body)
+                .into_owned()
+                .collect::<Vec<_>>();
+            assert_eq!(form.len(), 1);
+            assert_eq!(form[0].0, "params");
+            String::from_utf8(oracle("decrypt", &form[0].1)).unwrap()
+        }
+        _ => {
+            let ciphertext = url
+                .query_pairs()
+                .find(|(key, _)| key == "params")
+                .unwrap()
+                .1;
+            String::from_utf8(oracle("decrypt", &ciphertext)).unwrap()
+        }
+    };
     state
         .requests
         .lock()
@@ -252,7 +290,12 @@ fn serve(
         return;
     }
     let params: Value = serde_json::from_str(&parameters).unwrap();
-    assert_eq!(params["imei"], "native-fixture");
+    if !matches!(
+        url.path(),
+        wire::GROUP_VERSIONS_PATH | wire::GROUP_DETAILS_PATH
+    ) {
+        assert_eq!(params["imei"], "native-fixture");
+    }
     let data = match url.path() {
         "/api/social/profile/me-v2" => {
             assert_eq!(params["avatar_size"], 120);
@@ -279,12 +322,39 @@ fn serve(
         }
         "/api/group/getlg/v3" => {
             assert_eq!(params["count"], 100);
+            if matches!(scenario, Scenario::GroupsV4) {
+                let body = br#"{"error_code":604}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+                stream.flush().unwrap();
+                return;
+            }
             if params["page"] == 1 {
                 json!({"groups":[{"groupId":"77","name":"Thiết kế","totalMember":4}],"hasMore":1})
             } else {
                 assert_eq!(params["page"], 2);
                 json!({"groups":[{"groupId":"78","name":"Dự án"}],"hasMore":0})
             }
+        }
+        wire::GROUP_VERSIONS_PATH => {
+            assert!(matches!(scenario, Scenario::GroupsV4));
+            json!({"gridVerMap":{"77":5,"78":"6"}})
+        }
+        wire::GROUP_DETAILS_PATH => {
+            assert!(matches!(scenario, Scenario::GroupsV4));
+            assert_eq!(
+                serde_json::from_str::<Value>(params["gridVerMap"].as_str().unwrap()).unwrap(),
+                json!({"77":0,"78":0})
+            );
+            json!({"gridInfoMap":{
+                "77":{"groupId":"77","name":"Thiết kế","fullAvt":"https://avatar.talk.zdn.vn/synthetic","totalMember":4},
+                "78":{"groupId":"78","name":"Dự án","totalMember":2}
+            }})
         }
         "/api/preloadconvers/get-last-msgs" => {
             assert_eq!(params["threadIdLocalMsgId"], "{}");
@@ -401,6 +471,7 @@ async fn authenticated_preview_source_shapes_and_rejections_preserve_local_state
         let cached = crate::domain::Message {
             mentions: Vec::new(),
             reply_blocked: false,
+            expires_at_ms: None,
             recalled: false,
             source_client_id: None,
             quote: None,
@@ -611,11 +682,54 @@ async fn real_tls_discovery_commits_named_offline_cache_and_recent_messages_with
     assert_eq!(sink.store.page("11", "d:12", None, 100).unwrap().len(), 1);
     let requests = fixture.state.requests.lock().unwrap();
     assert_eq!(requests.len(), 10);
+    for pass in requests.as_chunks::<5>().0 {
+        assert_eq!(pass[0].0, "/api/preloadconvers/get-last-msgs");
+    }
     assert!(requests
         .iter()
         .all(|(_, _, cookie)| cookie == "zpw_sek=synthetic"));
     assert!(requests.iter().all(|(path, _, _)| !path.contains("ack")));
 }
+#[tokio::test]
+async fn group_v3_rejection_loads_correlated_v4_group_metadata_after_previews() {
+    let fixture = Fixture::new(Scenario::GroupsV4);
+    let mut sink = Sink {
+        store: MessageStore::in_memory().unwrap(),
+        commits: 0,
+    };
+    let report = fixture
+        .fetcher()
+        .synchronize(&fixture.session(), &mut sink, watch::channel(false).1)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(report.completed_groups);
+    assert_eq!((report.groups, report.preview_messages), (2, 2));
+    let group = sink.store.directory_record("11", "g:77").unwrap().unwrap();
+    assert_eq!(group.display_name, "Thiết kế");
+    assert_eq!(group.member_count, Some(4));
+    assert_eq!(
+        group.avatar_url.as_deref(),
+        Some("https://avatar.talk.zdn.vn/synthetic")
+    );
+    let requests = fixture.state.requests.lock().unwrap();
+    let paths: Vec<_> = requests.iter().map(|(path, ..)| path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/api/preloadconvers/get-last-msgs",
+            "/api/social/friend/getfriends",
+            "/api/group/getlg/v3",
+            wire::GROUP_VERSIONS_PATH,
+            wire::GROUP_DETAILS_PATH,
+            "/api/social/profile/me-v2",
+        ]
+    );
+    assert!(requests
+        .iter()
+        .all(|(_, _, cookie)| cookie == "zpw_sek=synthetic"));
+}
+
 #[tokio::test]
 async fn redirects_and_oversize_responses_are_partial_sanitized_failures_not_cache_deletions() {
     for (scenario, category) in [
@@ -764,6 +878,7 @@ async fn storage_failure_stops_further_requests_and_reports_no_committed_rows() 
         .await
         .unwrap();
     assert_eq!(report.contacts, 0);
+    assert_eq!(report.preview_messages, 0);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].category, DirectoryCategory::Storage);
     assert!(!report.completed_groups);

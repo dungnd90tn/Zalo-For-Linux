@@ -22,7 +22,7 @@ trap 'rm -rf -- "$SMOKE_ROOT"' EXIT
 SMOKE=(cargo run --quiet --locked --manifest-path "$MANIFEST" --offline -- --profile-root "$SMOKE_ROOT" --profile smoke)
 env -u DISPLAY -u WAYLAND_DISPLAY "${SMOKE[@]}" --help
 env -u DISPLAY -u WAYLAND_DISPLAY "${SMOKE[@]}" --version
-env -u DISPLAY -u WAYLAND_DISPLAY "${SMOKE[@]}" --doctor | python3 -c 'import json,sys; d=json.load(sys.stdin); assert not any(d[k] for k in ("display_available", "live_auth_available", "live_send_available", "live_auth_compiled", "live_messaging_compiled", "authenticated", "network_started", "history_import_available")); print("Offline diagnostics: capabilities correctly unavailable.")'
+env -u DISPLAY -u WAYLAND_DISPLAY "${SMOKE[@]}" --doctor | python3 -c 'import json,sys; d=json.load(sys.stdin); assert not any(d[k] for k in ("display_available", "live_auth_available", "live_send_available", "live_auth_compiled", "live_messaging_compiled", "live_e2ee_compiled", "authenticated", "network_started", "history_import_available")); print("Offline diagnostics: capabilities correctly unavailable.")'
 if find "$SMOKE_ROOT" -mindepth 1 -print -quit | read -r _; then
     echo "Smoke check failed: informational CLI flags wrote profile data." >&2
     exit 1

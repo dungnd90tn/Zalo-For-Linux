@@ -3,7 +3,7 @@
 use super::client::ClientType;
 use super::messaging::{numeric_id, validate_origin, ThreadKind};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use url::Url;
 
 pub const MAX_DIRECTORY_BODY: usize = 16 * 1024 * 1024;
@@ -11,6 +11,9 @@ pub const MAX_FRIENDS: usize = 20_000;
 pub const GROUP_PAGE_SIZE: u32 = 100;
 pub const MAX_GROUP_PAGES: u32 = 99;
 pub const DIRECTORY_BATCH_SIZE: usize = 200;
+pub(crate) const MAX_PREVIEW_CURSORS: usize = 40;
+pub(crate) const GROUP_VERSIONS_PATH: &str = "/api/group/getlg/v4";
+pub(crate) const GROUP_DETAILS_PATH: &str = super::group_roster::ROSTER_PATH;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectoryError {
@@ -59,16 +62,11 @@ impl DirectoryRequest {
         encrypted: &str,
         client_type: ClientType,
     ) -> Result<Url, DirectoryError> {
-        validate_origin(root, "https").map_err(|_| DirectoryError::Invalid)?;
+        let mut url = self.request_url(root, client_type)?;
         if encrypted.is_empty() || encrypted.len() > 16 * 1024 {
             return Err(DirectoryError::Resource);
         }
-        let mut url = root.clone();
-        url.set_path(self.path);
-        url.query_pairs_mut()
-            .append_pair("zpw_ver", "681")
-            .append_pair("zpw_type", client_type.api_type())
-            .append_pair("params", encrypted);
+        url.query_pairs_mut().append_pair("params", encrypted);
         if self.path == "/api/social/profile/me-v2" {
             // Source getOSCode() returns8 for navigator.platform Linux (688250).
             url.query_pairs_mut().append_pair("os", "8");
@@ -76,6 +74,20 @@ impl DirectoryRequest {
         if self.initial_friends {
             url.query_pairs_mut().append_pair("init", "1");
         }
+        Ok(url)
+    }
+
+    pub(crate) fn request_url(
+        &self,
+        root: &Url,
+        client_type: ClientType,
+    ) -> Result<Url, DirectoryError> {
+        validate_origin(root, "https").map_err(|_| DirectoryError::Invalid)?;
+        let mut url = root.clone();
+        url.set_path(self.path);
+        url.query_pairs_mut()
+            .append_pair("zpw_ver", "681")
+            .append_pair("zpw_type", client_type.api_type());
         Ok(url)
     }
 }
@@ -135,13 +147,64 @@ pub fn groups_request(imei: &str, page: u32) -> Result<DirectoryRequest, Directo
         initial_friends: false,
     })
 }
+
+/// Bundle N398643–398646 sends only the standard query fields for group versions.
+pub(crate) fn group_versions_request() -> DirectoryRequest {
+    DirectoryRequest {
+        service: DirectoryService::Group,
+        path: GROUP_VERSIONS_PATH,
+        parameters: Value::Null,
+        initial_friends: false,
+    }
+}
+
+/// The version manager (N158211–158220) requests version zero for uncached details.
+pub(crate) fn group_details_request(ids: &[String]) -> Result<DirectoryRequest, DirectoryError> {
+    if ids.is_empty() || ids.len() > GROUP_PAGE_SIZE as usize {
+        return Err(DirectoryError::Resource);
+    }
+    let mut versions = serde_json::Map::new();
+    for id in ids {
+        numeric_id(id).map_err(|_| DirectoryError::Invalid)?;
+        if versions.insert(id.clone(), json!(0)).is_some() {
+            return Err(DirectoryError::Invalid);
+        }
+    }
+    Ok(DirectoryRequest {
+        service: DirectoryService::Group,
+        path: GROUP_DETAILS_PATH,
+        parameters: json!({"gridVerMap": Value::Object(versions).to_string()}),
+        initial_friends: false,
+    })
+}
 /// Bundle N402175–402181; initial cache is empty, encoded as the string "{}".
 pub fn previews_request(imei: &str) -> Result<DirectoryRequest, DirectoryError> {
+    previews_request_with_cursors(imei, &BTreeMap::new())
+}
+
+/// Compact bundle L140629–140649 tags direct/group IDs and keeps message IDs as strings.
+pub(crate) fn previews_request_with_cursors(
+    imei: &str,
+    cursors: &BTreeMap<String, String>,
+) -> Result<DirectoryRequest, DirectoryError> {
     device(imei)?;
+    if cursors.len() > MAX_PREVIEW_CURSORS {
+        return Err(DirectoryError::Resource);
+    }
+    for (key, value) in cursors {
+        let (thread_id, kind) = key.rsplit_once('_').ok_or(DirectoryError::Invalid)?;
+        if !matches!(kind, "0" | "1")
+            || numeric_id(thread_id).is_err()
+            || numeric_id(value).is_err()
+        {
+            return Err(DirectoryError::Invalid);
+        }
+    }
+    let cursors = serde_json::to_string(cursors).map_err(|_| DirectoryError::Invalid)?;
     Ok(DirectoryRequest {
         service: DirectoryService::Conversation,
         path: "/api/preloadconvers/get-last-msgs",
-        parameters: json!({"threadIdLocalMsgId":"{}","imei":imei}),
+        parameters: json!({"threadIdLocalMsgId":cursors,"imei":imei}),
         initial_friends: false,
     })
 }
@@ -201,6 +264,56 @@ fn flag(value: Option<&Value>, default: bool) -> Result<bool, DirectoryError> {
         Some(Value::Number(value)) if value.as_u64() == Some(1) => Ok(true),
         _ => Err(DirectoryError::Invalid),
     }
+}
+
+pub(crate) fn parse_group_versions(data: &Value) -> Result<Vec<String>, DirectoryError> {
+    let versions = data
+        .get("gridVerMap")
+        .and_then(Value::as_object)
+        .ok_or(DirectoryError::Invalid)?;
+    if versions.len() > (MAX_GROUP_PAGES * GROUP_PAGE_SIZE) as usize {
+        return Err(DirectoryError::Resource);
+    }
+    versions
+        .iter()
+        .map(|(id, version)| {
+            numeric_id(id).map_err(|_| DirectoryError::Invalid)?;
+            if version.as_u64().is_none()
+                && !version
+                    .as_str()
+                    .is_some_and(|value| value.parse::<u64>().is_ok())
+            {
+                return Err(DirectoryError::Invalid);
+            }
+            Ok(id.clone())
+        })
+        .collect()
+}
+
+pub(crate) fn parse_group_details(
+    data: &Value,
+    requested: &[String],
+) -> Result<Vec<DirectoryEntry>, DirectoryError> {
+    let rows = data
+        .get("gridInfoMap")
+        .and_then(Value::as_object)
+        .ok_or(DirectoryError::Invalid)?;
+    if rows.len() > requested.len() {
+        return Err(DirectoryError::Invalid);
+    }
+    let mut entries = Vec::with_capacity(rows.len());
+    for (key, item) in rows {
+        let remote_id = id(item.get("groupId").ok_or(DirectoryError::Invalid)?)?;
+        if remote_id != *key || !requested.contains(key) {
+            return Err(DirectoryError::Invalid);
+        }
+        entries.push(group_entry(
+            item,
+            remote_id,
+            avatar(item.get("fullAvt")).or_else(|| avatar(item.get("avt"))),
+        )?);
+    }
+    Ok(entries)
 }
 fn avatar(value: Option<&Value>) -> Option<String> {
     avatar_url(value?.as_str()?)
@@ -298,25 +411,7 @@ pub fn parse_groups(data: &Value, page: u32) -> Result<GroupPage, DirectoryError
         if !seen.insert(remote_id.clone()) {
             return Err(DirectoryError::Invalid);
         }
-        let member_count = item
-            .get("totalMember")
-            .map(|value| {
-                value
-                    .as_u64()
-                    .filter(|count| *count <= 100_000)
-                    .map(|count| count as u32)
-                    .ok_or(DirectoryError::Invalid)
-            })
-            .transpose()?;
-        entries.push(DirectoryEntry {
-            kind: ThreadKind::Group,
-            remote_id,
-            display_name: name(item, "name")?,
-            avatar_url: avatar(item.get("avt")),
-            is_friend: None,
-            is_blocked: None,
-            member_count,
-        });
+        entries.push(group_entry(item, remote_id, avatar(item.get("avt")))?);
     }
     Ok(GroupPage {
         entries,
@@ -324,9 +419,86 @@ pub fn parse_groups(data: &Value, page: u32) -> Result<GroupPage, DirectoryError
     })
 }
 
+fn group_entry(
+    item: &Value,
+    remote_id: String,
+    avatar_url: Option<String>,
+) -> Result<DirectoryEntry, DirectoryError> {
+    let member_count = item
+        .get("totalMember")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|count| *count <= 100_000)
+                .map(|count| count as u32)
+                .ok_or(DirectoryError::Invalid)
+        })
+        .transpose()?;
+    Ok(DirectoryEntry {
+        kind: ThreadKind::Group,
+        remote_id,
+        display_name: name(item, "name")?,
+        avatar_url,
+        is_friend: None,
+        is_blocked: None,
+        member_count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_cursors_keep_direct_group_and_high_precision_ids_distinct() {
+        let cursors = [
+            ("77_0".into(), "923456789012345678901234".into()),
+            ("77_1".into(), "923456789012345678901235".into()),
+        ]
+        .into();
+        let request = previews_request_with_cursors("native-fixture", &cursors).unwrap();
+        let encoded = request.parameters["threadIdLocalMsgId"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<BTreeMap<String, String>>(encoded).unwrap(),
+            cursors
+        );
+        for (key, value) in [("77_2", "8"), ("g:77_1", "8"), ("77_1", "demo-8")] {
+            assert!(previews_request_with_cursors(
+                "native-fixture",
+                &[(key.into(), value.into())].into()
+            )
+            .is_err());
+        }
+        let oversized = (1..=MAX_PREVIEW_CURSORS + 1)
+            .map(|id| (format!("{id}_0"), id.to_string()))
+            .collect();
+        assert!(matches!(
+            previews_request_with_cursors("native-fixture", &oversized),
+            Err(DirectoryError::Resource)
+        ));
+    }
+
+    #[test]
+    fn versioned_group_directory_uses_only_correlated_detail_rows() {
+        let ids = parse_group_versions(&json!({"gridVerMap":{"77":"5","78":6}})).unwrap();
+        assert_eq!(ids, ["77", "78"]);
+        assert_eq!(
+            group_details_request(&ids).unwrap().parameters,
+            json!({"gridVerMap": "{\"77\":0,\"78\":0}"})
+        );
+        assert!(parse_group_versions(&json!({"gridVerMap":{"77":-1}})).is_err());
+        assert!(parse_group_details(
+            &json!({"gridInfoMap":{"77":{"groupId":"78","name":"Synthetic"}}}),
+            &ids,
+        )
+        .is_err());
+        assert!(parse_group_details(
+            &json!({"gridInfoMap":{"99":{"groupId":"99","name":"Synthetic"}}}),
+            &ids,
+        )
+        .is_err());
+    }
+
     #[test]
     fn source_self_profile_is_bound_to_authenticated_user_and_linux_contract() {
         let request = self_profile_request("native-fixture").unwrap();

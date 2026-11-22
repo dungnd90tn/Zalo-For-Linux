@@ -60,7 +60,8 @@ impl MessageStore {
             }
         }
         let text_links: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE account_id=?1 AND thread_id=?2 AND (body LIKE '%http://%' OR body LIKE '%https://%')",
+            "SELECT COUNT(*) FROM messages m WHERE account_id=?1 AND thread_id=?2 AND (body LIKE '%http://%' OR body LIKE '%https://%')
+             AND NOT EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=m.account_id AND e.thread_id=m.thread_id AND e.message_id=m.message_id)",
             params![account, thread],
             |row| row.get(0),
         )?;
@@ -105,6 +106,7 @@ impl MessageStore {
              FROM message_media mm JOIN messages m
                ON m.account_id=mm.account_id AND m.thread_id=mm.thread_id AND m.message_id=mm.message_id
              WHERE mm.account_id=?1 AND mm.thread_id=?2 AND mm.kind IN ({list})
+             AND NOT EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=m.account_id AND e.thread_id=m.thread_id AND e.message_id=m.message_id)
              ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?4"
         );
         let mut statement = self.conn.prepare_cached(&sql)?;
@@ -197,8 +199,9 @@ impl MessageStore {
 
     fn text_links(&self, account: &str, thread: &str, limit: usize) -> Result<Vec<SharedItem>> {
         let mut statement = self.conn.prepare_cached(
-            "SELECT message_id,sender,sent_at_ms,body FROM messages
+            "SELECT message_id,sender,sent_at_ms,body FROM messages m
              WHERE account_id=?1 AND thread_id=?2 AND (body LIKE '%http://%' OR body LIKE '%https://%')
+             AND NOT EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=m.account_id AND e.thread_id=m.thread_id AND e.message_id=m.message_id)
              ORDER BY sent_at_ms DESC,message_id DESC LIMIT ?3",
         )?;
         let rows = statement.query_map(params![account, thread, TEXT_SCAN_ROWS as i64], |row| {
@@ -285,6 +288,7 @@ mod tests {
 
     fn message(id: &str, text: &str, at: i64) -> Message {
         Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,

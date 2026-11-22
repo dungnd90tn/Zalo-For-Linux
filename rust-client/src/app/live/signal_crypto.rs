@@ -711,6 +711,7 @@ pub struct PreparedReceiveInput {
     context: e2ee::InputContext,
     ciphertext_digest: [u8; 32],
     queue: String,
+    activate_peer: Option<e2ee::PeerActivation>,
     deadline: Instant,
 }
 /// Non-constructible result of a successful decrypt: the plaintext and the exact state change that the
@@ -858,6 +859,40 @@ pub fn prekey_sender(body: &[u8]) -> Result<(u16, [u8; 33])> {
     }
 }
 
+#[cfg(test)]
+pub(super) fn ordinary_fixture_from_prekey(encoded: &str) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    // Signal's prekey wrapper contains the same authenticated SignalMessage
+    // bytes that a peer sends on their own once the session is acknowledged.
+    let cipher = personal_ciphertext_from_wire(encoded).unwrap();
+    assert!(matches!(
+        cipher.message_type,
+        engine::PersonalMessageType::PreKey
+    ));
+    let mut cursor = 1;
+    while cursor < cipher.body.len() {
+        let tag = read_varint(&cipher.body, &mut cursor).unwrap();
+        match tag & 7 {
+            0 => {
+                read_varint(&cipher.body, &mut cursor).unwrap();
+            }
+            2 => {
+                let length = read_varint(&cipher.body, &mut cursor).unwrap() as usize;
+                let end = cursor + length;
+                if tag >> 3 == 4 {
+                    let mut wire = vec![2];
+                    wire.extend_from_slice(&cipher.body[cursor..end]);
+                    return STANDARD.encode(wire);
+                }
+                cursor = end;
+            }
+            _ => panic!("unexpected prekey fixture field"),
+        }
+    }
+    panic!("prekey fixture has no SignalMessage");
+}
+
 impl Coordinator {
     /// Plans the decryption of ONE personal ciphertext into conversation `thread` (`d:<peer uid>`). The sender must already have an active, verified
     /// binding in this local epoch (for a first-contact prekey message the caller records the identity
@@ -875,6 +910,95 @@ impl Coordinator {
         gate: &e2ee::GenerationGate,
         cancel: &Cancellation,
     ) -> Result<PreparedReceiveInput> {
+        self.plan_receive_inner(
+            store,
+            sender,
+            message,
+            message_timestamp,
+            thread,
+            server_id,
+            queue,
+            gate,
+            cancel,
+            false,
+            e2ee::TargetKind::Personal,
+        )
+    }
+
+    /// A fresh device remains an untrusted candidate until a valid prekey message is committed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_receive_first_use(
+        &self,
+        store: &mut MessageStore,
+        sender: engine::TrustDecision,
+        message: engine::PersonalCiphertext,
+        message_timestamp: u64,
+        thread: &str,
+        server_id: &str,
+        queue: &str,
+        gate: &e2ee::GenerationGate,
+        cancel: &Cancellation,
+    ) -> Result<PreparedReceiveInput> {
+        self.plan_receive_inner(
+            store,
+            sender,
+            message,
+            message_timestamp,
+            thread,
+            server_id,
+            queue,
+            gate,
+            cancel,
+            true,
+            e2ee::TargetKind::Personal,
+        )
+    }
+
+    /// Uses the same pairwise decrypt transaction to record session traffic without a chat message.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_receive_session(
+        &self,
+        store: &mut MessageStore,
+        sender: engine::TrustDecision,
+        message: engine::PersonalCiphertext,
+        message_timestamp: u64,
+        thread: &str,
+        server_id: &str,
+        queue: &str,
+        gate: &e2ee::GenerationGate,
+        cancel: &Cancellation,
+        first_use: bool,
+    ) -> Result<PreparedReceiveInput> {
+        self.plan_receive_inner(
+            store,
+            sender,
+            message,
+            message_timestamp,
+            thread,
+            server_id,
+            queue,
+            gate,
+            cancel,
+            first_use,
+            e2ee::TargetKind::PersonalSession,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_receive_inner(
+        &self,
+        store: &mut MessageStore,
+        sender: engine::TrustDecision,
+        message: engine::PersonalCiphertext,
+        message_timestamp: u64,
+        thread: &str,
+        server_id: &str,
+        queue: &str,
+        gate: &e2ee::GenerationGate,
+        cancel: &Cancellation,
+        first_use: bool,
+        kind: e2ee::TargetKind,
+    ) -> Result<PreparedReceiveInput> {
         let deadline = Instant::now() + BATCH_TIMEOUT;
         self.current(gate, cancel)?;
         let local = store_local(&self.local)?;
@@ -886,18 +1010,46 @@ impl Coordinator {
             !(peer.uid == self.account.as_str() && peer.platform == local.platform),
             "A message cannot come from this device itself"
         );
-        store.e2ee_validate_peer_identity(
-            self.account.as_str(),
-            &local,
-            &peer,
-            sender.registration_id,
-            &sender.identity_key,
-            sender.session_timestamp,
-        )?;
+        let activate_peer = if first_use {
+            ensure!(
+                matches!(message.message_type, engine::PersonalMessageType::PreKey),
+                "First-use receive requires a prekey message"
+            );
+            ensure!(
+                prekey_sender(&message.body)? == (sender.registration_id, sender.identity_key),
+                "First-use receive identity disagrees with the prekey header"
+            );
+            store.e2ee_validate_first_use_identity(
+                self.account.as_str(),
+                &local,
+                &peer,
+                &e2ee::VerifiedBinding {
+                    platform: peer.platform,
+                    registration_id: sender.registration_id,
+                    identity_key: sender.identity_key,
+                    session_timestamp: sender.session_timestamp,
+                },
+            )?;
+            Some(e2ee::PeerActivation {
+                local: local.clone(),
+                peer: peer.clone(),
+                expected_previous: None,
+            })
+        } else {
+            store.e2ee_validate_peer_identity(
+                self.account.as_str(),
+                &local,
+                &peer,
+                sender.registration_id,
+                &sender.identity_key,
+                sender.session_timestamp,
+            )?;
+            None
+        };
         let allowed_keys = required_personal_records(&self.local, &sender, &message)?;
         let ciphertext_digest = personal_ciphertext_digest(&message);
         let context = e2ee::InputContext {
-            kind: e2ee::TargetKind::Personal,
+            kind,
             thread: thread.into(),
             server_id: server_id.into(),
             sender: peer.clone(),
@@ -932,6 +1084,7 @@ impl Coordinator {
             context,
             ciphertext_digest,
             queue: queue.into(),
+            activate_peer,
             deadline,
         })
     }
@@ -956,6 +1109,7 @@ impl Coordinator {
             context: input_context,
             ciphertext_digest,
             queue,
+            activate_peer,
             deadline,
         } = plan;
         ensure!(
@@ -1000,7 +1154,7 @@ impl Coordinator {
                 operation_id: durable_id,
                 input_digest,
                 allowed_keys,
-                activate_peers: vec![],
+                activate_peers: activate_peer.into_iter().collect(),
                 mutations: aggregate.into_values().collect(),
             },
             plaintext,

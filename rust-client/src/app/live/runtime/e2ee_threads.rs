@@ -9,7 +9,7 @@ const PAGE_WAIT: Duration = Duration::from_secs(10);
 impl Connection {
     /// Best effort: any failure leaves the conversation list as it was.
     pub(super) async fn sync_encrypted_threads(&mut self, db: &Database, events: &Events) {
-        let Ok(peers) = self.encrypted_peers().await else {
+        let Ok(peers) = self.encrypted_peers(Some((db, events))).await else {
             return;
         };
         if peers.is_empty() {
@@ -37,7 +37,13 @@ impl Connection {
             .await;
         (events.repaint)();
     }
-    pub(super) async fn encrypted_peers(&mut self) -> Result<Vec<String>> {
+    pub(super) async fn encrypted_peers(
+        &mut self,
+        #[cfg_attr(not(feature = "signal-crypto"), allow(unused_variables))] receive: Option<(
+            &Database,
+            &Events,
+        )>,
+    ) -> Result<Vec<String>> {
         let mut peers = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut last: Option<String> = None;
@@ -54,10 +60,18 @@ impl Connection {
                 let frame = tokio::time::timeout_at(deadline, self.next())
                     .await
                     .map_err(|_| anyhow::anyhow!("E2EE list timed out"))??;
-                if let Some(frame) = frame.filter(|frame| frame.cmd == 563) {
-                    break wire::e2ee_list_page(&frame.payload, &request).map_err(|failure| {
-                        anyhow::anyhow!("E2EE list rejected: {:?}", failure.reason)
-                    })?;
+                if let Some(frame) = frame {
+                    if frame.cmd == 563 {
+                        break wire::e2ee_list_page(&frame.payload, &request).map_err(
+                            |failure| anyhow::anyhow!("E2EE list rejected: {:?}", failure.reason),
+                        )?;
+                    }
+                    #[cfg(feature = "signal-crypto")]
+                    if let Some((db, events)) =
+                        receive.filter(|_| matches!(frame.cmd, 543..=545 | 551))
+                    {
+                        self.receive_e2ee_push(&frame, db, events).await;
+                    }
                 }
             };
             peers.extend(page.enabled);

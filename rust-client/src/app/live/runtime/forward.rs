@@ -69,22 +69,22 @@ impl TargetTtlProof {
 
 struct TtlSnapshot {
     // None means a duplicated destination row whose effective TTL cannot be proven.
-    rows: HashMap<String, Option<bool>>,
+    rows: HashMap<String, Option<u64>>,
     checked_at: Instant,
 }
 
 impl TtlSnapshot {
-    fn enabled(&self, target: &Target) -> Result<bool, WireError> {
+    fn duration_ms(&self, target: &Target) -> Result<u64, WireError> {
         // The source resets its entire TTL map on a verified snapshot.
         self.rows
             .get(&target.thread_id())
             .copied()
-            .unwrap_or(Some(false))
+            .unwrap_or(Some(0))
             .ok_or(WireError::Invalid)
     }
 
     fn proof(&self, target: &Target) -> Result<TargetTtlProof, WireError> {
-        if self.enabled(target)? {
+        if self.duration_ms(target)? != 0 {
             return Err(WireError::Unsupported);
         }
         Ok(TargetTtlProof {
@@ -121,7 +121,7 @@ fn parse_ttl_snapshot(payload: &Value, checked_at: Instant) -> Result<TtlSnapsho
         destinations
             .entry(thread)
             .and_modify(|previous| *previous = None)
-            .or_insert(Some(ttl > 0));
+            .or_insert(Some(ttl));
     }
     Ok(TtlSnapshot {
         rows: destinations,
@@ -131,7 +131,7 @@ fn parse_ttl_snapshot(payload: &Value, checked_at: Instant) -> Result<TtlSnapsho
 
 #[cfg(test)]
 fn ttl_enabled(payload: &Value, target: &Target) -> Result<bool, WireError> {
-    parse_ttl_snapshot(payload, Instant::now())?.enabled(target)
+    Ok(parse_ttl_snapshot(payload, Instant::now())?.duration_ms(target)? != 0)
 }
 
 fn service_url(session: &VerifiedSession, service: &str, path: &str) -> Result<Url> {
@@ -151,6 +151,16 @@ pub(super) async fn verify_target_ttl(
     target: &Target,
 ) -> Result<TargetTtlProof> {
     Ok(fetch_ttl_snapshot(client, session).await?.proof(target)?)
+}
+
+pub(super) async fn target_ttl_ms(
+    client: &reqwest::Client,
+    session: &VerifiedSession,
+    target: &Target,
+) -> Result<u64> {
+    Ok(fetch_ttl_snapshot(client, session)
+        .await?
+        .duration_ms(target)?)
 }
 
 async fn fetch_ttl_snapshot(

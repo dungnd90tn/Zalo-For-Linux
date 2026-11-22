@@ -6,7 +6,7 @@ Implementation is independently authored from the current local PC JavaScript bu
 
 All line references below refer to `pc-dist/lazy/default-login-main-startup-shared-worker-znotification.9e3e92e88644da772301.js` in this checkout.
 
-- `399824–399841`: legacy text POST `/api/message/sms` (command 11151), `/api/group/sendmsg` (11163). Session AES-CBC encrypted `params` form field; plaintext JSON contains `message`, numeric `clientId`, `imei`, and either `toid` or `grid` plus server-derived `visibility` (ordinary-group default 0; getter evidence `156861–156865`). Common query `zpw_ver` / `zpw_type`: `398136–398140`, construction `398186–398196`. This format has no extra request signature.
+- `399824–399841`: legacy text POST `/api/message/sms` (command 11151), `/api/group/sendmsg` (11163). The session AES-CBC encrypted `params` form field contains `message`, numeric `clientId`, `imei`, numeric `ttl`, and either `toid` or `grid` plus server-derived `visibility` (ordinary-group default 0, getter evidence `156861–156865`). Common query `zpw_ver` / `zpw_type` at `398136–398140`, construction at `398186–398196`. This format has no extra request signature.
 - `440600–440625`: HTTP success requires both outer `error_code: 0` and a successfully session-decrypted inner `error_code: 0`. An HTTP 200 alone is insufficient. Native send acceptance requires an actual `data.msgId`; acceptance does not claim delivery/read by the recipient.
 - `37661–37667`, `37971–37994`: socket binary header is version byte, little-endian u16 command, subcommand byte, followed by UTF-8 JSON.
 - `400376–400379`, `37903`: preserve the advertised WebSocket path, append `zpw_ver` / `zpw_type` and then timestamp `t`; the endpoint itself must have no query. HTTP chat/group service entries remain origin roots. Desktop headers follow `main-dist/main.js:110701` (`ZaloPC-linux-24v681`, with the existing Linux type mapping at `109415–109433`), and both the login and main renderer receive type 24 (`main-dist/main.js:110055`, `110085`, `110223`; renderer URL override `228138`). Authentication parameter encryption, signed bootstrap, directory/message HTTP and WebSocket queries now share this explicit client identity. Historical native type-30 records require fresh phone approval before transport; their cookie is never silently retargeted.
@@ -25,6 +25,22 @@ Personal plaintext eligibility is derived afresh before each send from request-c
 Eligibility failures carry fixed reasons for confirmed encrypted target, unsupported schema/field, correlation, timeout, intervening event and pagination. The UI distinguishes verified E2EE from an unknown state instead of labeling both as encrypted. Verification happens before reserving an outbox item or issuing the text HTTP request; rejection retains the draft and does not retry automatically. These source and local-TLS regressions do not identify which branch caused a prior real-account failure whose old log recorded only `send/unsupported`.
 
 Group eligibility uses session-encrypted GET `/api/group/getgi/v2` (`398677–398692`), matching target `groupId` and explicit false/zero `e2ee`. Group state checks at `161956–161960` show that the server flag controls encryption. Signal messages and queues are not consumed or acknowledged; supported text in a mixed legacy batch is retained and unsupported media/encryption receives an explicit placeholder without displaying ciphertext.
+
+## Disappearing text
+
+In `pc-dist/compact-app-pc.e08d0d44f38873747a6b.js`, `489085–489103`
+uses the same personal and group send routes for text. The helper at
+`524539–524543` adds a numeric `ttl` in milliseconds, defaulting to zero.
+The authenticated conversation snapshot at `491534–491537` supplies the
+destination policy. The default settings at `266951–266962` offer one,
+seven and 30 days. Native bounds the accepted positive duration at 30 days.
+
+The receive codec uses the server send timestamp `ts` and adds `ttl` to
+compute the deadline, following `108298–108307`, `659680–659689` and
+`385924–385936`. The same deadline travels with text on the live queue and
+recent-message HTTP preview paths. An invalid TTL suppresses only its row.
+Timed attachments and structured cards require separate cache lifecycle
+support. The codec discards raw quotes with an active or unknown TTL.
 
 ## Runtime and validation
 

@@ -88,6 +88,8 @@ impl MessageStore {
              FROM messages m LEFT JOIN message_media mm
                ON mm.account_id=m.account_id AND mm.thread_id=m.thread_id AND mm.message_id=m.message_id
              WHERE m.account_id=?1 AND m.thread_id=?2
+             AND NOT EXISTS(SELECT 1 FROM message_expirations e WHERE e.account_id=m.account_id
+                 AND e.thread_id=m.thread_id AND e.message_id=m.message_id)
              {boundary}
              ORDER BY m.sent_at_ms DESC,m.message_id DESC LIMIT ?4"
         );
@@ -179,6 +181,7 @@ mod tests {
 
     fn message(id: &str, text: &str, at: i64) -> Message {
         Message {
+            expires_at_ms: None,
             mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,

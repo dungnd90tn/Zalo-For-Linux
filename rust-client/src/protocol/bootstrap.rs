@@ -583,18 +583,25 @@ impl ServerConfig {
         if !group_board_v2 {
             services.remove("group_board");
         }
-        // PC NEW_TO_OLD explicitly requires both cloud switches.
-        if !feature_config(value, "cloud_setting")
-            .ok()
-            .flatten()
-            .is_some_and(|config| {
-                ["enable", "scroll_top_enable"].iter().all(|key| {
+        // Newest and older group cloud reads share a verified origin but use separate source switches.
+        let cloud = feature_config(value, "cloud_setting").ok().flatten();
+        let cloud_enabled = |mode| {
+            cloud.is_some_and(|config| {
+                ["enable", mode].iter().all(|key| {
                     config.get(key).is_some_and(|value| {
                         value.as_bool() == Some(true) || value.as_u64() == Some(1)
                     })
                 })
             })
+        };
+        if let Some(origin) = services
+            .get("group_cloud_message")
+            .filter(|_| cloud_enabled("load_last_msg_enable"))
+            .cloned()
         {
+            services.insert("group_cloud_latest".into(), origin);
+        }
+        if !cloud_enabled("scroll_top_enable") {
             services.remove("group_cloud_message");
         }
         // Native implements the source's raw async-file handler only. An advertised
