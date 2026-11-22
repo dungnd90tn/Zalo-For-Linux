@@ -5,9 +5,10 @@ use crate::{
         ForwardBatchResult, ForwardOutcome, ForwardTarget, LiveCommand, LiveConnection, LiveEvent,
         LiveWorker, MAX_FORWARD_BATCH,
     },
-    domain::Message,
+    domain::{reply::valid_source_id, Conversation, Message},
 };
 use eframe::egui::{self, vec2, RichText};
+use std::borrow::Cow;
 
 const MAX_PAGE: usize = 25;
 
@@ -92,6 +93,27 @@ impl Picker {
             .filter(|recipient| !self.submitted || recipient.result.is_some_and(retryable))
             .map(|recipient| recipient.target.thread_id.clone())
             .collect()
+    }
+
+    fn retain_recipients(
+        &mut self,
+        conversations: &[Conversation],
+        visible: impl Fn(&str) -> bool,
+    ) {
+        let account = &self.source.account;
+        let eligible = |thread: &str| {
+            visible(thread)
+                && (thread
+                    .strip_prefix("d:")
+                    .is_some_and(|peer| peer != account && valid_source_id(peer))
+                    || (thread.strip_prefix("g:").is_some_and(valid_source_id)
+                        && !conversations
+                            .iter()
+                            .any(|item| item.id == thread && item.group_left)))
+        };
+        self.entries.retain(|entry| eligible(&entry.thread_id));
+        self.selected
+            .retain(|recipient| eligible(&recipient.target.thread_id));
     }
 
     fn query_changed(&mut self) {
@@ -311,12 +333,23 @@ impl Forwarding {
             page,
             message: "901".into(),
         });
-        picker.entries = [
+        let friends = [
             ("d:33", "Đặng Hà"),
             ("d:44", "Lê Minh"),
             ("d:55", "Nguyễn Thanh Thảo"),
             ("d:66", "Trần Vũ Phương"),
-        ]
+        ];
+        let mixed = [
+            friends[0],
+            ("g:33", "Kế hoạch ra mắt tháng mười hai"),
+            ("g:50", "Nhóm kiểm thử cùng khách hàng"),
+            friends[1],
+        ];
+        picker.entries = if matches!(scene, "group-targets" | "group-results") {
+            mixed
+        } else {
+            friends
+        }
         .into_iter()
         .map(|(thread, name)| ForwardTarget {
             thread_id: thread.into(),
@@ -324,17 +357,17 @@ impl Forwarding {
         })
         .collect();
         let count = match scene {
-            "mixed" => 4,
-            "batch" => 2,
+            "mixed" | "group-results" => 4,
+            "batch" | "group-targets" => 2,
             _ => 1,
         };
         for index in 0..count {
             let entry = picker.entries[index].clone();
             picker.toggle(entry);
         }
-        if scene == "mixed" || scene == "unknown" {
+        if matches!(scene, "mixed" | "group-results" | "unknown") {
             picker.submitted = true;
-            let outcomes = if scene == "mixed" {
+            let outcomes = if scene != "unknown" {
                 [
                     ForwardOutcome::Accepted,
                     ForwardOutcome::Unknown,
@@ -477,9 +510,7 @@ impl NativeApp {
         let busy = forwarding.flight.is_some();
         let online = state.connection == LiveConnection::Online && state.worker.is_some();
         let visible = |thread: &str| state.privacy.list_visible(thread);
-        picker
-            .selected
-            .retain(|recipient| visible(&recipient.target.thread_id));
+        picker.retain_recipients(&self.model.conversations, visible);
         let ime_active = self.ime_composing
             || ctx.input(|input| {
                 input
@@ -517,7 +548,7 @@ impl NativeApp {
                         }
                         show_outcomes(ui, &picker, colors);
                     } else {
-                        lookup = show_recipients(ui, &mut picker, online && !ime_active, visible);
+                        lookup = show_recipients(ui, &mut picker, online && !ime_active);
                     }
                     if let Some(error) = picker.error {
                         ui.colored_label(colors.error, error);
@@ -592,18 +623,13 @@ impl NativeApp {
     }
 }
 
-fn show_recipients(
-    ui: &mut egui::Ui,
-    picker: &mut Picker,
-    search_enabled: bool,
-    visible: impl Fn(&str) -> bool,
-) -> bool {
+fn show_recipients(ui: &mut egui::Ui, picker: &mut Picker, search_enabled: bool) -> bool {
     let mut lookup = false;
     ui.horizontal(|ui| {
         if ui
             .add_sized(
                 vec2(108.0, 44.0),
-                egui::Button::new("Bạn bè")
+                egui::Button::new("Người nhận")
                     .selected(!picker.show_selected)
                     .rounding(12.0),
             )
@@ -638,7 +664,7 @@ fn show_recipients(
                             &picker.source.thread,
                             &picker.source.message,
                         ))
-                        .hint_text("Tìm người nhận")
+                        .hint_text("Tìm bạn bè hoặc nhóm")
                         .vertical_align(egui::Align::Center)
                         .char_limit(128),
                 )
@@ -658,7 +684,7 @@ fn show_recipients(
         } else if picker.search.trim() != picker.query {
             ui.label("Chọn Tìm để cập nhật kết quả.");
         } else if picker.entries.is_empty() && picker.error.is_none() {
-            ui.label("Không tìm thấy liên hệ phù hợp.");
+            ui.label("Không tìm thấy bạn bè hoặc nhóm phù hợp.");
         }
     } else if picker.selected.is_empty() {
         ui.label("Chưa chọn người nhận.");
@@ -670,17 +696,7 @@ fn show_recipients(
             .map(|recipient| &recipient.target)
             .collect()
     } else if picker.search.trim() == picker.query {
-        picker
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry
-                    .thread_id
-                    .strip_prefix("d:")
-                    .is_some_and(|peer| !peer.is_empty() && peer != picker.source.account)
-                    && visible(&entry.thread_id)
-            })
-            .collect()
+        picker.entries.iter().collect()
     } else {
         Vec::new()
     };
@@ -703,7 +719,7 @@ fn show_recipients(
                 let label = if checked {
                     format!("{name} · Đã chọn")
                 } else {
-                    name.to_owned()
+                    name.to_string()
                 };
                 let button = egui::Button::new(label)
                     .selected(checked)
@@ -722,7 +738,7 @@ fn show_recipients(
                     .on_hover_text(if checked {
                         format!("Bỏ chọn {name}")
                     } else {
-                        name.to_owned()
+                        name.into_owned()
                     })
                     .on_disabled_hover_text("Đã chọn tối đa 10 người nhận.");
             }
@@ -733,11 +749,12 @@ fn show_recipients(
     lookup
 }
 
-fn recipient_name(target: &ForwardTarget) -> &str {
-    if target.title.is_empty() {
-        "Bạn bè"
-    } else {
-        &target.title
+fn recipient_name(target: &ForwardTarget) -> Cow<'_, str> {
+    match (target.thread_id.starts_with("g:"), target.title.is_empty()) {
+        (true, false) => Cow::Owned(format!("Nhóm · {}", target.title)),
+        (true, true) => Cow::Borrowed("Nhóm"),
+        (false, true) => Cow::Borrowed("Bạn bè"),
+        (false, false) => Cow::Borrowed(&target.title),
     }
 }
 
@@ -755,8 +772,8 @@ fn show_outcomes(ui: &mut egui::Ui, picker: &Picker, colors: crate::theme::Palet
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             let name = recipient_name(&recipient.target);
-            ui.add(egui::Label::new(RichText::new(name).strong()).truncate())
-                .on_hover_text(name);
+            ui.add(egui::Label::new(RichText::new(name.as_ref()).strong()).truncate())
+                .on_hover_text(name.into_owned());
             ui.label(RichText::new(label).color(color).size(visuals::TEXT_SMALL));
         });
         ui.separator();
@@ -816,14 +833,22 @@ mod tests {
         }
     }
 
+    fn group(id: u64) -> ForwardTarget {
+        ForwardTarget {
+            thread_id: format!("g:{id}"),
+            title: format!("Kế hoạch {id}"),
+        }
+    }
+
     #[test]
     fn selections_survive_search_and_remain_unique_and_bounded() {
         let mut picker = picker();
-        for id in 33..=(33 + MAX_FORWARD_BATCH as u64) {
+        picker.toggle(group(33));
+        for id in 33..=(32 + MAX_FORWARD_BATCH as u64) {
             picker.toggle(target(id));
         }
         assert_eq!(picker.selected.len(), MAX_FORWARD_BATCH);
-        assert!(!picker.selected(&target(33 + MAX_FORWARD_BATCH as u64).thread_id));
+        assert!(!picker.selected(&target(32 + MAX_FORWARD_BATCH as u64).thread_id));
         picker.search = "Minh".into();
         picker.entries = vec![target(100)];
         picker.lookup_id = Some(9);
@@ -831,12 +856,35 @@ mod tests {
         assert!(picker.entries.is_empty());
         assert!(picker.lookup_id.is_none());
         assert_eq!(picker.send_targets().len(), MAX_FORWARD_BATCH);
+        assert!(picker.selected("g:33"));
         assert!(picker.selected("d:33"));
         picker.toggle(target(33));
         assert!(!picker.selected("d:33"));
+        assert!(picker.selected("g:33"));
         picker.toggle(target(100));
         assert_eq!(picker.send_targets().last().unwrap(), "d:100");
         assert_eq!(picker.send_targets().len(), MAX_FORWARD_BATCH);
+    }
+
+    #[test]
+    fn hidden_and_departed_recipients_disappear_from_results_and_selection() {
+        let mut picker = picker();
+        picker.entries = vec![target(33), group(33), group(44), group(55)];
+        for entry in picker.entries.clone() {
+            picker.toggle(entry);
+        }
+        let left = Conversation {
+            id: "g:44".into(),
+            title: "Đã rời".into(),
+            last_message_at_ms: 0,
+            last_text: String::new(),
+            last_sender: String::new(),
+            group_left: true,
+        };
+        picker.retain_recipients(&[left], |thread| thread != "g:33");
+        assert_eq!(picker.send_targets(), ["d:33", "g:55"]);
+        assert_eq!(picker.entries, [target(33), group(55)]);
+        assert_eq!(recipient_name(&picker.entries[1]), "Nhóm · Kế hoạch 55");
     }
 
     #[test]
@@ -844,8 +892,8 @@ mod tests {
         let (worker, mut commands, _events) = LiveWorker::presentation_fixture("11");
         let mut picker = picker();
         let mut view = Forwarding::default();
-        for id in 33..=36 {
-            picker.toggle(target(id));
+        for entry in [target(33), group(33), target(35), group(36)] {
+            picker.toggle(entry);
         }
         let targets = picker.send_targets();
         view.submit(&mut picker, &worker, targets.clone());
@@ -880,7 +928,7 @@ mod tests {
         assert!(!view.is_open());
         let mut parked = view.parked.take().unwrap();
         let retry = parked.send_targets();
-        assert_eq!(retry, ["d:35", "d:36"]);
+        assert_eq!(retry, ["d:35", "g:36"]);
         view.submit(&mut parked, &worker, retry.clone());
         assert!(matches!(
             commands.try_recv(),

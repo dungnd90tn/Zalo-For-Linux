@@ -1,4 +1,4 @@
-//! Ordinary direct forwarding with per-recipient preflight and authenticated dispatch.
+//! Ordinary direct text forwarding with per-recipient preflight and dispatch.
 use super::*;
 use crate::protocol::forward::{self as wire_forward, ForwardAck, ForwardReference};
 use std::collections::{HashMap, VecDeque};
@@ -27,9 +27,8 @@ impl ForwardRequest {
         let source = Target::from_thread(&self.source_thread)?;
         let target = Target::from_thread(&self.target_thread)?;
         if source.kind != ThreadKind::Direct
-            || target.kind != ThreadKind::Direct
-            || target.remote_id == account
             || source.remote_id == account
+            || (target.kind == ThreadKind::Direct && target.remote_id == account)
         {
             return Err(WireError::Unsupported);
         }
@@ -178,7 +177,30 @@ pub(super) enum ForwardDispatch {
     Unknown,
 }
 
-pub(super) struct PreparedDispatch {
+struct GroupProof {
+    request: group_roster::Request,
+    roster: group_roster::Proof,
+}
+
+struct DispatchProof {
+    ttl: TargetTtlProof,
+    group: Option<GroupProof>,
+}
+
+#[derive(Clone, Copy)]
+struct Transport<'a> {
+    session: &'a Arc<VerifiedSession>,
+    client: &'a reqwest::Client,
+}
+
+impl GroupProof {
+    fn applies(&self, account: &str, target: &Target) -> bool {
+        self.request.thread == target.thread_id()
+            && self.roster.allows_forward(&self.request, account)
+    }
+}
+
+struct PreparedDispatch {
     client_id: u64,
     target: Target,
     url: Url,
@@ -187,7 +209,7 @@ pub(super) struct PreparedDispatch {
 
 impl PreparedDispatch {
     /// Call with the immutable intent returned by the source-validation transaction.
-    pub fn new(
+    fn new(
         session: &VerifiedSession,
         request: &ForwardRequest,
         client_id: u64,
@@ -195,9 +217,12 @@ impl PreparedDispatch {
         reference: &ForwardReference,
     ) -> Result<Self> {
         let (_, target) = request.targets(session.account_id())?;
-        let url = service_url(session, "file", wire_forward::DIRECT_PATH)?;
-        let params =
-            wire_forward::direct_parameters(&target, client_id, session.imei(), text, reference)?;
+        let path = match target.kind {
+            ThreadKind::Direct => wire_forward::DIRECT_PATH,
+            ThreadKind::Group => wire_forward::GROUP_PATH,
+        };
+        let url = service_url(session, "file", path)?;
+        let params = wire_forward::parameters(&target, client_id, session.imei(), text, reference)?;
         let encrypted = session.encrypt_payload(&serde_json::to_vec(&params)?)?;
         let body = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("params", &encrypted)
@@ -210,18 +235,24 @@ impl PreparedDispatch {
         })
     }
 
-    /// Start only after fresh authenticated direct capability verification.
+    /// Start only after fresh authenticated capability verification.
     /// A failure after handing the request to HTTP is not proof of rejection.
-    pub async fn send(
+    async fn send(
         self,
         client: &reqwest::Client,
         session: &VerifiedSession,
         request: &ForwardRequest,
         privacy: &std::sync::RwLock<privacy::Projection>,
         revision: u64,
-        ttl: TargetTtlProof,
+        proof: DispatchProof,
     ) -> ForwardDispatch {
-        if !ttl.applies(&self.target) || normal_scope_revision(privacy, request) != Some(revision) {
+        if !proof.ttl.applies(&self.target)
+            || normal_scope_revision(privacy, request) != Some(revision)
+            || self.target.kind == ThreadKind::Group
+                && !proof
+                    .group
+                    .is_some_and(|group| group.applies(session.account_id(), &self.target))
+        {
             return ForwardDispatch::NotSent;
         }
         let response = tokio::time::timeout(
@@ -230,13 +261,11 @@ impl PreparedDispatch {
         )
         .await;
         match response {
-            Ok(Ok(payload)) => {
-                match wire_forward::direct_ack(&payload, &self.target, self.client_id) {
-                    Ok(ForwardAck::Accepted(ack)) => ForwardDispatch::Accepted(ack),
-                    Ok(ForwardAck::Rejected) => ForwardDispatch::Rejected,
-                    Err(_) => ForwardDispatch::Unknown,
-                }
-            }
+            Ok(Ok(payload)) => match wire_forward::ack(&payload, &self.target, self.client_id) {
+                Ok(ForwardAck::Accepted(ack)) => ForwardDispatch::Accepted(ack),
+                Ok(ForwardAck::Rejected) => ForwardDispatch::Rejected,
+                Err(_) => ForwardDispatch::Unknown,
+            },
             _ => ForwardDispatch::Unknown,
         }
     }
@@ -244,6 +273,7 @@ impl PreparedDispatch {
 
 enum Task {
     Ttl(tokio::task::JoinHandle<Result<TtlSnapshot>>),
+    Group(tokio::task::JoinHandle<Result<GroupProof>>),
     Ready,
     Dispatch {
         id: u64,
@@ -260,6 +290,7 @@ impl Drop for Running {
     fn drop(&mut self) {
         match &self.task {
             Task::Ttl(task) => task.abort(),
+            Task::Group(task) => task.abort(),
             Task::Dispatch { task, .. } => task.abort(),
             Task::Ready => {}
         }
@@ -269,6 +300,7 @@ impl Drop for Running {
 
 enum Phase {
     Ttl(Option<TtlSnapshot>),
+    Group(Result<GroupProof>),
     Ready,
     Dispatch { id: u64, result: ForwardDispatch },
 }
@@ -367,6 +399,7 @@ impl Forwarding {
         };
         let phase = match &mut job.task {
             Task::Ttl(task) => Phase::Ttl(task.await.ok().and_then(Result::ok)),
+            Task::Group(task) => Phase::Group(task.await.unwrap_or_else(|error| Err(error.into()))),
             Task::Ready => {
                 // Give queued local work a turn before another synchronous socket proof.
                 tokio::task::yield_now().await;
@@ -538,6 +571,7 @@ impl Forwarding {
     ) -> Result<CommandOutcome> {
         let Completion { request, phase } = completion;
         let at = authenticated_at(connection.as_deref());
+        let transport = Transport { session, client };
         let attempt = match phase {
             Phase::Ttl(None) => {
                 // A failed full snapshot cannot certify any remaining peer.
@@ -549,13 +583,21 @@ impl Forwarding {
             }
             Phase::Ttl(Some(ttl)) => {
                 self.work.as_mut().expect("TTL belongs to a forward").ttl = Some(ttl);
-                self.launch(&request, connection, db, events, session, client)
+                self.launch(&request, connection, db, events, transport, None)
                     .await?
             }
             Phase::Ready => {
-                self.launch(&request, connection, db, events, session, client)
+                self.launch(&request, connection, db, events, transport, None)
                     .await?
             }
+            Phase::Group(Ok(proof)) => {
+                self.launch(&request, connection, db, events, transport, Some(proof))
+                    .await?
+            }
+            Phase::Group(Err(error)) if wire_error(&error) == Some(&WireError::Authentication) => {
+                Attempt::Pause(error)
+            }
+            Phase::Group(Err(_)) => Attempt::Finished(ForwardOutcome::Unavailable),
             Phase::Dispatch { id, result } => {
                 Attempt::Finished(settle(db, events, id, result).await?)
             }
@@ -594,9 +636,10 @@ impl Forwarding {
         connection: Option<&mut Connection>,
         db: &Database,
         events: &Events,
-        session: &Arc<VerifiedSession>,
-        client: &reqwest::Client,
+        transport: Transport<'_>,
+        group: Option<GroupProof>,
     ) -> Result<Attempt> {
+        let Transport { session, client } = transport;
         let work = self.work.as_ref().expect("preflight belongs to a forward");
         let revision = work.revision;
         let (_, target) = request.targets(&events.account)?;
@@ -615,16 +658,59 @@ impl Forwarding {
         if at != work.authenticated_at || !permits_dispatch() {
             return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
         }
-        if let Err(error) = socket.verify_direct(&target, db, events).await {
-            return Ok(
-                if error.downcast_ref::<StorageContext>().is_some()
-                    || wire_error(&error) == Some(&WireError::Authentication)
-                {
-                    Attempt::Pause(error)
-                } else {
-                    Attempt::Finished(ForwardOutcome::Unavailable)
-                },
-            );
+        match target.kind {
+            ThreadKind::Direct => {
+                if let Err(error) = socket.verify_direct(&target, db, events).await {
+                    return Ok(
+                        if error.downcast_ref::<StorageContext>().is_some()
+                            || wire_error(&error) == Some(&WireError::Authentication)
+                        {
+                            Attempt::Pause(error)
+                        } else {
+                            Attempt::Finished(ForwardOutcome::Unavailable)
+                        },
+                    );
+                }
+            }
+            ThreadKind::Group => match &group {
+                None => {
+                    let (client, session, scope) =
+                        (client.clone(), session.clone(), events.privacy.clone());
+                    let roster_request = group_roster::Request {
+                        thread: request.target_thread.clone(),
+                        privacy_revision: revision,
+                        after: None,
+                    };
+                    self.running = Some(Running {
+                        request: request.clone(),
+                        task: Task::Group(tokio::spawn(async move {
+                            let (visibility, roster) = tokio::try_join!(
+                                verify_group(&client, &session, &target),
+                                group_roster::verify_members(
+                                    &client,
+                                    &session,
+                                    &scope,
+                                    &roster_request
+                                ),
+                            )?;
+                            if visibility != 0
+                                || !roster.allows_forward(&roster_request, session.account_id())
+                            {
+                                return Err(WireError::Unsupported.into());
+                            }
+                            Ok(GroupProof {
+                                request: roster_request,
+                                roster,
+                            })
+                        })),
+                    });
+                    return Ok(Attempt::Dispatched);
+                }
+                Some(proof) if !proof.applies(&events.account, &target) => {
+                    return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
+                }
+                Some(_) => {}
+            },
         }
         if authenticated_at(Some(socket)) != at || !permits_dispatch() {
             return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
@@ -668,13 +754,34 @@ impl Forwarding {
             events.privacy.clone(),
             request.clone(),
         );
+        let db = db.handle()?;
         self.running = Some(Running {
             request: request.clone(),
             task: Task::Dispatch {
                 id,
                 task: tokio::spawn(async move {
+                    if group.is_some() {
+                        let account = session.account_id().to_owned();
+                        let destination = submitted.target_thread.clone();
+                        if db
+                            .call(move |store| {
+                                store.forward_destination_valid(&account, &destination)
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return ForwardDispatch::NotSent;
+                        }
+                    }
                     dispatch
-                        .send(&client, &session, &submitted, &scope, revision, ttl)
+                        .send(
+                            &client,
+                            &session,
+                            &submitted,
+                            &scope,
+                            revision,
+                            DispatchProof { ttl, group },
+                        )
                         .await
                 }),
             },

@@ -186,6 +186,24 @@ synthetic TLS/WSS dispatch and restart case. Group/album/attachment forwarding,
 re-forwarding, multiple recipients and real-service interoperability are
 outside this verified slice.
 
+## Forwarding direct text to groups
+
+The ordinary group route is FILE POST `/api/group/mforward` with one
+session-encrypted `grids` entry containing `grid`, string `clientId`, and
+zero `ttl`. The outer request carries type `"1"`, zero TTL and count one.
+It uses the original direct-text reference and decoration format. The
+bundled client constructs the request at N489377–489394 and binds group
+results to submitted client IDs at `lazy/main-startup` N25522–25543.
+
+The group must have fewer than 100 members. Before dispatch the worker
+checks current group membership, ordinary plaintext capability, visibility,
+send permission and disabled auto-delete. Each result binds the exact
+client ID and any explicit destination in the reply. The existing forward
+outbox scopes receipts by account and complete direct or group thread ID.
+One picker can mix up to ten recipients. Each recipient has its own request
+and outcome. Unknown delivery does not redispatch after restart. The source
+is a saved ordinary direct text message, and the profile remains on schema 25.
+
 ## Ordinary direct text recall (2026-11-19)
 
 The original direct composer checks message age at N136319. N401877–401897

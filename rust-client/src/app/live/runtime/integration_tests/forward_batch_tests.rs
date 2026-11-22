@@ -1,5 +1,89 @@
 use super::*;
 
+pub(super) fn respond_group(
+    stream: &mut impl Write,
+    state: &State,
+    cipher: &SessionCipher,
+    path: &str,
+    headers: &str,
+    body: &[u8],
+) -> bool {
+    let (route, query) = path.split_once('?').unwrap();
+    if !matches!(
+        route,
+        "/api/group/getgi/v2" | "/api/group/getmg-v2" | "/api/group/mforward"
+    ) {
+        return false;
+    }
+    assert!(query.starts_with("zpw_ver=681&zpw_type=24"));
+    let get = route == "/api/group/getgi/v2";
+    assert!(headers.starts_with(if get { "GET " } else { "POST " }));
+    let (_, encrypted) = url::form_urlencoded::parse(if get { query.as_bytes() } else { body })
+        .find(|(key, _)| key == "params")
+        .unwrap();
+    let params: Value = serde_json::from_slice(&cipher.decrypt(&encrypted).unwrap()).unwrap();
+    let data = match route {
+        "/api/group/getgi/v2" => {
+            let id = params["grid"].as_str().unwrap();
+            assert!(matches!(id, "22" | "44" | "55" | "66"));
+            json!({"groupId":id,"visibility":0,"e2ee":id=="66"})
+        }
+        "/api/group/getmg-v2" => {
+            let map: Value = serde_json::from_str(params["gridVerMap"].as_str().unwrap()).unwrap();
+            assert_eq!(map.as_object().unwrap().len(), 1);
+            let id = map.as_object().unwrap().keys().next().unwrap();
+            assert!(matches!(id.as_str(), "22" | "44" | "55" | "66"));
+            json!({"gridInfoMap":{(id): {"groupId":id,"type":1,"creatorId":"33",
+                "totalMember":2,"memVerList":["33_1","11_1"],"adminIds":[]}}})
+        }
+        "/api/group/mforward" => {
+            assert_eq!(query, "zpw_ver=681&zpw_type=24");
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("cookie: zpw_sek=synthetic"));
+            let rows = params["grids"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            let grid = rows[0]["grid"].as_str().unwrap();
+            let client = rows[0]["clientId"].as_str().unwrap();
+            assert!(wire::numeric_id(client).is_ok());
+            assert_eq!(rows[0], json!({"grid":grid,"clientId":client,"ttl":0}));
+            assert!(matches!(grid, "22" | "55"));
+            assert_eq!(params["ttl"], 0);
+            assert_eq!(params["msgType"], "1");
+            assert_eq!(params["totalIds"], 1);
+            assert!(params.get("imei").is_none() && params.get("toIds").is_none());
+            let info: Value = serde_json::from_str(params["msgInfo"].as_str().unwrap()).unwrap();
+            assert_eq!(info["message"], "Tin tổng hợp được chuyển tiếp");
+            let reference: Value =
+                serde_json::from_str(info["reference"].as_str().unwrap()).unwrap();
+            assert!(matches!(
+                crate::protocol::forward::ForwardMarker::parse(&reference),
+                Some(crate::protocol::forward::ForwardMarker::Parsed(_))
+            ));
+            state.http_sends.fetch_add(1, Ordering::SeqCst);
+            if grid == "55" {
+                return true;
+            }
+            json!({"success":[{"clientId":client,"msgId":"991","ts":1760000000099_i64}],"failed":[]})
+        }
+        _ => unreachable!(),
+    };
+    let inner = serde_json::to_vec(&json!({"error_code":0,"data":data})).unwrap();
+    let response = serde_json::to_vec(&json!({
+        "error_code":0,"data":cipher.encrypt(&inner).unwrap()
+    }))
+    .unwrap();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.len()
+    )
+    .unwrap();
+    stream.write_all(&response).unwrap();
+    stream.flush().unwrap();
+    true
+}
+
 async fn expect_forward_batch(
     incoming: &mut mpsc::Receiver<LiveEvent>,
     request_id: u64,
@@ -39,11 +123,19 @@ async fn expect_forward_batch(
 }
 
 fn batch_session(fixture: &Fixture) -> (Arc<VerifiedSession>, PathBuf) {
+    session_with_targets(fixture, false)
+}
+
+fn session_with_targets(fixture: &Fixture, groups: bool) -> (Arc<VerifiedSession>, PathBuf) {
+    let mut services = json!({
+        "chat":["https://wpa.zaloapp.com"],"conversation":["https://wpa.zaloapp.com"],
+        "file":["https://wpa.zaloapp.com"]
+    });
+    if groups {
+        services["group"] = json!(["https://wpa.zaloapp.com"]);
+    }
     let config = ServerConfig::parse(&json!({
-        "zpw_service_map_v3":{
-            "chat":["https://wpa.zaloapp.com"],"conversation":["https://wpa.zaloapp.com"],
-            "file":["https://wpa.zaloapp.com"]
-        },
+        "zpw_service_map_v3":services,
         "zpw_ws":["wss://wpa.zaloapp.com"]
     }))
     .unwrap();
@@ -65,6 +157,17 @@ fn batch_session(fixture: &Fixture) -> (Arc<VerifiedSession>, PathBuf) {
                         is_blocked: Some(false),
                         member_count: None,
                     })
+                    .chain(["22", "44", "55", "66"].into_iter().filter(|_| groups).map(
+                        |remote_id| crate::store::directory::DirectoryRecord {
+                            remote_id: remote_id.into(),
+                            is_group: true,
+                            display_name: format!("Nhóm {remote_id}"),
+                            avatar_url: None,
+                            is_friend: None,
+                            is_blocked: None,
+                            member_count: Some(2),
+                        },
+                    ))
                     .collect(),
                 messages: vec![],
                 message_info: vec![],
@@ -98,6 +201,67 @@ async fn await_source(incoming: &mut mpsc::Receiver<LiveEvent>, restored: bool) 
             LiveEvent::Received { message, .. } if message.id == "910" => source = true,
             _ => {}
         }
+    }
+}
+
+#[tokio::test]
+async fn mixed_forward_batch_keeps_groups_scoped_and_does_not_retry_unknown() {
+    use ForwardOutcome::{Accepted, Unavailable, Unknown};
+
+    let fixture = Fixture::new(Reply::Forward(5));
+    let (session, db_path) = session_with_targets(&fixture, true);
+    for run in 0..2 {
+        let (commands, requests) = mpsc::channel(16);
+        let (events, mut incoming) = mpsc::channel(64);
+        let (stop, cancel) = watch::channel(false);
+        let actor = tokio::spawn(run_with_transports(
+            fixture.profile.clone(),
+            session.clone(),
+            requests,
+            events,
+            Arc::new(|| {}),
+            cancel,
+            fixture.transports(),
+        ));
+        tokio::time::timeout(Duration::from_secs(12), async {
+            await_source(&mut incoming, run > 0).await;
+            if run == 0 {
+                commands
+                    .send(batch(1, &["d:22", "g:22", "g:44", "g:55", "g:66"]))
+                    .await
+                    .unwrap();
+                expect_forward_batch(
+                    &mut incoming,
+                    1,
+                    &[
+                        ("d:22", Accepted),
+                        ("g:22", Accepted),
+                        ("g:44", Unavailable),
+                        ("g:55", Unknown),
+                        ("g:66", Unavailable),
+                    ],
+                )
+                .await;
+            } else {
+                commands.send(batch(2, &["g:55"])).await.unwrap();
+                expect_forward_batch(&mut incoming, 2, &[("g:55", Unknown)]).await;
+            }
+            assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 3);
+        })
+        .await
+        .unwrap();
+        stop.send(true).unwrap();
+        actor.await.unwrap();
+    }
+    let store = MessageStore::open(&db_path).unwrap();
+    for thread in ["d:22", "g:22"] {
+        let page = store.page("11", thread, None, 10).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "991");
+        assert_eq!(page[0].thread_id, thread);
+    }
+    for thread in ["g:44", "g:55", "g:66"] {
+        assert!(store.page("11", thread, None, 10).unwrap().is_empty());
     }
 }
 

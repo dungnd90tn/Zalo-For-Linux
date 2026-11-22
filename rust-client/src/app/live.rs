@@ -180,9 +180,8 @@ fn valid_forward_targets(targets: &[String], account: &str) -> bool {
     let mut unique = std::collections::HashSet::new();
     targets.iter().all(|thread| {
         unique.insert(thread)
-            && Target::from_thread(thread).is_ok_and(|target| {
-                target.kind == ThreadKind::Direct && target.remote_id != account
-            })
+            && Target::from_thread(thread)
+                .is_ok_and(|target| target.kind == ThreadKind::Group || target.remote_id != account)
     })
 }
 
@@ -1312,7 +1311,7 @@ impl LiveWorker {
                     && Target::from_thread(source_thread)
                         .is_ok_and(|t| t.kind == ThreadKind::Direct)
                     && Target::from_thread(target_thread)
-                        .is_ok_and(|t| t.kind == ThreadKind::Direct)
+                        .is_ok_and(|t| t.kind == ThreadKind::Group || t.remote_id != self.account)
                     && crate::protocol::messaging::numeric_id(source_message_id).is_ok()
             }
             LiveCommand::ForwardBatch {

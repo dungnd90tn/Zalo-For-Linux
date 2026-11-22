@@ -44,6 +44,7 @@ pub(crate) struct VerifiedGroup {
     admins: BTreeSet<String>,
     restricted: bool,
     pub(crate) can_pin: bool,
+    pub(crate) can_forward: bool,
     pub permissions: GroupPermissions,
 }
 
@@ -241,12 +242,17 @@ pub(crate) fn verify_group(
             && (privileged || (disabled("addMemberOnly") && disabled("joinAppr"))),
         leave: account != owner,
     };
+    // The source's ordinary multi-forward path falls back at 100 members.
+    // An absent send lock defaults to open in the original settings reader.
+    let can_forward = total < MAX_MEMBERS as u64
+        && (privileged || row.pointer("/setting/lockSendMsg").is_none() || disabled("lockSendMsg"));
     Ok(VerifiedGroup {
         versions,
         owner,
         admins,
         restricted,
         can_pin,
+        can_forward,
         permissions,
     })
 }
@@ -381,6 +387,28 @@ mod tests {
             "setting": {"lockViewMember": 1},
             "memVerList": request_fixture()["sourceMembers"]
         })
+    }
+
+    #[test]
+    fn forwarding_requires_send_permission_and_fewer_than_a_hundred_members() {
+        let target = Target::new(ThreadKind::Group, GROUP).unwrap();
+        let mut row = locked_row();
+        row["setting"]["lockSendMsg"] = json!(true);
+        let payload = response(row);
+        assert!(!verify_group(&payload, "22", &target).unwrap().can_forward);
+        assert!(verify_group(&payload, "88", &target).unwrap().can_forward);
+
+        for (total, permitted) in [(99, true), (100, false)] {
+            let mut row = locked_row();
+            row["totalMember"] = json!(total);
+            row["memVerList"] = json!((1..=total).map(|id| format!("{id}_1")).collect::<Vec<_>>());
+            assert_eq!(
+                verify_group(&response(row), "22", &target)
+                    .unwrap()
+                    .can_forward,
+                permitted
+            );
+        }
     }
 
     #[test]

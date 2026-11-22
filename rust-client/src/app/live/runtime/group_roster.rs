@@ -32,6 +32,10 @@ impl Proof {
     pub(super) fn member_visible(&self, uid: &str) -> bool {
         uid != self.account && self.roster.contains(uid) && self.roster.can_view(&self.account, uid)
     }
+
+    pub(super) fn allows_forward(&self, request: &Request, account: &str) -> bool {
+        self.applies(request, account) && self.roster.can_forward
+    }
 }
 
 impl Request {

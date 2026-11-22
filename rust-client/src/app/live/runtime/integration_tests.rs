@@ -1600,6 +1600,18 @@ fn serve(
         return;
     }
     if let Reply::Forward(mode) = reply {
+        if mode == 5
+            && forward_batch_tests::respond_group(
+                &mut stream,
+                &state,
+                &cipher,
+                &path,
+                &headers,
+                &body,
+            )
+        {
+            return;
+        }
         let get = route == "/api/conv/autodelete/getConvers";
         let form = if get {
             path.split_once('?').unwrap().1.as_bytes()
@@ -1620,6 +1632,8 @@ fn serve(
                 json!({"convers":[{"destId":"22","isGroup":false,"ttl":60000}]})
             } else if mode == 3 {
                 json!({"convers":[{"destId":"66","isGroup":false,"ttl":60000}]})
+            } else if mode == 5 {
+                json!({"convers":[{"destId":"44","isGroup":true,"ttl":60000}]})
             } else {
                 json!({"convers":[]})
             }

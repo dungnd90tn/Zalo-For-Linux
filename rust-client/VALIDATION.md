@@ -1947,3 +1947,20 @@ all-feature Clippy passed. An offline release smoke and a separate migration
 from the previous binary preserved all 19 synthetic messages at schema 25.
 The previous binary refused the upgraded profile. Real-service verification
 remains pending.
+
+## Forwarding direct text to ordinary groups
+
+The mixed TLS/WSS fixture selected a friend and a group with the same numeric
+ID and gave both the same mock server message ID. Native saved each under its
+own thread. It held an unacknowledged group send across restart and issued no
+mutation for the TTL-enabled or encrypted groups. Two other TLS/WSS cases
+covered the existing friend-only batch and cancellation. Offline roster
+tests cover the send lock, privileged role and 99/100-member boundary.
+The other offline cases cover response binding, cache privacy, departure
+and per-target retry. Eight X11 captures cover recipient selection and
+results in both themes at 640×480 and 1200×780.
+
+Default checks passed 319 Rust and 19 Python tests. The all-feature run
+passed 176 store tests, four picker tests, seven protocol/roster tests and
+strict Clippy. The live release passed the schema 25 offline smoke.
+Verification on a real Zalo account remains pending.
