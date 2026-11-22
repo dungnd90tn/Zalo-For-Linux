@@ -87,6 +87,16 @@ pub struct DirectoryCommit {
     pub metadata_rows: usize,
     pub inserted_messages: usize,
 }
+#[cfg(feature = "messaging")]
+type DirectoryDeleteChange = super::delete_for_me::DeleteForMeChange;
+#[cfg(not(feature = "messaging"))]
+enum DirectoryDeleteChange {}
+type DirectoryChanges = (
+    DirectoryCommit,
+    Vec<super::recall::RecallChange>,
+    Vec<DirectoryDeleteChange>,
+);
+
 /// Called within MessageStore's existing schema transaction, never a second writer.
 pub(super) fn initialize(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS directory_entries(
@@ -263,7 +273,7 @@ impl MessageStore {
         forwards: &[super::ForwardBinding],
     ) -> Result<DirectoryCommit> {
         self.apply_directory_batch_inner(batch, refs, forwards, &[])
-            .map(|(commit, _)| commit)
+            .map(|(commit, _, _)| commit)
     }
 
     #[cfg(feature = "messaging")]
@@ -273,7 +283,7 @@ impl MessageStore {
         refs: &[crate::domain::read_state::ReceiptBinding],
         forwards: &[super::ForwardBinding],
         notices: &[super::RecallNotice],
-    ) -> Result<(DirectoryCommit, Vec<super::recall::RecallChange>)> {
+    ) -> Result<DirectoryChanges> {
         self.apply_directory_batch_inner(batch, refs, forwards, notices)
     }
 
@@ -283,7 +293,7 @@ impl MessageStore {
         refs: &[crate::domain::read_state::ReceiptBinding],
         _forwards: &[super::ForwardBinding],
         _notices: &[super::RecallNotice],
-    ) -> Result<(DirectoryCommit, Vec<super::recall::RecallChange>)> {
+    ) -> Result<DirectoryChanges> {
         let refs =
             super::read_state::validate_bindings(&batch.account_id, batch.messages.iter(), refs)?;
         validate_id(&batch.account_id)?;
@@ -441,6 +451,25 @@ impl MessageStore {
                 ])?;
             }
         }
+        #[cfg(feature = "messaging")]
+        let mut deleted_changes = Vec::new();
+        #[cfg(not(feature = "messaging"))]
+        let deleted_changes = Vec::new();
+        #[cfg(feature = "messaging")]
+        if !batch.messages.is_empty() && super::delete_for_me::has_pending(&tx, &batch.account_id)?
+        {
+            for source in &batch.messages {
+                let key = (source.thread_id.as_str(), source.id.as_str());
+                if !infos.contains_key(&key)
+                    && !media_map.contains_key(&key)
+                    && !quotes.contains_key(&key)
+                    && super::delete_for_me::ordinary_replay(source, forwards.get(&key).copied())
+                {
+                    deleted_changes
+                        .extend(super::delete_for_me::confirm_pending(&tx, source, false)?);
+                }
+            }
+        }
         let mut inserted_messages = 0;
         for source in &batch.messages {
             if super::delete_for_me::suppresses(&tx, source)? {
@@ -501,6 +530,8 @@ impl MessageStore {
                 rename.execute(params![batch.account_id, thread])?;
             }
         }
+        #[cfg(feature = "messaging")]
+        super::delete_for_me::refresh_changes(&tx, &batch.account_id, &mut deleted_changes)?;
         tx.commit()?;
         Ok((
             DirectoryCommit {
@@ -508,6 +539,7 @@ impl MessageStore {
                 inserted_messages,
             },
             changes,
+            deleted_changes,
         ))
     }
     /// Indexed keyset pages. Separate group/direct cursors avoid ID collisions.

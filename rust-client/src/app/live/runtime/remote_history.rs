@@ -299,7 +299,12 @@ impl History {
             })
             .await;
         let outcome = match saved {
-            Ok(count) => {
+            Ok((count, deletions)) => {
+                for change in deletions {
+                    events
+                        .emit(delete_for_me::projection(events, change))
+                        .await?;
+                }
                 self.continuation = next.map(|next| (scope, next));
                 if count == 0 && next.is_none() {
                     RemoteHistoryOutcome::Exhausted

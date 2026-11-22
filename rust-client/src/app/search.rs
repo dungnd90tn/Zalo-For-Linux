@@ -107,6 +107,30 @@ impl Model {
         self.search.pending = false;
         self.search.failed = false;
     }
+
+    #[cfg(feature = "messaging")]
+    pub(super) fn remove_search_message(&mut self, thread: &str, message_id: &str, sender: &str) {
+        if self.search.thread.as_deref() == Some(thread) {
+            if self.search.pending {
+                // An in-flight search may still contain the deleted row.
+                self.search.request = self.search.request.wrapping_add(1);
+                self.search.pending = false;
+            }
+            if let Some(results) = &mut self.search.results {
+                results
+                    .hits
+                    .retain(|hit| hit.message_id != message_id || hit.sender != sender);
+            }
+        }
+        if self
+            .search
+            .focus
+            .as_ref()
+            .is_some_and(|focus| focus.thread == thread && focus.message_id == message_id)
+        {
+            self.search.focus = None;
+        }
+    }
     /// Whether `hit` is in the loaded page, so no reload is needed to show it.
     pub fn hit_loaded(&self, hit: &MessageHit) -> bool {
         self.messages.iter().any(|m| m.id == hit.message_id)

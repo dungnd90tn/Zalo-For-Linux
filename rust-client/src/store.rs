@@ -41,7 +41,7 @@ mod voices;
 pub(crate) use sticker_send::Reservation as StickerReservation;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// One received message with optional outbox hint and complete rich sidecars.
 /// The immutable metadata commits with its message and receive cursor.
@@ -78,6 +78,8 @@ pub struct ForwardBinding {
 }
 
 #[cfg(feature = "messaging")]
+use crate::protocol::delete_for_me::DeleteForMeNotice;
+#[cfg(feature = "messaging")]
 use crate::protocol::reactions::ReactionNotice;
 #[cfg(feature = "messaging")]
 use crate::protocol::recall::RecallNotice;
@@ -94,12 +96,18 @@ struct ReceiveExtras<'a> {
         &'a [ReactionNotice],
         &'a mut std::collections::BTreeSet<String>,
     )>,
+    #[cfg(feature = "messaging")]
+    deletes: Option<(
+        &'a [DeleteForMeNotice],
+        &'a mut Vec<delete_for_me::DeleteForMeChange>,
+    )>,
 }
 
 #[cfg(feature = "messaging")]
 pub(crate) struct ReceiveNotices<'a> {
     pub recalls: &'a [RecallNotice],
     pub reactions: &'a [ReactionNotice],
+    pub deletes: &'a [DeleteForMeNotice],
 }
 
 type ReceivedWithRecalls = (
@@ -889,6 +897,8 @@ impl MessageStore {
                 notices: &[],
                 #[cfg(feature = "messaging")]
                 reactions: None,
+                #[cfg(feature = "messaging")]
+                deletes: None,
             },
         )
         .map(|(messages, unread, _)| (messages, unread))
@@ -926,9 +936,10 @@ impl MessageStore {
             ReceiveNotices {
                 recalls: notices,
                 reactions: &[],
+                deletes: &[],
             },
         )
-        .map(|(batch, _)| batch)
+        .map(|(batch, _, _)| batch)
     }
 
     #[cfg(feature = "messaging")]
@@ -940,8 +951,13 @@ impl MessageStore {
         receipts: &[ReceiptBinding],
         context: ReceiveContext,
         notices: ReceiveNotices<'_>,
-    ) -> Result<(ReceivedWithRecalls, std::collections::BTreeSet<String>)> {
+    ) -> Result<(
+        ReceivedWithRecalls,
+        std::collections::BTreeSet<String>,
+        Vec<delete_for_me::DeleteForMeChange>,
+    )> {
         let mut changed = std::collections::BTreeSet::new();
+        let mut deletes = Vec::new();
         let batch = self.receive_batch_inner(
             account,
             messages
@@ -962,9 +978,10 @@ impl MessageStore {
                 attention: Some((receipts, context)),
                 notices: notices.recalls,
                 reactions: Some((notices.reactions, &mut changed)),
+                deletes: Some((notices.deletes, &mut deletes)),
             },
         )?;
-        Ok((batch, changed))
+        Ok((batch, changed, deletes))
     }
 
     fn receive_batch_inner<'a>(
@@ -1024,6 +1041,33 @@ impl MessageStore {
             .attention
             .is_some_and(|(_, context)| context == ReceiveContext::LiveFresh);
         let tx = self.conn.transaction()?;
+        #[cfg(feature = "messaging")]
+        let (mut deleted_changes, delete_output) = {
+            let (notices, result) = extras
+                .deletes
+                .map_or((&[][..], None), |(notices, result)| (notices, Some(result)));
+            if notices.len() > MAX_PAGE_SIZE {
+                bail!(FailureReason::Validation);
+            }
+            let mut changes = Vec::new();
+            for notice in notices {
+                changes.extend(delete_for_me::apply_notice(&tx, account, notice)?);
+            }
+            if message_count > 0 && delete_for_me::has_pending(&tx, account)? {
+                // Settle before projecting siblings: a reply may precede its
+                // original in the batch, and must see the same tombstone.
+                for (source, _, info, media, quote, marker) in messages.clone() {
+                    if info.is_none()
+                        && media.is_none()
+                        && quote.is_none()
+                        && delete_for_me::ordinary_replay(source, marker)
+                    {
+                        changes.extend(delete_for_me::confirm_pending(&tx, source, true)?);
+                    }
+                }
+            }
+            (changes, result)
+        };
         #[cfg(feature = "messaging")]
         let has_pending_reactions = message_count > 0
             && tx.query_row(
@@ -1336,7 +1380,15 @@ impl MessageStore {
         if let Some((queue, id)) = cursor {
             advance_receive_cursor(&tx, account, queue, id)?;
         }
+        #[cfg(feature = "messaging")]
+        if delete_output.is_some() {
+            delete_for_me::refresh_changes(&tx, account, &mut deleted_changes)?;
+        }
         tx.commit()?;
+        #[cfg(feature = "messaging")]
+        if let Some(result) = delete_output {
+            result.extend(deleted_changes);
+        }
         Ok((result, unread, changes))
     }
 

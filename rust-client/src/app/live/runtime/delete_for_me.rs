@@ -289,28 +289,37 @@ pub(super) async fn complete(db: &Database, events: &Events, completed: Completi
     if matches!(result, Dispatch::Accepted) {
         let storage = db
             .call(move |store| {
+                if store.delete_for_me_is_confirmed(&account, client_id)? {
+                    return Ok(None);
+                }
                 store.record_delete_for_me_ack(&account, client_id)?;
-                store.accept_delete_for_me_ack(&account, client_id)
+                store
+                    .accept_delete_for_me_ack(&account, client_id)
+                    .map(Some)
             })
             .await;
         // A proved receipt with a failed local write still cannot be retried.
         return match storage {
-            Ok(change) => publish(events, request, Ok(change)).await,
+            Ok(Some(change)) => publish(events, request, Ok(change)).await,
+            Ok(None) => finish(events, request, DeleteForMeOutcome::Accepted).await,
             Err(_) => finish(events, request, DeleteForMeOutcome::Unknown).await,
         };
     }
     let unknown = matches!(result, Dispatch::Unknown);
     let saved = db
-        .call(move |store| store.fail_delete_for_me(&account, client_id, unknown))
+        .call(move |store| {
+            store.fail_delete_for_me(&account, client_id, unknown)?;
+            store.delete_for_me_is_confirmed(&account, client_id)
+        })
         .await;
-    let outcome = if saved.is_err() {
-        DeleteForMeOutcome::Unknown
-    } else {
-        match result {
+    let outcome = match saved {
+        Ok(true) => DeleteForMeOutcome::Accepted,
+        Ok(false) => match result {
             Dispatch::NotSent => DeleteForMeOutcome::Unavailable,
             Dispatch::Rejected => DeleteForMeOutcome::Rejected,
             Dispatch::Unknown | Dispatch::Accepted => DeleteForMeOutcome::Unknown,
-        }
+        },
+        Err(_) => DeleteForMeOutcome::Unknown,
     };
     finish(events, request, outcome).await
 }
@@ -336,21 +345,23 @@ async fn publish(
             // This deletion is committed. A revision change elsewhere need
             // not suppress updates for a still-visible conversation.
             if recall::normal_scope_revision(&events.privacy, &request.thread).is_some() {
-                events
-                    .emit(LiveEvent::DeletedForMe {
-                        account_id: events.account.clone(),
-                        thread: change.thread_id,
-                        message_id: change.message_id,
-                        sender_id: change.sender_id,
-                        conversation: change.conversation,
-                    })
-                    .await?;
+                events.emit(projection(events, change)).await?;
             }
             DeleteForMeOutcome::Accepted
         }
         Err(error) => store_outcome(&error),
     };
     finish(events, request, outcome).await
+}
+
+pub(super) fn projection(events: &Events, change: DeleteForMeChange) -> LiveEvent {
+    LiveEvent::DeletedForMe {
+        account_id: events.account.clone(),
+        thread: change.thread_id,
+        message_id: change.message_id,
+        sender_id: change.sender_id,
+        conversation: change.conversation,
+    }
 }
 
 async fn finish(events: &Events, request: Request, outcome: DeleteForMeOutcome) -> Result<()> {

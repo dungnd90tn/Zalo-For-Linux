@@ -213,6 +213,7 @@ impl Projection {
                 return None
             }
             LiveEvent::Recalled { thread, .. }
+            | LiveEvent::DeletedForMe { thread, .. }
             | LiveEvent::Page { thread, .. }
             | LiveEvent::Overview { thread, .. }
             | LiveEvent::OverviewFailed { thread, .. }

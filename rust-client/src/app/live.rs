@@ -2211,8 +2211,8 @@ impl super::Model {
                     return false;
                 }
                 self.upsert_live_conversation(conversation);
+                self.remove_search_message(&thread, &message_id, &sender_id);
                 if self.selected.as_deref() == Some(&thread) {
-                    self.clear_search();
                     self.messages.retain(|visible| {
                         visible.account_id != account_id
                             || visible.thread_id != thread

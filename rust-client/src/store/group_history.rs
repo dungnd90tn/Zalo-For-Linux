@@ -55,10 +55,11 @@ impl MessageStore {
         thread: &str,
         anchor: &Cursor,
         batch: IncomingBatch,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<delete_for_me::DeleteForMeChange>)> {
         ensure!(
             batch.messages.len() <= MAX_PAGE_SIZE
                 && batch.recalls.is_empty()
+                && batch.deletes.is_empty()
                 && batch.reactions.is_empty(),
             FailureReason::Validation
         );
@@ -99,6 +100,22 @@ impl MessageStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         verify_anchor(&tx, account, thread, anchor)?;
+        let mut deleted_changes = Vec::new();
+        if !batch.messages.is_empty() && delete_for_me::has_pending(&tx, account)? {
+            for row in &batch.messages {
+                if row.info.is_none()
+                    && row.media.is_none()
+                    && row.quote_content.is_none()
+                    && delete_for_me::ordinary_replay(&row.message, row.forward.as_ref())
+                {
+                    deleted_changes.extend(delete_for_me::confirm_pending(
+                        &tx,
+                        &row.message,
+                        false,
+                    )?);
+                }
+            }
+        }
         let mut inserted = 0;
         for row in &batch.messages {
             let source = &row.message;
@@ -156,8 +173,9 @@ impl MessageStore {
                 params![account, thread],
             )?;
         }
+        delete_for_me::refresh_changes(&tx, account, &mut deleted_changes)?;
         tx.commit()?;
-        Ok(inserted)
+        Ok((inserted, deleted_changes))
     }
 }
 
@@ -297,7 +315,8 @@ mod tests {
         assert_eq!(
             store
                 .ingest_group_history("11", "g:77", &anchor, page(vec![quoted, own, recalled]))
-                .unwrap(),
+                .unwrap()
+                .0,
             3
         );
 

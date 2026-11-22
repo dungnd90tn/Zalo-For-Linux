@@ -53,6 +53,7 @@ enum Reply {
     Recall(u8),
     GroupRecall(group_recall_tests::Mode),
     DeleteForMe(bool),
+    SyncDeleteForMe,
     GroupHistory,
     Reactions,
     ReactionReplay,
@@ -803,6 +804,15 @@ fn serve(
                     .unwrap(),
             ))
             .unwrap();
+        }
+        if matches!(reply, Reply::SyncDeleteForMe) {
+            for payload in delete_for_me_tests::synthetic_sync_queues() {
+                ws.send(tungstenite::Message::Binary(
+                    wire::encode_frame(521, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
+                        .unwrap(),
+                ))
+                .unwrap();
+            }
         }
         if matches!(reply, Reply::GroupHistory) {
             ws.send(tungstenite::Message::Binary(
@@ -2404,7 +2414,7 @@ async fn info_preview_and_socket_orders_keep_identical_full_metadata_without_ack
             account: "11".into(),
             db: db.handle().unwrap(),
             updates,
-            recalls: mpsc::channel(1).0,
+            message_changes: mpsc::channel(1).0,
         };
         let fetcher = DirectoryFetcher::with_client(f.client());
         let session = f.directory_session(false);
@@ -2510,7 +2520,7 @@ async fn media_preview_and_socket_orders_preserve_complete_metadata_across_chunk
             account: "11".into(),
             db: db.handle().unwrap(),
             updates,
-            recalls: mpsc::channel(1).0,
+            message_changes: mpsc::channel(1).0,
         };
         let fetcher = DirectoryFetcher::with_client(f.client());
         let session = f.directory_session(false);
@@ -2714,7 +2724,7 @@ async fn http_media_refresh_enriches_durable_legacy_placeholders_without_rewindi
         account: "11".into(),
         db: db.handle().unwrap(),
         updates,
-        recalls: mpsc::channel(1).0,
+        message_changes: mpsc::channel(1).0,
     };
     let (_stop, cancel) = watch::channel(false);
     let report = DirectoryFetcher::with_client(f.client())
@@ -4546,7 +4556,7 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
         account: "11".into(),
         db: db.handle().unwrap(),
         updates: directory.updates_tx.clone(),
-        recalls: directory.recalls_tx.clone(),
+        message_changes: directory.message_changes_tx.clone(),
     };
     sink.apply(DirectoryBatch {
         message_quotes: Vec::new(),

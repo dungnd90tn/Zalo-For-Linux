@@ -613,6 +613,7 @@ pub struct Incoming {
 pub(crate) struct IncomingBatch {
     pub messages: Vec<Incoming>,
     pub recalls: Vec<super::recall::RecallNotice>,
+    pub deletes: Vec<super::delete_for_me::DeleteForMeNotice>,
     pub reactions: Vec<super::reactions::ReactionNotice>,
 }
 // Stickers carry a catalog address, never an image URL. Unknown/malformed media
@@ -659,7 +660,7 @@ pub(super) fn incoming_verified_preview(
     incoming_with_scope(
         session.account_id(),
         payload,
-        IncomingScope::AuthenticatedQueue,
+        IncomingScope::AuthenticatedPreview,
     )
 }
 /// Reports only the fixed field that failed, never its value or identifiers.
@@ -674,6 +675,7 @@ pub fn incoming_messages_detailed(
 enum IncomingScope {
     RecipientChecked,
     AuthenticatedQueue,
+    AuthenticatedPreview,
 }
 fn incoming_with_scope(
     account: &str,
@@ -704,10 +706,8 @@ fn incoming_with_reason(
     numeric_id(account)?;
     service_code(payload)?;
     context.field_type = Some(FrameValueType::of(payload.get("data")));
-    let data = payload
-        .get("data")
-        .and_then(Value::as_object)
-        .ok_or(WireError::Invalid)?;
+    let raw_data = payload.get("data").ok_or(WireError::Invalid)?;
+    let data = raw_data.as_object().ok_or(WireError::Invalid)?;
     let mut result = IncomingBatch::default();
     let mut rows = 0;
     let mut info_bytes = 0usize;
@@ -751,7 +751,21 @@ fn incoming_with_reason(
             {
                 return Err(WireError::Invalid);
             }
-            if scope == IncomingScope::AuthenticatedQueue
+            if message_type == "chat.delete" {
+                // Destructive controls have authority only from the verified
+                // message socket. Invalid or unsupported forms never become rows.
+                if scope == IncomingScope::AuthenticatedQueue
+                    && matches!(field, "msgs" | "groupMsgs")
+                    && super::delete_for_me::ordinary(raw_data)
+                {
+                    let remaining = super::delete_for_me::MAX_NOTICES - result.deletes.len();
+                    result
+                        .deletes
+                        .extend(super::delete_for_me::notices(account, kind, v, remaining));
+                }
+                continue;
+            }
+            if scope != IncomingScope::RecipientChecked
                 && matches!(field, "msgs" | "groupMsgs")
                 && message_type == "chat.undo"
             {
@@ -772,7 +786,7 @@ fn incoming_with_reason(
                 result.recalls.extend(notice);
                 continue;
             }
-            if scope == IncomingScope::AuthenticatedQueue && message_type == "chat.reaction" {
+            if scope != IncomingScope::RecipientChecked && message_type == "chat.reaction" {
                 // The old chat route carries reaction actions alongside messages.
                 // A notice never becomes an ordinary timeline row or a receipt.
                 if field != "pageMsgs" {
@@ -888,7 +902,7 @@ fn incoming_with_reason(
                     })
                 });
             let content = v.get("content");
-            let structured_webchat = scope == IncomingScope::AuthenticatedQueue
+            let structured_webchat = scope != IncomingScope::RecipientChecked
                 && message_type == "webchat"
                 && info.is_none()
                 && legacy
@@ -984,7 +998,7 @@ fn incoming_with_reason(
             let has_mentions = v.get("mentions").is_some_and(|value| {
                 !value.is_null() && !value.as_array().is_some_and(|items| items.is_empty())
             });
-            let mentions = if scope == IncomingScope::AuthenticatedQueue
+            let mentions = if scope != IncomingScope::RecipientChecked
                 && kind == ThreadKind::Group
                 && ordinary_text
                 && has_mentions
@@ -1418,6 +1432,44 @@ pub fn legacy_group_allowed_detailed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_delete_controls_have_only_authenticated_message_queue_authority() {
+        let row = json!({"msgType":"chat.delete","uidFrom":"0","idTo":"22","content":[
+            {"type":1,"actionType":0,"globalDelMsgId":"701","clientDelMsgId":"801",
+                "uidFrom":"22","uidTo":"11"},
+            {"type":1,"actionType":1,"globalDelMsgId":"702","clientDelMsgId":"802",
+                "uidFrom":"22","uidTo":"11"},
+            {"type":2,"actionType":0,"globalDelMsgId":"703","clientDelMsgId":"803",
+                "uidFrom":"22","uidTo":"11"},
+            {"type":1,"globalDelMsgId":"704","clientDelMsgId":"804","uidFrom":"22","uidTo":"11"}
+        ]});
+        let mut payload = json!({"error_code":0,"data":{"msgs":[row.clone(),{
+            "msgType":"webchat","uidFrom":"22","idTo":"11","msgId":"710",
+            "cliMsgId":"810","ts":1760000000000_i64,"content":"saved"
+        }]}});
+        let parse = |payload: &Value, scope| incoming_with_scope("11", payload, scope).unwrap();
+        let accepted = parse(&payload, IncomingScope::AuthenticatedQueue);
+        assert_eq!(accepted.messages.len(), 1);
+        assert_eq!(accepted.deletes.len(), 1);
+        assert_eq!(accepted.deletes[0].message_id, "701");
+        for scope in [
+            IncomingScope::RecipientChecked,
+            IncomingScope::AuthenticatedPreview,
+        ] {
+            let ignored = parse(&payload, scope);
+            assert_eq!(ignored.messages.len(), 1);
+            assert!(ignored.deletes.is_empty());
+        }
+        payload["data"]["e2ee"] = json!(1);
+        assert!(parse(&payload, IncomingScope::AuthenticatedQueue)
+            .deletes
+            .is_empty());
+        let wrong_queue = json!({"error_code":0,"data":{"pageMsgs":[row]}});
+        let ignored = parse(&wrong_queue, IncomingScope::AuthenticatedQueue);
+        assert!(ignored.deletes.is_empty());
+        assert!(ignored.messages.is_empty());
+    }
     fn authenticated() -> FrameDecoder {
         FrameDecoder {
             key: (0..32).collect(),

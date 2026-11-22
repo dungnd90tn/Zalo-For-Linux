@@ -1870,5 +1870,22 @@ The final optimized live build passed offline startup and restart smoke checks.
 The ignored X11 fixture uses `ZALO_UI_FIXTURE_DELETE=menu|account|device|unknown`
 with `ZALO_UI_FIXTURE_READY=1`. Sixteen synthetic captures cover 640×480
 and 1200×780 in both themes. Account mode still needs real Zalo acceptance.
-The native client does not consume delete controls issued from another
-device.
+
+## Receiving account-only deletions from another device
+
+The authenticated TLS/WSS fixture confirmed one committed deletion, a
+persisted receive cursor, preservation of a neighboring message, and zero
+outgoing delete requests. The offline cases cover queue trust, exact
+message binding, notice-before-source ordering, receipt recovery,
+transaction rollback and projecting redacted quotes on later directory
+import. An unsolicited UI event removes only the matching history, search,
+pin preview and quote references. Four X11 captures verified the existing
+confirmation layout at 640×480 and 1200×780 in both themes.
+
+Default verification passed 318 Rust and 19 Python tests. The all-feature
+checks passed 172 store tests and 13 focused wire, store and UI cases in
+separate runs. Strict Clippy passed. The optimized live binary passed the
+schema 24 startup and restart smoke test. A disposable schema 23 profile
+kept all 19 synthetic messages on upgrade, and the previous binary
+refused the upgraded profile. Phone-to-Linux verification on a real Zalo
+account remains pending.

@@ -1,6 +1,89 @@
 use super::*;
 use crate::app::live::{DeleteForMeMode, DeleteForMeOutcome};
 
+pub(super) fn synthetic_sync_queues() -> [Value; 2] {
+    let text = |message_id, client_id, ts, body| {
+        json!({"uidFrom":"33","idTo":"22","msgId":message_id,"cliMsgId":client_id,
+            "ts":ts,"msgType":"webchat","content":body})
+    };
+    let deleted = text("910", "990", 1760000000000_i64, "synthetic deleted");
+    let kept = text("911", "991", 1760000000001_i64, "synthetic kept");
+    let control = json!({"uidFrom":"0","idTo":"22","msgKey":"g22","isGroup":true,
+        "msgType":"chat.delete","content":[
+            {"type":1,"actionType":0,"globalDelMsgId":"910","clientDelMsgId":"990",
+                "uidFrom":"33","uidTo":"22","destId":"22"},
+            {"type":1,"actionType":1,"globalDelMsgId":"911","clientDelMsgId":"991",
+                "uidFrom":"33","uidTo":"22","destId":"22"}
+        ]
+    });
+    [
+        json!({"error_code":0,"data":{"groupMsgs":[deleted.clone(),kept]}}),
+        json!({"error_code":0,"data":{"groupMsgs":[control.clone(),deleted,control],
+            "queueStatus":{"511_0":{"lastId":"940"}}
+        }}),
+    ]
+}
+
+#[tokio::test]
+async fn authenticated_sync_delete_commits_once_with_cursor_and_no_resend() {
+    let fixture = Fixture::new(Reply::SyncDeleteForMe);
+    let (commands, requests) = mpsc::channel(8);
+    let (events, mut incoming) = mpsc::channel(32);
+    let (stop, cancel) = watch::channel(false);
+    let actor = tokio::spawn(run_with_transports(
+        fixture.profile.clone(),
+        fixture.session(),
+        requests,
+        events,
+        Arc::new(|| {}),
+        cancel,
+        fixture.transports(),
+    ));
+    tokio::time::timeout(Duration::from_secs(6), async {
+        let mut original_seen = false;
+        loop {
+            match incoming.recv().await.unwrap() {
+                LiveEvent::Received { message, .. } if message.id == "910" => {
+                    assert!(!original_seen);
+                    original_seen = true;
+                }
+                LiveEvent::DeletedForMe {
+                    account_id,
+                    thread,
+                    message_id,
+                    sender_id,
+                    ..
+                } => {
+                    assert!(original_seen);
+                    assert_eq!(
+                        (
+                            account_id.as_str(),
+                            thread.as_str(),
+                            message_id.as_str(),
+                            sender_id.as_str()
+                        ),
+                        ("11", "g:22", "910", "33")
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    actor.await.unwrap();
+    drop(commands);
+    assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 0);
+    let store =
+        MessageStore::open(&fixture.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+    assert_eq!(store.receive_cursor("11", "511_0").unwrap(), "940");
+    let page = store.page("11", "g:22", None, 10).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, "911");
+}
+
 pub(super) fn respond(
     stream: &mut StreamOwned<ServerConnection, TcpStream>,
     state: &State,

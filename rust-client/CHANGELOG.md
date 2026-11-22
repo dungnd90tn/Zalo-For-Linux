@@ -17,7 +17,8 @@ Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) đ�
 - Gửi album từ 2 đến 6 ảnh HD trong chat cá nhân và nhóm đủ điều kiện. Khay xem trước giữ thứ tự chọn và phần chữ đang soạn. Nếu một ảnh lỗi hoặc chưa rõ kết quả, ứng dụng báo số ảnh đã xác nhận và dừng các ảnh còn lại.
 - Thu, nghe lại và gửi tin nhắn thoại MP3 tối đa 60 giây qua chat cá nhân và nhóm đủ điều kiện. Có nút phát tin thoại nhận được và giữ bản nháp chữ khi gửi hoặc hủy bản ghi.
 - Xóa một tin văn bản thường ở phía mình. Hộp xác nhận nêu phạm vi thiết bị hoặc tài khoản. Tin đã xóa được bỏ khỏi lịch sử, tìm kiếm và xem trước hội thoại.
-- Hồ sơ nâng lên **schema 23** để giữ dấu xóa khi ứng dụng tải lại lịch sử. Quá trình nâng cấp giữ lịch sử, album và thông tin tin thoại đã lưu. Bản cũ dùng schema 22 trở xuống sẽ từ chối mở hồ sơ đã nâng cấp.
+- Nhận sự kiện xóa tin văn bản ở phía mình từ thiết bị khác. Nếu sự kiện đến trước tin gốc, ứng dụng lưu chờ đến khi có tin khớp để đối chiếu.
+- Hồ sơ nâng lên **schema 24** để giữ các sự kiện xóa đang chờ đối chiếu. Quá trình nâng cấp giữ lịch sử, album và thông tin tin thoại đã lưu. Bản cũ dùng schema 23 trở xuống sẽ từ chối mở hồ sơ đã nâng cấp.
 
 ## 2.0.5 — gói thử 2.0.5-2
 

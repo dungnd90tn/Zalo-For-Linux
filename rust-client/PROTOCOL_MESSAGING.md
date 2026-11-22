@@ -240,8 +240,16 @@ Schema 23 binds a deletion to the account, thread, message and sender. A
 confirmed action removes the local row, sanitizes matching quotes and
 suppresses replay. Uncertain account requests retain the message and are
 never retried automatically. An acknowledgement survives a failed projection
-transaction. The client does not yet consume deletion controls initiated
-on another device.
+transaction.
+
+The authenticated message queue accepts `chat.delete` with an own-account
+actor, single-message type 1 or 3, explicit account-only action type 0, and an
+exact target tuple. The ordinary text target must match account, conversation,
+server message ID, source client ID and sender. Schema 24 stores up to 4,096
+pending claims per account for notices arriving before the original. The
+queue transaction commits notices and its cursor together. Matching history
+can settle a pending claim, and an exact notice can settle an uncertain local
+intent. See PC bundle lines 469779–469814 and 471398–471425.
 
 ## Ordinary group members, invite and leave (2026-11-19)
 

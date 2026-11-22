@@ -1744,6 +1744,155 @@ pub(in crate::ui) mod tests {
         }
     }
     #[test]
+    fn synced_delete_updates_only_the_matching_message_and_its_projections() {
+        use crate::{
+            app::live::{GroupPinEntry, GroupPinSnapshot},
+            domain::{MessageHit, MessageQuote, MessageSearch, ReplyReference},
+        };
+
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        let mut state = app.live.take().unwrap();
+        let chat = |id: &str| Conversation {
+            id: id.into(),
+            title: "Nhóm kiểm thử".into(),
+            last_text: "Tin còn lại".into(),
+            last_sender: "11".into(),
+            last_message_at_ms: 2,
+            group_left: false,
+        };
+        let message = |id: &str, sender: &str, text: &str, sent_at_ms| crate::domain::Message {
+            account_id: "11".into(),
+            thread_id: "g:70".into(),
+            id: id.into(),
+            sender: sender.into(),
+            text: text.into(),
+            sent_at_ms,
+            source_client_id: None,
+            reply_blocked: false,
+            recalled: false,
+            mentions: vec![],
+            quote: None,
+            media: None,
+            sticker: None,
+        };
+        let deleted = message("901", "22", "Tin bị xóa", 1);
+        let mut survivor = message("902", "11", "Tin còn lại", 2);
+        survivor.quote = Some(MessageQuote {
+            owner_id: "22".into(),
+            message_id: "901".into(),
+            client_id: None,
+            message_type: 1,
+            sent_at_ms: 1,
+            text: deleted.text.clone(),
+            ttl: None,
+        });
+        let hit = |message: &crate::domain::Message| MessageHit {
+            message_id: message.id.clone(),
+            sender: message.sender.clone(),
+            sent_at_ms: message.sent_at_ms,
+            snippet: message.text.clone(),
+            highlight: (0, 3),
+            jump: None,
+        };
+        let deleted_hit = hit(&deleted);
+        let survivor_hit = hit(&survivor);
+        let before = survivor.cursor();
+        app.model.conversations = vec![chat("g:70"), chat("g:71")];
+        app.model.selected = Some("g:70".into());
+        app.model.messages = vec![deleted, survivor];
+        app.model.status = "Đang soạn".into();
+        let original_generation = app.model.generation;
+        for thread in ["g:71", "g:70"] {
+            app.drafts.select(thread).unwrap();
+            thread.clone_into(&mut app.drafts.active.text);
+            app.drafts.active.set_reply(ReplyReference {
+                account_id: "11".into(),
+                thread_id: thread.into(),
+                message_id: "901".into(),
+                sender: "22".into(),
+                text: "Trích dẫn mẫu".into(),
+            });
+        }
+        let mut request = 0;
+        app.model
+            .request_search("g:70", "Tin", |id, _| {
+                request = id;
+                Ok(())
+            })
+            .unwrap();
+        let search = MessageSearch {
+            query: "Tin".into(),
+            hits: vec![survivor_hit.clone(), deleted_hit.clone()],
+            next: Some(before.clone()),
+            truncated: true,
+        };
+        assert!(app.model.apply_search(request, "g:70", search.clone()));
+        app.model.focus_hit("g:70", &deleted_hit);
+        app.model
+            .request_search_before("g:70", "Tin", Some(before), |id, _, _| {
+                request = id;
+                Ok(())
+            })
+            .unwrap();
+        let pins_scope = app.group_pin_scope(&state).unwrap();
+        state.group_pins.fixture(
+            pins_scope,
+            GroupPinSnapshot {
+                can_mutate: false,
+                entries: [deleted_hit, survivor_hit.clone()]
+                    .into_iter()
+                    .map(|hit| GroupPinEntry {
+                        message_id: hit.message_id.clone(),
+                        hit: Some(hit),
+                    })
+                    .collect(),
+                unresolved: vec![],
+            },
+        );
+        let event = |account: &str, thread: &str| LiveEvent::DeletedForMe {
+            account_id: account.into(),
+            thread: thread.into(),
+            message_id: "901".into(),
+            sender_id: "22".into(),
+            conversation: chat(thread),
+        };
+        app.apply_live_event(&mut state, event("12", "g:70"), &ctx);
+        assert_eq!(app.model.messages.len(), 2);
+        assert!(app.drafts.active.reply().is_some());
+        app.apply_live_event(&mut state, event("11", "g:70"), &ctx);
+        assert_eq!(app.model.selected.as_deref(), Some("g:70"));
+        assert_eq!(app.model.generation, original_generation);
+        assert_eq!(app.model.status, "Đang soạn");
+        assert_eq!(app.model.messages.len(), 1);
+        assert_eq!(app.model.messages[0].id, "902");
+        assert_eq!(
+            app.model.messages[0].quote.as_ref().unwrap().text,
+            crate::store::delete_for_me::DELETED_FOR_ME_TEXT
+        );
+        assert!(app.model.focus().is_none());
+        assert!(!app.model.search_pending("g:70"));
+        assert!(!app.model.apply_search(request, "g:70", search));
+        assert_eq!(
+            app.model.search_results("g:70").unwrap().hits.as_slice(),
+            std::slice::from_ref(&survivor_hit)
+        );
+        let entries = state.group_pins.fixture_entries();
+        assert!(entries[0].hit.is_none());
+        assert_eq!(entries[1].hit.as_ref(), Some(&survivor_hit));
+        assert!(!state.delete_for_me.is_open());
+        assert!(state.delete_for_me.status_label().is_none());
+        assert_eq!(app.drafts.active.text, "g:70");
+        assert!(app.drafts.active.reply().is_none());
+        app.drafts.select("g:71").unwrap();
+        assert_eq!(app.drafts.active.text, "g:71");
+        assert!(app.drafts.active.reply().is_some());
+        drop(state);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn accepted_send_failure_enters_review_without_losing_newer_draft_or_replaying_stale_events() {
         for edited in [false, true] {
             let ctx = egui::Context::default();

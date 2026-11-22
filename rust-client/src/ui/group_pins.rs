@@ -228,6 +228,11 @@ impl Pins {
         self.snapshot = Some(snapshot);
         self.fixture = true;
     }
+
+    #[cfg(test)]
+    pub(super) fn fixture_entries(&self) -> &[crate::app::live::GroupPinEntry] {
+        &self.snapshot.as_ref().unwrap().entries
+    }
 }
 
 pub(super) struct MenuAction {

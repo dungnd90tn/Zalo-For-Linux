@@ -12,6 +12,11 @@ pub(super) fn initialize(conn: &Connection) -> Result<()> {
             CHECK(operation_id IS NOT NULL OR state='deleted'),
             PRIMARY KEY(account_id,thread_id,message_id),
             UNIQUE(account_id,operation_id)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS delete_for_me_pending_notices(
+            account_id TEXT NOT NULL,thread_id TEXT NOT NULL,message_id TEXT NOT NULL,
+            sender_id TEXT NOT NULL,source_client_id TEXT NOT NULL,
+            PRIMARY KEY(account_id,thread_id,message_id,sender_id,source_client_id)
         ) WITHOUT ROWID;",
     )?;
     Ok(())
@@ -87,10 +92,12 @@ pub(super) fn state(
 mod live {
     use super::*;
     use crate::domain::reply::valid_source_id;
+    use crate::protocol::delete_for_me::DeleteForMeNotice;
     use anyhow::ensure;
 
     const MAX_CLIENT_ID: i64 = 9_007_199_254_740_991;
     const MAX_UNRESOLVED: i64 = 100;
+    const MAX_PENDING_NOTICES: i64 = 4096;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum DeleteForMeFailure {
@@ -204,7 +211,7 @@ mod live {
         thread: &str,
         id: &str,
         sender: &str,
-    ) -> Result<DeleteForMeChange> {
+    ) -> Result<Option<DeleteForMeChange>> {
         let current_sender: Option<String> = conn.query_row(
             "SELECT sender FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
             params![account,thread,id], |row| row.get(0),
@@ -236,17 +243,198 @@ mod live {
              WHERE c.account_id=?1 AND c.thread_id=?2",
             params![account,thread],
         )?;
-        let conversation = conn.query_row(
-            CONVERSATION_SQL,
-            params![account, thread, MAX_PREVIEW_CHARS as i64],
-            conversation_row,
-        )?;
-        Ok(DeleteForMeChange {
+        let conversation = conn
+            .query_row(
+                CONVERSATION_SQL,
+                params![account, thread, MAX_PREVIEW_CHARS as i64],
+                conversation_row,
+            )
+            .optional()?;
+        Ok(conversation.map(|conversation| DeleteForMeChange {
             thread_id: thread.into(),
             message_id: id.into(),
             sender_id: sender.into(),
             conversation,
-        })
+        }))
+    }
+
+    pub(in super::super) fn refresh_changes(
+        conn: &Connection,
+        account: &str,
+        changes: &mut [DeleteForMeChange],
+    ) -> Result<()> {
+        for change in changes {
+            change.conversation = conn.query_row(
+                CONVERSATION_SQL,
+                params![account, change.thread_id, MAX_PREVIEW_CHARS as i64],
+                conversation_row,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn encrypted(conn: &Connection, account: &str, thread: &str) -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM e2ee_threads WHERE account_id=?1 AND thread_id=?2)",
+            params![account, thread],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn confirm_notice(
+        conn: &Connection,
+        account: &str,
+        thread: &str,
+        id: &str,
+        sender: &str,
+        client: &str,
+    ) -> Result<Option<DeleteForMeChange>> {
+        let inserted = conn.execute(
+            "INSERT INTO delete_for_me_intents VALUES(?1,?2,?3,?4,?5,NULL,'deleted')
+             ON CONFLICT(account_id,thread_id,message_id) DO UPDATE SET state='deleted'
+             WHERE sender_id=excluded.sender_id AND source_client_id=excluded.source_client_id
+               AND state<>'deleted'",
+            params![account, thread, id, sender, client],
+        )?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        conn.execute(
+            "DELETE FROM delete_for_me_pending_notices WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
+            params![account,thread,id],
+        )?;
+        project(conn, account, thread, id, sender)
+    }
+
+    pub(in super::super) fn apply_notice(
+        conn: &Connection,
+        account: &str,
+        notice: &DeleteForMeNotice,
+    ) -> Result<Option<DeleteForMeChange>> {
+        let thread = &notice.thread_id;
+        let id = &notice.message_id;
+        let sender = &notice.sender_id;
+        let client = &notice.source_client_id;
+        let Some((kind, remote)) = thread.split_once(':') else {
+            return Ok(None);
+        };
+        if !matches!(kind, "d" | "g")
+            || ![account, remote, id, sender, client]
+                .into_iter()
+                .all(valid_source_id)
+            || (kind == "d" && (account == remote || (sender != remote && sender != account)))
+            || encrypted(conn, account, thread)?
+            || state(conn, account, thread, id)?.as_deref() == Some("deleted")
+        {
+            return Ok(None);
+        }
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)",
+            params![account,thread,id], |row| row.get(0),
+        )?;
+        if exists {
+            let source = match eligible_message(conn, account, thread, id, kind, remote) {
+                Ok(source) => source,
+                Err(error)
+                    if error.downcast_ref::<DeleteForMeFailure>()
+                        == Some(&DeleteForMeFailure::Unavailable) =>
+                {
+                    return Ok(None)
+                }
+                Err(error) => return Err(error),
+            };
+            if source.sender != *sender {
+                return Ok(None);
+            }
+            if let Some(source_client) = source.client {
+                return if source_client == *client {
+                    confirm_notice(conn, account, thread, id, sender, client)
+                } else {
+                    Ok(None)
+                };
+            }
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO delete_for_me_pending_notices
+             SELECT ?1,?2,?3,?4,?5
+             WHERE (SELECT count(*) FROM delete_for_me_pending_notices WHERE account_id=?1) < ?6",
+            params![account, thread, id, sender, client, MAX_PENDING_NOTICES],
+        )?;
+        Ok(None)
+    }
+
+    /// The pending operation proves its scope only once the wire mapper supplies
+    /// a canonical ordinary message with both IDs and the same sender.
+    pub(in super::super) fn confirm_pending(
+        conn: &Connection,
+        message: &Message,
+        publish_existing: bool,
+    ) -> Result<Option<DeleteForMeChange>> {
+        let Some(client) = &message.source_client_id else {
+            return Ok(None);
+        };
+        let account = &message.account_id;
+        let thread = &message.thread_id;
+        let id = &message.id;
+        let sender = &message.sender;
+        let pending: bool = conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM delete_for_me_pending_notices
+             WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND sender_id=?4 AND source_client_id=?5)",
+        )?.query_row(params![account,thread,id,sender,client], |row| row.get(0))?;
+        if !pending || encrypted(conn, account, thread)? {
+            return Ok(None);
+        }
+        let Some((kind, remote)) = thread.split_once(':') else {
+            return Ok(None);
+        };
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)",
+            params![account,thread,id], |row| row.get(0),
+        )?;
+        if exists {
+            if !publish_existing {
+                // History importers cannot publish a removal for already loaded
+                // pages. The queued receive path will settle this exact proof.
+                return Ok(None);
+            }
+            match eligible_message(conn, account, thread, id, kind, remote) {
+                Ok(source)
+                    if source.sender == *sender
+                        && source.client.as_deref().is_none_or(|known| known == client) => {}
+                Ok(_) => return Ok(None),
+                Err(error)
+                    if error.downcast_ref::<DeleteForMeFailure>()
+                        == Some(&DeleteForMeFailure::Unavailable) =>
+                {
+                    return Ok(None)
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        confirm_notice(conn, account, thread, id, sender, client)
+    }
+
+    pub(in super::super) fn has_pending(conn: &Connection, account: &str) -> Result<bool> {
+        Ok(conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM delete_for_me_pending_notices WHERE account_id=?1)",
+            )?
+            .query_row([account], |row| row.get(0))?)
+    }
+
+    pub(in super::super) fn ordinary_replay(
+        message: &Message,
+        marker: Option<&ForwardMarker>,
+    ) -> bool {
+        !matches!(
+            marker,
+            Some(
+                ForwardMarker::Parsed(_)
+                    | ForwardMarker::Unavailable
+                    | ForwardMarker::StructuredWebchat
+            )
+        ) && message.quote.is_none()
+            && message.reply_reference().is_some()
     }
 
     impl MessageStore {
@@ -262,7 +450,8 @@ mod live {
                 "INSERT INTO delete_for_me_intents VALUES(?1,?2,?3,?4,?5,NULL,'deleted')",
                 params![account, thread, message_id, target.sender, target.client],
             )?;
-            let change = project(&tx, account, thread, message_id, &target.sender)?;
+            let change = project(&tx, account, thread, message_id, &target.sender)?
+                .ok_or(FailureReason::ConflictingMessage)?;
             tx.commit()?;
             Ok(change)
         }
@@ -361,6 +550,19 @@ mod live {
             Ok(())
         }
 
+        pub(crate) fn delete_for_me_is_confirmed(
+            &self,
+            account: &str,
+            client_id: u64,
+        ) -> Result<bool> {
+            Ok(self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM delete_for_me_intents
+                 WHERE account_id=?1 AND operation_id=?2 AND state='deleted')",
+                params![account, i64::try_from(client_id)?],
+                |row| row.get(0),
+            )?)
+        }
+
         pub(crate) fn accept_delete_for_me_ack(
             &mut self,
             account: &str,
@@ -378,7 +580,8 @@ mod live {
                 "UPDATE delete_for_me_intents SET state='deleted' WHERE account_id=?1 AND operation_id=?2",
                 params![account,client_id],
             )?;
-            let change = project(&tx, account, &thread, &id, &sender)?;
+            let change = project(&tx, account, &thread, &id, &sender)?
+                .ok_or(FailureReason::ConflictingMessage)?;
             tx.commit()?;
             Ok(change)
         }
@@ -423,11 +626,16 @@ mod live {
 }
 
 #[cfg(feature = "messaging")]
+pub(super) use live::{
+    apply_notice, confirm_pending, has_pending, ordinary_replay, refresh_changes,
+};
+#[cfg(feature = "messaging")]
 pub(crate) use live::{DeleteForMeChange, DeleteForMeFailure};
 
 #[cfg(all(test, feature = "messaging"))]
 mod tests {
     use super::*;
+    use crate::protocol::delete_for_me::DeleteForMeNotice;
 
     fn text(account: &str, thread: &str, id: &str, sender: &str) -> Message {
         Message {
@@ -445,6 +653,189 @@ mod tests {
             sticker: None,
             media: None,
         }
+    }
+
+    fn notice(message: &Message) -> DeleteForMeNotice {
+        DeleteForMeNotice {
+            thread_id: message.thread_id.clone(),
+            message_id: message.id.clone(),
+            sender_id: message.sender.clone(),
+            source_client_id: message.source_client_id.clone().unwrap(),
+        }
+    }
+
+    fn batch(
+        store: &mut MessageStore,
+        rows: Vec<Message>,
+        notices: &[DeleteForMeNotice],
+        cursor: &str,
+    ) -> Result<Vec<DeleteForMeChange>> {
+        let rows = rows
+            .into_iter()
+            .map(|row| ((row, None, None, None, None), None))
+            .collect::<Vec<_>>();
+        let (_, _, changes) = store.receive_batch_with_notices(
+            "11",
+            &rows,
+            Some(("510_0", cursor)),
+            &[],
+            ReceiveContext::OfflineSync,
+            ReceiveNotices {
+                recalls: &[],
+                reactions: &[],
+                deletes: notices,
+            },
+        )?;
+        Ok(changes)
+    }
+
+    #[test]
+    fn identical_sync_notice_and_original_commit_without_creating_a_conversation() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let deleted = text("11", "d:22", "701", "22");
+        let notice = notice(&deleted);
+        store.conn.execute_batch(
+            "CREATE TRIGGER fail_cursor BEFORE INSERT ON receive_cursors BEGIN SELECT RAISE(ABORT,'synthetic'); END;",
+        ).unwrap();
+        assert!(batch(
+            &mut store,
+            vec![deleted.clone()],
+            std::slice::from_ref(&notice),
+            "901"
+        )
+        .is_err());
+        assert_eq!(state(&store.conn, "11", "d:22", "701").unwrap(), None);
+        assert!(!has_pending(&store.conn, "11").unwrap());
+        assert_eq!(store.receive_cursor("11", "510_0").unwrap(), "1");
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_cursor")
+            .unwrap();
+
+        let changes = batch(
+            &mut store,
+            vec![deleted.clone()],
+            &[notice.clone(), notice],
+            "901",
+        )
+        .unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(store.receive_cursor("11", "510_0").unwrap(), "901");
+        assert!(suppresses(&store.conn, &deleted).unwrap());
+        assert!(store.conversations("11", 20).unwrap().is_empty());
+        assert!(batch(&mut store, vec![deleted], &[], "902")
+            .unwrap()
+            .is_empty());
+        assert!(store.page("11", "d:22", None, 20).unwrap().is_empty());
+        assert!(!has_pending(&store.conn, "11").unwrap());
+    }
+
+    #[test]
+    fn early_notice_never_suppresses_conflicting_or_nonordinary_message() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let actual = text("11", "g:22", "701", "55");
+        let mut conflict = notice(&actual);
+        conflict.source_client_id = "755".into();
+        let mut unsupported = text("11", "g:22", "702", "55");
+        unsupported.reply_blocked = true;
+        let sibling = text("11", "d:33", "701", "33");
+        batch(&mut store, vec![], &[conflict, notice(&unsupported)], "901").unwrap();
+        assert!(batch(
+            &mut store,
+            vec![actual.clone(), unsupported, sibling],
+            &[],
+            "902"
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(store.page("11", "g:22", None, 20).unwrap().len(), 2);
+        assert!(!suppresses(&store.conn, &actual).unwrap());
+        assert_eq!(store.page("11", "d:33", None, 20).unwrap().len(), 1);
+        assert_eq!(store.receive_cursor("11", "510_0").unwrap(), "902");
+    }
+
+    #[test]
+    fn directory_confirmation_refreshes_a_saved_quote_when_the_original_was_absent() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let target = text("11", "d:22", "701", "22");
+        let mut later = text("11", "d:22", "703", "22");
+        later.quote = Some(MessageQuote {
+            owner_id: target.sender.clone(),
+            message_id: target.id.clone(),
+            client_id: target.source_client_id.clone(),
+            message_type: 1,
+            sent_at_ms: target.sent_at_ms,
+            text: target.text.clone(),
+            ttl: None,
+        });
+        store.insert_batch(std::slice::from_ref(&later)).unwrap();
+        assert!(batch(&mut store, vec![], &[notice(&target)], "901")
+            .unwrap()
+            .is_empty());
+        let (commit, recalls, deletes) = store
+            .apply_directory_batch_with_forwards_and_recalls(
+                &directory::DirectoryBatch {
+                    account_id: "11".into(),
+                    entries: vec![],
+                    messages: vec![target],
+                    message_info: vec![],
+                    message_media: vec![],
+                    message_quotes: vec![],
+                    observed_at_ms: 1000,
+                },
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(commit.inserted_messages, 0);
+        assert!(recalls.is_empty());
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(deletes[0].message_id, "701");
+        assert_eq!(deletes[0].conversation.last_text, later.text);
+        let visible = store.page("11", "d:22", None, 20).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].quote.as_ref().unwrap().text, DELETED_FOR_ME_TEXT);
+    }
+
+    #[test]
+    fn synced_effect_resolves_matching_unknown_and_refreshes_preview_once() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let earlier = text("11", "g:22", "701", "55");
+        let deleted = text("11", "g:22", "702", "56");
+        let other = text("33", "g:22", "702", "56");
+        store
+            .insert_batch(&[earlier.clone(), deleted.clone(), other.clone()])
+            .unwrap();
+        store.replace_live_privacy("11", &[], None).unwrap();
+        store
+            .conn
+            .execute("INSERT INTO message_unread VALUES('11','g:22','702')", [])
+            .unwrap();
+        let reservation = store
+            .prepare_delete_for_me("11", "g:22", "702", 1000)
+            .unwrap();
+        let op = reservation.client_id;
+        store.fail_delete_for_me("11", op, true).unwrap();
+        let mut conflicting = notice(&deleted);
+        conflicting.sender_id = "55".into();
+        let notice = notice(&deleted);
+        assert!(batch(&mut store, vec![], &[conflicting], "901")
+            .unwrap()
+            .is_empty());
+        assert!(!store.delete_for_me_is_confirmed("11", op).unwrap());
+        assert_eq!(store.thread_read_state("11", "g:22").unwrap().unread, 1);
+
+        let changes = batch(&mut store, vec![], &[notice.clone(), notice.clone()], "902").unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].conversation.last_text, earlier.text);
+        assert!(store.delete_for_me_is_confirmed("11", op).unwrap());
+        assert_eq!(store.thread_read_state("11", "g:22").unwrap().unread, 0);
+        assert_eq!(store.page("33", "g:22", None, 20).unwrap(), [other]);
+        assert!(batch(&mut store, vec![deleted], &[notice], "903")
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.page("11", "g:22", None, 20).unwrap(), [earlier]);
     }
 
     #[test]

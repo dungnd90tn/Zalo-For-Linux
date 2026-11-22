@@ -574,8 +574,7 @@ fn parse_previews_inner(
                 None => super::messaging::incoming_messages_detailed(account, &payload).map(
                     |messages| super::messaging::IncomingBatch {
                         messages,
-                        recalls: Vec::new(),
-                        reactions: Vec::new(),
+                        ..Default::default()
                     },
                 ),
             }

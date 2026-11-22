@@ -669,25 +669,16 @@ struct RuntimeDirectorySink {
     account: String,
     db: DatabaseHandle,
     updates: watch::Sender<u64>,
-    recalls: mpsc::Sender<crate::store::recall::RecallChange>,
+    message_changes: mpsc::Sender<DirectoryMessageChange>,
+}
+enum DirectoryMessageChange {
+    Recall(Box<crate::store::recall::RecallChange>),
+    DeleteForMe(crate::store::delete_for_me::DeleteForMeChange),
 }
 impl DirectorySink for RuntimeDirectorySink {
     async fn apply(&mut self, batch: DirectoryBatch) -> std::result::Result<(), DirectoryFailure> {
-        if batch.account_id != self.account {
-            return Err(directory_failure(DirectoryCategory::Storage));
-        }
-        self.db
-            .call_with(StorageOperation::DirectoryWrite, move |store| {
-                store.apply_directory_batch(&batch)?;
-                Ok(())
-            })
+        self.apply_preview(batch, Vec::new(), Vec::new(), Vec::new())
             .await
-            .map_err(|_| directory_failure(DirectoryCategory::Storage))?;
-        // Coalesce durable changes while the UI is slow. The directory task
-        // never reserves critical WebSocket event capacity.
-        self.updates
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
-        Ok(())
     }
 
     async fn apply_preview(
@@ -697,27 +688,33 @@ impl DirectorySink for RuntimeDirectorySink {
         forwards: Vec<crate::store::ForwardBinding>,
         recalls: Vec<crate::protocol::recall::RecallNotice>,
     ) -> std::result::Result<(), DirectoryFailure> {
-        if receipts.is_empty() && forwards.is_empty() && recalls.is_empty() {
-            return self.apply(batch).await;
-        }
         if batch.account_id != self.account {
             return Err(directory_failure(DirectoryCategory::Storage));
         }
-        let changes = self
+        let (_, recalls, deletions) = self
             .db
             .call_with(StorageOperation::DirectoryWrite, move |store| {
-                store
-                    .apply_directory_batch_with_forwards_and_recalls(
-                        &batch, &receipts, &forwards, &recalls,
-                    )
-                    .map(|(_, changes)| changes)
+                store.apply_directory_batch_with_forwards_and_recalls(
+                    &batch, &receipts, &forwards, &recalls,
+                )
             })
             .await
             .map_err(|_| directory_failure(DirectoryCategory::Storage))?;
+        // Coalesce durable changes while the UI is slow. The directory task
+        // never reserves critical WebSocket event capacity.
         self.updates
             .send_modify(|revision| *revision = revision.wrapping_add(1));
-        for change in changes {
-            self.recalls
+        for change in recalls
+            .into_iter()
+            .map(Box::new)
+            .map(DirectoryMessageChange::Recall)
+            .chain(
+                deletions
+                    .into_iter()
+                    .map(DirectoryMessageChange::DeleteForMe),
+            )
+        {
+            self.message_changes
                 .send(change)
                 .await
                 .map_err(|_| directory_failure(DirectoryCategory::Cancelled))?;
@@ -769,14 +766,14 @@ struct DirectorySync {
     updates_rx: watch::Receiver<u64>,
     status: Option<(u64, bool, DirectoryReport)>,
     conversations_changed: bool,
-    recalls_tx: mpsc::Sender<crate::store::recall::RecallChange>,
-    recalls_rx: mpsc::Receiver<crate::store::recall::RecallChange>,
-    pending_recall: Option<crate::store::recall::RecallChange>,
+    message_changes_tx: mpsc::Sender<DirectoryMessageChange>,
+    message_changes_rx: mpsc::Receiver<DirectoryMessageChange>,
+    pending_message_change: Option<DirectoryMessageChange>,
 }
 impl DirectorySync {
     fn new() -> Self {
         let (updates_tx, updates_rx) = watch::channel(0);
-        let (recalls_tx, recalls_rx) = mpsc::channel(32);
+        let (message_changes_tx, message_changes_rx) = mpsc::channel(32);
         Self {
             last_started: None,
             running: None,
@@ -785,9 +782,9 @@ impl DirectorySync {
             updates_rx,
             status: None,
             conversations_changed: false,
-            recalls_tx,
-            recalls_rx,
-            pending_recall: None,
+            message_changes_tx,
+            message_changes_rx,
+            pending_message_change: None,
         }
     }
     fn request(
@@ -861,7 +858,7 @@ impl DirectorySync {
             account: session.account_id().into(),
             db,
             updates: self.updates_tx.clone(),
-            recalls: self.recalls_tx.clone(),
+            message_changes: self.message_changes_tx.clone(),
         };
         let task = tokio::spawn(async move { fetcher.synchronize(&session, &mut sink, rx).await });
         self.running = Some(DirectoryRun {
@@ -910,7 +907,7 @@ impl DirectorySync {
         }
     }
     fn notifications_pending(&self) -> bool {
-        self.pending_recall.is_some() || self.status.is_some() || self.conversations_changed
+        self.pending_message_change.is_some() || self.status.is_some() || self.conversations_changed
     }
     async fn publish_notification(
         &mut self,
@@ -918,12 +915,21 @@ impl DirectorySync {
         db: &Database,
         events: &Events,
     ) -> Result<()> {
-        if let Some(change) = self.pending_recall.take() {
+        if let Some(change) = self.pending_message_change.take() {
+            let event = match change {
+                DirectoryMessageChange::Recall(change) => recall::projection(events, *change),
+                DirectoryMessageChange::DeleteForMe(change) => {
+                    // A socket commit can overtake a directory task's snapshot.
+                    // Keep the coalesced sidebar refresh after this projection.
+                    self.conversations_changed = true;
+                    delete_for_me::projection(events, change)
+                }
+            };
             if let Some(event) = events
                 .privacy
                 .read()
                 .map_err(|_| anyhow::anyhow!("Privacy state unavailable"))?
-                .event(recall::projection(events, change))
+                .event(event)
             {
                 permit.send(event);
             }
@@ -1515,6 +1521,7 @@ impl Connection {
                 let wire::IncomingBatch {
                     messages: parsed,
                     recalls,
+                    deletes,
                     reactions: reaction_notices,
                 } = self
                     .decoder
@@ -1653,24 +1660,36 @@ impl Connection {
                     crate::domain::read_state::ReceiveContext::OfflineSync
                 };
                 attention::apply_status(db, events, &frame.payload).await?;
-                let (stored, new_unread, changes, changed_reactions) = db
+                let (stored, new_unread, changes, changed_reactions, deleted_changes) = db
                     .call_with(StorageOperation::ReceiveBatch, move |s| {
-                        let ((mut stored, new_unread, changes), changed_reactions) = s
-                            .receive_batch_with_notices(
-                                &account,
-                                &messages,
-                                cursor.as_ref().map(|(q, id)| (q.as_str(), id.as_str())),
-                                &receipts,
-                                context,
-                                crate::store::ReceiveNotices {
-                                    recalls: &recalls,
-                                    reactions: &reaction_notices,
-                                },
-                            )?;
+                        let (
+                            (mut stored, new_unread, changes),
+                            changed_reactions,
+                            mut deleted_changes,
+                        ) = s.receive_batch_with_notices(
+                            &account,
+                            &messages,
+                            cursor.as_ref().map(|(q, id)| (q.as_str(), id.as_str())),
+                            &receipts,
+                            context,
+                            crate::store::ReceiveNotices {
+                                recalls: &recalls,
+                                reactions: &reaction_notices,
+                                deletes: &deletes,
+                            },
+                        )?;
                         if !silent.is_empty() {
                             // Birthday cards and Official Account broadcasts never move a conversation in the list.
                             let refreshed = s.mark_list_silent(&account, &silent)?;
-                            for (_, conversation) in &mut stored {
+                            let conversations = stored
+                                .iter_mut()
+                                .map(|(_, conversation)| conversation)
+                                .chain(
+                                    deleted_changes
+                                        .iter_mut()
+                                        .map(|change| &mut change.conversation),
+                                );
+                            for conversation in conversations {
                                 if let Some(update) =
                                     refreshed.iter().find(|c| c.id == conversation.id)
                                 {
@@ -1678,7 +1697,13 @@ impl Connection {
                                 }
                             }
                         }
-                        Ok((stored, new_unread, changes, changed_reactions))
+                        Ok((
+                            stored,
+                            new_unread,
+                            changes,
+                            changed_reactions,
+                            deleted_changes,
+                        ))
                     })
                     .await?;
                 for (queue, id) in cursors.into_iter().skip(1) {
@@ -1726,6 +1751,11 @@ impl Connection {
                             message,
                             conversation,
                         })
+                        .await?;
+                }
+                for change in deleted_changes {
+                    events
+                        .emit(delete_for_me::projection(events, change))
                         .await?;
                 }
                 if offline_queue && more {
@@ -2763,8 +2793,8 @@ async fn run_inner(
                 changed.map_err(|_|anyhow::anyhow!("Directory stopped"))?;
                 directory.changed();
             },
-            change = directory.recalls_rx.recv(), if directory.pending_recall.is_none() => {
-                directory.pending_recall = change;
+            change = directory.message_changes_rx.recv(), if directory.pending_message_change.is_none() => {
+                directory.pending_message_change = change;
             },
             permit = events.tx.reserve(), if directory.notifications_pending() => {
                 directory.publish_notification(permit.map_err(|_|anyhow::anyhow!("UI stopped"))?,&db,events).await?;
@@ -2954,8 +2984,8 @@ async fn run_inner(
                             changed.map_err(|_|anyhow::anyhow!("Directory stopped"))?;
                             directory.changed();
                         },
-                        change = directory.recalls_rx.recv(), if directory.pending_recall.is_none() => {
-                            directory.pending_recall = change;
+                        change = directory.message_changes_rx.recv(), if directory.pending_message_change.is_none() => {
+                            directory.pending_message_change = change;
                         },
                         permit = events.tx.reserve(), if directory.notifications_pending() => {
                             directory.publish_notification(permit.map_err(|_|anyhow::anyhow!("UI stopped"))?,&db,events).await?;
