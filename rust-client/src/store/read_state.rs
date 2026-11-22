@@ -395,7 +395,9 @@ impl MessageStore {
             };
             tx.execute(
                 "INSERT INTO delivery_receipts(account_id,thread_id,message_id,client_id,reader_id,state,observed_at_ms)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)
+                 SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT EXISTS(
+                   SELECT 1 FROM delete_for_me_intents
+                   WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND state='deleted')
                  ON CONFLICT(account_id,thread_id,message_id,client_id,reader_id) DO UPDATE SET
                  state=MAX(state,excluded.state),observed_at_ms=MAX(observed_at_ms,excluded.observed_at_ms)",
                 params![account,update.thread_id,update.message_id,update.client_id.as_deref().unwrap_or(""),reader,state,now_ms],

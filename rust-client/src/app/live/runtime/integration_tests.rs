@@ -52,6 +52,7 @@ enum Reply {
     Forward(u8),
     Recall(u8),
     GroupRecall(group_recall_tests::Mode),
+    DeleteForMe(bool),
     GroupHistory,
     Reactions,
     ReactionReplay,
@@ -791,7 +792,11 @@ fn serve(
             ))
             .unwrap();
         }
-        if let Reply::GroupRecall(mode) = reply {
+        if let Some(mode) = match reply {
+            Reply::GroupRecall(mode) => Some(mode),
+            Reply::DeleteForMe(_) => Some(group_recall_tests::Mode::Peer),
+            _ => None,
+        } {
             let payload = group_recall_tests::messages(&state, mode);
             ws.send(tungstenite::Message::Binary(
                 wire::encode_frame(521, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
@@ -1506,6 +1511,30 @@ fn serve(
     }
     if let Reply::GroupRecall(mode) = reply {
         group_recall_tests::respond(&mut stream, &state, &cipher, mode, &path, &headers, &body);
+        return;
+    }
+    if let Reply::DeleteForMe(drop_receipt) = reply {
+        if route == "/api/group/deletemsg" {
+            delete_for_me_tests::respond(
+                &mut stream,
+                &state,
+                &cipher,
+                drop_receipt,
+                &path,
+                &headers,
+                &body,
+            );
+        } else {
+            group_recall_tests::respond(
+                &mut stream,
+                &state,
+                &cipher,
+                group_recall_tests::Mode::Peer,
+                &path,
+                &headers,
+                &body,
+            );
+        }
         return;
     }
     if matches!(reply, Reply::GroupHistory) {
@@ -6097,6 +6126,7 @@ async fn opening_a_conversation_refreshes_names_and_avatars_at_most_every_two_mi
     assert_eq!(friend_lists(), 2);
 }
 
+mod delete_for_me_tests;
 mod file_fixture;
 mod file_upload_tests;
 mod forward_batch_tests;

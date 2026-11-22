@@ -1846,3 +1846,29 @@ without resending. The captures used no network or audio-device connections.
 The voice TLS/WSS integration case was compiled. Its permission review
 timed out, so the loopback run is pending renewed permission. Microphone
 and speaker checks and Zalo phone-to-Linux acceptance remain pending.
+
+## Deleting one ordinary text message for me (2.0.6 development branch)
+
+The message menu confirms account or device scope. Account mode requires an
+affirmative server flag and sends `onlyMe:1` for a bound message. Device
+mode stores suppression locally. The confirmation is invalidated if the
+account, message, conversation or offered mode changes before submission.
+
+The synthetic TLS/WSS case verified the GROUP request, exact scoped IDs,
+device mode without an HTTP request, rejection after capability mismatch,
+and no retry after a lost acknowledgement and restart. The wire unit cases
+also cover sent and received direct messages. Storage tests exercise
+late replay, stale quote IDs, unread counts, search and failed local
+projection after a durable acknowledgement.
+
+The default checks passed 318 Rust and 19 Python tests. Separate all-feature
+runs passed six focused cases and 168 store tests, and strict all-feature
+Clippy passed. Upgrading a disposable schema 22 profile preserved all 19
+synthetic messages. The previous optimized binary refused schema 23.
+The final optimized live build passed offline startup and restart smoke checks.
+
+The ignored X11 fixture uses `ZALO_UI_FIXTURE_DELETE=menu|account|device|unknown`
+with `ZALO_UI_FIXTURE_READY=1`. Sixteen synthetic captures cover 640×480
+and 1200×780 in both themes. Account mode still needs real Zalo acceptance.
+The native client does not consume delete controls issued from another
+device.

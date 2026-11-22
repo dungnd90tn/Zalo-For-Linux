@@ -4,6 +4,8 @@ pub mod auth;
 pub mod bootstrap;
 pub mod client;
 #[cfg(feature = "messaging")]
+pub(crate) mod delete_for_me;
+#[cfg(feature = "messaging")]
 pub mod directory;
 #[cfg(feature = "messaging")]
 pub(crate) mod forward;

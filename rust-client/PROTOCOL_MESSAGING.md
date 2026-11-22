@@ -225,6 +225,24 @@ redacted rows. These are logical storage changes. Separately forwarded
 messages remain independent. Group, media and E2EE recall and local deletion
 are outside this slice.
 
+## Deleting one ordinary text message for the account
+
+The session must affirm `settings.features.sync_del_msg_or_conv.enable_sync_del_msg`
+or its `setttings` alias. The native confirmation fixes the selected mode.
+With sync disabled, a device-only action records local suppression without an
+HTTP request. Account mode posts encrypted form parameters to CHAT
+`/api/message/delete` or GROUP `/api/group/deletemsg` with `onlyMe:1`.
+One message in `msgs` binds the stored global ID, client ID, sender and
+destination. The action has a separate monotonic client ID. See PC bundle
+lines 472907–472947 and 491041–491075.
+
+Schema 23 binds a deletion to the account, thread, message and sender. A
+confirmed action removes the local row, sanitizes matching quotes and
+suppresses replay. Uncertain account requests retain the message and are
+never retried automatically. An acknowledgement survives a failed projection
+transaction. The client does not yet consume deletion controls initiated
+on another device.
+
 ## Ordinary group members, invite and leave (2026-11-19)
 
 N398655 builds authenticated GROUP POST `/api/group/getmg-v2`. The client

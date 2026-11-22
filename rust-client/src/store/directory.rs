@@ -443,6 +443,9 @@ impl MessageStore {
         }
         let mut inserted_messages = 0;
         for source in &batch.messages {
+            if super::delete_for_me::suppresses(&tx, source)? {
+                continue;
+            }
             let key = (source.thread_id.as_str(), source.id.as_str());
             #[cfg(feature = "messaging")]
             if super::structured_webchat_conflicts_with_send_echo(

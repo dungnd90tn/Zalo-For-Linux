@@ -374,25 +374,7 @@ mod live {
         id: &str,
         actor: &str,
     ) -> Result<()> {
-        let args = params![account, thread, id, actor, PLACEHOLDER];
-        conn.execute(
-            "UPDATE message_reply SET quote_projection=json_set(quote_projection,'$.text',?5,'$.message_type',0),
-                quote_metadata=NULL,quote_source=0
-             WHERE account_id=?1 AND thread_id=?2 AND json_valid(quote_projection)
-             AND json_extract(quote_projection,'$.message_id')=?3
-             AND json_extract(quote_projection,'$.owner_id')=?4",
-            args,
-        )?;
-        conn.execute(
-            "UPDATE outgoing_reply SET quote_projection=json_set(quote_projection,'$.text',?5,'$.message_type',0),
-                quote_metadata=json_object('globalMsgId',?3,'ownerId',?4,'cliMsgType',0,'msg',?5)
-             WHERE account_id=?1 AND json_valid(quote_projection)
-             AND client_id IN (SELECT client_id FROM outgoing WHERE account_id=?1 AND thread_id=?2)
-             AND json_extract(quote_projection,'$.message_id')=?3
-             AND json_extract(quote_projection,'$.owner_id')=?4",
-            args,
-        )?;
-        Ok(())
+        message_reply::redact_copies(conn, account, thread, id, actor, PLACEHOLDER)
     }
 
     fn bound_pending(conn: &Connection, account: &str) -> Result<()> {
@@ -591,6 +573,11 @@ mod live {
         if !valid_source_id(&notice.event_id) || notice.event_id == notice.message_id {
             return Ok(None);
         }
+        if delete_for_me::state(conn, account, &notice.thread_id, &notice.message_id)?.as_deref()
+            == Some("deleted")
+        {
+            return Ok(None);
+        }
         if notice.thread_id.starts_with("g:")
             && conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM e2ee_threads WHERE account_id=?1 AND thread_id=?2)",
@@ -664,6 +651,10 @@ mod live {
             ensure!(
                 tombstone(&tx, account, thread, id)?.is_none(),
                 RecallFailure::AlreadyRecalled
+            );
+            ensure!(
+                delete_for_me::state(&tx, account, thread, id)?.is_none(),
+                RecallFailure::Unresolved
             );
             let original = original(&tx, account, thread, id)?.ok_or(RecallFailure::Unavailable)?;
             ensure!(

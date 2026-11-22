@@ -377,6 +377,7 @@ impl Privacy {
             | LiveEvent::SearchFailed { thread, .. }
             | LiveEvent::SenderNames { thread, .. }
             | LiveEvent::Recalled { thread, .. }
+            | LiveEvent::DeletedForMe { thread, .. }
             | LiveEvent::MessagesRefreshed { thread, .. }
             | LiveEvent::MessagesRefreshFailed { thread, .. }
             | LiveEvent::RequestFailed { thread, .. }

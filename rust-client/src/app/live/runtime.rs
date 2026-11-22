@@ -17,6 +17,7 @@ use tokio_tungstenite::{
 use url::Url;
 
 mod attention;
+mod delete_for_me;
 mod desktop;
 #[cfg(feature = "signal-crypto")]
 mod e2ee_compose;
@@ -584,6 +585,7 @@ impl Database {
                         s.recover_voices(&account)?;
                         s.recover_forwards(&account)?;
                         s.recover_recalls(&account)?;
+                        s.recover_delete_for_me(&account)?;
                         s.recover_group_actions(&account)?;
                         Ok(s)
                     });
@@ -2074,6 +2076,7 @@ async fn handle_command(
         | LiveCommand::GroupInvite { .. }
         | LiveCommand::GroupLeave { .. }
         | LiveCommand::Recall { .. }
+        | LiveCommand::DeleteForMe { .. }
         | LiveCommand::LoadRemoteHistory { .. }
         | LiveCommand::Forward { .. }
         | LiveCommand::ForwardBatch { .. }
@@ -2674,6 +2677,7 @@ async fn run_inner(
     let mut attention = attention::Attention::new(&db, events, desktop).await?;
     let mut forwards = forward::Forwarding::default();
     let mut recalls = recall::Recalls::default();
+    let mut deletes = delete_for_me::Deletes::default();
     let mut history = remote_history::History::default();
     let mut reactions = reactions::Reactions::default();
     let mut groups = group_actions::Groups::default();
@@ -2719,6 +2723,12 @@ async fn run_inner(
         .emit(LiveEvent::RemoteHistoryCapability {
             account_id: events.account.clone(),
             available: root_for(&session, crate::protocol::remote_history::SERVICE).is_ok(),
+        })
+        .await?;
+    events
+        .emit(LiveEvent::DeleteForMeCapability {
+            account_id: events.account.clone(),
+            account_sync: session.config().delete_for_me_sync,
         })
         .await?;
     let mut directory = DirectorySync::new();
@@ -2783,6 +2793,9 @@ async fn run_inner(
             },
             completed = recalls.next() => {
                 recall::complete(&db, events, completed).await?;
+            },
+            completed = deletes.next() => {
+                delete_for_me::complete(&db, events, completed).await?;
             },
             found = sticker_search.next() => {
                 sticker_search.complete(found, sticker_catalog::authenticated_at(connection.as_ref()), events).await?;
@@ -2871,6 +2884,18 @@ async fn run_inner(
                         continue;
                     }
                 };
+                let available = connection.as_mut().filter(|_| !uploads.active());
+                let command = match deletes.command(command, available, &db, events, &session, &client).await? {
+                    recall::Command::Continue(command) => command,
+                    recall::Command::Handled => continue,
+                    recall::Command::PauseTransport => {
+                        uploads.invalidate();
+                        attention.reset_transport();
+                        connection = None;
+                        network_paused = true;
+                        continue;
+                    }
+                };
                 let Some(command) = privacy.command(command,&db,events,&session,transports).await? else { continue; };
                 let Some(command) = photos.command(command,events).await? else {continue;};
                 let Some(command) = uploads.command(command,&profile,&session,&db,&client,events).await? else { continue; };
@@ -2949,6 +2974,9 @@ async fn run_inner(
                         completed = recalls.next() => {
                             recall::complete(&db, events, completed).await?;
                         },
+                        completed = deletes.next() => {
+                            delete_for_me::complete(&db, events, completed).await?;
+                        },
                         found = sticker_search.next() => {
                             sticker_search.complete(found, None, events).await?;
                         },
@@ -2981,6 +3009,14 @@ async fn run_inner(
                                 }
                             };
                             let command = match recalls.command(command, None, &db, events, &session, &client).await? {
+                                recall::Command::Continue(command) => command,
+                                recall::Command::Handled => continue,
+                                recall::Command::PauseTransport => {
+                                    network_paused = true;
+                                    break None;
+                                }
+                            };
+                            let command = match deletes.command(command, None, &db, events, &session, &client).await? {
                                 recall::Command::Continue(command) => command,
                                 recall::Command::Handled => continue,
                                 recall::Command::PauseTransport => {

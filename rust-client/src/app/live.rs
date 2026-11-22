@@ -195,6 +195,20 @@ pub enum RecallOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteForMeMode {
+    Device,
+    Account,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteForMeOutcome {
+    Accepted,
+    Rejected,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteHistoryOutcome {
     Imported { count: usize, has_more: bool },
     Exhausted,
@@ -290,6 +304,12 @@ pub enum LiveCommand {
         request_id: u64,
         thread: String,
         message_id: String,
+    },
+    DeleteForMe {
+        request_id: u64,
+        thread: String,
+        message_id: String,
+        mode: DeleteForMeMode,
     },
     LoadRemoteHistory {
         request_id: u64,
@@ -582,6 +602,24 @@ pub enum LiveEvent {
         thread: String,
         message_id: String,
         outcome: RecallOutcome,
+    },
+    DeleteForMeCapability {
+        account_id: String,
+        account_sync: bool,
+    },
+    DeleteForMeFinished {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        message_id: String,
+        outcome: DeleteForMeOutcome,
+    },
+    DeletedForMe {
+        account_id: String,
+        thread: String,
+        message_id: String,
+        sender_id: String,
+        conversation: Conversation,
     },
     RemoteHistoryCapability {
         account_id: String,
@@ -885,6 +923,9 @@ impl LiveEvent {
             | Self::GroupPins { account_id, .. }
             | Self::GroupPinFinished { account_id, .. }
             | Self::RecallFinished { account_id, .. }
+            | Self::DeleteForMeCapability { account_id, .. }
+            | Self::DeleteForMeFinished { account_id, .. }
+            | Self::DeletedForMe { account_id, .. }
             | Self::RemoteHistoryCapability { account_id, .. }
             | Self::RemoteHistoryFinished { account_id, .. }
             | Self::Recalled { account_id, .. }
@@ -1152,6 +1193,12 @@ impl LiveWorker {
                 request_id,
                 thread,
                 message_id,
+            }
+            | LiveCommand::DeleteForMe {
+                request_id,
+                thread,
+                message_id,
+                ..
             } => {
                 *request_id > 0
                     && Target::from_thread(thread)
@@ -2149,6 +2196,44 @@ impl super::Model {
                 }
                 true
             }
+            LiveEvent::DeletedForMe {
+                account_id,
+                thread,
+                message_id,
+                sender_id,
+                conversation,
+            } => {
+                if crate::protocol::messaging::Target::from_thread(&thread).is_err()
+                    || crate::protocol::messaging::numeric_id(&message_id).is_err()
+                    || crate::protocol::messaging::numeric_id(&sender_id).is_err()
+                    || conversation.id != thread
+                {
+                    return false;
+                }
+                self.upsert_live_conversation(conversation);
+                if self.selected.as_deref() == Some(&thread) {
+                    self.clear_search();
+                    self.messages.retain(|visible| {
+                        visible.account_id != account_id
+                            || visible.thread_id != thread
+                            || visible.id != message_id
+                            || visible.sender != sender_id
+                    });
+                    for visible in &mut self.messages {
+                        if visible.account_id != account_id || visible.thread_id != thread {
+                            continue;
+                        }
+                        if let Some(quote) = visible.quote.as_mut().filter(|quote| {
+                            quote.message_id == message_id && quote.owner_id == sender_id
+                        }) {
+                            crate::store::delete_for_me::DELETED_FOR_ME_TEXT
+                                .clone_into(&mut quote.text);
+                            quote.message_type = 0;
+                        }
+                    }
+                }
+                true
+            }
             LiveEvent::Sent {
                 generation,
                 thread,
@@ -2292,6 +2377,8 @@ impl super::Model {
             | LiveEvent::GroupPins { .. }
             | LiveEvent::GroupPinFinished { .. }
             | LiveEvent::RecallFinished { .. }
+            | LiveEvent::DeleteForMeCapability { .. }
+            | LiveEvent::DeleteForMeFinished { .. }
             | LiveEvent::RemoteHistoryCapability { .. }
             | LiveEvent::RemoteHistoryFinished { .. }
             | LiveEvent::ForwardFinished { .. }

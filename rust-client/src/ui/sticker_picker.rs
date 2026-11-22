@@ -333,6 +333,7 @@ impl NativeApp {
                     || state.attention.settings_open
                     || state.forwarding.is_open()
                     || state.recall.is_open()
+                    || state.delete_for_me.is_open()
                     || state.groups.is_open()
             }) {
                 state.sticker_send.picker = None;

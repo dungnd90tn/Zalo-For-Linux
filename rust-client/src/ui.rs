@@ -11,6 +11,8 @@ mod avatars;
 #[cfg(test)]
 mod conversation_tests;
 #[cfg(feature = "messaging")]
+mod delete_for_me;
+#[cfg(feature = "messaging")]
 mod delivery;
 mod dialog;
 #[cfg(feature = "messaging")]
@@ -252,6 +254,7 @@ impl NativeApp {
                 || state.sticker_send.is_open()
                 || state.forwarding.is_open()
                 || state.recall.is_open()
+                || state.delete_for_me.is_open()
                 || state.groups.is_open()
             {
                 return true;
@@ -455,6 +458,10 @@ impl NativeApp {
     fn older_page(&mut self) {
         if let Some(cursor) = self.model.messages.first().map(Message::cursor) {
             self.load_page_before(cursor);
+        } else if self.model.has_older && !self.model.pending {
+            if let Some(thread) = self.model.selected.clone() {
+                self.load_latest(thread);
+            }
         }
     }
 
@@ -2287,6 +2294,7 @@ impl eframe::App for NativeApp {
             self.sync_sticker_picker(ctx);
             self.sync_forward();
             self.sync_recall();
+            self.sync_delete_for_me();
             self.sync_groups(ctx);
             self.sync_group_pins();
             self.sync_remote_history();
@@ -2324,6 +2332,7 @@ impl eframe::App for NativeApp {
             self.show_notification_settings(ctx);
             self.show_forward_picker(ctx);
             self.show_recall_confirmation(ctx);
+            self.show_delete_for_me(ctx);
             self.show_group_dialogs(ctx);
             self.sync_reactions(ctx);
             self.finish_attention_frame(ctx);

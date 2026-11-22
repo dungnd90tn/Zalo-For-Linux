@@ -503,11 +503,11 @@ mod tests {
         drafts.select("d:33").unwrap();
         drafts.active.set_reply(quote("d:33", "33"));
 
-        drafts.remove_recalled_reply("11", "d:22", "901", "11");
+        drafts.remove_message_reply("11", "d:22", "901", "11");
         drafts.select("d:22").unwrap();
         assert!(drafts.active.reply().is_some());
         drafts.select("d:33").unwrap();
-        drafts.remove_recalled_reply("11", "d:22", "901", "22");
+        drafts.remove_message_reply("11", "d:22", "901", "22");
         assert!(drafts.active.reply().is_some());
         drafts.select("d:22").unwrap();
         assert_eq!(drafts.active.text, "Nháp cần giữ");

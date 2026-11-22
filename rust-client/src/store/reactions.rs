@@ -187,6 +187,8 @@ mod live {
                (account_id,thread_id,message_id,source_client_id,actor_id,client_id,event_id,occurred_at_ms,kind)
              SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9
              WHERE NOT EXISTS(SELECT 1 FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)
+               AND NOT EXISTS(SELECT 1 FROM delete_for_me_intents
+                 WHERE account_id=?1 AND thread_id=?2 AND message_id=?3 AND state='deleted')
                AND NOT EXISTS(SELECT 1 FROM e2ee_threads WHERE account_id=?1 AND thread_id=?2)
              ON CONFLICT(account_id,thread_id,message_id,event_id) DO NOTHING",
             params![account,notice.thread,notice.message_id,notice.source_client_id,notice.actor,

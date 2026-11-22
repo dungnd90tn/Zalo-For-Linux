@@ -55,6 +55,8 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub recall: super::recall::Recall,
     #[cfg(feature = "messaging")]
+    pub delete_for_me: super::delete_for_me::DeleteForMe,
+    #[cfg(feature = "messaging")]
     pub groups: super::group_members::Groups,
     #[cfg(feature = "messaging")]
     pub group_pins: super::group_pins::Pins,
@@ -139,6 +141,8 @@ impl LiveState {
             forwarding: Default::default(),
             #[cfg(feature = "messaging")]
             recall: Default::default(),
+            #[cfg(feature = "messaging")]
+            delete_for_me: Default::default(),
             #[cfg(feature = "messaging")]
             groups: Default::default(),
             #[cfg(feature = "messaging")]
@@ -289,6 +293,7 @@ impl LiveState {
                 self.reactions.worker_closed();
                 self.forwarding.worker_closed();
                 self.recall.worker_closed();
+                self.delete_for_me.interrupted();
                 self.groups.worker_closed();
                 self.remote_history.worker_closed();
                 self.mention_picker.set_scope(None);
@@ -320,6 +325,7 @@ impl LiveState {
         self.reactions.worker_closed();
         self.forwarding.worker_closed();
         self.recall.worker_closed();
+        self.delete_for_me.worker_closed();
         self.groups.worker_closed();
         self.remote_history.worker_closed();
         self.mention_picker.set_scope(None);
@@ -619,6 +625,7 @@ impl NativeApp {
                         state.attention = Default::default();
                         state.forwarding = Default::default();
                         state.recall = Default::default();
+                        state.delete_for_me = Default::default();
                         state.groups = Default::default();
                         state.group_pins = Default::default();
                         state.remote_history = Default::default();
@@ -746,15 +753,22 @@ impl NativeApp {
         state.attention.observe(&event, &self.model);
         state.forwarding.observe(&event);
         state.recall.observe(&event);
+        state.delete_for_me.observe(&event);
         if let LiveEvent::Recalled {
             thread,
             message_id,
-            actor_id,
+            actor_id: sender,
+            ..
+        }
+        | LiveEvent::DeletedForMe {
+            thread,
+            message_id,
+            sender_id: sender,
             ..
         } = &event
         {
             self.drafts
-                .remove_recalled_reply(&account_id, thread, message_id, actor_id);
+                .remove_message_reply(&account_id, thread, message_id, sender);
         }
         self.drafts.apply_live(&event, &account_id);
         match &event {
@@ -806,6 +820,7 @@ impl NativeApp {
             state.reactions.worker_closed();
             state.forwarding.worker_closed();
             state.recall.worker_closed();
+            state.delete_for_me.worker_closed();
             state.groups.worker_closed();
             state.remote_history.worker_closed();
             state.mention_picker.set_scope(None);
@@ -879,11 +894,14 @@ impl NativeApp {
         self.quarantine_privacy(state, ctx, false);
         if let LiveEvent::Recalled {
             thread, message_id, ..
+        }
+        | LiveEvent::DeletedForMe {
+            thread, message_id, ..
         } = &event
         {
             state
                 .media
-                .close_recalled_viewer(&account_id, thread, message_id);
+                .close_message_viewer(&account_id, thread, message_id);
             state.group_pins.remove_preview(thread, message_id);
             if self.model.selected.as_deref() == Some(thread) {
                 self.model.overview = Default::default();
@@ -918,10 +936,30 @@ impl NativeApp {
             } if *generation == self.model.generation => Some(conversation.id.clone()),
             _ => None,
         };
-        if self.model.apply_live(event, &account_id, self.latest_page) && refresh_senders {
-            state
-                .sender_names
-                .prepare(&account_id, &self.model, force_names, ctx);
+        let deleted_selected = matches!(&event, LiveEvent::DeletedForMe { thread, .. }
+            if self.model.selected.as_deref() == Some(thread));
+        if self.model.apply_live(event, &account_id, self.latest_page) {
+            if refresh_senders {
+                state
+                    .sender_names
+                    .prepare(&account_id, &self.model, force_names, ctx);
+            }
+            // An empty page has no keyset cursor for the older-page control.
+            if deleted_selected
+                && self.model.messages.is_empty()
+                && self.model.has_older
+                && !self.model.pending
+            {
+                if let (Some(thread), Some(worker)) = (self.model.selected.clone(), &state.worker) {
+                    if self
+                        .model
+                        .select_live_if_accepted(thread, |command| worker.submit(command))
+                        .is_ok()
+                    {
+                        self.latest_page = true;
+                    }
+                }
+            }
         }
         self.quarantine_privacy(state, ctx, false);
         if let Some(thread) = opened {
@@ -1007,6 +1045,7 @@ impl NativeApp {
                             state.attention = Default::default();
                             state.forwarding = Default::default();
                             state.recall = Default::default();
+                            state.delete_for_me = Default::default();
                             state.groups = Default::default();
                             state.group_pins = Default::default();
                             state.remote_history = Default::default();
@@ -1342,6 +1381,7 @@ pub(in crate::ui) mod tests {
                 seen_v2: true,
                 group_board_v2: false,
                 recall_max_age_ms: Some(300_000),
+                delete_for_me_sync: true,
                 chat_poll: vec![],
                 control_poll: vec![],
                 websocket: vec![],
@@ -2405,7 +2445,7 @@ pub(in crate::ui) mod tests {
                 let anchored_menu =
                     std::env::var("ZALO_UI_FIXTURE_INTERACTIONS").is_ok_and(|scene| {
                         matches!(scene.as_str(), "reaction-menu" | "group-pin-menu")
-                    });
+                    }) || std::env::var("ZALO_UI_FIXTURE_DELETE").as_deref() == Ok("menu");
                 if !self.menu_opened
                     && (anchored_menu || std::env::var_os("ZALO_UI_FIXTURE_MESSAGE_MENU").is_some())
                 {
@@ -2476,12 +2516,14 @@ pub(in crate::ui) mod tests {
         let attention_scene = std::env::var("ZALO_UI_FIXTURE_ATTENTION").ok();
         let forward_scene = std::env::var("ZALO_UI_FIXTURE_FORWARD").ok();
         let recall_scene = std::env::var("ZALO_UI_FIXTURE_RECALL").ok();
+        let delete_scene = std::env::var("ZALO_UI_FIXTURE_DELETE").ok();
         let group_scene = std::env::var("ZALO_UI_FIXTURE_GROUP").ok();
         let cached = album_scene.is_some()
             || voice_scene.is_some()
             || media_mode.is_some()
             || forward_scene.is_some()
             || recall_scene.is_some()
+            || delete_scene.is_some()
             || group_scene.is_some()
             || attention_scene.is_some()
             || interactions_scene.is_some()
@@ -2538,6 +2580,7 @@ pub(in crate::ui) mod tests {
                     || voice_scene.is_some()
                     || forward_scene.is_some()
                     || recall_scene.is_some()
+                    || delete_scene.is_some()
                     || group_scene.is_some()
                     || interactions_scene.is_some()
                 {
@@ -2784,6 +2827,18 @@ pub(in crate::ui) mod tests {
                             scene,
                         );
                     }
+                }
+                if let Some(scene) = delete_scene.as_deref() {
+                    let message = &mut app.model.messages[0];
+                    message.id = "901".into();
+                    message.source_client_id = Some("900".into());
+                    app.drafts.active.text = "Bản nháp cần giữ".into();
+                    let scope = app.message_menu_scope().unwrap();
+                    app.live
+                        .as_mut()
+                        .unwrap()
+                        .delete_for_me
+                        .fixture(scope, scene);
                 }
                 if let Some(scene) = group_scene.as_deref() {
                     let group = "g:70";
@@ -3358,6 +3413,7 @@ pub(in crate::ui) mod tests {
                 if media_mode.as_deref() == Some("files")
                     || forward_scene.is_some()
                     || recall_scene.is_some()
+                    || delete_scene.is_some()
                     || group_scene.is_some()
                     || matches!(
                         interactions_scene.as_deref(),

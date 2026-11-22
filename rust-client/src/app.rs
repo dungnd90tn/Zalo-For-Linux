@@ -754,12 +754,12 @@ impl DraftBook {
     }
 
     #[cfg(feature = "messaging")]
-    pub(crate) fn remove_recalled_reply(
+    pub(crate) fn remove_message_reply(
         &mut self,
         account: &str,
         thread: &str,
         id: &str,
-        actor: &str,
+        sender: &str,
     ) {
         let composer = if self.thread.as_deref() == Some(thread) {
             Some(&mut self.active)
@@ -771,7 +771,7 @@ impl DraftBook {
                 reply.account_id == account
                     && reply.thread_id == thread
                     && reply.message_id == id
-                    && reply.sender == actor
+                    && reply.sender == sender
             }) {
                 composer.clear_reply();
             }

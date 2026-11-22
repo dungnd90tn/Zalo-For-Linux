@@ -349,6 +349,7 @@ impl NativeApp {
                 || state.privacy.prompt.is_some()
                 || state.forwarding.is_open()
                 || state.recall.is_open()
+                || state.delete_for_me.is_open()
                 || state.groups.is_open();
             open
         });
@@ -388,6 +389,10 @@ impl NativeApp {
         let can_recall = self.can_recall(message);
         #[cfg(feature = "messaging")]
         let mut recall_selected = false;
+        #[cfg(feature = "messaging")]
+        let delete_for_me = self.delete_for_me_menu(message);
+        #[cfg(feature = "messaging")]
+        let mut delete_selected = None;
         #[cfg(feature = "messaging")]
         let pin_action = self.pin_menu_action(message);
         #[cfg(feature = "messaging")]
@@ -519,15 +524,33 @@ impl NativeApp {
                         select_many = button.clicked();
                     }
                     #[cfg(feature = "messaging")]
-                    if !self.demo && own {
+                    if !self.demo && (own || delete_for_me.is_some()) {
                         menu_separator(ui);
-                        let button =
-                            action_row(ui, "Thu hồi", "fa-outline-recall", can_recall, true);
-                        if can_recall {
-                            buttons.push(button.id);
+                        if own {
+                            let button =
+                                action_row(ui, "Thu hồi", "fa-outline-recall", can_recall, true);
+                            if can_recall {
+                                buttons.push(button.id);
+                            }
+                            recall_selected = button.clicked();
+                            button.on_disabled_hover_text(self.recall_unavailable());
                         }
-                        recall_selected = button.clicked();
-                        button.on_disabled_hover_text(self.recall_unavailable());
+                        if let Some((mode, enabled)) = delete_for_me {
+                            let button = action_row(
+                                ui,
+                                super::delete_for_me::menu_label(mode),
+                                "fa-outline-trash",
+                                enabled,
+                                true,
+                            );
+                            if enabled {
+                                buttons.push(button.id);
+                            }
+                            if button.clicked() {
+                                delete_selected = Some(mode);
+                            }
+                            button.on_disabled_hover_text("Chưa thể xóa tin nhắn lúc này.");
+                        }
                     }
                 });
         });
@@ -563,6 +586,12 @@ impl NativeApp {
         if recall_selected {
             self.message_menu = None;
             self.open_recall(&popup.message);
+            return;
+        }
+        #[cfg(feature = "messaging")]
+        if let Some(mode) = delete_selected {
+            self.message_menu = None;
+            self.open_delete_for_me(&popup.message, mode);
             return;
         }
         #[cfg(feature = "messaging")]

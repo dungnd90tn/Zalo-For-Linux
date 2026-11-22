@@ -9,6 +9,7 @@ use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 pub mod attachments;
+pub(crate) mod delete_for_me;
 pub mod directory;
 pub mod e2ee;
 pub mod forward;
@@ -40,7 +41,7 @@ mod voices;
 pub(crate) use sticker_send::Reservation as StickerReservation;
 
 pub const MAX_REFRESH_MESSAGES: usize = 50;
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// One received message with optional outbox hint and complete rich sidecars.
 /// The immutable metadata commits with its message and receive cursor.
@@ -263,6 +264,9 @@ fn insert_validated_with_media<'a>(
                 VALUES (?1,?2,?3,?4,?5,?6)",
         )?;
         for (m, info, media) in messages {
+            if delete_for_me::suppresses(conn, m)? {
+                continue;
+            }
             if (info.is_some() && (media.is_some() || m.media.is_some() || !m.mentions.is_empty()))
                 || (m.sticker.is_some() && media.is_some())
             {
@@ -465,6 +469,7 @@ impl MessageStore {
         read_state::initialize(&conn)?;
         forward::initialize(&conn)?;
         recall::initialize(&conn)?;
+        delete_for_me::initialize(&conn)?;
         group_actions::initialize(&conn)?;
         group_pins::initialize(&conn)?;
         sticker_send::initialize(&conn)?;
@@ -697,6 +702,7 @@ impl MessageStore {
         validate_id(server_id)?;
         let changed=self.conn.execute("UPDATE outgoing SET state='acknowledged',server_id=?3 WHERE account_id=?1 AND client_id=?2 AND (server_id IS NULL OR server_id=?3)
             AND NOT EXISTS(SELECT 1 FROM outgoing other WHERE other.account_id=outgoing.account_id AND other.thread_id=outgoing.thread_id AND other.server_id=?3 AND other.client_id<>outgoing.client_id)
+            AND NOT EXISTS(SELECT 1 FROM delete_for_me_intents WHERE account_id=?1 AND thread_id=outgoing.thread_id AND message_id=?3 AND state='deleted')
             AND NOT EXISTS(SELECT 1 FROM forward_outbox WHERE account_id=?1 AND thread_id=outgoing.thread_id AND server_id=?3)
             AND NOT EXISTS(SELECT 1 FROM message_forward WHERE account_id=?1 AND thread_id=outgoing.thread_id AND message_id=?3 AND kind='forwarded')",params![account,client_id.to_string(),server_id])?;
         if changed != 1 {
@@ -761,6 +767,9 @@ impl MessageStore {
             media: None,
             sent_at_ms: existing_ts.or(timestamp).unwrap_or(created),
         };
+        if delete_for_me::suppresses(&tx, &message)? {
+            bail!(FailureReason::ConflictingEcho);
+        }
         if existing_ts.is_some() {
             mention::check_existing_ack(&tx, &message)?;
         }
@@ -1042,6 +1051,9 @@ impl MessageStore {
         let mut unread = Vec::new();
         let mut result = Vec::with_capacity(message_count);
         for (source, client_id, info, media, quote, _marker) in messages {
+            if delete_for_me::suppresses(&tx, source)? {
+                continue;
+            }
             #[cfg(feature = "messaging")]
             if structured_webchat_conflicts_with_send_echo(&tx, source, _marker)? {
                 continue;
@@ -1095,9 +1107,8 @@ impl MessageStore {
             let info = info.filter(|_| !recalled);
             let media = media.filter(|_| !recalled);
             let quote = quote.filter(|_| !recalled);
-            #[cfg(feature = "messaging")]
             if let Some(quote) = &mut m.quote {
-                recall::redact_quote(&tx, &m.account_id, &m.thread_id, quote)?;
+                message_reply::redact_quote(&tx, &m.account_id, &m.thread_id, quote)?;
             }
             let mut previous_reply = m.clone();
             previous_reply.source_client_id = None;

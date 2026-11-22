@@ -376,6 +376,7 @@ pub struct ServerConfig {
     pub voice_recording_allowed: bool,
     pub seen_v2: bool,
     pub group_board_v2: bool,
+    pub delete_for_me_sync: bool,
     pub recall_max_age_ms: Option<i64>,
     pub chat_poll: Vec<Url>,
     pub control_poll: Vec<Url>,
@@ -762,6 +763,11 @@ impl ServerConfig {
                 .and_then(|v| v.get("v2_enable"))
                 .is_none_or(|v| v.is_null() || v.as_bool() == Some(true) || v.as_i64() == Some(1))
         });
+        let delete_for_me_sync = feature_config(value, "sync_del_msg_or_conv")
+            .ok()
+            .flatten()
+            .and_then(|config| config.get("enable_sync_del_msg"))
+            .is_some_and(|value| value.as_bool() == Some(true) || value.as_u64() == Some(1));
         let recall_settings = [
             value.pointer("/settings/common/recallMessageMaxTime"),
             value.pointer("/setttings/common/recallMessageMaxTime"),
@@ -793,6 +799,7 @@ impl ServerConfig {
             voice_recording_allowed,
             seen_v2,
             group_board_v2,
+            delete_for_me_sync,
             recall_max_age_ms,
             file_chunk_size,
             // The native runtime uses WebSockets, not legacy chat/control LP.
@@ -1271,6 +1278,28 @@ mod tests {
             config.services["group_board"][0].as_str(),
             "https://groupboard-wpa.zaloapp.com/"
         );
+    }
+    #[test]
+    fn delete_for_me_sync_needs_affirmative_consistent_server_config() {
+        let mut value = json!({});
+        assert!(!ServerConfig::parse(&value).unwrap().delete_for_me_sync);
+        for key in ["settings", "setttings"] {
+            value[key] = json!({"features":{
+                "sync_del_msg_or_conv":{"enable_sync_del_msg":1}
+            }});
+            assert!(ServerConfig::parse(&value).unwrap().delete_for_me_sync);
+            value.as_object_mut().unwrap().remove(key);
+        }
+        for invalid in [json!(false), json!("1"), Value::Null] {
+            value["settings"] = json!({"features":{
+                "sync_del_msg_or_conv":{"enable_sync_del_msg":invalid}
+            }});
+            assert!(!ServerConfig::parse(&value).unwrap().delete_for_me_sync);
+        }
+        value["setttings"] = json!({"features":{
+            "sync_del_msg_or_conv":{"enable_sync_del_msg":1}
+        }});
+        assert!(!ServerConfig::parse(&value).unwrap().delete_for_me_sync);
     }
 
     #[test]

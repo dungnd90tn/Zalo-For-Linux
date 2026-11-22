@@ -163,7 +163,9 @@ impl Attention {
     pub fn observe(&mut self, event: &LiveEvent, model: &crate::app::Model) {
         match event {
             LiveEvent::NotificationOpen { thread, .. } => self.activation = Some(thread.clone()),
-            LiveEvent::ReadStateChanged { .. } | LiveEvent::Recalled { .. } => self.dirty = true,
+            LiveEvent::ReadStateChanged { .. }
+            | LiveEvent::Recalled { .. }
+            | LiveEvent::DeletedForMe { .. } => self.dirty = true,
             LiveEvent::ReadState {
                 generation,
                 unread,

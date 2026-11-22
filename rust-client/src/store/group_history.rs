@@ -102,6 +102,9 @@ impl MessageStore {
         let mut inserted = 0;
         for row in &batch.messages {
             let source = &row.message;
+            if delete_for_me::suppresses(&tx, source)? {
+                continue;
+            }
             if structured_webchat_conflicts_with_send_echo(&tx, source, row.forward.as_ref())? {
                 continue;
             }
