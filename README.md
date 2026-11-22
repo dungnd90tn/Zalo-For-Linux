@@ -35,7 +35,7 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 - **Phím tắt soạn tin:** `Enter` gửi, `Ctrl+Enter` (hoặc `Shift+Enter`) xuống dòng. Ứng dụng không gửi khi bộ gõ tiếng Việt đang soạn chữ.
 - **Có thông tin chẩn đoán:** lỗi kết nối hiển thị giai đoạn/nhóm lỗi, kèm nhật ký có giới hạn dung lượng để hỗ trợ điều tra.
 
-Tin nhắn bình chọn hiện hiển thị thông báo/câu hỏi đính kèm; chưa có chi tiết, kết quả hay thao tác bỏ phiếu. Với mẫu thẻ chưa hỗ trợ, ứng dụng thông báo rõ thay vì hiển thị các thao tác không hoạt động.
+Trong nhóm thường đủ điều kiện, bấm **Xem bình chọn** trên thẻ tin nhắn để tải câu hỏi và các lựa chọn. Nếu Zalo cho phép xem kết quả, thẻ sẽ hiện số phiếu. Tính năng hiện hỗ trợ xem chi tiết và tải lại kết quả.
 
 ## Ảnh chụp giao diện
 
@@ -184,7 +184,7 @@ Sau mỗi lần biên dịch bản mới, chạy lại trình cài đặt để 
 | Nội dung | Gửi ảnh gốc ngoài phạm vi JPEG hiện tại, gửi nhiều tệp, tin thoại mã hóa, tiếp tục lượt tải dở và các mẫu thẻ OA còn lại |
 | Thao tác tin nhắn | Ghim trong chat cá nhân, cập nhật tin ghim theo thời gian thực, chuyển tiếp từ hoặc đến nhóm, nhắc cả nhóm, thu hồi ảnh và tệp gửi từ thiết bị khác, xác nhận thu hồi và đồng bộ xóa trên thiết bị thật, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
 | Quản lý nhóm | Tạo nhóm, xóa thành viên, chuyển quyền trưởng nhóm, mời nhiều người và tham gia lại nhóm đã rời |
-| Bình chọn và tìm kiếm | Chi tiết/kết quả/bỏ phiếu và tìm kiếm toàn bộ tin nhắn |
+| Bình chọn và tìm kiếm | Tạo bình chọn, bỏ phiếu, cập nhật kết quả tự động, xác nhận xem bình chọn trên tài khoản thật và tìm kiếm toàn bộ tin nhắn |
 | Tích hợp Linux | Khay hệ thống, thông báo sau khi thoát hẳn, chụp màn hình và kiểm tra trên nhiều môi trường desktop |
 | Đăng nhập và mã hóa | Đăng nhập số điện thoại và nhắn tin Signal/E2EE trong bản sử dụng thực tế |
 | Phân phối | Kho `apt`/`dnf` và cập nhật tự động (đã có gói `.deb`/`.rpm` cài thủ công), nhập bản sao lưu/lịch sử |

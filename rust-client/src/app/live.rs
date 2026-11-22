@@ -318,6 +318,13 @@ pub enum LiveCommand {
         anchor: Cursor,
         privacy_revision: u64,
     },
+    LoadPollDetail {
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        message_id: String,
+        privacy_revision: u64,
+    },
     Forward {
         request_id: u64,
         source_thread: String,
@@ -633,6 +640,21 @@ pub enum LiveEvent {
         privacy_revision: u64,
         outcome: RemoteHistoryOutcome,
     },
+    PollDetailCapability {
+        account_id: String,
+        available: bool,
+    },
+    PollDetail {
+        account_id: String,
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        message_id: String,
+        privacy_revision: u64,
+        poll_id: Option<u64>,
+        detail: Option<crate::domain::poll::PollDetails>,
+        notice: Option<&'static str>,
+    },
     Recalled {
         account_id: String,
         thread: String,
@@ -928,6 +950,8 @@ impl LiveEvent {
             | Self::DeletedForMe { account_id, .. }
             | Self::RemoteHistoryCapability { account_id, .. }
             | Self::RemoteHistoryFinished { account_id, .. }
+            | Self::PollDetailCapability { account_id, .. }
+            | Self::PollDetail { account_id, .. }
             | Self::Recalled { account_id, .. }
             | Self::ForwardFinished { account_id, .. }
             | Self::ForwardBatchFinished { account_id, .. }
@@ -1216,6 +1240,17 @@ impl LiveWorker {
                         .is_ok_and(|target| target.kind == ThreadKind::Group)
                     && anchor.sent_at_ms > 0
                     && crate::protocol::messaging::numeric_id(&anchor.id).is_ok()
+            }
+            LiveCommand::LoadPollDetail {
+                request_id,
+                thread,
+                message_id,
+                ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+                    && crate::protocol::messaging::numeric_id(message_id).is_ok()
             }
             LiveCommand::Forward {
                 request_id,
@@ -2376,6 +2411,8 @@ impl super::Model {
             | LiveEvent::GroupActionFinished { .. }
             | LiveEvent::GroupPins { .. }
             | LiveEvent::GroupPinFinished { .. }
+            | LiveEvent::PollDetailCapability { .. }
+            | LiveEvent::PollDetail { .. }
             | LiveEvent::RecallFinished { .. }
             | LiveEvent::DeleteForMeCapability { .. }
             | LiveEvent::DeleteForMeFinished { .. }

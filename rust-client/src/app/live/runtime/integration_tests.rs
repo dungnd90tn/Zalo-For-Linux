@@ -56,6 +56,7 @@ enum Reply {
     DeleteForMe(bool),
     SyncDeleteForMe,
     GroupHistory,
+    GroupPoll,
     Reactions,
     ReactionReplay,
     GroupActions(bool),
@@ -825,6 +826,12 @@ fn serve(
                 })).unwrap(),
             )).unwrap();
         }
+        if matches!(reply, Reply::GroupPoll) {
+            ws.send(tungstenite::Message::Binary(
+                wire::encode_frame(521, 0, &group_poll_tests::poll_notice()).unwrap(),
+            ))
+            .unwrap();
+        }
         loop {
             let message = match ws.read() {
                 Ok(m) => m,
@@ -1442,6 +1449,11 @@ fn serve(
         if group_pin_tests::respond(&mut stream, &state, &cipher, lost, &path, &headers, &body) {
             return;
         }
+    }
+    if matches!(reply, Reply::GroupPoll)
+        && group_poll_tests::respond(&mut stream, &state, &cipher, &path, &headers, &body)
+    {
+        return;
     }
     if matches!(reply, Reply::Reactions) {
         assert!(headers.starts_with("POST "));
@@ -6148,6 +6160,7 @@ mod forward_batch_tests;
 
 mod group_history_tests;
 mod group_pin_tests;
+mod group_poll_tests;
 mod group_recall_tests;
 mod media_recall_tests;
 mod mention_tests;

@@ -1,5 +1,5 @@
 //! Bounded rendering snapshots and complete immutable source media content.
-use super::{canonical_content_json, InfoContentError};
+use super::{canonical_content_json, poll, InfoContentError};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -246,6 +246,9 @@ pub struct PollDescriptor {
     pub title: String,
     pub question: String,
     pub anonymous: Option<bool>,
+    /// Recovered from the original notice only. Persisted summary bytes remain stable.
+    #[serde(skip)]
+    pub poll_id: Option<u64>,
 }
 /// A source file card, not permission to fetch or execute the attachment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,7 +376,12 @@ impl MediaDescriptor {
             }
             Self::Poll(poll) => {
                 ensure!(
-                    !poll.title.is_empty() && text(&poll.title, 1024) && text(&poll.question, 4096),
+                    !poll.title.is_empty()
+                        && text(&poll.title, 1024)
+                        && text(&poll.question, 4096)
+                        && poll
+                            .poll_id
+                            .is_none_or(|id| (1..=super::poll::MAX_POLL_ID).contains(&id)),
                     "Invalid poll descriptor"
                 );
             }
@@ -429,7 +437,7 @@ impl MediaMessageContent {
             MediaKind::Voice => MediaDescriptor::Voice(voice(content)),
             MediaKind::WebContent => MediaDescriptor::WebContent(web_content(content)),
             MediaKind::Recommended => MediaDescriptor::Recommended(recommended(content)),
-            MediaKind::Poll => MediaDescriptor::Poll(poll(content)),
+            MediaKind::Poll => MediaDescriptor::Poll(poll_notice(content, raw.len())),
             MediaKind::File => MediaDescriptor::File(file(content)),
         };
         fit_descriptor(&mut descriptor);
@@ -858,7 +866,22 @@ fn call_duration(seconds: i64) -> String {
     parts.join(" ")
 }
 
-fn poll(content: &Value) -> PollDescriptor {
+pub(crate) fn poll_id_in_notice(raw: &str, summary: &PollDescriptor) -> Option<u64> {
+    if raw.len() > poll::MAX_POLL_NOTICE_BYTES {
+        return None;
+    }
+    let content: Value = serde_json::from_str(raw).ok()?;
+    let notice = poll_notice(&content, raw.len());
+    if notice.title != summary.title
+        || notice.question != summary.question
+        || notice.anonymous != summary.anonymous
+    {
+        return None;
+    }
+    notice.poll_id
+}
+
+fn poll_notice(content: &Value, raw_len: usize) -> PollDescriptor {
     // GroupPollInfoManager reads this embedded notice separately from fetched
     // getPollDetail options/votes. Project only fields present in the message.
     let params = parsed(content.get("params")).unwrap_or(Value::Null);
@@ -873,6 +896,11 @@ fn poll(content: &Value) -> PollDescriptor {
         },
         question: bounded(params.get("question"), 4096),
         anonymous: params.get("isAnonymous").and_then(Value::as_bool),
+        poll_id: if raw_len <= poll::MAX_POLL_NOTICE_BYTES {
+            poll::notice_id(&params)
+        } else {
+            None
+        },
     }
 }
 
@@ -880,6 +908,60 @@ fn poll(content: &Value) -> PollDescriptor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_poll_reference_is_transient_and_requires_the_exact_notice_field() {
+        let params = json!({"pollId": 42, "question": "Họp lúc nào?", "isAnonymous": true});
+        for params in [params.clone(), json!(params.to_string())] {
+            let notice = json!({"params": params, "poll_id": 99});
+            let content = MediaMessageContent::new(MediaKind::Poll, &notice).unwrap();
+            let MediaDescriptor::Poll(poll) = content.descriptor() else {
+                panic!("expected poll notice");
+            };
+            assert_eq!(poll.poll_id, Some(42));
+            assert_eq!(poll_id_in_notice(content.as_json(), poll), Some(42));
+            let summary = serde_json::to_value(content.descriptor()).unwrap();
+            assert_eq!(
+                summary,
+                json!({"kind":"poll", "data":{"title":POLL_PREVIEW,"question":"Họp lúc nào?","anonymous":true}})
+            );
+            let MediaDescriptor::Poll(restored) = serde_json::from_value(summary).unwrap() else {
+                panic!("expected stored poll descriptor");
+            };
+            assert_eq!(restored.poll_id, None);
+        }
+        for id in [
+            json!(0),
+            json!(-1),
+            json!(poll::MAX_POLL_ID + 1),
+            json!("+42"),
+            json!("04"),
+            json!("42x"),
+            json!(false),
+            json!(42.5),
+        ] {
+            let content = MediaMessageContent::new(
+                MediaKind::Poll,
+                &json!({"params": {"pollId": id, "question":"Tóm tắt"}}),
+            )
+            .unwrap();
+            assert_eq!(content.descriptor().preview_text(), "Tóm tắt");
+            let MediaDescriptor::Poll(poll) = content.descriptor() else {
+                panic!("expected poll notice");
+            };
+            assert_eq!(poll_id_in_notice(content.as_json(), poll), None);
+        }
+        let oversized = MediaMessageContent::new(
+            MediaKind::Poll,
+            &json!({"params": {"pollId": "42", "question":"Tóm tắt"}, "extra": "x".repeat(poll::MAX_POLL_NOTICE_BYTES)}),
+        )
+        .unwrap();
+        assert_eq!(oversized.descriptor().preview_text(), "Tóm tắt");
+        let MediaDescriptor::Poll(poll) = oversized.descriptor() else {
+            panic!("expected poll notice");
+        };
+        assert_eq!(poll_id_in_notice(oversized.as_json(), poll), None);
+    }
 
     #[test]
     fn source_files_match_original_title_url_readers_and_keep_complete_content() {

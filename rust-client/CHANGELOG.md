@@ -6,6 +6,8 @@ Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) đ�
 
 ## Chưa phát hành — nhánh 2.0.6
 
+- Xem câu hỏi, các lựa chọn và số phiếu được Zalo cho phép hiển thị ngay trên thẻ bình chọn trong nhóm thường đủ điều kiện. Bấm **Cập nhật bình chọn** để đọc kết quả mới nhất.
+
 - Gõ `@` để chọn và nhắc từng thành viên trong nhóm thường có tối đa 100 người. Chọn bằng chuột hoặc phím ↑/↓ và Enter. Ứng dụng giữ bản nháp khi lượt gửi bị từ chối hoặc chưa xác định được kết quả.
 - Làm nổi bật phần nhắc tên đã xác minh trong tin nhắn nhóm, kể cả khi mở lại lịch sử.
 - Ghim và bỏ ghim tin văn bản trong nhóm thường theo quyền Zalo. Xem danh sách trong **Thông tin hội thoại** và bấm để mở tin đã lưu. Nếu ghim trên thiết bị khác, dùng **Cập nhật tin ghim** để tải trạng thái mới.

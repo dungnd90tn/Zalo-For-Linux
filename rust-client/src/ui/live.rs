@@ -61,6 +61,8 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub group_pins: super::group_pins::Pins,
     #[cfg(feature = "messaging")]
+    pub polls: super::polls::Polls,
+    #[cfg(feature = "messaging")]
     pub remote_history: super::remote_history::RemoteHistory,
     #[cfg(feature = "messaging")]
     pub mention_picker: super::mentions::Picker,
@@ -147,6 +149,8 @@ impl LiveState {
             groups: Default::default(),
             #[cfg(feature = "messaging")]
             group_pins: Default::default(),
+            #[cfg(feature = "messaging")]
+            polls: Default::default(),
             #[cfg(feature = "messaging")]
             remote_history: Default::default(),
             #[cfg(feature = "messaging")]
@@ -247,6 +251,7 @@ impl LiveState {
         self.stickers = Default::default();
         self.reactions.worker_closed();
         self.group_pins.set_scope(None);
+        self.polls = Default::default();
         self.remote_history.worker_closed();
         self.directory.privacy_reset(&self.context, false);
         match LiveWorker::start(
@@ -327,6 +332,7 @@ impl LiveState {
         self.recall.worker_closed();
         self.delete_for_me.worker_closed();
         self.groups.worker_closed();
+        self.polls = Default::default();
         self.remote_history.worker_closed();
         self.mention_picker.set_scope(None);
         self.photo_preview.clear();
@@ -628,6 +634,7 @@ impl NativeApp {
                         state.delete_for_me = Default::default();
                         state.groups = Default::default();
                         state.group_pins = Default::default();
+                        state.polls = Default::default();
                         state.remote_history = Default::default();
                         state.mention_picker = Default::default();
                         state.uploads = Default::default();
@@ -866,6 +873,16 @@ impl NativeApp {
         let Some(event) = state.privacy.project(event) else {
             return;
         };
+        if matches!(
+            &event,
+            LiveEvent::PollDetail { .. } | LiveEvent::PollDetailCapability { .. }
+        ) {
+            let scope = self.poll_scope(state);
+            state
+                .polls
+                .observe(event, scope.as_ref(), &self.model.messages);
+            return;
+        }
         let reaction_scope = self
             .model
             .selected
@@ -1046,6 +1063,7 @@ impl NativeApp {
                             state.delete_for_me = Default::default();
                             state.groups = Default::default();
                             state.group_pins = Default::default();
+                            state.polls = Default::default();
                             state.remote_history = Default::default();
                             state.mention_picker = Default::default();
                             state.uploads = Default::default();
@@ -2660,6 +2678,7 @@ pub(in crate::ui) mod tests {
         let album_scene = std::env::var("ZALO_UI_FIXTURE_ALBUM").ok();
         let voice_scene = std::env::var("ZALO_UI_FIXTURE_VOICE").ok();
         let media_mode = std::env::var("ZALO_UI_FIXTURE_MEDIA").ok();
+        let poll_details = matches!(media_mode.as_deref(), Some("poll-detail" | "poll-hidden"));
         let attention_scene = std::env::var("ZALO_UI_FIXTURE_ATTENTION").ok();
         let forward_scene = std::env::var("ZALO_UI_FIXTURE_FORWARD").ok();
         let recall_scene = std::env::var("ZALO_UI_FIXTURE_RECALL").ok();
@@ -2725,6 +2744,7 @@ pub(in crate::ui) mod tests {
                 if online
                     || album_scene.is_some()
                     || voice_scene.is_some()
+                    || poll_details
                     || forward_scene.is_some()
                     || recall_scene.is_some()
                     || delete_scene.is_some()
@@ -3681,13 +3701,13 @@ pub(in crate::ui) mod tests {
                 }),
                 false,
             )],
-            "poll" => vec![(
+            "poll" | "poll-detail" | "poll-hidden" => vec![(
                 MediaKind::Poll,
                 serde_json::json!({"params":{
                     "msg":{"vi":"Đã tạo bình chọn mới cho nhóm"},
                     "question":"Mọi người muốn tổ chức buổi trao đổi kế hoạch vào thời gian nào trong tuần tới?",
                     "isAnonymous":true,
-                    "pollId":"synthetic-poll"
+                    "pollId":7601
                 }}),
                 false,
             )],
@@ -3720,7 +3740,7 @@ pub(in crate::ui) mod tests {
             ],
             _ => vec![(MediaKind::Photo, content("photo_object"), false)],
         };
-        let thread = if matches!(mode, "poll" | "files") {
+        let thread = if matches!(mode, "poll" | "poll-detail" | "poll-hidden" | "files") {
             "g:90"
         } else {
             "d:22"
@@ -3785,6 +3805,44 @@ pub(in crate::ui) mod tests {
         app.model.messages = store.page("11", thread, None, 50).unwrap();
         app.drafts.select(thread).unwrap();
         app.compact_list = false;
+        if matches!(mode, "poll-detail" | "poll-hidden") {
+            use crate::domain::poll::{PollDetails, PollOption};
+            let group = app
+                .model
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == thread)
+                .unwrap();
+            group.title = "Lịch họp nhóm · dữ liệu tổng hợp".into();
+            let scope = super::super::group_members::Scope {
+                account: "11".into(),
+                auth: app.auth_generation(),
+                thread: thread.into(),
+                generation: app.model.generation,
+                privacy_revision: super::super::privacy::Privacy::fixture_ready().revision,
+            };
+            let counts_visible = mode == "poll-detail";
+            let options = [
+                ("Sáng thứ Hai", 2),
+                (
+                    "Chiều thứ Tư sau cuộc họp triển khai và tổng kết định kỳ",
+                    5,
+                ),
+                ("Sáng thứ Sáu", 0),
+            ]
+            .into_iter()
+            .map(|(text, votes)| PollOption {
+                text: text.into(),
+                votes: counts_visible.then_some(votes),
+            })
+            .collect();
+            app.live.as_mut().unwrap().polls.fixture(scope, &app.model.messages[0], PollDetails {
+                question: "Mọi người muốn tổ chức buổi trao đổi kế hoạch vào thời gian nào trong tuần tới?".into(),
+                options,
+                closed: counts_visible,
+                anonymous: true,
+            });
+        }
         let (width, height, rgba) = std::thread::spawn(|| {
             crate::app::media::decode_fixture(include_bytes!(
                 "../../tests/fixtures/media/photo.jxl"

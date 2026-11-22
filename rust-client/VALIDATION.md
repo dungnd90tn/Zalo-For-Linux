@@ -1913,3 +1913,19 @@ The ignored X11 fixture supports `ZALO_UI_FIXTURE_RECALL=photo-confirm`,
 offline captures cover both themes at 640×480 and 1200×780. The confirmation
 identifies the chosen item and conversation scope. The recalled row shows
 only the recall label. Real-service testing with Linux and a phone is pending.
+
+## Read-only group poll details
+
+The synthetic TLS/WSS test receives and saves a group poll notice, then
+checks the exact authenticated detail request. Wrong groups, missing
+messages and stale privacy revisions send no detail request. A mismatched
+response poll ID yields the unavailable state. The verified result hides
+counts before joining a restricted poll and preserves explicit zero counts.
+
+Default verification passed 319 Rust and 19 Python tests. The all-feature
+checks passed 174 store tests, 17 offline poll-related tests, and strict
+Clippy. The optimized live binary passed startup and restart
+smoke checks at schema 24. Twelve offline X11 captures show the summary, results
+and hidden counts in both themes at 640×480 and 1200×780. At 640×480 the
+expanded card can extend above the visible chat area. Real-service
+comparison with a second device remains pending.

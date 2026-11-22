@@ -533,6 +533,7 @@ impl ServerConfig {
             "sticker",
             "reaction",
             "group_board",
+            "group_poll",
             "group_cloud_message",
             "up_file",
             "zcloud_up_file",

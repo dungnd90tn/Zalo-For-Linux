@@ -400,7 +400,8 @@ impl Privacy {
             LiveEvent::ReactionState { thread, .. }
             | LiveEvent::ReactionsChanged { thread, .. }
             | LiveEvent::GroupPins { thread, .. }
-            | LiveEvent::GroupPinFinished { thread, .. } => {
+            | LiveEvent::GroupPinFinished { thread, .. }
+            | LiveEvent::PollDetail { thread, .. } => {
                 if !self.list_visible(thread) {
                     return None;
                 }
@@ -499,6 +500,7 @@ impl NativeApp {
             state.recall.clear_confirmation();
             state.groups.clear_projection();
             state.group_pins.set_scope(None);
+            state.polls.clear_view();
             state.remote_history.clear_view();
             state.mention_picker.set_scope(None);
         }

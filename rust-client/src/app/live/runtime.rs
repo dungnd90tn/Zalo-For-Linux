@@ -39,6 +39,7 @@ mod echo_recovery;
 mod forward;
 mod group_actions;
 mod group_pins;
+mod group_poll;
 mod group_roster;
 #[cfg(test)]
 mod integration_tests;
@@ -2108,6 +2109,7 @@ async fn handle_command(
         | LiveCommand::Recall { .. }
         | LiveCommand::DeleteForMe { .. }
         | LiveCommand::LoadRemoteHistory { .. }
+        | LiveCommand::LoadPollDetail { .. }
         | LiveCommand::Forward { .. }
         | LiveCommand::ForwardBatch { .. }
         | LiveCommand::ForwardTargets { .. } => {
@@ -2709,6 +2711,7 @@ async fn run_inner(
     let mut recalls = recall::Recalls::default();
     let mut deletes = delete_for_me::Deletes::default();
     let mut history = remote_history::History::default();
+    let mut polls = group_poll::Polls::default();
     let mut reactions = reactions::Reactions::default();
     let mut groups = group_actions::Groups::default();
     let mut pins = group_pins::Pins::default();
@@ -2755,6 +2758,14 @@ async fn run_inner(
             available: root_for(&session, crate::protocol::remote_history::SERVICE).is_ok(),
         })
         .await?;
+    if root_for(&session, crate::protocol::group_poll::SERVICE).is_ok() {
+        events
+            .emit(LiveEvent::PollDetailCapability {
+                account_id: events.account.clone(),
+                available: true,
+            })
+            .await?;
+    }
     events
         .emit(LiveEvent::DeleteForMeCapability {
             account_id: events.account.clone(),
@@ -2774,6 +2785,7 @@ async fn run_inner(
             .as_ref()
             .filter(|socket| socket.decoder.authenticated())
             .and_then(|socket| socket.authenticated_at);
+        polls.retain(original_epoch, events);
         uploads
             .check_original_entitlement(original_epoch, &session, &client, events)
             .await?;
@@ -2846,6 +2858,7 @@ async fn run_inner(
                 let Some(command) = groups.command(command, online, &db, events, &session, &client).await? else { continue; };
                 let Some(command) = attention.command(command, &db, events).await? else { continue; };
                 let Some(command) = history.command(command, remote_history::epoch(connection.as_ref()), &db, events, &session, &client).await? else { continue; };
+                let Some(command) = polls.command(command, original_epoch, &db, events, &session, &client).await? else { continue; };
                 let Some(command) = forwards.command(command, connection.as_ref(), &db, events, &session, &client).await? else { continue; };
                 let sticker_session = sticker_catalog::authenticated_at(connection.as_ref());
                 if let Some(request) = sticker_catalog::Request::from_command(&command) {
@@ -2967,6 +2980,9 @@ async fn run_inner(
             completed = history.next() => {
                 history.complete(completed, remote_history::epoch(connection.as_ref()), &db, events).await?;
             },
+            completed = polls.next() => {
+                group_poll::Polls::complete(completed, original_epoch, &db, events).await?;
+            },
             _ = tokio::time::sleep_until(privacy_deadline), if !privacy.running() => { privacy.start(session.clone(),transports); },
             _ = tokio::time::sleep_until(next_connect), if connection.is_none() && !network_paused && privacy_ready => {
                 events.connection(if retries == 0 { LiveConnection::Connecting } else { LiveConnection::Reconnecting }).await?;
@@ -3025,6 +3041,7 @@ async fn run_inner(
                             let Some(command) = groups.command(command, false, &db, events, &session, &client).await? else { continue; };
                             let Some(command) = attention.command(command, &db, events).await? else { continue; };
                             let Some(command) = history.command(command, None, &db, events, &session, &client).await? else { continue; };
+                            let Some(command) = polls.command(command, None, &db, events, &session, &client).await? else { continue; };
                             let Some(command) = forwards.command(command, None, &db, events, &session, &client).await? else { continue; };
                             if let Some(request) = sticker_catalog::Request::from_command(&command) {
                                 sticker_search.start(request, None, events, &session, &client).await?;

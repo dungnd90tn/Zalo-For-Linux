@@ -48,6 +48,8 @@ mod modal_tests;
 #[cfg(feature = "messaging")]
 mod photos;
 #[cfg(feature = "messaging")]
+mod polls;
+#[cfg(feature = "messaging")]
 mod privacy;
 #[cfg(all(test, feature = "messaging"))]
 mod privacy_native_fixture;
@@ -1697,6 +1699,8 @@ impl NativeApp {
 
         let timeline_margin = if compact { 18.0 } else { 30.0 };
         let selecting = self.message_selection.is_some();
+        #[cfg(feature = "messaging")]
+        let poll_scope = self.live.as_ref().and_then(|state| self.poll_scope(state));
         let selection_gutter = if selecting {
             message_selection::GUTTER
         } else {
@@ -1828,9 +1832,12 @@ impl NativeApp {
                                     #[cfg(not(feature = "messaging"))]
                                     let delivery_label = None;
                                     #[cfg(feature = "messaging")]
-                                    let (sticker_cache,media_cache) = match self.live.as_mut() {
-                                        Some(state) if state.account.is_some() => (Some(&mut state.stickers),Some(&mut state.media)),
-                                        _ => (None,None),
+                                    let (sticker_cache,media_cache,poll_access) = match self.live.as_mut() {
+                                        Some(state) if state.account.is_some() => (Some(&mut state.stickers),Some(&mut state.media),poll_scope.as_ref().map(|scope| polls::Access {
+                                            scope, polls: &mut state.polls,
+                                            worker: state.worker.as_ref().filter(|_| !selecting && ui.is_enabled()),
+                                        })),
+                                        _ => (None,None,None),
                                     };
                                     let focused = focus.as_ref().filter(|(id, _)| *id == message.id);
                                     let backdrop = ui.painter().add(egui::Shape::Noop);
@@ -1839,6 +1846,8 @@ impl NativeApp {
                                         sticker_cache,
                                         #[cfg(feature = "messaging")]
                                         media_cache,
+                                        #[cfg(feature = "messaging")]
+                                        poll_access,
                                         self.model.generation, delivery_label, album_position,
                                     ));
                                     #[cfg(feature = "messaging")]
@@ -2297,6 +2306,7 @@ impl eframe::App for NativeApp {
             self.sync_delete_for_me();
             self.sync_groups(ctx);
             self.sync_group_pins();
+            self.sync_polls();
             self.sync_remote_history();
         }
         self.update_modal_input(ctx);
@@ -2672,6 +2682,7 @@ fn message_bubble(
     avatar_texture: Option<&egui::TextureHandle>,
     #[cfg(feature = "messaging")] sticker_cache: Option<&mut stickers::StickerCache>,
     #[cfg(feature = "messaging")] media_cache: Option<&mut media::MediaCache>,
+    #[cfg(feature = "messaging")] poll_access: Option<polls::Access<'_>>,
     generation: u64,
     delivery: Option<&str>,
     album_position: AlbumPosition,
@@ -2843,7 +2854,14 @@ fn message_bubble(
                         }
                         if message.media.is_some() {
                             #[cfg(feature = "messaging")]
-                            media::show(ui, message, generation, media_cache, max_bubble);
+                            media::show(
+                                ui,
+                                message,
+                                generation,
+                                media_cache,
+                                max_bubble,
+                                poll_access,
+                            );
                             #[cfg(not(feature = "messaging"))]
                             {
                                 let _ = generation;

@@ -25,11 +25,21 @@ thumbnails; only `recommened.link` exposes an explicit browser link. Contact IDs
 call identifiers and sticker-set addresses are retained without being treated
 as executable actions or image URLs. Unknown actions have an honest fallback.
 
-`group.poll` renders the embedded Vietnamese notice, question and an anonymity
-label only when an explicit boolean is present. Options, votes, results and
-poll updates belong to a separate authenticated detail API and are not invented
-from the notice. Voting remains unavailable. The exact-source
-`rich_cards_oracle.cjs` exercises six synthetic original-reader cases.
+`group.poll` renders the embedded Vietnamese notice, question and explicit
+anonymity. The exact-source `rich_cards_oracle.cjs` exercises six synthetic
+original-reader cases. Native recovers a positive `params.pollId` from the
+saved notice without changing the stored projection or schema.
+
+An explicit click in a verified visible ordinary group loads details from
+the advertised `group_poll` service. The original bundle builds GET
+`/api/poll/detail` with AES `params` containing `poll_id` and `imei`
+(N490384–490390). Native verifies current group membership and rechecks the
+account, group, message and privacy revision before applying the reply. The
+response must match the requested poll and any explicit group ID. It provides
+up to 30 options, the explicit closed and anonymous flags, and counts when
+the preview is public or the viewer has joined a restricted poll. The
+detail projection is transient and omits voter identities. Creation, voting
+and background updates remain outside the read-only flow.
 
 `share.file` maps to the original file type. Its card reads `content.title`,
 `content.href` and string/object `params.fileSize`, `fileExt`, `fType`; `fType=2`

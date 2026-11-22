@@ -468,6 +468,8 @@ mod tests {
                         None,
                         #[cfg(feature = "messaging")]
                         None,
+                        #[cfg(feature = "messaging")]
+                        None,
                         0,
                         None,
                         super::super::AlbumPosition::Single,

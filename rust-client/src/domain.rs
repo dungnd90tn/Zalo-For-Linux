@@ -13,6 +13,7 @@ pub(crate) mod info;
 pub mod media;
 pub mod mention;
 pub mod overview;
+pub mod poll;
 pub mod reply;
 pub mod search;
 pub use reply::{MessageQuote, MessageQuoteBinding, QuoteContent, ReplyReference};

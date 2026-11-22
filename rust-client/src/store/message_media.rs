@@ -1,5 +1,7 @@
 //! Full immutable media content and a separately bounded presentation snapshot.
 use super::FailureReason;
+use crate::domain::media::poll_id_in_notice;
+use crate::domain::poll::MAX_POLL_NOTICE_BYTES;
 use crate::domain::{
     MediaDescriptor, MediaKind, MediaMessageContent, Message, MAX_INFO_CONTENT_BYTES,
     MAX_MEDIA_DESCRIPTOR_BYTES, MAX_PREVIEW_CHARS,
@@ -160,9 +162,10 @@ fn preview(descriptor: &MediaDescriptor) -> String {
 }
 
 pub(super) fn projection(conn: &Connection, message: &Message) -> Result<Option<MediaDescriptor>> {
-    let row: Option<(String, Option<String>, Option<String>)> = conn
+    let row: Option<Stored> = conn
         .prepare_cached(
             "SELECT kind,
+        CASE WHEN kind='group.poll' AND length(CAST(metadata AS BLOB))<=?6 THEN metadata END,
         CASE WHEN length(CAST(projection AS BLOB))<=?4 THEN projection END,
         CASE WHEN length(CAST(preview AS BLOB))<=?5 THEN preview END
         FROM message_media WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
@@ -173,14 +176,15 @@ pub(super) fn projection(conn: &Connection, message: &Message) -> Result<Option<
                 message.thread_id,
                 message.id,
                 MAX_PROJECTION_BYTES as i64,
-                MAX_PREVIEW_BYTES as i64
+                MAX_PREVIEW_BYTES as i64,
+                MAX_POLL_NOTICE_BYTES as i64
             ],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    row.map(|(kind, projection, stored_preview)| {
+    row.map(|(kind, notice, projection, stored_preview)| {
         let projection = projection.ok_or(FailureReason::ConflictingMetadata)?;
-        let descriptor: MediaDescriptor =
+        let mut descriptor: MediaDescriptor =
             serde_json::from_str(&projection).map_err(|_| FailureReason::ConflictingMetadata)?;
         descriptor
             .validate()
@@ -192,9 +196,53 @@ pub(super) fn projection(conn: &Connection, message: &Message) -> Result<Option<
                 && message.text == descriptor.kind().legacy_placeholder(),
             FailureReason::ConflictingMetadata
         );
+        if let MediaDescriptor::Poll(poll) = &mut descriptor {
+            poll.poll_id = notice
+                .as_deref()
+                .and_then(|raw| poll_id_in_notice(raw, poll));
+        }
         Ok(descriptor)
     })
     .transpose()
+}
+
+#[cfg(feature = "messaging")]
+impl super::MessageStore {
+    /// Resolve an opaque UI message key through the current account and visibility policy.
+    pub(crate) fn poll_detail_target(
+        &self,
+        account: &str,
+        thread: &str,
+        message_id: &str,
+    ) -> Result<Option<u64>> {
+        use crate::domain::reply::valid_source_id;
+
+        if !valid_source_id(account)
+            || !thread.strip_prefix("g:").is_some_and(valid_source_id)
+            || !valid_source_id(message_id)
+            || self.group_write_blocked(account, thread)?
+        {
+            return Ok(None);
+        }
+        let allowed: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.live_privacy WHERE account_id=?1 AND ready=1)
+             AND NOT EXISTS(SELECT 1 FROM temp.live_hidden WHERE account_id=?1 AND thread_id=?2)
+             AND NOT EXISTS(SELECT 1 FROM e2ee_threads WHERE account_id=?1 AND thread_id=?2)",
+            params![account, thread],
+            |row| row.get(0),
+        )?;
+        if !allowed {
+            return Ok(None);
+        }
+        let mut messages = self.refresh_messages(account, thread, &[message_id.to_owned()])?;
+        let Some(message) = messages.pop().filter(|message| !message.is_recalled()) else {
+            return Ok(None);
+        };
+        Ok(match message.media {
+            Some(MediaDescriptor::Poll(poll)) => poll.poll_id,
+            _ => None,
+        })
+    }
 }
 
 type Stored = (String, Option<String>, Option<String>, Option<String>);
@@ -349,6 +397,65 @@ mod tests {
             message_id: message.id.clone(),
             content,
         }
+    }
+
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn poll_detail_lookup_uses_the_saved_notice_and_live_privacy_scope() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let (mut notice, _) = message(MediaKind::Poll, "801");
+        notice.thread_id = "g:22".into();
+        let content = MediaMessageContent::new(
+            MediaKind::Poll,
+            &json!({"action":"create", "params":"{\"pollId\":42,\"question\":\"Họp lúc nào?\"}"}),
+        )
+        .unwrap();
+        notice.media = Some(content.descriptor().clone());
+        store
+            .receive_batch_with_media("11", &[(notice.clone(), None, None, Some(content))], None)
+            .unwrap();
+        assert_eq!(
+            store.page("11", "g:22", None, 10).unwrap(),
+            vec![notice.clone()]
+        );
+        let conflicting = MediaMessageContent::new(
+            MediaKind::Poll,
+            &json!({"action":"create", "params":"{\"pollId\":43,\"question\":\"Họp lúc nào?\"}"}),
+        )
+        .unwrap();
+        notice.media = Some(conflicting.descriptor().clone());
+        assert!(store
+            .receive_batch_with_media("11", &[(notice, None, None, Some(conflicting))], None)
+            .is_err());
+        store.begin_live_privacy("11").unwrap();
+        assert_eq!(store.poll_detail_target("11", "g:22", "801").unwrap(), None);
+        store.replace_live_privacy("11", &[], None).unwrap();
+        assert_eq!(
+            store.poll_detail_target("11", "g:22", "801").unwrap(),
+            Some(42)
+        );
+        for (account, thread, id) in [
+            ("33", "g:22", "801"),
+            ("11", "d:22", "801"),
+            ("11", "g:23", "801"),
+            ("11", "g:22", "42"),
+        ] {
+            assert_eq!(store.poll_detail_target(account, thread, id).unwrap(), None);
+        }
+        store
+            .replace_live_privacy("11", &["g:22".into()], None)
+            .unwrap();
+        assert_eq!(store.poll_detail_target("11", "g:22", "801").unwrap(), None);
+        store.unlock_live_thread("11", Some("g:22")).unwrap();
+        assert_eq!(store.poll_detail_target("11", "g:22", "801").unwrap(), None);
+        store.begin_live_privacy("11").unwrap();
+        assert_eq!(store.poll_detail_target("11", "g:22", "801").unwrap(), None);
+        store.replace_live_privacy("11", &[], None).unwrap();
+        store
+            .conn
+            .execute("INSERT INTO group_left VALUES('11','g:22',1000)", [])
+            .unwrap();
+        assert_eq!(store.poll_detail_target("11", "g:22", "801").unwrap(), None);
     }
     #[test]
     fn stored_call_logs_are_reprojected_from_their_immutable_content() {
