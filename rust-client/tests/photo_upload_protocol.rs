@@ -54,14 +54,10 @@ fn ordinary_hd_photo_matches_executed_source_routes_chunks_resource_and_caption_
             );
         }
         let u = &case["urls"];
-        let urls = PhotoUrls {
-            org: u["org"].as_str().unwrap().into(),
-            thumb: u["thumb"].as_str().unwrap().into(),
-            hd: u["hd"].as_str().unwrap().into(),
-            thumb_size: Some(1),
-            file_size: Some(6),
-            hd_size: Some(4),
-        };
+        let urls = PhotoUrls::from_value(&json!({
+            "org":u["org"],"thumb":u["thumb"],"hd":u["hd"],"thumbSize":1,"fileSize":6,"hdSize":4
+        }))
+        .unwrap();
         assert_eq!(
             photo::message_parameters(
                 &target,
@@ -85,6 +81,92 @@ fn ordinary_hd_photo_matches_executed_source_routes_chunks_resource_and_caption_
         );
         assert!(!final_url.query_pairs().any(|(k, _)| k == "type"));
     }
+}
+
+#[test]
+fn album_members_match_the_bundled_picker_and_per_photo_submission() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/messaging/photo_album_upload.json")).unwrap();
+    let urls = PhotoUrls::from_value(&json!({
+        "org":"https://photos.example.test/original","thumb":"https://photos.example.test/thumb",
+        "hd":"https://photos.example.test/hd","thumbSize":1,"fileSize":6,"hdSize":4
+    }))
+    .unwrap();
+    let base_media = photo::media_content("", 640, 480, &urls).unwrap();
+    for case in fixture["albums"].as_array().unwrap() {
+        let group = case["group"].as_bool().unwrap();
+        let kind = if group {
+            ThreadKind::Group
+        } else {
+            ThreadKind::Direct
+        };
+        let target = Target::new(kind, if group { "33" } else { "22" }).unwrap();
+        let layout_id = case["layoutId"].as_str().unwrap().parse().unwrap();
+        let extra = case["extraMetadata"].as_bool().unwrap();
+        for (index, final_request) in case["finals"].as_array().unwrap().iter().enumerate() {
+            let expected = &final_request["payload"];
+            let client_id = expected["clientId"].as_u64().unwrap();
+            let mut request = photo::message_parameters(
+                &target,
+                "synthetic-photo",
+                client_id,
+                "",
+                640,
+                480,
+                "synthetic-device",
+                &urls,
+            )
+            .unwrap();
+            let album = photo::AlbumMember::new(layout_id, index as u32, 3).unwrap();
+            album
+                .apply_to_message_parameters(&mut request, extra)
+                .unwrap();
+            assert_eq!(&request, expected);
+            assert_eq!(
+                photo::AlbumMember::from_message_parameters(&request),
+                Some(album)
+            );
+            let content = album.apply_to_media_content(&base_media).unwrap();
+            assert_eq!(content.album_member(), Some(album));
+            let mut wrong = request;
+            wrong["idInGroup"] = json!(3);
+            assert!(photo::has_album_message_fields(&wrong));
+            assert_eq!(photo::AlbumMember::from_message_parameters(&wrong), None);
+            wrong["idInGroup"] = json!(index);
+            wrong["extMsgProp"] = json!("{\"groupMediaMsg\":{\"groupLayoutId\":\"999\"}}");
+            assert_eq!(photo::AlbumMember::from_message_parameters(&wrong), None);
+        }
+    }
+}
+
+#[test]
+fn authenticated_album_config_uses_source_defaults_and_honors_a_smaller_count() {
+    use zalo_rust::protocol::bootstrap::ServerConfig;
+    let defaults = json!({"zpw_service_map_v3":{"chat":["https://wpa.zaloapp.com"]}});
+    let config = ServerConfig::parse(&defaults).unwrap();
+    assert_eq!(config.photo_album_max_count, 9);
+    assert!(config.photo_album_extra_metadata);
+    let mut selected = defaults;
+    selected["setttings"] = json!({
+        "sharefile":{"max_file":3},"features":{"should_attach_extraMsgProp":0}
+    });
+    let config = ServerConfig::parse(&selected).unwrap();
+    assert_eq!(config.photo_album_max_count, 3);
+    assert!(!config.photo_album_extra_metadata);
+    selected["settings"]["sharefile"]["max_file"] = json!(4);
+    assert_eq!(
+        ServerConfig::parse(&selected)
+            .unwrap()
+            .photo_album_max_count,
+        0
+    );
+    selected["setttings"]["sharefile"]["max_file"] = json!("malformed");
+    assert_eq!(
+        ServerConfig::parse(&selected)
+            .unwrap()
+            .photo_album_max_count,
+        0
+    );
 }
 
 #[test]

@@ -186,6 +186,53 @@ synthetic TLS/WSS dispatch and restart case. Group/album/attachment forwarding,
 re-forwarding, multiple recipients and real-service interoperability are
 outside this verified slice.
 
+## Forwarding direct text to groups
+
+The ordinary group route is FILE POST `/api/group/mforward` with one
+session-encrypted `grids` entry containing `grid`, string `clientId`, and
+zero `ttl`. The outer request carries type `"1"`, zero TTL and count one.
+It uses the original direct-text reference and decoration format. The
+bundled client constructs the request at N489377–489394 and binds group
+results to submitted client IDs at `lazy/main-startup` N25522–25543.
+
+The group must have fewer than 100 members. Before dispatch the worker
+checks current group membership, ordinary plaintext capability, visibility,
+send permission and disabled auto-delete. Each result binds the exact
+client ID and any explicit destination in the reply. The existing forward
+outbox scopes receipts by account and complete direct or group thread ID.
+One picker can mix up to ten recipients. Each recipient has its own request
+and outcome. Unknown delivery does not redispatch after restart. The source
+is a saved ordinary direct text message, and the profile remains on schema 25.
+
+## Forwarding text from an ordinary group
+
+The source can also be a saved, verified first-generation text message in a
+visible ordinary group of fewer than 100 members. The worker verifies active
+membership, plaintext capability and disabled auto-delete in the source
+group before dispatch. Source read access is checked independently of the
+destination's send permission. A stale proof is renewed between recipients,
+and the committed source is revalidated immediately before sending.
+
+The original reference builder (N480089–480156) uses the group source type
+`2` and hashes the source client ID, effective sender ID and `g<grid>`.
+Native uses that reference with the existing direct or group destination
+route and the account/thread-scoped forward outbox. Schema 25 is compatible.
+
+## Mentioning all members in an ordinary group
+
+The picker creates a single typed `@All` span on explicit selection. The
+PC bundle uses `uid: "-1"` and `type: 1` for this span (N57897–57899 and
+N321604–321608). Native sends UTF-16 offsets through the existing authenticated
+POST `/api/group/mention` (N489237–489258). The typed outbox binds the span to
+the exact message and recipient group.
+
+Native requires an explicitly advertised positive `max_member_mention_all`
+(N263600). It rechecks current visibility, plaintext capability, membership,
+send permission, the advertised size limit and disabled auto-delete before
+sending. Only authenticated ordinary group messages with the exact type and
+sentinel pair can project the broadcast. Schema 26 marks compatibility with
+the persisted sentinel while preserving earlier individual mentions.
+
 ## Ordinary direct text recall (2026-11-19)
 
 The original direct composer checks message age at N136319. N401877–401897
@@ -224,6 +271,50 @@ with the same words. Saved search and conversation previews read the
 redacted rows. These are logical storage changes. Separately forwarded
 messages remain independent. Group, media and E2EE recall and local deletion
 are outside this slice.
+
+## Ordinary photo and file recall
+
+The ordinary client dispatches both text and media through the existing
+undo request. The direct endpoint is `/api/message/undo` and the group
+endpoint is `/api/group/undomsg`. Native scopes the target to an accepted
+PHOTO or FILE record for this account and thread, matching the actor, server
+message ID and original client ID. Each album image has its own target.
+The normal capability, group membership and recall deadline checks apply.
+
+An authenticated own-account notice with the original client ID can wait
+for the typed receipt and be applied in the same transaction as acceptance.
+The local projection clears resource URLs and display metadata. Late typed
+receipts and history copies use the redacted projection. Native retains the
+receipt identity and scoped tombstone in schema 24. A recalled first album
+member retains its layout ID, index and count so the remaining images can
+finish sending. Previously saved local downloads and media sent from other
+clients are outside this implementation.
+
+## Deleting one ordinary text message for the account
+
+The session must affirm `settings.features.sync_del_msg_or_conv.enable_sync_del_msg`
+or its `setttings` alias. The native confirmation fixes the selected mode.
+With sync disabled, a device-only action records local suppression without an
+HTTP request. Account mode posts encrypted form parameters to CHAT
+`/api/message/delete` or GROUP `/api/group/deletemsg` with `onlyMe:1`.
+One message in `msgs` binds the stored global ID, client ID, sender and
+destination. The action has a separate monotonic client ID. See PC bundle
+lines 472907–472947 and 491041–491075.
+
+Schema 23 binds a deletion to the account, thread, message and sender. A
+confirmed action removes the local row, sanitizes matching quotes and
+suppresses replay. Uncertain account requests retain the message and are
+never retried automatically. An acknowledgement survives a failed projection
+transaction.
+
+The authenticated message queue accepts `chat.delete` with an own-account
+actor, single-message type 1 or 3, explicit account-only action type 0, and an
+exact target tuple. The ordinary text target must match account, conversation,
+server message ID, source client ID and sender. Schema 24 stores up to 4,096
+pending claims per account for notices arriving before the original. The
+queue transaction commits notices and its cursor together. Matching history
+can settle a pending claim, and an exact notice can settle an uncertain local
+intent. See PC bundle lines 469779–469814 and 471398–471425.
 
 ## Ordinary group members, invite and leave (2026-11-19)
 

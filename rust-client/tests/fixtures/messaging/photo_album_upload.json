@@ -1,0 +1,339 @@
+{
+  "provenance": "Original _uploadImg group layout allocation and sendMsgPhotoAsync, no-network transport, synthetic IDs and service URLs.",
+  "albums": [
+    {
+      "group": false,
+      "extraMetadata": false,
+      "layoutId": "8001",
+      "finals": [
+        {
+          "url": "https://files.example.test/api/message/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8002,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "toid": "22",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "normalUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8001",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 0
+          }
+        },
+        {
+          "url": "https://files.example.test/api/message/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8004,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "toid": "22",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "normalUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8001",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 1
+          }
+        },
+        {
+          "url": "https://files.example.test/api/message/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8005,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "toid": "22",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "normalUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8001",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 2
+          }
+        }
+      ]
+    },
+    {
+      "group": false,
+      "extraMetadata": true,
+      "layoutId": "8006",
+      "finals": [
+        {
+          "url": "https://files.example.test/api/message/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8007,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "toid": "22",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "normalUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8006",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 0,
+            "extMsgProp": "{\"groupMediaMsg\":{\"groupLayoutId\":\"8006\"}}"
+          }
+        },
+        {
+          "url": "https://files.example.test/api/message/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8009,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "toid": "22",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "normalUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8006",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 1,
+            "extMsgProp": "{\"groupMediaMsg\":{\"groupLayoutId\":\"8006\"}}"
+          }
+        },
+        {
+          "url": "https://files.example.test/api/message/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8010,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "toid": "22",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "normalUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8006",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 2,
+            "extMsgProp": "{\"groupMediaMsg\":{\"groupLayoutId\":\"8006\"}}"
+          }
+        }
+      ]
+    },
+    {
+      "group": true,
+      "extraMetadata": false,
+      "layoutId": "8011",
+      "finals": [
+        {
+          "url": "https://files.example.test/api/group/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8012,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "grid": "33",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "oriUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8011",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 0
+          }
+        },
+        {
+          "url": "https://files.example.test/api/group/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8014,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "grid": "33",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "oriUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8011",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 1
+          }
+        },
+        {
+          "url": "https://files.example.test/api/group/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8015,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "grid": "33",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "oriUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8011",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 2
+          }
+        }
+      ]
+    },
+    {
+      "group": true,
+      "extraMetadata": true,
+      "layoutId": "8016",
+      "finals": [
+        {
+          "url": "https://files.example.test/api/group/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8017,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "grid": "33",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "oriUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8016",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 0,
+            "extMsgProp": "{\"groupMediaMsg\":{\"groupLayoutId\":\"8016\"}}"
+          }
+        },
+        {
+          "url": "https://files.example.test/api/group/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8019,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "grid": "33",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "oriUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8016",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 1,
+            "extMsgProp": "{\"groupMediaMsg\":{\"groupLayoutId\":\"8016\"}}"
+          }
+        },
+        {
+          "url": "https://files.example.test/api/group/photo_original/send?zpw_ver=800&zpw_type=24",
+          "payload": {
+            "photoId": "synthetic-photo",
+            "clientId": 8020,
+            "desc": "",
+            "width": 640,
+            "height": 480,
+            "grid": "33",
+            "rawUrl": "https://photos.example.test/original",
+            "thumbUrl": "https://photos.example.test/thumb",
+            "oriUrl": "https://photos.example.test/original",
+            "hdUrl": "https://photos.example.test/hd",
+            "thumbSize": 1,
+            "fileSize": 6,
+            "hdSize": 4,
+            "language": "VN",
+            "ttl": 0,
+            "imei": "synthetic-device",
+            "groupLayoutId": "8016",
+            "totalItemInGroup": 3,
+            "isGroupLayout": 1,
+            "idInGroup": 2,
+            "extMsgProp": "{\"groupMediaMsg\":{\"groupLayoutId\":\"8016\"}}"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -204,6 +204,7 @@ fn demo_screenshot() {
                 )?;
                 let messages: Vec<_> = (0..75)
                     .map(|i| Message {
+                        mentions: Vec::new(),
                         reply_blocked: false,
                         recalled: false,
                         source_client_id: None,
@@ -253,7 +254,7 @@ pub(super) struct Grabber {
 
 #[cfg(feature = "messaging")]
 impl Grabber {
-    pub(super) fn tick(&mut self, ctx: &egui::Context) {
+    pub(super) fn tick(&mut self, ctx: &egui::Context, check_frame: impl FnOnce()) {
         let Some(out) = std::env::var_os("ZALO_UI_SHOT") else {
             return;
         };
@@ -263,6 +264,7 @@ impl Grabber {
             .and_then(|value| value.parse().ok())
             .unwrap_or(60);
         if self.frames >= settle && !self.requested {
+            check_frame();
             self.requested = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
         }
@@ -295,6 +297,7 @@ fn seed_shared_items(profile: &Profile) -> anyhow::Result<()> {
     let mut text = |id: &str, body: &str, at: i64| {
         batch.push((
             crate::domain::Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 source_client_id: None,
@@ -321,6 +324,7 @@ fn seed_shared_items(profile: &Profile) -> anyhow::Result<()> {
     let media = |id: &str, kind: MediaKind, content: serde_json::Value, at: i64| {
         let content = MediaMessageContent::new(kind, &content).expect("synthetic content");
         let message = crate::domain::Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

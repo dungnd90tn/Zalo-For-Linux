@@ -25,11 +25,33 @@ thumbnails; only `recommened.link` exposes an explicit browser link. Contact IDs
 call identifiers and sticker-set addresses are retained without being treated
 as executable actions or image URLs. Unknown actions have an honest fallback.
 
-`group.poll` renders the embedded Vietnamese notice, question and an anonymity
-label only when an explicit boolean is present. Options, votes, results and
-poll updates belong to a separate authenticated detail API and are not invented
-from the notice. Voting remains unavailable. The exact-source
-`rich_cards_oracle.cjs` exercises six synthetic original-reader cases.
+`group.poll` renders the embedded Vietnamese notice, question and explicit
+anonymity. The exact-source `rich_cards_oracle.cjs` exercises six synthetic
+original-reader cases. Native recovers a positive `params.pollId` from the
+saved notice without changing the stored projection or schema.
+
+An explicit click in a verified visible ordinary group loads details from
+the advertised `group_poll` service. The original bundle builds GET
+`/api/poll/detail` with AES `params` containing `poll_id` and `imei`
+(N490384–490390). Native verifies current group membership and rechecks the
+account, group, message and privacy revision before applying the reply. The
+response must match the requested poll and any explicit group ID. It provides
+up to 30 options, the explicit closed and anonymous flags, and counts when
+the preview is public or the viewer has joined a restricted poll. The
+detail projection is transient and omits voter identities.
+
+A separate explicit action casts a first vote. The source uses GET
+`/api/poll/vote` with encrypted `poll_id`, one numeric ID in `option_ids`,
+and `imei` (N490401–490408). Native reads details again to confirm the
+poll is open, unexpired, single-choice and unjoined, and that the exact
+option ID and displayed text still match. It records one guard per
+account and poll in schema 25 before dispatch. The guard contains the
+bound group and message and omits the selected option. The vote transport
+uses a fresh connection without automatic retry. A fresh detail read
+confirms participation and confirms the selected option only when the
+server explicitly reports the viewer's selection. An uncertain vote
+remains blocked across restart. Creation, changing or withdrawing a vote,
+multi-choice voting and background updates remain outside this flow.
 
 `share.file` maps to the original file type. Its card reads `content.title`,
 `content.href` and string/object `params.fileSize`, `fileExt`, `fType`; `fType=2`
@@ -39,8 +61,8 @@ unknown; zero is a valid size. `files_oracle.cjs` retains eight synthetic origin
 reader cases. File URLs are exposed only as an explicit HTTPS browser action;
 HTTP links upgrade to HTTPS. No file is automatically downloaded, opened locally
 or executed. Nonempty `secureKey`/`e2eeKey` markers withhold the plaintext action.
-Ordinary single-file and single-photo HD sending are implemented as described
-below. Original-photo sending, albums, animation, transfer resume, folder
+Ordinary single-file, single-photo HD, HD album and entitled original JPEG
+sending are implemented as described below. Animation, transfer resume, folder
 extraction and E2EE attachment decryption remain unavailable.
 
 ## Ordinary single-file sending
@@ -115,6 +137,50 @@ unknown final dispatch, durable ACK/local-echo repair and no automatic resend
 follow the FILE contract. Older binaries refuse schema twelve; no downgrade is
 provided. Real-service photo acceptance remains pending.
 
+## Sending an original JPEG
+
+An authenticated paid Zalo Cloud plan and the session's original-upload
+capability are required. The client rechecks the plan before sending bytes.
+It preserves JPEG image data and removes APP1 metadata, then uploads through
+the Cloud service and sends through the configured photo service. The response
+must identify an original URL at the prepared size. See
+[original JPEG verification](VALIDATION.md#sending-one-original-jpeg-206-development-branch).
+
+## Sending an HD album
+
+The image picker prepares 2–6 HD JPEGs in the chosen order and honors smaller
+session limits. The existing HD service sends each image with a distinct client
+ID, shared decimal-string `groupLayoutId`, zero-based `idInGroup`,
+`isGroupLayout:1`, and `totalItemInGroup`. When advertised by session settings,
+`extMsgProp` also carries the layout ID. See PC bundle N136681–136724 and
+N401554–401571. Draft text stays in the composer.
+
+Each image uses the scoped photo ledger, including its group metadata through
+receipt reconciliation. The next image starts only after durable acceptance of
+the previous one. Failure or an uncertain response stops the send. A restart
+can reconcile a recorded receipt and does not resume the album. Schema 21
+adds the album projection and prevents earlier clients from opening the
+upgraded profile. The timeline groups complete contiguous runs and keeps the
+separate photo actions.
+
+## Recording and sending a voice message
+
+The recorder holds one MP3 clip in memory, up to 60 seconds or 2 MiB. A user
+action starts FFmpeg on the local PulseAudio-compatible socket. Switching
+thread or account cancels capture and playback. Ordinary direct and group
+sends use FILE paths `/api/message/voicemp3` and `/api/group/sendmp3`
+respectively. Encrypted URL parameters carry the scoped target and decimal
+client ID. The multipart body contains the MP3 as `fileContent`. See
+`compact-app-pc` lines 489489–489503.
+
+Schema 22 adds a voice receipt ledger and preserves existing media rows.
+The ledger stores a digest and scoped send state. A typed HTTP receipt or
+matching own echo settles a send. A send that may have reached the server is
+never retried automatically. The timeline uses the actual incoming
+`chat.voice` sidecar. Voice playback fetches up to 8 MiB from an approved
+HTTPS CDN only after a click, then decodes MP3, AAC or AMR via a pipe.
+Encrypted audio and service-side format conversion remain unavailable.
+
 ## Durable content and replay
 
 **Schema eight** retains the entire canonical source content in scoped
@@ -184,7 +250,7 @@ capped at 100 MiB, never overwrite existing files, and cancel even during a stal
 response, cleaning the private partial file. An unsolicited HTTP 206 is refused.
 The viewer footer scrolls within its bound so save actions remain reachable in compact
 windows and with long captions. Browser navigation still requires a separate explicit
-click. Original-photo sending, full-resolution in-app viewing and universal OA actions remain pending.
+click. Full-resolution in-app viewing and universal OA actions remain pending.
 See [file transfer limits](PROTOCOL_FILES.md#receiving-files-implemented-unverified-against-the-real-service).
 Local HTTP and synthetic UI checks establish these behaviors, not production CDN acceptance.
 

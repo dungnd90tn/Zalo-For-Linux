@@ -43,17 +43,21 @@ impl MessageStore {
     }
 
     pub(crate) fn group_write_blocked(&self, account: &str, thread: &str) -> Result<bool> {
-        if group_id(account, thread).is_none() {
-            return Ok(false);
-        }
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM group_left WHERE account_id=?1 AND thread_id=?2)
-             OR EXISTS(SELECT 1 FROM group_action_outbox WHERE account_id=?1 AND thread_id=?2
-               AND kind='leave' AND state IN ('sending','unknown'))",
-            params![account, thread],
-            |row| row.get(0),
-        )?)
+        write_blocked(&self.conn, account, thread)
     }
+}
+
+pub(super) fn write_blocked(conn: &Connection, account: &str, thread: &str) -> Result<bool> {
+    if group_id(account, thread).is_none() {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM group_left WHERE account_id=?1 AND thread_id=?2)
+         OR EXISTS(SELECT 1 FROM group_action_outbox WHERE account_id=?1 AND thread_id=?2
+           AND kind='leave' AND state IN ('sending','unknown'))",
+        params![account, thread],
+        |row| row.get(0),
+    )?)
 }
 
 pub(super) fn left(conn: &Connection, account: &str, thread: &str) -> Result<bool> {
@@ -484,6 +488,7 @@ mod tests {
             sender: "55".into(),
             text: "Lịch sử tổng hợp trước khi rời nhóm".into(),
             source_client_id: None,
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             quote: None,

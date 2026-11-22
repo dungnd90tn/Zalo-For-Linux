@@ -259,6 +259,7 @@ mod cache {
             };
             model.messages = (1..=50)
                 .map(|i| Message {
+                    mentions: Vec::new(),
                     reply_blocked: false,
                     recalled: false,
                     source_client_id: None,
@@ -369,6 +370,7 @@ mod tests {
     use super::*;
     fn message() -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -466,8 +468,11 @@ mod tests {
                         None,
                         #[cfg(feature = "messaging")]
                         None,
+                        #[cfg(feature = "messaging")]
+                        None,
                         0,
                         None,
+                        super::super::AlbumPosition::Single,
                     );
                 });
             },

@@ -23,6 +23,7 @@ pub(super) fn show(
     generation: u64,
     cache: Option<&mut MediaCache>,
     max_width: f32,
+    poll_access: Option<super::polls::Access<'_>>,
 ) {
     let Some(media) = &message.media else {
         return;
@@ -38,8 +39,17 @@ pub(super) fn show(
         MediaDescriptor::Recommended(card) => {
             web_card(ui, message, generation, card, cache, max_width, true)
         }
-        MediaDescriptor::Poll(poll) => poll_card(ui, poll),
+        MediaDescriptor::Poll(poll) => poll_card(ui, message, poll, poll_access),
         MediaDescriptor::File(file) => file_card(ui, message, file, cache),
+        MediaDescriptor::Voice(voice) => {
+            let playback = cache
+                .filter(|cache| {
+                    cache.matches_scope(&message.account_id, &message.thread_id, generation)
+                        && !cache.has_viewer()
+                })
+                .map(|cache| &mut cache.voice);
+            super::voice::message_card(ui, message, voice, playback);
+        }
     }
 }
 fn file_card(
@@ -446,7 +456,12 @@ fn web_card(
         );
     }
 }
-fn poll_card(ui: &mut egui::Ui, poll: &PollDescriptor) {
+fn poll_card(
+    ui: &mut egui::Ui,
+    message: &Message,
+    poll: &PollDescriptor,
+    mut access: Option<super::polls::Access<'_>>,
+) {
     let colors = crate::theme::palette(ui.ctx());
     ui.horizontal_top(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
@@ -460,32 +475,33 @@ fn poll_card(ui: &mut egui::Ui, poll: &PollDescriptor) {
             .wrap(),
         );
     });
-    if !poll.question.is_empty() {
-        ui.add(egui::Label::new(&poll.question).wrap());
+    let detail = access.as_ref().and_then(|access| access.detail(message));
+    let question = detail.map_or(poll.question.as_str(), |detail| detail.question.as_str());
+    if !question.is_empty() && question != poll.title {
+        ui.add(egui::Label::new(question).wrap());
     }
-    if let Some(anonymous) = poll.anonymous {
-        ui.label(
-            RichText::new(if anonymous {
-                "Bình chọn ẩn danh"
-            } else {
-                "Bình chọn công khai"
-            })
-            .size(12.0)
-            .color(colors.text_secondary),
-        );
+    let anonymous = detail.map(|detail| detail.anonymous).or(poll.anonymous);
+    if let Some(anonymous) = anonymous {
+        let privacy = if anonymous {
+            "Bình chọn ẩn danh"
+        } else {
+            "Bình chọn công khai"
+        };
+        if detail.is_some_and(|detail| detail.closed) {
+            super::polls::metadata(ui, &format!("{privacy} · Đã đóng"));
+        } else {
+            super::polls::metadata(ui, privacy);
+        }
     }
-    ui.add_enabled(false, egui::Button::new("Bình chọn"))
-        .on_disabled_hover_text("Ứng dụng native chưa hỗ trợ tham gia bình chọn.");
-    ui.add(
-        egui::Label::new(
-            RichText::new(
-                "Chưa tải các lựa chọn và kết quả. Hiện chỉ xem được nội dung thông báo bình chọn.",
-            )
-            .size(12.0)
-            .color(colors.text_secondary),
-        )
-        .wrap(),
-    );
+    if let Some(access) = access.as_mut() {
+        access.options(ui, message);
+    }
+    if !access
+        .as_mut()
+        .is_some_and(|access| access.controls(ui, message))
+    {
+        super::polls::metadata(ui, "Hiện chỉ xem được thông báo bình chọn.");
+    }
 }
 #[allow(clippy::too_many_arguments)]
 fn thumbnail(
@@ -773,6 +789,7 @@ mod tests {
                         original_url: None,
                         width: Some(pixel_width),
                         height: Some(pixel_height),
+                        album: None,
                     }));
                     let mut sizes = Vec::new();
                     let mut frame_time = 0.0;
@@ -809,7 +826,14 @@ mod tests {
                                 } else {
                                     egui::CentralPanel::default().show(ctx, |ui| {
                                         let available_width = ui.available_width();
-                                        show(ui, &message, 1, Some(&mut cache), available_width);
+                                        show(
+                                            ui,
+                                            &message,
+                                            1,
+                                            Some(&mut cache),
+                                            available_width,
+                                            None,
+                                        );
                                     });
                                 }
                             });
@@ -902,6 +926,7 @@ mod tests {
 
     fn message(media: MediaDescriptor) -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -929,7 +954,7 @@ mod tests {
             buttons: vec![],
         }));
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show(ui, &message, 1, None, 300.0));
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &message, 1, None, 300.0, None));
         });
         assert!(output.platform_output.open_url.is_none());
     }
@@ -943,9 +968,11 @@ mod tests {
                 title: "Đã tạo bình chọn".into(),
                 question: "Chúng ta họp vào lúc nào?".into(),
                 anonymous,
+                poll_id: None,
             }));
             let output = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| show(ui, &message, 1, None, 300.0));
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| show(ui, &message, 1, None, 300.0, None));
             });
             let text = output
                 .shapes
@@ -958,7 +985,8 @@ mod tests {
                 .join("\n");
             assert!(text.contains("Đã tạo bình chọn"));
             assert!(text.contains("Chúng ta họp vào lúc nào?"));
-            assert!(text.contains("Chưa tải các lựa chọn và kết quả"));
+            assert!(text.contains("Hiện chỉ xem được thông báo bình chọn"));
+            assert!(!text.contains("Xem bình chọn"));
             assert_eq!(text.contains("Bình chọn ẩn danh"), anonymous == Some(true));
             assert_eq!(
                 text.contains("Bình chọn công khai"),
@@ -991,6 +1019,7 @@ mod tests {
             ],
         };
         let message = Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -1005,7 +1034,7 @@ mod tests {
             media: Some(MediaDescriptor::WebContent(card)),
         };
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show(ui, &message, 1, None, 300.0));
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &message, 1, None, 300.0, None));
         });
         assert!(output.platform_output.open_url.is_none());
         for url in [
@@ -1158,6 +1187,7 @@ mod tests {
                     original_url: Some(original.into()),
                     width: Some(16),
                     height: Some(16),
+                    album: None,
                 };
                 let message = message(MediaDescriptor::Photo(photo.clone()));
                 let mut cache = MediaCache::default();

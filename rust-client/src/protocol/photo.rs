@@ -1,13 +1,79 @@
-//! Ordinary HD photo upload and final submission; photo resource completion is not an ACK.
+//! Ordinary photo upload and final submission; resource completion is not an ACK.
 use super::{
     bootstrap::PhotoUploadRoute,
     client::ClientType,
     messaging::{self, Target, ThreadKind, WireError},
     upload,
 };
+pub use crate::domain::{
+    media::{has_album_message_fields, MAX_WIRE_ALBUM_PHOTOS},
+    PhotoAlbumMember as AlbumMember,
+};
 use crate::domain::{MediaKind, MediaMessageContent, MAX_TEXT_BYTES};
 use serde_json::{json, Value};
 use url::Url;
+
+impl AlbumMember {
+    /// PC bundle N136681–136724 and N401554–401571. Every photo is submitted
+    /// separately with the same layout ID and total, and its own zero-based index.
+    pub fn apply_to_message_parameters(
+        self,
+        parameters: &mut Value,
+        attach_extra_metadata: bool,
+    ) -> Result<(), WireError> {
+        if has_album_message_fields(parameters)
+            || !self.is_valid()
+            || self.count() > MAX_WIRE_ALBUM_PHOTOS
+        {
+            return Err(WireError::Invalid);
+        }
+        let fields = parameters.as_object_mut().ok_or(WireError::Invalid)?;
+        let layout_id = self.layout_id().to_string();
+        if attach_extra_metadata {
+            fields.insert(
+                "extMsgProp".into(),
+                json!(json!({"groupMediaMsg":{"groupLayoutId":layout_id}}).to_string()),
+            );
+        }
+        fields.insert("groupLayoutId".into(), json!(layout_id));
+        fields.insert("idInGroup".into(), json!(self.index()));
+        fields.insert("isGroupLayout".into(), json!(1));
+        fields.insert("totalItemInGroup".into(), json!(self.count()));
+        Ok(())
+    }
+
+    pub fn apply_to_media_content(
+        self,
+        content: &MediaMessageContent,
+    ) -> Result<MediaMessageContent, WireError> {
+        if content.kind() != MediaKind::Photo || self.count() > MAX_WIRE_ALBUM_PHOTOS {
+            return Err(WireError::Invalid);
+        }
+        let mut raw: Value =
+            serde_json::from_str(content.as_json()).map_err(|_| WireError::Invalid)?;
+        let params = raw
+            .get_mut("params")
+            .and_then(Value::as_object_mut)
+            .ok_or(WireError::Invalid)?;
+        for (name, value) in [
+            ("group_layout_id", json!(self.layout_id().to_string())),
+            ("id_in_group", json!(self.index())),
+            ("is_group_layout", json!(1)),
+            ("total_item_in_group", json!(self.count())),
+        ] {
+            if params.insert(name.into(), value).is_some() {
+                return Err(WireError::Invalid);
+            }
+        }
+        let result =
+            MediaMessageContent::new(MediaKind::Photo, &raw).map_err(|_| WireError::Invalid)?;
+        if result.album_member() != Some(self) {
+            return Err(WireError::Invalid);
+        }
+        Ok(result)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhotoUrls {
     pub org: String,
@@ -16,9 +82,10 @@ pub struct PhotoUrls {
     pub thumb_size: Option<u64>,
     pub file_size: Option<u64>,
     pub hd_size: Option<u64>,
+    explicit_original: bool,
 }
 impl PhotoUrls {
-    fn from_value(value: &Value) -> Result<Self, WireError> {
+    pub fn from_value(value: &Value) -> Result<Self, WireError> {
         let get = |key| {
             value
                 .get(key)
@@ -57,7 +124,12 @@ impl PhotoUrls {
             thumb_size: size("thumbSize")?,
             file_size: size("fileSize")?,
             hd_size: size("hdSize")?,
+            explicit_original: get("org").is_some(),
         })
+    }
+
+    pub(crate) fn matches_original(&self, size: u64) -> bool {
+        self.explicit_original && self.file_size == Some(size)
     }
 }
 pub fn endpoint(
@@ -73,6 +145,10 @@ pub fn endpoint(
         (ThreadKind::Group, Some(PhotoUploadRoute::File)) => "/api/group/photo_original/upload",
         (ThreadKind::Direct, Some(PhotoUploadRoute::Photo)) => "/api/message/upload/photo",
         (ThreadKind::Group, Some(PhotoUploadRoute::Photo)) => "/api/group/upload/photo",
+        (ThreadKind::Direct, Some(PhotoUploadRoute::Original)) => {
+            "/api/message/zcloud-upload/photo"
+        }
+        (ThreadKind::Group, Some(PhotoUploadRoute::Original)) => "/api/group/zcloud-upload/photo",
         (ThreadKind::Direct, None) => "/api/message/photo_original/send",
         (ThreadKind::Group, None) => "/api/group/photo_original/send",
     });
@@ -161,9 +237,13 @@ pub fn chunk_result(payload: &Value) -> Result<PhotoChunkResult, WireError> {
             .get("thumbUrl")
             .and_then(Value::as_str)
             .ok_or(WireError::Invalid)?;
-        Some(PhotoUrls::from_value(
-            &json!({"org":normal,"thumb":thumb,"hd":data.get("hdUrl").and_then(Value::as_str).unwrap_or(normal)}),
-        )?)
+        let mut urls = json!({"org":normal,"thumb":thumb,"hd":data.get("hdUrl").and_then(Value::as_str).unwrap_or(normal)});
+        for field in ["thumbSize", "fileSize", "hdSize"] {
+            if let Some(value) = data.get(field).filter(|value| !value.is_null()) {
+                urls[field] = value.clone();
+            }
+        }
+        Some(PhotoUrls::from_value(&urls)?)
     } else {
         None
     };
@@ -222,7 +302,28 @@ pub fn media_content(
     height: u32,
     urls: &PhotoUrls,
 ) -> Result<MediaMessageContent, WireError> {
-    MediaMessageContent::new(MediaKind::Photo,&json!({"title":"","description":caption,"href":urls.org,"thumb":urls.thumb,"params":{"width":width,"height":height,"hd":urls.hd,"rawUrl":urls.org}})).map_err(|_|WireError::Invalid)
+    content_for_resolution(
+        caption,
+        width,
+        height,
+        urls,
+        crate::domain::PhotoResolution::Hd,
+    )
+}
+
+pub(crate) fn content_for_resolution(
+    caption: &str,
+    width: u32,
+    height: u32,
+    urls: &PhotoUrls,
+    resolution: crate::domain::PhotoResolution,
+) -> Result<MediaMessageContent, WireError> {
+    let mut content = json!({"title":"","description":caption,"href":urls.org,"thumb":urls.thumb,
+        "params":{"width":width,"height":height,"hd":urls.hd,"rawUrl":urls.org}});
+    if resolution == crate::domain::PhotoResolution::Original {
+        content["params"]["is_original"] = json!(1);
+    }
+    MediaMessageContent::new(MediaKind::Photo, &content).map_err(|_| WireError::Invalid)
 }
 
 #[cfg(test)]

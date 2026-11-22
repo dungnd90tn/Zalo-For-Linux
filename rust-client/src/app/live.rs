@@ -1,6 +1,7 @@
 //! Live account worker: bounded commands/events, no rendering-thread I/O.
 use super::SubmitError;
 pub use crate::app::directory::{DirectoryFailure, DirectoryReport};
+use crate::app::voice::{PreparedVoice, MAX_VOICE_BYTES, MAX_VOICE_DURATION_MS};
 pub use crate::protocol::group_roster::{Page as GroupMemberPage, Role as GroupMemberRole};
 pub use crate::protocol::messaging::ThreadKind;
 pub use crate::store::directory::{
@@ -16,7 +17,10 @@ use anyhow::Result;
 use std::{sync::Arc, thread::JoinHandle};
 use tokio::sync::{mpsc, watch};
 mod photo;
+pub use crate::domain::PhotoResolution;
 pub use photo::{PhotoPreparationFailure, PhotoThumbnail, PreparedPhoto};
+pub(crate) const MAX_ORIGINAL_PHOTO_BYTES: u64 = crate::store::photos::MAX_PHOTO_BYTES;
+pub const MAX_ALBUM_PHOTOS: usize = crate::store::photos::MAX_ALBUM_PHOTOS;
 pub(crate) mod runtime;
 #[cfg(feature = "signal-crypto")]
 pub mod signal_crypto;
@@ -149,6 +153,7 @@ impl Drop for HiddenPin {
 }
 
 use crate::domain::read_state::{MessageDelivery, NotificationPreferences, ThreadReadState};
+pub use crate::protocol::sticker_catalog::StickerPack;
 pub use crate::store::forward::ForwardTarget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +162,27 @@ pub enum ForwardOutcome {
     Rejected,
     Unavailable,
     Unknown,
+}
+
+pub const MAX_FORWARD_BATCH: usize = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardBatchResult {
+    pub target_thread: String,
+    pub outcome: ForwardOutcome,
+}
+
+fn valid_forward_targets(targets: &[String], account: &str) -> bool {
+    use crate::protocol::messaging::Target;
+    if !(1..=MAX_FORWARD_BATCH).contains(&targets.len()) {
+        return false;
+    }
+    let mut unique = std::collections::HashSet::new();
+    targets.iter().all(|thread| {
+        unique.insert(thread)
+            && Target::from_thread(thread)
+                .is_ok_and(|target| target.kind == ThreadKind::Group || target.remote_id != account)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,11 +194,63 @@ pub enum RecallOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteForMeMode {
+    Device,
+    Account,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteForMeOutcome {
+    Accepted,
+    Rejected,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteHistoryOutcome {
+    Imported { count: usize, has_more: bool },
+    Exhausted,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollVoteOutcome {
+    Accepted,
+    Joined,
+    Rejected,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StickerOutcome {
     Accepted,
     Rejected,
     Unavailable,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupPinOutcome {
+    Accepted,
+    Rejected,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupPinEntry {
+    pub message_id: String,
+    pub hit: Option<crate::domain::search::MessageHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupPinSnapshot {
+    pub can_mutate: bool,
+    pub entries: Vec<GroupPinEntry>,
+    pub unresolved: Vec<String>,
 }
 
 pub use crate::protocol::reactions::{
@@ -197,6 +275,18 @@ pub enum LiveCommand {
         thread: String,
         privacy_revision: u64,
         after: Option<String>,
+    },
+    GroupPins {
+        request_id: u64,
+        thread: String,
+        privacy_revision: u64,
+    },
+    SetGroupPin {
+        request_id: u64,
+        thread: String,
+        privacy_revision: u64,
+        message_id: String,
+        pinned: bool,
     },
     CancelGroupMembers {
         request_id: u64,
@@ -223,11 +313,47 @@ pub enum LiveCommand {
         thread: String,
         message_id: String,
     },
+    DeleteForMe {
+        request_id: u64,
+        thread: String,
+        message_id: String,
+        mode: DeleteForMeMode,
+    },
+    LoadRemoteHistory {
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        anchor: Cursor,
+        privacy_revision: u64,
+    },
+    LoadPollDetail {
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        message_id: String,
+        privacy_revision: u64,
+    },
+    VotePoll {
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        message_id: String,
+        privacy_revision: u64,
+        poll_id: u64,
+        option_id: u64,
+        option_text: String,
+    },
     Forward {
         request_id: u64,
         source_thread: String,
         source_message_id: String,
         target_thread: String,
+    },
+    ForwardBatch {
+        request_id: u64,
+        source_thread: String,
+        source_message_id: String,
+        target_threads: Vec<String>,
     },
     ForwardTargets {
         generation: u64,
@@ -244,6 +370,16 @@ pub enum LiveCommand {
         request_id: u64,
         thread: String,
         query: String,
+    },
+    ListStickerPacks {
+        request_id: u64,
+        thread: String,
+    },
+    BrowseStickerPack {
+        request_id: u64,
+        thread: String,
+        pack_list_id: u64,
+        category_id: u64,
     },
     SendCatalogSticker {
         request_id: u64,
@@ -333,6 +469,14 @@ pub enum LiveCommand {
         reply_to: Option<String>,
         request_id: u64,
     },
+    SendMentions {
+        generation: u64,
+        thread: String,
+        text: String,
+        mentions: Vec<crate::domain::mention::Mention>,
+        privacy_revision: u64,
+        request_id: u64,
+    },
     SendFile {
         generation: u64,
         thread: String,
@@ -342,13 +486,28 @@ pub enum LiveCommand {
     CancelFile {
         request_id: u64,
     },
+    CancelAlbum {
+        thread: String,
+        request_id: u64,
+    },
     PreparePhoto {
         generation: u64,
         thread: String,
         attachment: crate::domain::Attachment,
+        resolution: PhotoResolution,
+        request_id: u64,
+    },
+    PrepareAlbum {
+        generation: u64,
+        thread: String,
+        attachments: Vec<crate::domain::Attachment>,
         request_id: u64,
     },
     CancelPhotoPreparation {
+        request_id: u64,
+    },
+    CancelAlbumPreparation {
+        thread: String,
         request_id: u64,
     },
     SendPhoto {
@@ -358,12 +517,35 @@ pub enum LiveCommand {
         caption: String,
         request_id: u64,
     },
+    SendAlbum {
+        generation: u64,
+        thread: String,
+        photos: Vec<PreparedPhoto>,
+        request_id: u64,
+    },
+    SendVoice {
+        generation: u64,
+        thread: String,
+        recording: PreparedVoice,
+        request_id: u64,
+    },
+    CancelVoice {
+        thread: String,
+        request_id: u64,
+    },
     Shutdown,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferKind {
     File,
     Photo,
+    Album,
+    Voice,
+}
+
+fn voice_fits_limits(recording: &PreparedVoice) -> bool {
+    (1..=MAX_VOICE_BYTES).contains(&recording.bytes().len())
+        && (1..=MAX_VOICE_DURATION_MS).contains(&recording.duration_ms())
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileTransferPhase {
@@ -376,9 +558,26 @@ pub enum FileTransferPhase {
     Failed,
     Unknown,
     AcceptedLocalFailure,
+    Partial,
 }
 #[derive(Debug)]
 pub enum LiveEvent {
+    GroupPins {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        privacy_revision: u64,
+        snapshot: Option<GroupPinSnapshot>,
+    },
+    GroupPinFinished {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        privacy_revision: u64,
+        message_id: String,
+        outcome: GroupPinOutcome,
+        snapshot: Option<GroupPinSnapshot>,
+    },
     ReactionCapability {
         account_id: String,
         available: bool,
@@ -429,6 +628,62 @@ pub enum LiveEvent {
         message_id: String,
         outcome: RecallOutcome,
     },
+    DeleteForMeCapability {
+        account_id: String,
+        account_sync: bool,
+    },
+    DeleteForMeFinished {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        message_id: String,
+        outcome: DeleteForMeOutcome,
+    },
+    DeletedForMe {
+        account_id: String,
+        thread: String,
+        message_id: String,
+        sender_id: String,
+        conversation: Conversation,
+    },
+    RemoteHistoryCapability {
+        account_id: String,
+        available: bool,
+    },
+    RemoteHistoryFinished {
+        account_id: String,
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        privacy_revision: u64,
+        outcome: RemoteHistoryOutcome,
+    },
+    PollDetailCapability {
+        account_id: String,
+        available: bool,
+    },
+    PollDetail {
+        account_id: String,
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        message_id: String,
+        privacy_revision: u64,
+        poll_id: Option<u64>,
+        detail: Option<crate::domain::poll::PollDetails>,
+        notice: Option<&'static str>,
+    },
+    PollVoteFinished {
+        account_id: String,
+        request_id: u64,
+        generation: u64,
+        thread: String,
+        message_id: String,
+        privacy_revision: u64,
+        poll_id: Option<u64>,
+        outcome: PollVoteOutcome,
+        detail: Option<crate::domain::poll::PollDetails>,
+    },
     Recalled {
         account_id: String,
         thread: String,
@@ -444,6 +699,13 @@ pub enum LiveEvent {
         source_message_id: String,
         target_thread: String,
         outcome: ForwardOutcome,
+    },
+    ForwardBatchFinished {
+        account_id: String,
+        request_id: u64,
+        source_thread: String,
+        source_message_id: String,
+        results: Vec<ForwardBatchResult>,
     },
     ForwardTargets {
         account_id: String,
@@ -470,6 +732,19 @@ pub enum LiveEvent {
         thread: String,
         stickers: Option<Vec<crate::domain::StickerDescriptor>>,
     },
+    StickerPacksFound {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        packs: Option<Vec<StickerPack>>,
+    },
+    StickerPackFound {
+        account_id: String,
+        request_id: u64,
+        thread: String,
+        category_id: u64,
+        stickers: Option<Vec<crate::domain::StickerDescriptor>>,
+    },
     ReadState {
         account_id: String,
         generation: u64,
@@ -491,6 +766,8 @@ pub enum LiveEvent {
     PhotoCapability {
         account_id: String,
         available: bool,
+        original_available: bool,
+        album_max_count: usize,
     },
     PhotoPrepared {
         account_id: String,
@@ -499,7 +776,18 @@ pub enum LiveEvent {
         request_id: u64,
         result: std::result::Result<PreparedPhoto, PhotoPreparationFailure>,
     },
+    AlbumPrepared {
+        account_id: String,
+        generation: u64,
+        thread: String,
+        request_id: u64,
+        result: std::result::Result<Vec<PreparedPhoto>, PhotoPreparationFailure>,
+    },
     FileCapability {
+        account_id: String,
+        available: bool,
+    },
+    VoiceCapability {
         account_id: String,
         available: bool,
     },
@@ -683,20 +971,35 @@ impl LiveEvent {
             | Self::GroupMembers { account_id, .. }
             | Self::GroupInviteTargets { account_id, .. }
             | Self::GroupActionFinished { account_id, .. }
+            | Self::GroupPins { account_id, .. }
+            | Self::GroupPinFinished { account_id, .. }
             | Self::RecallFinished { account_id, .. }
+            | Self::DeleteForMeCapability { account_id, .. }
+            | Self::DeleteForMeFinished { account_id, .. }
+            | Self::DeletedForMe { account_id, .. }
+            | Self::RemoteHistoryCapability { account_id, .. }
+            | Self::RemoteHistoryFinished { account_id, .. }
+            | Self::PollDetailCapability { account_id, .. }
+            | Self::PollDetail { account_id, .. }
+            | Self::PollVoteFinished { account_id, .. }
             | Self::Recalled { account_id, .. }
             | Self::ForwardFinished { account_id, .. }
+            | Self::ForwardBatchFinished { account_id, .. }
             | Self::ForwardTargets { account_id, .. }
             | Self::StickerFinished { account_id, .. }
             | Self::StickerSearchCapability { account_id, .. }
             | Self::StickersFound { account_id, .. }
+            | Self::StickerPacksFound { account_id, .. }
+            | Self::StickerPackFound { account_id, .. }
             | Self::ReadState { account_id, .. }
             | Self::ReadStateChanged { account_id, .. }
             | Self::NotificationPreferences { account_id, .. }
             | Self::NotificationOpen { account_id, .. }
             | Self::PhotoCapability { account_id, .. }
             | Self::PhotoPrepared { account_id, .. }
+            | Self::AlbumPrepared { account_id, .. }
             | Self::FileCapability { account_id, .. }
+            | Self::VoiceCapability { account_id, .. }
             | Self::FileTransfer { account_id, .. }
             | Self::FileAccepted { account_id, .. }
             | Self::Avatars { account_id, .. }
@@ -818,6 +1121,25 @@ impl LiveWorker {
         })
         .is_ok()
     }
+    pub fn sticker_packs(&self, request_id: u64, thread: String) -> bool {
+        self.submit(LiveCommand::ListStickerPacks { request_id, thread })
+            .is_ok()
+    }
+    pub fn browse_sticker_pack(
+        &self,
+        request_id: u64,
+        thread: String,
+        pack_list_id: u64,
+        category_id: u64,
+    ) -> bool {
+        self.submit(LiveCommand::BrowseStickerPack {
+            request_id,
+            thread,
+            pack_list_id,
+            category_id,
+        })
+        .is_ok()
+    }
     pub fn send_catalog_sticker(
         &self,
         request_id: u64,
@@ -871,6 +1193,24 @@ impl LiveWorker {
                     && after.as_ref().is_none_or(|value| value.len() == 67)
             }
             LiveCommand::CancelGroupMembers { request_id } => *request_id > 0,
+            LiveCommand::GroupPins {
+                request_id, thread, ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+            }
+            LiveCommand::SetGroupPin {
+                request_id,
+                thread,
+                message_id,
+                ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+                    && crate::protocol::messaging::numeric_id(message_id).is_ok()
+            }
             LiveCommand::GroupInviteTargets {
                 request_id,
                 thread,
@@ -907,11 +1247,59 @@ impl LiveWorker {
                 request_id,
                 thread,
                 message_id,
+            }
+            | LiveCommand::DeleteForMe {
+                request_id,
+                thread,
+                message_id,
+                ..
             } => {
                 *request_id > 0
                     && Target::from_thread(thread)
-                        .is_ok_and(|t| t.kind == ThreadKind::Direct && t.remote_id != self.account)
+                        .is_ok_and(|t| t.kind == ThreadKind::Group || t.remote_id != self.account)
                     && crate::protocol::messaging::numeric_id(message_id).is_ok()
+            }
+            LiveCommand::LoadRemoteHistory {
+                request_id,
+                thread,
+                anchor,
+                ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+                    && anchor.sent_at_ms > 0
+                    && crate::protocol::messaging::numeric_id(&anchor.id).is_ok()
+            }
+            LiveCommand::LoadPollDetail {
+                request_id,
+                thread,
+                message_id,
+                ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+                    && crate::protocol::messaging::numeric_id(message_id).is_ok()
+            }
+            LiveCommand::VotePoll {
+                request_id,
+                thread,
+                message_id,
+                poll_id,
+                option_id,
+                option_text,
+                ..
+            } => {
+                use crate::domain::poll::{MAX_POLL_ID, MAX_POLL_OPTION_BYTES};
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+                    && crate::protocol::messaging::numeric_id(message_id).is_ok()
+                    && (1..=MAX_POLL_ID).contains(poll_id)
+                    && (1..=MAX_POLL_ID).contains(option_id)
+                    && !option_text.is_empty()
+                    && option_text.len() <= MAX_POLL_OPTION_BYTES
             }
             LiveCommand::Forward {
                 request_id,
@@ -921,10 +1309,23 @@ impl LiveWorker {
             } => {
                 *request_id > 0
                     && Target::from_thread(source_thread)
-                        .is_ok_and(|t| t.kind == ThreadKind::Direct)
+                        .is_ok_and(|t| t.kind == ThreadKind::Group || t.remote_id != self.account)
                     && Target::from_thread(target_thread)
-                        .is_ok_and(|t| t.kind == ThreadKind::Direct)
+                        .is_ok_and(|t| t.kind == ThreadKind::Group || t.remote_id != self.account)
                     && crate::protocol::messaging::numeric_id(source_message_id).is_ok()
+            }
+            LiveCommand::ForwardBatch {
+                request_id,
+                source_thread,
+                source_message_id,
+                target_threads,
+            } => {
+                *request_id > 0
+                    && Target::from_thread(source_thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
+                    && crate::protocol::messaging::numeric_id(source_message_id).is_ok()
+                    && valid_forward_targets(target_threads, &self.account)
             }
             LiveCommand::ForwardTargets {
                 generation,
@@ -934,7 +1335,7 @@ impl LiveWorker {
             } => {
                 *generation > 0
                     && Target::from_thread(source_thread)
-                        .is_ok_and(|t| t.kind == ThreadKind::Direct)
+                        .is_ok_and(|t| t.kind == ThreadKind::Group || t.remote_id != self.account)
                     && crate::protocol::messaging::numeric_id(source_message_id).is_ok()
                     && query.len() <= 512
                     && query.chars().count() <= 128
@@ -1047,6 +1448,19 @@ impl LiveWorker {
                     && !text.trim().is_empty()
                     && text.len() <= MAX_TEXT_BYTES
             }
+            LiveCommand::SendMentions {
+                request_id,
+                thread,
+                text,
+                mentions,
+                ..
+            } => {
+                *request_id > 0
+                    && Target::from_thread(thread)
+                        .is_ok_and(|target| target.kind == ThreadKind::Group)
+                    && crate::domain::mention::validate_outgoing(text, mentions).is_ok()
+                    && mentions.iter().all(|mention| mention.uid != self.account)
+            }
             LiveCommand::SendSticker {
                 request_id,
                 thread,
@@ -1065,6 +1479,25 @@ impl LiveWorker {
             } => {
                 *request_id > 0
                     && crate::protocol::sticker_catalog::valid_query(query)
+                    && Target::from_thread(thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
+            }
+            LiveCommand::ListStickerPacks { request_id, thread } => {
+                *request_id > 0
+                    && Target::from_thread(thread).is_ok_and(|target| {
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
+                    })
+            }
+            LiveCommand::BrowseStickerPack {
+                request_id,
+                thread,
+                pack_list_id,
+                category_id,
+            } => {
+                *request_id > 0
+                    && *pack_list_id > 0
+                    && crate::protocol::sticker_catalog::valid_pack_id(*category_id)
                     && Target::from_thread(thread).is_ok_and(|target| {
                         target.kind == ThreadKind::Group || target.remote_id != self.account
                     })
@@ -1099,14 +1532,37 @@ impl LiveWorker {
                 thread,
                 attachment,
                 request_id,
+                resolution,
                 ..
             } => {
                 Target::from_thread(thread).is_ok()
                     && *request_id != 0
                     && attachment.size_bytes > 0
-                    && attachment.size_bytes <= 20 * 1024 * 1024
+                    && attachment.size_bytes
+                        <= match resolution {
+                            PhotoResolution::Hd => 20 * 1024 * 1024,
+                            PhotoResolution::Original => MAX_ORIGINAL_PHOTO_BYTES,
+                        }
             }
             LiveCommand::CancelPhotoPreparation { request_id } => *request_id != 0,
+            LiveCommand::CancelAlbum { thread, request_id }
+            | LiveCommand::CancelAlbumPreparation { thread, request_id }
+            | LiveCommand::CancelVoice { thread, request_id } => {
+                Target::from_thread(thread).is_ok() && *request_id != 0
+            }
+            LiveCommand::PrepareAlbum {
+                thread,
+                attachments,
+                request_id,
+                ..
+            } => {
+                Target::from_thread(thread).is_ok()
+                    && *request_id != 0
+                    && (2..=MAX_ALBUM_PHOTOS).contains(&attachments.len())
+                    && attachments
+                        .iter()
+                        .all(|attachment| (1..=20 * 1024 * 1024).contains(&attachment.size_bytes))
+            }
             LiveCommand::SendPhoto {
                 thread,
                 photo,
@@ -1120,7 +1576,32 @@ impl LiveWorker {
                     && photo.size_bytes() <= 5 * 1024 * 1024
                     && caption.len() <= MAX_TEXT_BYTES
             }
+            LiveCommand::SendAlbum {
+                thread,
+                photos,
+                request_id,
+                ..
+            } => {
+                Target::from_thread(thread).is_ok()
+                    && *request_id != 0
+                    && (2..=MAX_ALBUM_PHOTOS).contains(&photos.len())
+                    && photos.iter().all(|photo| {
+                        photo.resolution() == PhotoResolution::Hd
+                            && (1..=crate::store::photos::MAX_PHOTO_BYTES)
+                                .contains(&photo.size_bytes())
+                    })
+            }
             LiveCommand::CancelFile { request_id } => *request_id != 0,
+            LiveCommand::SendVoice {
+                thread,
+                recording,
+                request_id,
+                ..
+            } => {
+                Target::from_thread(thread).is_ok()
+                    && *request_id != 0
+                    && voice_fits_limits(recording)
+            }
             LiveCommand::Reconnect
             | LiveCommand::RefreshDirectory { .. }
             | LiveCommand::Shutdown => true,
@@ -1156,6 +1637,7 @@ impl super::Composer {
                 && file.photo.is_some()
                 && file.revision == self.photo_revision
                 && self.photo.as_ref() == file.photo.as_ref();
+            let same_album = kind == TransferKind::Album && file.revision == self.photo_revision;
             let clear_caption = same_photo && self.revision == file.draft_revision;
             if same_file {
                 self.clear_attachment();
@@ -1163,8 +1645,12 @@ impl super::Composer {
             if same_photo {
                 self.clear_photo();
             }
+            if same_album {
+                self.clear_album();
+            }
             if clear_caption {
                 self.text.clear();
+                self.clear_mentions();
                 self.edited();
             }
             self.pending_file = None;
@@ -1181,6 +1667,27 @@ impl super::Composer {
         attachment: crate::domain::Attachment,
         enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
     ) -> std::result::Result<(), SubmitError> {
+        self.prepare_live_photo_with_resolution(
+            generation,
+            thread,
+            attachment,
+            PhotoResolution::Hd,
+            enqueue,
+        )
+    }
+
+    pub fn photo_resolution(&self) -> PhotoResolution {
+        self.photo_resolution
+    }
+
+    pub fn prepare_live_photo_with_resolution(
+        &mut self,
+        generation: u64,
+        thread: String,
+        attachment: crate::domain::Attachment,
+        resolution: PhotoResolution,
+        enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
+    ) -> std::result::Result<(), SubmitError> {
         if self.reply().is_some() || self.attachment().is_some() {
             return Err(SubmitError::Invalid);
         }
@@ -1190,10 +1697,13 @@ impl super::Composer {
             generation,
             thread: thread.clone(),
             attachment: attachment.clone(),
+            resolution,
             request_id,
         })?;
+        self.clear_album();
         self.photo_revision = self.photo_revision.wrapping_add(1);
         self.photo_source = Some(attachment);
+        self.photo_resolution = resolution;
         self.photo = None;
         self.photo_problem = None;
         self.photo_preparation = Some(super::PendingPhotoPreparation {
@@ -1203,6 +1713,81 @@ impl super::Composer {
             revision: self.photo_revision,
         });
         self.edited();
+        Ok(())
+    }
+
+    pub fn prepare_live_album(
+        &mut self,
+        generation: u64,
+        thread: String,
+        attachments: Vec<crate::domain::Attachment>,
+        enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
+    ) -> std::result::Result<(), SubmitError> {
+        if self.reply().is_some()
+            || self.attachment().is_some()
+            || !(2..=MAX_ALBUM_PHOTOS).contains(&attachments.len())
+        {
+            return Err(SubmitError::Invalid);
+        }
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = self.next_request_id;
+        enqueue(LiveCommand::PrepareAlbum {
+            generation,
+            thread: thread.clone(),
+            attachments: attachments.clone(),
+            request_id,
+        })?;
+        self.clear_photo();
+        self.photo_revision = self.photo_revision.wrapping_add(1);
+        self.album = super::AlbumDraft {
+            sources: attachments,
+            preparation: Some(super::PendingPhotoPreparation {
+                request_id,
+                thread,
+                generation,
+                revision: self.photo_revision,
+            }),
+            ..Default::default()
+        };
+        self.edited();
+        Ok(())
+    }
+
+    pub fn send_live_album(
+        &mut self,
+        generation: u64,
+        thread: String,
+        enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
+    ) -> std::result::Result<(), SubmitError> {
+        if self.reply().is_some()
+            || self.attachment().is_some()
+            || self.album_preparing()
+            || self.album_problem().is_some()
+        {
+            return Err(SubmitError::Invalid);
+        }
+        if self.in_flight() {
+            return Err(SubmitError::Busy);
+        }
+        let photos = self.album().ok_or(SubmitError::Invalid)?.to_vec();
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = self.next_request_id;
+        enqueue(LiveCommand::SendAlbum {
+            generation,
+            thread: thread.clone(),
+            photos,
+            request_id,
+        })?;
+        self.pending_file = Some(super::PendingFile {
+            request_id,
+            thread,
+            revision: self.photo_revision,
+            kind: TransferKind::Album,
+            attachment: None,
+            photo: None,
+            draft_revision: self.revision,
+        });
+        self.pending = Some((request_id, self.revision));
         Ok(())
     }
 
@@ -1281,6 +1866,16 @@ impl super::Composer {
         thread: String,
         enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
     ) -> std::result::Result<(), SubmitError> {
+        self.send_live_in_scope(generation, thread, None, enqueue)
+    }
+
+    pub fn send_live_in_scope(
+        &mut self,
+        generation: u64,
+        thread: String,
+        privacy_revision: Option<u64>,
+        enqueue: impl FnOnce(LiveCommand) -> std::result::Result<(), SubmitError>,
+    ) -> std::result::Result<(), SubmitError> {
         if self.attachment().is_some()
             || self.has_photo_intent()
             || self.reply().is_some_and(|reply| reply.thread_id != thread)
@@ -1292,13 +1887,28 @@ impl super::Composer {
         }
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let request_id = self.next_request_id;
-        enqueue(LiveCommand::Send {
-            generation,
-            thread,
-            text: self.text.clone(),
-            reply_to: self.reply().map(|reply| reply.message_id.clone()),
-            request_id,
-        })?;
+        if self.has_mentions() {
+            if self.reply().is_some() || !thread.starts_with("g:") {
+                return Err(SubmitError::Invalid);
+            }
+            let privacy_revision = privacy_revision.ok_or(SubmitError::Invalid)?;
+            enqueue(LiveCommand::SendMentions {
+                generation,
+                thread,
+                text: crate::domain::canonical_plain_text(&self.text).to_owned(),
+                mentions: self.wire_mentions().map_err(|_| SubmitError::Invalid)?,
+                privacy_revision,
+                request_id,
+            })?;
+        } else {
+            enqueue(LiveCommand::Send {
+                generation,
+                thread,
+                text: self.text.clone(),
+                reply_to: self.reply().map(|reply| reply.message_id.clone()),
+                request_id,
+            })?;
+        }
         self.pending = Some((request_id, self.revision));
         Ok(())
     }
@@ -1327,13 +1937,18 @@ impl super::Composer {
                         );
                     } else {
                         match result {
-                            Ok(photo) => {
+                            Ok(photo) if photo.resolution() == self.photo_resolution => {
                                 self.photo = Some(photo.clone());
                                 self.photo_problem = None;
                             }
                             Err(error) => {
                                 self.photo = None;
                                 self.photo_problem = Some(error.to_string());
+                            }
+                            Ok(_) => {
+                                self.photo = None;
+                                self.photo_problem =
+                                    Some("Chế độ ảnh đã thay đổi; hãy chọn lại ảnh.".into());
                             }
                         }
                     }
@@ -1346,7 +1961,8 @@ impl super::Composer {
                 conversation,
                 kind,
                 ..
-            } if message.account_id == account_id
+            } if *kind != TransferKind::Album
+                && message.account_id == account_id
                 && message.thread_id == *thread
                 && conversation.id == *thread =>
             {
@@ -1363,20 +1979,74 @@ impl super::Composer {
                 // file message after its privacy lease has been revoked.
                 self.accept_live_attachment(thread, *request_id, *kind);
             }
+            LiveEvent::AlbumPrepared {
+                generation,
+                thread,
+                request_id,
+                result,
+                ..
+            } if self.album.preparation.as_ref().is_some_and(|pending| {
+                pending.request_id == *request_id
+                    && pending.thread == *thread
+                    && pending.generation == *generation
+                    && pending.revision == self.photo_revision
+            }) =>
+            {
+                self.album.preparation = None;
+                if self.reply().is_some() || self.attachment().is_some() {
+                    self.album.problem = Some(
+                        "Bản nháp đã thay đổi. Hãy bỏ album để gửi tệp hoặc trích dẫn.".into(),
+                    );
+                } else {
+                    match result {
+                        Ok(photos)
+                            if photos.len() == self.album.sources.len()
+                                && photos
+                                    .iter()
+                                    .all(|photo| photo.resolution() == PhotoResolution::Hd) =>
+                        {
+                            self.album.photos.clone_from(photos);
+                            self.album.problem = None;
+                        }
+                        Ok(_) => {
+                            self.album.problem = Some("Album đã thay đổi. Hãy chọn lại ảnh.".into())
+                        }
+                        Err(error) => self.album.problem = Some(error.to_string()),
+                    }
+                }
+            }
             LiveEvent::FileTransfer {
                 request_id,
                 thread,
                 kind,
                 phase:
-                    FileTransferPhase::Cancelled
+                    phase @ (FileTransferPhase::Cancelled
                     | FileTransferPhase::Failed
                     | FileTransferPhase::Unknown
-                    | FileTransferPhase::AcceptedLocalFailure,
+                    | FileTransferPhase::AcceptedLocalFailure
+                    | FileTransferPhase::Partial),
+                message,
                 ..
             } => {
                 if self.pending_file.as_ref().is_some_and(|file| {
                     file.request_id == *request_id && file.thread == *thread && file.kind == *kind
                 }) {
+                    if *kind == TransferKind::Album
+                        && self
+                            .pending_file
+                            .as_ref()
+                            .is_some_and(|file| file.revision == self.photo_revision)
+                        && matches!(
+                            phase,
+                            FileTransferPhase::Unknown
+                                | FileTransferPhase::AcceptedLocalFailure
+                                | FileTransferPhase::Partial
+                        )
+                    {
+                        self.album.problem = Some(message.clone().unwrap_or_else(|| {
+                            "Hãy kiểm tra tin đã gửi trước khi chọn lại album.".into()
+                        }));
+                    }
                     self.pending_file = None;
                     if self.pending.is_some_and(|(id, _)| id == *request_id) {
                         self.pending = None;
@@ -1393,6 +2063,7 @@ impl super::Composer {
                     if pending == *request_id {
                         if self.revision == revision {
                             self.text.clear();
+                            self.clear_mentions();
                             self.reply = None;
                             self.edited();
                         }
@@ -1424,6 +2095,15 @@ impl super::Composer {
                         Some("Kết nối đã thay đổi; chuẩn bị lại ảnh trước khi gửi.".into());
                     self.photo_revision = self.photo_revision.wrapping_add(1);
                 }
+                if !self.album.sources.is_empty() {
+                    self.album.photos.clear();
+                    self.album.preparation = None;
+                    self.album.problem = Some(
+                        "Kết nối đã thay đổi. Hãy kiểm tra hội thoại trước khi chọn lại album."
+                            .into(),
+                    );
+                    self.photo_revision = self.photo_revision.wrapping_add(1);
+                }
             }
             _ => {}
         }
@@ -1439,6 +2119,7 @@ impl super::DraftBook {
             | LiveEvent::FileAccepted { thread, .. }
             | LiveEvent::FileTransfer { thread, .. }
             | LiveEvent::PhotoPrepared { thread, .. }
+            | LiveEvent::AlbumPrepared { thread, .. }
             | LiveEvent::SendFailed { thread, .. }
             | LiveEvent::SendSettled { thread, .. } => {
                 if self.thread.as_deref() == Some(thread) {
@@ -1576,8 +2257,8 @@ impl super::Model {
                         self.upsert_live_conversation(conversation);
                     }
                 }
+                self.remove_search_message(&thread, &message_id, &actor_id);
                 if self.selected.as_deref() == Some(&thread) {
-                    self.clear_search();
                     for visible in &mut self.messages {
                         if visible.account_id != account_id || visible.thread_id != thread {
                             continue;
@@ -1593,6 +2274,44 @@ impl super::Model {
                             .filter(|q| q.message_id == message_id && q.owner_id == actor_id)
                         {
                             crate::domain::RECALLED_TEXT.clone_into(&mut quote.text);
+                            quote.message_type = 0;
+                        }
+                    }
+                }
+                true
+            }
+            LiveEvent::DeletedForMe {
+                account_id,
+                thread,
+                message_id,
+                sender_id,
+                conversation,
+            } => {
+                if crate::protocol::messaging::Target::from_thread(&thread).is_err()
+                    || crate::protocol::messaging::numeric_id(&message_id).is_err()
+                    || crate::protocol::messaging::numeric_id(&sender_id).is_err()
+                    || conversation.id != thread
+                {
+                    return false;
+                }
+                self.upsert_live_conversation(conversation);
+                self.remove_search_message(&thread, &message_id, &sender_id);
+                if self.selected.as_deref() == Some(&thread) {
+                    self.messages.retain(|visible| {
+                        visible.account_id != account_id
+                            || visible.thread_id != thread
+                            || visible.id != message_id
+                            || visible.sender != sender_id
+                    });
+                    for visible in &mut self.messages {
+                        if visible.account_id != account_id || visible.thread_id != thread {
+                            continue;
+                        }
+                        if let Some(quote) = visible.quote.as_mut().filter(|quote| {
+                            quote.message_id == message_id && quote.owner_id == sender_id
+                        }) {
+                            crate::store::delete_for_me::DELETED_FOR_ME_TEXT
+                                .clone_into(&mut quote.text);
                             quote.message_type = 0;
                         }
                     }
@@ -1622,6 +2341,7 @@ impl super::Model {
                 thread,
                 message,
                 conversation,
+                kind,
                 ..
             } => {
                 if message.account_id != account_id
@@ -1631,7 +2351,7 @@ impl super::Model {
                     return false;
                 }
                 self.append_live_message(message, conversation, latest_page);
-                if self.selected.as_deref() == Some(&thread) {
+                if kind != TransferKind::Album && self.selected.as_deref() == Some(&thread) {
                     self.status = "Zalo đã nhận tệp. Chưa xác nhận người nhận đã xem.".into();
                 }
                 true
@@ -1640,9 +2360,20 @@ impl super::Model {
                 thread,
                 phase,
                 message,
+                kind,
                 ..
             } => {
                 if self.selected.as_deref() == Some(&thread) {
+                    if matches!(kind, TransferKind::Album | TransferKind::Voice) {
+                        if kind == TransferKind::Album && phase == FileTransferPhase::Accepted {
+                            self.status = "Zalo đã nhận đủ ảnh trong album.".into();
+                        } else if let Some(message) = message {
+                            self.status = message;
+                        } else {
+                            return false;
+                        }
+                        return true;
+                    }
                     self.status = match phase {
                         FileTransferPhase::Unknown => {
                             "Chưa xác định tệp đã gửi hay chưa. Không tự gửi lại.".into()
@@ -1727,20 +2458,34 @@ impl super::Model {
             | LiveEvent::GroupMembers { .. }
             | LiveEvent::GroupInviteTargets { .. }
             | LiveEvent::GroupActionFinished { .. }
+            | LiveEvent::GroupPins { .. }
+            | LiveEvent::GroupPinFinished { .. }
+            | LiveEvent::PollDetailCapability { .. }
+            | LiveEvent::PollDetail { .. }
+            | LiveEvent::PollVoteFinished { .. }
             | LiveEvent::RecallFinished { .. }
+            | LiveEvent::DeleteForMeCapability { .. }
+            | LiveEvent::DeleteForMeFinished { .. }
+            | LiveEvent::RemoteHistoryCapability { .. }
+            | LiveEvent::RemoteHistoryFinished { .. }
             | LiveEvent::ForwardFinished { .. }
+            | LiveEvent::ForwardBatchFinished { .. }
             | LiveEvent::ForwardTargets { .. }
             | LiveEvent::StickerFinished { .. }
             | LiveEvent::StickerSearchCapability { .. }
             | LiveEvent::StickersFound { .. }
+            | LiveEvent::StickerPacksFound { .. }
+            | LiveEvent::StickerPackFound { .. }
             | LiveEvent::ReadState { .. }
             | LiveEvent::ReadStateChanged { .. }
             | LiveEvent::NotificationPreferences { .. }
             | LiveEvent::NotificationOpen { .. }
             | LiveEvent::Avatars { .. }
             | LiveEvent::PhotoPrepared { .. }
+            | LiveEvent::AlbumPrepared { .. }
             | LiveEvent::PhotoCapability { .. }
             | LiveEvent::FileCapability { .. }
+            | LiveEvent::VoiceCapability { .. }
             | LiveEvent::PrivacyChanged { .. }
             | LiveEvent::HiddenMatches { .. }
             | LiveEvent::HiddenUnlockResult { .. }
@@ -1814,6 +2559,7 @@ mod tests {
     use crate::app::{DraftBook, Model};
     fn message() -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -1917,6 +2663,7 @@ mod tests {
         let bad = LiveEvent::Received {
             account_id: "11".into(),
             message: Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 source_client_id: None,
@@ -1984,6 +2731,77 @@ mod tests {
             },
             "11",
         );
+    }
+    #[test]
+    fn album_ack_applies_only_to_the_complete_batch_and_leaves_text_intact() {
+        let files = FileFixtures::new();
+        let (source, photo) = photo_draft_fixture(&files);
+        for final_phase in [FileTransferPhase::Accepted, FileTransferPhase::Partial] {
+            let mut composer = crate::app::Composer {
+                text: "Bản nháp".into(),
+                ..Default::default()
+            };
+            composer
+                .prepare_live_album(
+                    1,
+                    "d:22".into(),
+                    vec![source.clone(), source.clone()],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            let prepared = |generation| LiveEvent::AlbumPrepared {
+                account_id: "11".into(),
+                thread: "d:22".into(),
+                generation,
+                request_id: 1,
+                result: Ok(vec![photo.clone(), photo.clone()]),
+            };
+            composer.apply_live(&prepared(2), "11");
+            assert!(composer.album_preparing());
+            composer.apply_live(&prepared(1), "11");
+            assert_eq!(composer.album().map(|album| album.len()), Some(2));
+            composer
+                .send_live_album(1, "d:22".into(), |_| Ok(()))
+                .unwrap();
+            // Receipt publication may happen for every member. The draft waits
+            // for the actor's batch result, even if one receipt precedes failure.
+            composer.apply_live(
+                &LiveEvent::FileAccepted {
+                    account_id: "11".into(),
+                    thread: "d:22".into(),
+                    kind: TransferKind::Album,
+                    request_id: 2,
+                    message: message(),
+                    conversation: conversation(),
+                },
+                "11",
+            );
+            assert!(composer.in_flight());
+            composer.apply_live(
+                &LiveEvent::FileTransfer {
+                    account_id: "11".into(),
+                    thread: "d:22".into(),
+                    kind: TransferKind::Album,
+                    request_id: 2,
+                    phase: final_phase,
+                    uploaded: 50,
+                    total: 50,
+                    message: None,
+                },
+                "11",
+            );
+            assert!(!composer.in_flight());
+            assert_eq!(composer.text, "Bản nháp");
+            if final_phase == FileTransferPhase::Partial {
+                assert_eq!(composer.album_sources().len(), 2);
+                assert!(composer.album_problem().is_some());
+                assert!(composer
+                    .send_live_album(1, "d:22".into(), |_| panic!("Album retry is blocked"))
+                    .is_err());
+            } else {
+                assert!(composer.album_sources().is_empty());
+            }
+        }
     }
     #[test]
     fn photo_ack_preserves_new_component_caption_and_quote_intent() {

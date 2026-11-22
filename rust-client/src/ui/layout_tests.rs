@@ -19,6 +19,7 @@ fn fixture(ctx: &egui::Context) -> (NativeApp, std::path::PathBuf) {
     }];
     app.model.selected = Some("d:22".into());
     app.model.messages = vec![Message {
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         source_client_id: None,

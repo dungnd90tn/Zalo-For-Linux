@@ -61,6 +61,24 @@ impl Projection {
                         .retain(|target| !self.hidden.contains(&format!("d:{}", target.contact)));
                 }
             }
+            LiveEvent::GroupPins {
+                thread,
+                privacy_revision,
+                snapshot,
+                ..
+            }
+            | LiveEvent::GroupPinFinished {
+                thread,
+                privacy_revision,
+                snapshot,
+                ..
+            } if !self.confirmed
+                || self.status != LivePrivacyStatus::Ready
+                || *privacy_revision != self.revision
+                || self.hidden.contains(thread) =>
+            {
+                *snapshot = None;
+            }
             LiveEvent::ForwardTargets {
                 source_thread,
                 entries,
@@ -95,13 +113,68 @@ impl Projection {
             LiveEvent::PhotoPrepared { result, thread, .. } if !self.permits(thread) => {
                 *result = Err(PhotoPreparationFailure::Cancelled);
             }
+            LiveEvent::AlbumPrepared { result, thread, .. } if !self.permits(thread) => {
+                *result = Err(PhotoPreparationFailure::Cancelled);
+            }
             LiveEvent::StickersFound {
+                thread, stickers, ..
+            }
+            | LiveEvent::StickerPackFound {
                 thread, stickers, ..
             } if !self.confirmed
                 || self.status != LivePrivacyStatus::Ready
                 || self.hidden.contains(thread) =>
             {
                 *stickers = None;
+            }
+            LiveEvent::StickerPacksFound { thread, packs, .. }
+                if !self.confirmed
+                    || self.status != LivePrivacyStatus::Ready
+                    || self.hidden.contains(thread) =>
+            {
+                *packs = None;
+            }
+            LiveEvent::RemoteHistoryFinished {
+                thread,
+                privacy_revision,
+                outcome,
+                ..
+            } if !self.confirmed
+                || self.status != LivePrivacyStatus::Ready
+                || *privacy_revision != self.revision
+                || self.hidden.contains(thread) =>
+            {
+                *outcome = RemoteHistoryOutcome::Unavailable;
+            }
+            LiveEvent::PollDetail {
+                thread,
+                privacy_revision,
+                poll_id,
+                detail,
+                ..
+            } if !self.confirmed
+                || self.status != LivePrivacyStatus::Ready
+                || *privacy_revision != self.revision
+                || self.hidden.contains(thread) =>
+            {
+                *poll_id = None;
+                *detail = None;
+            }
+            LiveEvent::PollVoteFinished {
+                thread,
+                privacy_revision,
+                poll_id,
+                detail,
+                outcome,
+                ..
+            } if !self.confirmed
+                || self.status != LivePrivacyStatus::Ready
+                || *privacy_revision != self.revision
+                || self.hidden.contains(thread) =>
+            {
+                *poll_id = None;
+                *detail = None;
+                *outcome = PollVoteOutcome::Unavailable;
             }
             LiveEvent::Avatars { avatars, .. } => {
                 avatars.retain(|entry| self.permits(&entry.thread_id))
@@ -123,6 +196,9 @@ impl Projection {
                 request_id,
                 ..
             } if !self.permits(thread) => {
+                if *kind == TransferKind::Album {
+                    return None;
+                }
                 return Some(LiveEvent::FileTransfer {
                     kind: *kind,
                     account_id: account_id.clone(),
@@ -167,6 +243,7 @@ impl Projection {
                 return None
             }
             LiveEvent::Recalled { thread, .. }
+            | LiveEvent::DeletedForMe { thread, .. }
             | LiveEvent::Page { thread, .. }
             | LiveEvent::Overview { thread, .. }
             | LiveEvent::OverviewFailed { thread, .. }

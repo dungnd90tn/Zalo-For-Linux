@@ -55,6 +55,7 @@ mod live {
     const MAX_CLIENT_ID: i64 = 9_007_199_254_740_991;
     const MAX_UNRESOLVED: i64 = 100;
     const MAX_REFERENCE_BYTES: usize = 4096;
+    const MAX_GROUP_MEMBERS: i64 = 99;
     pub(crate) const MAX_TARGETS: usize = 25;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +114,23 @@ mod live {
         )?)
     }
 
+    fn normal_group_source(conn: &Connection, account: &str, thread: &str) -> Result<bool> {
+        if !thread.strip_prefix("g:").is_some_and(valid_source_id)
+            || group_actions::write_blocked(conn, account, thread)?
+        {
+            return Ok(false);
+        }
+        // A cached group size can exclude a source. The live worker proves
+        // current membership and group size even when the directory is absent.
+        Ok(conn.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM directory_entries
+             WHERE account_id=?1 AND thread_id=?2 AND is_group=1
+             AND member_count NOT BETWEEN 1 AND ?3)",
+            params![account, thread, MAX_GROUP_MEMBERS],
+            |row| row.get(0),
+        )?)
+    }
+
     fn source(
         conn: &Connection,
         account: &str,
@@ -120,9 +138,11 @@ mod live {
         id: &str,
     ) -> Result<(String, ForwardReference)> {
         ensure!(
-            direct_peer(account, thread).is_some()
+            valid_source_id(account)
                 && valid_source_id(id)
-                && normal_thread(conn, account, thread)?,
+                && normal_thread(conn, account, thread)?
+                && (direct_peer(account, thread).is_some()
+                    || normal_group_source(conn, account, thread)?),
             ForwardFailure::Source
         );
         let mut source = conn.query_row(
@@ -139,7 +159,7 @@ mod live {
             |row| Ok(Message {
                 account_id: account.into(), thread_id: thread.into(), id: id.into(),
                 sender: row.get(0)?, text: row.get(1)?, sent_at_ms: row.get(2)?,
-                source_client_id: None, reply_blocked: false, recalled: false, quote: None, sticker: None, media: None,
+                source_client_id: None, mentions: Vec::new(), reply_blocked: false, recalled: false, quote: None, sticker: None, media: None,
             }),
         ).optional()?.ok_or(ForwardFailure::Source)?;
         message_reply::hydrate(conn, &mut source)?;
@@ -155,16 +175,26 @@ mod live {
     }
 
     fn destination(conn: &Connection, account: &str, thread: &str) -> Result<()> {
-        let peer = direct_peer(account, thread).ok_or(ForwardFailure::Destination)?;
+        let (kind, remote) = thread
+            .split_once(':')
+            .filter(|(_, remote)| valid_source_id(account) && valid_source_id(remote))
+            .ok_or(ForwardFailure::Destination)?;
+        let is_group = match kind {
+            "d" if remote != account => false,
+            "g" => true,
+            _ => bail!(ForwardFailure::Destination),
+        };
         ensure!(
-            normal_thread(conn, account, thread)?,
+            normal_thread(conn, account, thread)?
+                && (!is_group || !group_actions::write_blocked(conn, account, thread)?),
             ForwardFailure::Destination
         );
         let eligible: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM directory_entries
-             WHERE account_id=?1 AND thread_id=?2 AND remote_id=?3 AND is_group=0
-             AND is_friend=1 AND COALESCE(is_blocked,0)=0)",
-            params![account, thread, peer],
+             WHERE account_id=?1 AND thread_id=?2 AND remote_id=?3 AND is_group=?4
+             AND (CASE WHEN ?4 THEN COALESCE(member_count,1) BETWEEN 1 AND ?5
+                       ELSE is_friend=1 AND COALESCE(is_blocked,0)=0 END))",
+            params![account, thread, remote, is_group, MAX_GROUP_MEMBERS],
             |row| row.get(0),
         )?;
         ensure!(eligible, ForwardFailure::Destination);
@@ -438,6 +468,19 @@ mod live {
     }
 
     impl MessageStore {
+        pub(crate) fn forward_source_valid(
+            &self,
+            account: &str,
+            thread: &str,
+            id: &str,
+        ) -> Result<()> {
+            source(&self.conn, account, thread, id).map(|_| ())
+        }
+
+        pub(crate) fn forward_destination_valid(&self, account: &str, thread: &str) -> Result<()> {
+            destination(&self.conn, account, thread)
+        }
+
         pub(crate) fn forward_targets(
             &self,
             account: &str,
@@ -460,20 +503,26 @@ mod live {
             );
             let mut statement = self.conn.prepare_cached(
                 "SELECT d.thread_id,d.display_name FROM directory_entries d
-                 WHERE d.account_id=?1 AND d.is_group=0 AND d.remote_id<>?1
-                 AND d.is_friend=1 AND COALESCE(d.is_blocked,0)=0
+                 WHERE d.account_id=?1
+                 AND ((d.is_group=0 AND d.remote_id<>?1 AND d.is_friend=1 AND COALESCE(d.is_blocked,0)=0)
+                   OR (d.is_group=1 AND COALESCE(d.member_count,1) BETWEEN 1 AND ?4
+                    AND NOT EXISTS(SELECT 1 FROM group_left l WHERE l.account_id=d.account_id AND l.thread_id=d.thread_id)
+                    AND NOT EXISTS(SELECT 1 FROM group_action_outbox a WHERE a.account_id=d.account_id AND a.thread_id=d.thread_id
+                        AND a.kind='leave' AND a.state IN ('sending','unknown'))))
                  AND d.search_name LIKE ?2 ESCAPE '\\'
                  AND NOT EXISTS(SELECT 1 FROM temp.live_hidden h WHERE h.account_id=d.account_id AND h.thread_id=d.thread_id)
                  AND NOT EXISTS(SELECT 1 FROM e2ee_threads e WHERE e.account_id=d.account_id AND e.thread_id=d.thread_id)
                  ORDER BY d.display_name,d.thread_id LIMIT ?3",
             )?;
-            let rows =
-                statement.query_map(params![account, pattern, MAX_TARGETS as i64], |row| {
+            let rows = statement.query_map(
+                params![account, pattern, MAX_TARGETS as i64, MAX_GROUP_MEMBERS],
+                |row| {
                     Ok(ForwardTarget {
                         thread_id: row.get(0)?,
                         title: row.get(1)?,
                     })
-                })?;
+                },
+            )?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         }
 
@@ -621,6 +670,7 @@ mod live {
                 sender: account.into(),
                 text: row.body,
                 source_client_id: Some(row.client),
+                mentions: Vec::new(),
                 reply_blocked: true,
                 recalled: false,
                 quote: None,
@@ -676,6 +726,7 @@ mod tests {
             quote: None,
             media: None,
             sticker: None,
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
         }
@@ -761,6 +812,141 @@ mod tests {
                 .is_err(),
             "a later non-ordinary forward marker blocks use as a clean source"
         );
+    }
+
+    #[test]
+    fn group_destinations_require_visibility_and_keep_receipts_separate_from_direct_threads() {
+        let (mut store, source) = fixture();
+        store.conn.execute_batch(
+            "INSERT INTO directory_entries(account_id,thread_id,remote_id,is_group,display_name,search_name,member_count,observed_at_ms)
+             VALUES('11','g:33','33',1,'Bảo Nhỏ','bao nho',99,1),
+                   ('11','g:44','44',1,'Bảo Ẩn','bao an',NULL,1),
+                   ('11','g:45','45',1,'Bảo Kín','bao kin',3,1),
+                   ('11','g:46','46',1,'Bảo Cũ','bao cu',3,1),
+                   ('11','g:47','47',1,'Bảo Chờ','bao cho',3,1),
+                   ('11','g:48','48',1,'Bảo Lớn','bao lon',100,1),
+                   ('77','g:49','49',1,'Bảo Khác','bao khac',3,1);
+             INSERT INTO e2ee_threads VALUES ('11','g:45');
+             INSERT INTO group_left VALUES ('11','g:46',1);",
+        ).unwrap();
+        store
+            .replace_live_privacy("11", &["g:44".into()], Some("g:44"))
+            .unwrap();
+        store.prepare_group_leave("11", "g:47", 1).unwrap();
+        receive(&mut store, source, Some(ForwardMarker::Ordinary), None).unwrap();
+
+        let targets = store.forward_targets("11", "d:22", "100", "Bảo").unwrap();
+        let ids: Vec<_> = targets
+            .iter()
+            .map(|target| target.thread_id.as_str())
+            .collect();
+        assert_eq!(ids, ["g:33", "d:33"]);
+        for thread in ["g:44", "g:45", "g:46", "g:47", "g:48", "g:49"] {
+            assert!(store.forward_destination_valid("11", thread).is_err());
+            assert!(store
+                .prepare_forward("11", "d:22", "100", thread, 1000)
+                .is_err());
+        }
+
+        let group = store
+            .prepare_forward("11", "d:22", "100", "g:33", 1000)
+            .unwrap();
+        store.recover_forwards("11").unwrap();
+        assert!(store
+            .prepare_forward("11", "d:22", "100", "g:33", 1000)
+            .is_err());
+        let direct = store
+            .prepare_forward("11", "d:22", "100", "d:33", 1000)
+            .unwrap();
+        assert_eq!(direct.client_id, group.client_id + 1);
+
+        receive(
+            &mut store,
+            message("d:33", "300", "11", &group.client_id.to_string()),
+            Some(ForwardMarker::Parsed(group.reference)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            store.forward_outcome("11", group.client_id).unwrap(),
+            ForwardOutcome::Unknown
+        );
+        assert_eq!(
+            store.forward_outcome("11", direct.client_id).unwrap(),
+            ForwardOutcome::Pending
+        );
+        store
+            .record_forward_ack("11", group.client_id, "300", Some(222))
+            .unwrap();
+        let (sent, group_conversation) = store.accept_forward_ack("11", group.client_id).unwrap();
+        assert_eq!(group_conversation.title, "Bảo Nhỏ");
+        assert_eq!(sent.thread_id, "g:33");
+        assert!(sent.reply_blocked);
+        assert_eq!(
+            store.forward_outcome("11", group.client_id).unwrap(),
+            ForwardOutcome::Accepted
+        );
+        assert_eq!(
+            store.forward_outcome("11", direct.client_id).unwrap(),
+            ForwardOutcome::Pending
+        );
+        store.prepare_group_leave("11", "g:33", 2).unwrap();
+        assert!(store.forward_destination_valid("11", "g:33").is_err());
+    }
+
+    #[test]
+    fn group_source_requires_committed_ordinary_text_and_remains_scoped_at_dispatch() {
+        let (mut store, _) = fixture();
+        let source = message("g:22", "100", "24", "200");
+        store.insert_batch(std::slice::from_ref(&source)).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
+        store.replace_live_privacy("11", &[], None).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
+        receive(&mut store, source, Some(ForwardMarker::Ordinary), None).unwrap();
+        let targets = store.forward_targets("11", "g:22", "100", "Bảo").unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].thread_id, "d:33");
+        let send = store
+            .prepare_forward("11", "g:22", "100", "d:33", 1000)
+            .unwrap();
+        assert_eq!(send.text, "Xin chào đầu tiên");
+        assert!(store.forward_source_valid("11", "d:22", "100").is_err());
+        store.replace_live_privacy("77", &[], None).unwrap();
+        assert!(store.forward_source_valid("77", "g:22", "100").is_err());
+
+        let mut mention = message("g:22", "101", "24", "201");
+        mention.text = "@An xem".into();
+        mention.reply_blocked = true;
+        mention.mentions = vec![crate::domain::mention::Mention {
+            uid: "25".into(),
+            pos: 0,
+            len: 3,
+        }];
+        receive(&mut store, mention, Some(ForwardMarker::Ordinary), None).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "101").is_err());
+
+        store
+            .replace_live_privacy("11", &["g:22".into()], Some("g:22"))
+            .unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
+        store.replace_live_privacy("11", &[], None).unwrap();
+        store.conn.execute_batch(
+            "INSERT INTO directory_entries(account_id,thread_id,remote_id,is_group,display_name,search_name,member_count,observed_at_ms)
+             VALUES('11','g:22','22',1,'Nhóm','nhom',100,1);",
+        ).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
+        store.conn.execute_batch(
+            "UPDATE directory_entries SET member_count=99 WHERE account_id='11' AND thread_id='g:22';
+             INSERT INTO e2ee_threads VALUES ('11','g:22');",
+        ).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
+        store
+            .conn
+            .execute_batch("DELETE FROM e2ee_threads WHERE account_id='11' AND thread_id='g:22';")
+            .unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_ok());
+        store.prepare_group_leave("11", "g:22", 1001).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
     }
 
     #[test]
@@ -918,7 +1104,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            18
+            crate::store::SCHEMA_VERSION
         );
         assert_eq!(migrated.receive_cursor("11", "510_0").unwrap(), "99");
         migrated.replace_live_privacy("11", &[], None).unwrap();

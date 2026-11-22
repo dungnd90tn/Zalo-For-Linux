@@ -42,6 +42,7 @@ pub(super) fn incoming_reference(
                 | "share.file"
                 | "chat.sticker"
                 | "chat.photo"
+                | "chat.voice"
                 | "chat.webcontent"
                 | "chat.recommended"
         );

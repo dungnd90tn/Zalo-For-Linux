@@ -1,7 +1,7 @@
-//! Background photo preparation; the preview and upload share the same immutable JPEG bytes.
+//! Background photo validation and preview for immutable upload bytes.
 use super::super::photo::{CacheCharge, PhotoData, MAX_PREPARED_BYTES, PREPARED_BYTES};
 use super::*;
-use crate::domain::Attachment;
+use crate::domain::{Attachment, PhotoResolution};
 use image::{ImageDecoder, ImageFormat, ImageReader};
 use md5::{Digest, Md5};
 use std::{
@@ -22,15 +22,18 @@ impl Drop for ProcessingPermit {
 struct Pending {
     generation: u64,
     thread: String,
-    attachment: Attachment,
+    attachments: Vec<Attachment>,
     request_id: u64,
+    resolution: PhotoResolution,
+    album: bool,
 }
 struct Running {
     generation: u64,
     thread: String,
     request_id: u64,
+    album: bool,
     cancel: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<std::result::Result<PreparedPhoto, PhotoPreparationFailure>>,
+    task: tokio::task::JoinHandle<std::result::Result<Vec<PreparedPhoto>, PhotoPreparationFailure>>,
 }
 #[derive(Default)]
 pub(super) struct Photos {
@@ -53,59 +56,95 @@ impl Photos {
         command: LiveCommand,
         events: &Events,
     ) -> Result<Option<LiveCommand>> {
-        match command {
+        let pending = match command {
             LiveCommand::PreparePhoto {
                 generation,
                 thread,
                 attachment,
                 request_id,
-            } => {
-                if let Some(old) = self.pending.take() {
-                    self.emit(
-                        events,
-                        old.generation,
-                        old.thread,
-                        old.request_id,
-                        Err(PhotoPreparationFailure::Cancelled),
-                    )
-                    .await?;
-                }
-                if let Some(job) = &self.running {
-                    job.cancel.store(true, Ordering::Release);
-                }
-                self.pending = Some(Pending {
-                    generation,
-                    thread,
-                    attachment,
-                    request_id,
-                });
-                Ok(None)
-            }
+                resolution,
+            } => Pending {
+                generation,
+                thread,
+                attachments: vec![attachment],
+                request_id,
+                resolution,
+                album: false,
+            },
+            LiveCommand::PrepareAlbum {
+                generation,
+                thread,
+                attachments,
+                request_id,
+            } => Pending {
+                generation,
+                thread,
+                attachments,
+                request_id,
+                resolution: PhotoResolution::Hd,
+                album: true,
+            },
             LiveCommand::CancelPhotoPreparation { request_id } => {
-                if let Some(job) = &self.running {
-                    if job.request_id == request_id {
-                        job.cancel.store(true, Ordering::Release);
-                    }
-                }
-                if self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|job| job.request_id == request_id)
-                {
-                    let job = self.pending.take().unwrap();
-                    self.emit(
-                        events,
-                        job.generation,
-                        job.thread,
-                        job.request_id,
-                        Err(PhotoPreparationFailure::Cancelled),
-                    )
-                    .await?;
-                }
-                Ok(None)
+                self.cancel(events, request_id, None).await?;
+                return Ok(None);
             }
-            command => Ok(Some(command)),
+            LiveCommand::CancelAlbumPreparation { thread, request_id } => {
+                self.cancel(events, request_id, Some(&thread)).await?;
+                return Ok(None);
+            }
+            command => return Ok(Some(command)),
+        };
+        if let Some(old) = self.pending.replace(pending) {
+            self.emit(
+                events,
+                old.generation,
+                old.thread,
+                old.request_id,
+                old.album,
+                Err(PhotoPreparationFailure::Cancelled),
+            )
+            .await?;
         }
+        if let Some(job) = &self.running {
+            job.cancel.store(true, Ordering::Release);
+        }
+        Ok(None)
+    }
+    async fn cancel(
+        &mut self,
+        events: &Events,
+        request_id: u64,
+        album_thread: Option<&str>,
+    ) -> Result<()> {
+        let matches_scope = |id, thread: &str, album| {
+            id == request_id
+                && match album_thread {
+                    Some(scope) => album && scope == thread,
+                    None => !album,
+                }
+        };
+        if let Some(job) = &self.running {
+            if matches_scope(job.request_id, &job.thread, job.album) {
+                job.cancel.store(true, Ordering::Release);
+            }
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|job| matches_scope(job.request_id, &job.thread, job.album))
+        {
+            let job = self.pending.take().expect("matched preparation");
+            self.emit(
+                events,
+                job.generation,
+                job.thread,
+                job.request_id,
+                job.album,
+                Err(PhotoPreparationFailure::Cancelled),
+            )
+            .await?;
+        }
+        Ok(())
     }
     async fn emit(
         &self,
@@ -113,17 +152,28 @@ impl Photos {
         generation: u64,
         thread: String,
         request_id: u64,
-        result: std::result::Result<PreparedPhoto, PhotoPreparationFailure>,
+        album: bool,
+        result: std::result::Result<Vec<PreparedPhoto>, PhotoPreparationFailure>,
     ) -> Result<()> {
-        events
-            .emit(LiveEvent::PhotoPrepared {
+        let event = if album {
+            LiveEvent::AlbumPrepared {
                 account_id: events.account.clone(),
                 generation,
                 thread,
                 request_id,
                 result,
-            })
-            .await
+            }
+        } else {
+            LiveEvent::PhotoPrepared {
+                account_id: events.account.clone(),
+                generation,
+                thread,
+                request_id,
+                result: result
+                    .and_then(|mut photos| photos.pop().ok_or(PhotoPreparationFailure::Storage)),
+            }
+        };
+        events.emit(event).await
     }
     pub async fn poll(
         &mut self,
@@ -131,6 +181,8 @@ impl Photos {
         events: &Events,
         lease: u64,
         limits: crate::protocol::bootstrap::PhotoLimits,
+        original_limits: Option<crate::protocol::bootstrap::PhotoLimits>,
+        album_max_count: usize,
     ) -> Result<()> {
         if let Some(job) = &self.running {
             if !events.privacy.read().is_ok_and(|p| p.permits(&job.thread)) {
@@ -147,22 +199,54 @@ impl Photos {
                 .task
                 .await
                 .unwrap_or(Err(PhotoPreparationFailure::Storage));
-            self.emit(events, job.generation, job.thread, job.request_id, result)
-                .await?;
+            let result = if job.cancel.load(Ordering::Acquire) {
+                Err(PhotoPreparationFailure::Cancelled)
+            } else {
+                result
+            };
+            self.emit(
+                events,
+                job.generation,
+                job.thread,
+                job.request_id,
+                job.album,
+                result,
+            )
+            .await?;
         }
         if self.running.is_none() {
             if let Some(job) = self.pending.take() {
+                let album = job.album;
                 if lease == 0 || !events.privacy.read().is_ok_and(|p| p.permits(&job.thread)) {
                     self.emit(
                         events,
                         job.generation,
                         job.thread,
                         job.request_id,
+                        album,
                         Err(PhotoPreparationFailure::Cancelled),
                     )
                     .await?;
                     return Ok(());
                 }
+                let limits = match job.resolution {
+                    PhotoResolution::Hd => Some(limits),
+                    PhotoResolution::Original => original_limits,
+                };
+                let Some(limits) = limits
+                    .filter(|_| !album || (2..=album_max_count).contains(&job.attachments.len()))
+                else {
+                    self.emit(
+                        events,
+                        job.generation,
+                        job.thread,
+                        job.request_id,
+                        album,
+                        Err(PhotoPreparationFailure::Unavailable),
+                    )
+                    .await?;
+                    return Ok(());
+                };
                 let cancel = Arc::new(AtomicBool::new(false));
                 let flag = cancel.clone();
                 let profile = profile.clone();
@@ -181,15 +265,20 @@ impl Photos {
                     let permit = ProcessingPermit;
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit;
-                        prepare(
-                            &profile,
-                            &account,
-                            &thread,
-                            lease,
-                            &job.attachment,
-                            &flag,
-                            limits,
-                        )
+                        job.attachments
+                            .iter()
+                            .map(|attachment| {
+                                prepare(
+                                    &profile,
+                                    &account,
+                                    &thread,
+                                    lease,
+                                    attachment,
+                                    &flag,
+                                    (limits, job.resolution),
+                                )
+                            })
+                            .collect()
                     })
                     .await
                     .unwrap_or(Err(PhotoPreparationFailure::Storage))
@@ -198,6 +287,7 @@ impl Photos {
                     generation: job.generation,
                     thread: job.thread,
                     request_id: job.request_id,
+                    album,
                     cancel,
                     task,
                 });
@@ -288,10 +378,16 @@ fn prepare(
     lease: u64,
     attachment: &Attachment,
     cancel: &AtomicBool,
-    limits: crate::protocol::bootstrap::PhotoLimits,
+    (limits, resolution): (crate::protocol::bootstrap::PhotoLimits, PhotoResolution),
 ) -> std::result::Result<PreparedPhoto, PhotoPreparationFailure> {
     check(cancel)?;
-    if attachment.size_bytes > MAX_INPUT.min(limits.input_size) {
+    let original = resolution == PhotoResolution::Original;
+    let max_input = if original {
+        limits.size.min(MAX_JPEG as u64)
+    } else {
+        MAX_INPUT
+    };
+    if attachment.size_bytes > max_input.min(limits.input_size) {
         return Err(PhotoPreparationFailure::Resource);
     }
     let mut snapshot = super::upload::snapshot(profile, attachment, cancel).map_err(|_| {
@@ -307,6 +403,9 @@ fn prepare(
         .read_to_end(&mut bytes)
         .map_err(|_| PhotoPreparationFailure::Storage)?;
     let format = image::guess_format(&bytes).map_err(|_| PhotoPreparationFailure::InvalidFormat)?;
+    if original && format != ImageFormat::Jpeg {
+        return Err(PhotoPreparationFailure::OriginalFormat);
+    }
     if !matches!(
         format,
         ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP
@@ -345,8 +444,54 @@ fn prepare(
                 .orientation()
                 .map_err(|_| PhotoPreparationFailure::InvalidFormat)?,
         );
+    if original && orientation != image::metadata::Orientation::NoTransforms {
+        return Err(PhotoPreparationFailure::OriginalOrientation);
+    }
     let mut decoded = image::DynamicImage::from_decoder(decoder)
         .map_err(|_| PhotoPreparationFailure::InvalidFormat)?;
+    check(cancel)?;
+    if original {
+        let (width, height) = (decoded.width(), decoded.height());
+        if width > limits.width.min(2560)
+            || height > limits.height.min(2560)
+            || snapshot.size > limits.size
+        {
+            return Err(PhotoPreparationFailure::Resource);
+        }
+        let (file, size, checksum) = match strip_jpeg_app1(&bytes, cancel)? {
+            Some(clean) => {
+                let size = clean.len() as u64;
+                let checksum = format!("{:x}", Md5::digest(&clean));
+                (spool(profile, &clean)?, size, checksum)
+            }
+            None => (snapshot.file, snapshot.size, snapshot.checksum),
+        };
+        drop(bytes);
+        let thumbnail = thumbnail(decoded);
+        check(cancel)?;
+        let charge = CacheCharge::reserve(
+            &PREPARED_BYTES,
+            size,
+            thumbnail.rgba.len(),
+            MAX_PREPARED_BYTES,
+        )?;
+        return Ok(PreparedPhoto(Arc::new(PhotoData {
+            file,
+            resolution,
+            checksum,
+            size,
+            width,
+            height,
+            source_width,
+            source_height,
+            source_size: snapshot.size,
+            thumbnail,
+            account: account.into(),
+            thread: thread.into(),
+            lease,
+            _charge: charge,
+        })));
+    }
     drop(bytes);
     decoded.apply_orientation(orientation);
     check(cancel)?;
@@ -379,16 +524,36 @@ fn prepare(
     check(cancel)?;
     let preview = image::load_from_memory_with_format(&encoded, ImageFormat::Jpeg)
         .map_err(|_| PhotoPreparationFailure::InvalidFormat)?;
-    let thumbnail = if preview.width() > 256 || preview.height() > 256 {
-        preview.thumbnail(256, 256)
-    } else {
-        preview
-    }
-    .into_rgba8();
-    let tw = thumbnail.width();
-    let th = thumbnail.height();
+    let thumbnail = thumbnail(preview);
     let checksum = format!("{:x}", Md5::digest(&encoded));
     let size = encoded.len() as u64;
+    let file = spool(profile, &encoded)?;
+    check(cancel)?;
+    let charge = CacheCharge::reserve(
+        &PREPARED_BYTES,
+        size,
+        thumbnail.rgba.len(),
+        MAX_PREPARED_BYTES,
+    )?;
+    Ok(PreparedPhoto(Arc::new(PhotoData {
+        file,
+        resolution,
+        checksum,
+        size,
+        width,
+        height,
+        source_width,
+        source_height,
+        source_size: attachment.size_bytes,
+        thumbnail,
+        account: account.into(),
+        thread: thread.into(),
+        lease,
+        _charge: charge,
+    })))
+}
+
+fn spool(profile: &Profile, bytes: &[u8]) -> Result<std::fs::File, PhotoPreparationFailure> {
     let path = profile.paths.cache_dir.join(format!(
         ".photo-{}",
         crate::domain::local_message_id().map_err(|_| PhotoPreparationFailure::Storage)?
@@ -402,35 +567,89 @@ fn prepare(
         .open(&path)
         .map_err(|_| PhotoPreparationFailure::Storage)?;
     std::fs::remove_file(path).map_err(|_| PhotoPreparationFailure::Storage)?;
-    file.write_all(&encoded)
+    file.write_all(bytes)
         .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
         .map_err(|_| PhotoPreparationFailure::Storage)?;
-    check(cancel)?;
-    let charge = CacheCharge::reserve(
-        &PREPARED_BYTES,
-        size,
-        thumbnail.as_raw().len(),
-        MAX_PREPARED_BYTES,
-    )?;
-    Ok(PreparedPhoto(Arc::new(PhotoData {
-        file,
-        checksum,
-        size,
-        width,
-        height,
-        source_width,
-        source_height,
-        source_size: attachment.size_bytes,
-        thumbnail: PhotoThumbnail {
-            width: tw,
-            height: th,
-            rgba: thumbnail.into_raw().into(),
-        },
-        account: account.into(),
-        thread: thread.into(),
-        lease,
-        _charge: charge,
-    })))
+    Ok(file)
+}
+
+/// Delete APP1 segments without decoding or changing any compressed scan data.
+/// Segment boundaries also remain checked between scans of progressive JPEGs.
+fn strip_jpeg_app1(
+    bytes: &[u8],
+    cancel: &AtomicBool,
+) -> Result<Option<Vec<u8>>, PhotoPreparationFailure> {
+    use PhotoPreparationFailure::OriginalFormat;
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return Err(OriginalFormat);
+    }
+    let mut offset = 2;
+    let mut copy_from = 0;
+    let mut scan = false;
+    let mut output: Option<Vec<u8>> = None;
+    while offset < bytes.len() {
+        check(cancel)?;
+        if scan {
+            offset += bytes[offset..]
+                .iter()
+                .position(|byte| *byte == 0xff)
+                .ok_or(OriginalFormat)?;
+        }
+        if bytes.get(offset) != Some(&0xff) {
+            return Err(OriginalFormat);
+        }
+        let marker_start = offset;
+        while bytes.get(offset) == Some(&0xff) {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset).ok_or(OriginalFormat)?;
+        offset += 1;
+        if scan && matches!(marker, 0x00 | 0xd0..=0xd7) {
+            continue;
+        }
+        match marker {
+            0xd9 if offset == bytes.len() => {
+                if let Some(output) = &mut output {
+                    output.extend_from_slice(&bytes[copy_from..]);
+                }
+                return Ok(output);
+            }
+            0x01 => {
+                scan = false;
+                continue;
+            }
+            0x00 | 0xd0..=0xd9 => return Err(OriginalFormat),
+            _ => {}
+        }
+        let length = bytes.get(offset..offset + 2).ok_or(OriginalFormat)?;
+        let length = usize::from(u16::from_be_bytes([length[0], length[1]]));
+        if length < 2 || offset + length > bytes.len() {
+            return Err(OriginalFormat);
+        }
+        offset += length;
+        scan = marker == 0xda;
+        if marker == 0xe1 {
+            output
+                .get_or_insert_with(|| Vec::with_capacity(bytes.len() - length))
+                .extend_from_slice(&bytes[copy_from..marker_start]);
+            copy_from = offset;
+        }
+    }
+    Err(OriginalFormat)
+}
+
+fn thumbnail(image: image::DynamicImage) -> PhotoThumbnail {
+    let rgba = if image.width() > 256 || image.height() > 256 {
+        image.thumbnail(256, 256)
+    } else {
+        image
+    }
+    .into_rgba8();
+    PhotoThumbnail {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: rgba.into_raw().into(),
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +659,17 @@ pub(crate) fn prepare_fixture(
     account: &str,
     thread: &str,
 ) -> std::result::Result<PreparedPhoto, PhotoPreparationFailure> {
+    prepare_fixture_with_resolution(profile, attachment, account, thread, PhotoResolution::Hd)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_fixture_with_resolution(
+    profile: &Profile,
+    attachment: &Attachment,
+    account: &str,
+    thread: &str,
+    resolution: PhotoResolution,
+) -> std::result::Result<PreparedPhoto, PhotoPreparationFailure> {
     prepare(
         profile,
         account,
@@ -447,7 +677,10 @@ pub(crate) fn prepare_fixture(
         1,
         attachment,
         &AtomicBool::new(false),
-        crate::protocol::bootstrap::PhotoLimits::default(),
+        (
+            crate::protocol::bootstrap::PhotoLimits::default(),
+            resolution,
+        ),
     )
 }
 
@@ -523,7 +756,7 @@ mod tests {
             1,
             &source,
             &AtomicBool::new(false),
-            limits,
+            (limits, PhotoResolution::Hd),
         )
         .unwrap();
         assert!(photo.size_bytes() > source.size_bytes);
@@ -599,7 +832,7 @@ mod tests {
             1,
             &selected,
             &AtomicBool::new(false),
-            limits,
+            (limits, PhotoResolution::Hd),
         )
         .unwrap();
         assert_eq!((prepared.width(), prepared.height()), (2, 4));
@@ -615,7 +848,7 @@ mod tests {
             1,
             &selected,
             &AtomicBool::new(false),
-            original_bounds,
+            (original_bounds, PhotoResolution::Hd),
         )
         .unwrap();
         assert_eq!((oriented.width(), oriented.height()), (4, 8));
@@ -633,7 +866,89 @@ mod tests {
         let mut encoded = vec![0; prepared.size_bytes() as usize];
         std::os::unix::fs::FileExt::read_exact_at(&prepared.0.file, &mut encoded, 0).unwrap();
         assert!(!encoded.windows(6).any(|bytes| bytes == b"Exif\0\0"));
+        assert_eq!(
+            prepare(
+                &profile,
+                "11",
+                "d:22",
+                1,
+                &selected,
+                &AtomicBool::new(false),
+                (original_bounds, PhotoResolution::Original),
+            )
+            .unwrap_err(),
+            PhotoPreparationFailure::OriginalOrientation
+        );
         drop(prepared);
+        drop(profile);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn original_jpeg_preserves_compressed_bytes_and_removes_app1_without_reencoding() {
+        let (root, profile) = fixture();
+        let path = root.join("synthetic.jpg");
+        let mut jpeg = Vec::new();
+        let pixels = image::RgbImage::from_pixel(40, 12, image::Rgb([17, 115, 86]));
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 63)
+            .encode_image(&image::DynamicImage::ImageRgb8(pixels))
+            .unwrap();
+        let mut tagged = jpeg[..2].to_vec();
+        for value in [
+            b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x01\0\0\0\0\0\0\0".as_slice(),
+            b"http://ns.adobe.com/xap/1.0/\0Synthetic metadata".as_slice(),
+        ] {
+            tagged.extend_from_slice(&[0xff, 0xe1]);
+            tagged.extend_from_slice(&((value.len() + 2) as u16).to_be_bytes());
+            tagged.extend_from_slice(value);
+        }
+        tagged.extend_from_slice(&jpeg[2..]);
+        let limits = crate::protocol::bootstrap::PhotoLimits::default();
+        let cancel = AtomicBool::new(false);
+        for source in [&jpeg, &tagged] {
+            std::fs::write(&path, source).unwrap();
+            let selected = Attachment::inspect(&path).unwrap();
+            let photo = prepare(
+                &profile,
+                "11",
+                "g:22",
+                1,
+                &selected,
+                &cancel,
+                (limits, PhotoResolution::Original),
+            )
+            .unwrap();
+            assert_eq!(photo.resolution(), PhotoResolution::Original);
+            let mut actual = vec![0; photo.size_bytes() as usize];
+            std::os::unix::fs::FileExt::read_exact_at(&photo.0.file, &mut actual, 0).unwrap();
+            assert_eq!(actual, jpeg);
+            assert_eq!(photo.0.checksum, format!("{:x}", Md5::digest(&jpeg)));
+            assert_eq!(
+                photo.thumbnail().rgba.as_ref(),
+                image::load_from_memory_with_format(&jpeg, ImageFormat::Jpeg)
+                    .unwrap()
+                    .into_rgba8()
+                    .as_raw()
+                    .as_slice()
+            );
+            assert!(photo.permits("11", "g:22", 1));
+            assert!(!photo.permits("11", "d:22", 1));
+        }
+        let png = root.join("synthetic.png");
+        image::RgbImage::new(2, 1).save(&png).unwrap();
+        assert_eq!(
+            prepare(
+                &profile,
+                "11",
+                "g:22",
+                1,
+                &Attachment::inspect(&png).unwrap(),
+                &cancel,
+                (limits, PhotoResolution::Original),
+            )
+            .unwrap_err(),
+            PhotoPreparationFailure::OriginalFormat
+        );
         drop(profile);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use url::Url;
 
 const ZERO_IV: [u8; 16] = [0; 16];
-const AUTH_ORIGIN: &str = "https://wpa.zaloapp.com";
+pub(super) const AUTH_ORIGIN: &str = "https://wpa.zaloapp.com";
 const MAX_ENDPOINTS_PER_SERVICE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +336,7 @@ impl PreloginConfig {
 pub enum PhotoUploadRoute {
     File,
     Photo,
+    Original,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhotoLimits {
@@ -369,12 +370,72 @@ pub struct ServerConfig {
     pub file_chunk_size: usize,
     pub photo_upload_route: Option<PhotoUploadRoute>,
     pub photo_limits: PhotoLimits,
+    pub original_photo_limits: Option<PhotoLimits>,
+    pub photo_album_max_count: u32,
+    pub photo_album_extra_metadata: bool,
+    pub voice_recording_allowed: bool,
     pub seen_v2: bool,
+    pub group_board_v2: bool,
+    pub mention_all_limit: Option<u32>,
+    pub delete_for_me_sync: bool,
     pub recall_max_age_ms: Option<i64>,
     pub chat_poll: Vec<Url>,
     pub control_poll: Vec<Url>,
     pub websocket: Vec<Url>,
 }
+
+fn photo_album_config(value: &Value) -> (u32, bool) {
+    use crate::domain::media::MAX_WIRE_ALBUM_PHOTOS;
+    // Source N227219/N228183, N227921/N223233: the picker count and
+    // optional extra message property have independent session settings.
+    let count = |path| {
+        value
+            .pointer(path)
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| {
+                        let value = value.as_str()?;
+                        if value.len() > 16 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                            return None;
+                        }
+                        value.parse().ok()
+                    })
+                    .map(|count| count.min(u64::from(MAX_WIRE_ALBUM_PHOTOS)) as u32)
+            })
+    };
+    let count = match [
+        count("/settings/sharefile/max_file"),
+        count("/setttings/sharefile/max_file"),
+    ] {
+        [Some(a), Some(b)] if a != b => 0,
+        [Some(count), _] | [_, Some(count)] => count.unwrap_or(0),
+        _ => MAX_WIRE_ALBUM_PHOTOS,
+    };
+    let extra = |path| {
+        value
+            .pointer(path)
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value.as_bool().or_else(|| match value.as_u64() {
+                    Some(0) => Some(false),
+                    Some(1) => Some(true),
+                    _ => None,
+                })
+            })
+    };
+    let extra = match [
+        extra("/settings/features/should_attach_extraMsgProp"),
+        extra("/setttings/features/should_attach_extraMsgProp"),
+    ] {
+        [Some(a), Some(b)] if a != b => false,
+        [Some(extra), _] | [_, Some(extra)] => extra.unwrap_or(false),
+        _ => true,
+    };
+    (count, extra)
+}
+
 /// Optional authenticated feature settings have used both spellings and legacy aliases.
 /// Null means source defaults; conflicting/malformed nonnull aliases never authorize a capability.
 fn feature_config<'a>(
@@ -472,7 +533,12 @@ impl ServerConfig {
             "file",
             "sticker",
             "reaction",
+            "group_board",
+            "group_poll",
+            "group_cloud_message",
             "up_file",
+            "zcloud_up_file",
+            "zcloud",
         ] {
             let mut endpoints =
                 endpoint_list(modern.and_then(|map| map.get(name)), false).unwrap_or_default();
@@ -498,6 +564,38 @@ impl ServerConfig {
         };
         if !reactions_enabled {
             services.remove("reaction");
+        }
+        // PC bundle N225405–225415 and N323752–323770. Board actions
+        // require an explicitly enabled production v2 configuration.
+        let group_board_v2 = services.contains_key("group_board")
+            && feature_config(value, "group_topics")
+                .ok()
+                .flatten()
+                .is_some_and(|config| {
+                    let enabled =
+                        |value: &Value| value.as_bool() == Some(true) || value.as_u64() == Some(1);
+                    let disabled =
+                        |value: &Value| value.as_bool() == Some(false) || value.as_u64() == Some(0);
+                    config.get("enable").is_some_and(enabled)
+                        && config.get("using_new_api").is_none_or(enabled)
+                        && config.get("using_dev_api").is_none_or(disabled)
+                });
+        if !group_board_v2 {
+            services.remove("group_board");
+        }
+        // PC NEW_TO_OLD explicitly requires both cloud switches.
+        if !feature_config(value, "cloud_setting")
+            .ok()
+            .flatten()
+            .is_some_and(|config| {
+                ["enable", "scroll_top_enable"].iter().all(|key| {
+                    config.get(key).is_some_and(|value| {
+                        value.as_bool() == Some(true) || value.as_u64() == Some(1)
+                    })
+                })
+            })
+        {
+            services.remove("group_cloud_message");
         }
         // Native implements the source's raw async-file handler only. An advertised
         // multi-site/cloud handler is a separate protocol and cannot fall back silently.
@@ -604,11 +702,87 @@ impl ServerConfig {
                 photo_upload_route = None;
             }
         }
+        // Original has independent limits and a different upload domain. Neither
+        // advertised origin is evidence of the account's current cloud plan.
+        let original_photo_limits = photo_config
+            .filter(|config| {
+                raw_file_handler
+                    && ["file", "zcloud_up_file", "zcloud"]
+                        .iter()
+                        .all(|name| services.contains_key(*name))
+                    && config.get("enable_upload_original").and_then(Value::as_u64) == Some(1)
+            })
+            .and_then(|config| {
+                let resolution = config.get("resolutionLimit").filter(|v| !v.is_null());
+                if resolution.is_some_and(|value| !value.is_object()) {
+                    return None;
+                }
+                let original = resolution
+                    .and_then(|limits| limits.get("original"))
+                    .filter(|v| !v.is_null());
+                if original.is_some_and(|value| !value.is_object()) {
+                    return None;
+                }
+                let bounded =
+                    |name: &str, cap: u64| match original.and_then(|value| value.get(name)) {
+                        None | Some(Value::Null) => Some(cap),
+                        Some(value) => value
+                            .as_u64()
+                            .filter(|value| *value > 0)
+                            .map(|value| value.min(cap)),
+                    };
+                let width = bounded("width", 2560)?.min(bounded("maxInputWidth", 2560)?) as u32;
+                let height = bounded("height", 2560)?.min(bounded("maxInputHeight", 2560)?) as u32;
+                let size = bounded("size", 5 * 1024 * 1024)?;
+                Some(PhotoLimits {
+                    width,
+                    height,
+                    size,
+                    input_width: width,
+                    input_height: height,
+                    input_size: size.min(bounded("maxInputSize", 5 * 1024 * 1024)?),
+                })
+            });
+        if original_photo_limits.is_none() {
+            services.remove("zcloud_up_file");
+            services.remove("zcloud");
+        }
+        let (photo_album_max_count, photo_album_extra_metadata) = photo_album_config(value);
+        // The bundled client declares this field but does not wire a recorder.
+        // An explicit session disable always takes precedence.
+        let voice_recording_allowed = [
+            "/isOffVoiceRecord",
+            "/settings/isOffVoiceRecord",
+            "/setttings/isOffVoiceRecord",
+            "/settings/features/isOffVoiceRecord",
+            "/setttings/features/isOffVoiceRecord",
+        ]
+        .into_iter()
+        .filter_map(|path| value.pointer(path))
+        .all(|value| value.as_bool() == Some(false) || value.as_u64() == Some(0));
         let seen_v2 = feature_config(value, "ack_seen").is_ok_and(|config| {
             config
                 .and_then(|v| v.get("v2_enable"))
                 .is_none_or(|v| v.is_null() || v.as_bool() == Some(true) || v.as_i64() == Some(1))
         });
+        // The PC bundle reads max_member_mention_all from feature settings. This
+        // optional action needs a positive advertised limit under either spelling.
+        let mention_all_limit = match [
+            value.pointer("/settings/features/max_member_mention_all"),
+            value.pointer("/setttings/features/max_member_mention_all"),
+        ] {
+            [Some(a), Some(b)] if a != b => None,
+            [Some(limit), _] | [_, Some(limit)] => limit
+                .as_u64()
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit.min(100) as u32),
+            _ => None,
+        };
+        let delete_for_me_sync = feature_config(value, "sync_del_msg_or_conv")
+            .ok()
+            .flatten()
+            .and_then(|config| config.get("enable_sync_del_msg"))
+            .is_some_and(|value| value.as_bool() == Some(true) || value.as_u64() == Some(1));
         let recall_settings = [
             value.pointer("/settings/common/recallMessageMaxTime"),
             value.pointer("/setttings/common/recallMessageMaxTime"),
@@ -634,7 +808,14 @@ impl ServerConfig {
             services,
             photo_upload_route,
             photo_limits,
+            original_photo_limits,
+            photo_album_max_count,
+            photo_album_extra_metadata,
+            voice_recording_allowed,
             seen_v2,
+            group_board_v2,
+            mention_all_limit,
+            delete_for_me_sync,
             recall_max_age_ms,
             file_chunk_size,
             // The native runtime uses WebSockets, not legacy chat/control LP.
@@ -1072,6 +1253,128 @@ mod tests {
             value["zpw_service_map_v3"]["chat"] = serde_json::json!([bad]);
             assert!(ServerConfig::parse(&value).is_err());
         }
+    }
+    #[test]
+    fn group_board_is_optional_and_uses_advertised_validated_origins() {
+        let mut value = json!({"zpw_service_map_v3":{
+            "group":["https://group-wpa.zaloapp.com/"],
+            "group_board":["https://groupboard-wpa.api.zalo.me/"]
+        }});
+        let config = ServerConfig::parse(&value).unwrap();
+        assert!(!config.group_board_v2);
+        assert!(!config.services.contains_key("group_board"));
+        value["settings"] = json!({"features":{"group_topics":{"enable":1}}});
+        let config = ServerConfig::parse(&value).unwrap();
+        assert!(config.group_board_v2);
+        assert_eq!(
+            config.services["group_board"][0].as_str(),
+            "https://groupboard-wpa.api.zalo.me/"
+        );
+
+        for invalid in [
+            json!({"enable":1,"using_new_api":0}),
+            json!({"enable":1,"using_dev_api":1}),
+            json!({"enable":"1"}),
+            json!({"enable":1,"using_new_api":null}),
+        ] {
+            value["settings"]["features"]["group_topics"] = invalid;
+            assert!(!ServerConfig::parse(&value).unwrap().group_board_v2);
+        }
+        value["settings"]["features"]["group_topics"] = json!({"enable":1});
+        value["zpw_service_map_v3"]["group_board"] = json!(["https://untrusted.invalid/"]);
+        let config = ServerConfig::parse(&value).unwrap();
+        assert!(config.services.contains_key("group"));
+        assert!(!config.services.contains_key("group_board"));
+        assert!(!config.group_board_v2);
+
+        value["zpw_service_map_new"] = json!({"group_board":"https://groupboard-wpa.zaloapp.com/"});
+        let config = ServerConfig::parse(&value).unwrap();
+        assert!(config.group_board_v2);
+        assert_eq!(
+            config.services["group_board"][0].as_str(),
+            "https://groupboard-wpa.zaloapp.com/"
+        );
+    }
+    #[test]
+    fn mention_all_limit_requires_a_positive_consistent_feature_value() {
+        let limit = |value: Value| ServerConfig::parse(&value).unwrap().mention_all_limit;
+        assert_eq!(limit(json!({})), None);
+        for spelling in ["settings", "setttings"] {
+            for (raw, expected) in [
+                (json!(0), None),
+                (json!(false), None),
+                (json!(null), None),
+                (json!("42"), None),
+                (json!(42), Some(42)),
+                (json!(120), Some(100)),
+            ] {
+                assert_eq!(
+                    limit(json!({(spelling): {"features": {"max_member_mention_all": raw}}})),
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            limit(json!({
+                "settings":{"features":{"max_member_mention_all":42}},
+                "setttings":{"features":{"max_member_mention_all":43}}
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn delete_for_me_sync_needs_affirmative_consistent_server_config() {
+        let mut value = json!({});
+        assert!(!ServerConfig::parse(&value).unwrap().delete_for_me_sync);
+        for key in ["settings", "setttings"] {
+            value[key] = json!({"features":{
+                "sync_del_msg_or_conv":{"enable_sync_del_msg":1}
+            }});
+            assert!(ServerConfig::parse(&value).unwrap().delete_for_me_sync);
+            value.as_object_mut().unwrap().remove(key);
+        }
+        for invalid in [json!(false), json!("1"), Value::Null] {
+            value["settings"] = json!({"features":{
+                "sync_del_msg_or_conv":{"enable_sync_del_msg":invalid}
+            }});
+            assert!(!ServerConfig::parse(&value).unwrap().delete_for_me_sync);
+        }
+        value["setttings"] = json!({"features":{
+            "sync_del_msg_or_conv":{"enable_sync_del_msg":1}
+        }});
+        assert!(!ServerConfig::parse(&value).unwrap().delete_for_me_sync);
+    }
+
+    #[test]
+    fn remote_group_history_requires_both_cloud_flags_and_trusted_advertisement() {
+        let mut value = json!({"zpw_service_map_v3":{
+            "group_cloud_message":["https://wpa.chat.zalo.me/"]
+        }});
+        let has_cloud = |value: &Value| {
+            ServerConfig::parse(value)
+                .unwrap()
+                .services
+                .contains_key("group_cloud_message")
+        };
+        assert!(!has_cloud(&value));
+        for cloud in [
+            json!({"enable":true}),
+            json!({"enable":true,"scroll_top_enable":false}),
+            json!({"enable":"1","scroll_top_enable":true}),
+        ] {
+            value["settings"] = json!({"features":{"cloud_setting":cloud}});
+            assert!(!has_cloud(&value));
+        }
+        value["settings"]["features"]["cloud_setting"] =
+            json!({"enable":1,"scroll_top_enable":true});
+        assert!(has_cloud(&value));
+        value["setttings"] =
+            json!({"features":{"cloud_setting":{"enable":0,"scroll_top_enable":true}}});
+        assert!(!has_cloud(&value));
+        value.as_object_mut().unwrap().remove("setttings");
+        value["zpw_service_map_v3"]["group_cloud_message"] = json!(["https://untrusted.invalid/"]);
+        assert!(!has_cloud(&value));
     }
     #[test]
     fn optional_directory_routes_fail_locally_without_rejecting_verified_bootstrap_identity() {

@@ -12,14 +12,41 @@ pub(super) fn respond(
 ) -> bool {
     let (route, query) = path.split_once('?').unwrap();
     let data = match route {
+        "/api/message/sticker/category/list/v2" => {
+            assert_eq!(mode, 4);
+            let params = read_catalog_params(headers, query, cipher);
+            assert!(params.is_empty());
+            json!({
+                "data":[
+                    {"id":10047,"name":"Gói thử","iconUrl":"https://outside.invalid/cover"},
+                    {"id":10048,"name":"Gói bị loại"},
+                    {"id":10049,"name":"Gói riêng tư","isHidden":6},
+                    {"id":10050,"name":"Gói ẩn","is_hidden":5},
+                    {"id":0,"name":"Mặc định"}
+                ],
+                "exCateIds":[10048],
+                "dataUrl":"https://wpa.zaloapp.com/untrusted-catalog", "cs":"only-inline-data"
+            })
+        }
+        "/api/message/sticker/category/sticker_detail" => {
+            assert_eq!(mode, 4);
+            let params = read_catalog_params(headers, query, cipher);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&params).unwrap(),
+                json!({"cid":"10047"})
+            );
+            json!([
+                {"id":20695,"cateId":10047,"type":3,"stickerUrl":"https://outside.invalid/image"},
+                {"id":20696,"cateId":10047,"type":3,"status":1},
+                {"id":20697,"cateId":10048,"type":3},
+                {"id":20698,"cateId":10047,"type":3,"effectId":7},
+                {"id":20695,"cateId":10047,"type":3}
+            ])
+        }
         "/api/message/sticker/search" | "/api/message/sticker/sticker_detail" => {
             assert_eq!(mode, 3);
-            assert!(headers.starts_with("GET "));
-            let (_, encrypted) = url::form_urlencoded::parse(query.as_bytes())
-                .find(|(name, _)| name == "params")
-                .unwrap();
             let params: Value =
-                serde_json::from_slice(&cipher.decrypt(&encrypted).unwrap()).unwrap();
+                serde_json::from_slice(&read_catalog_params(headers, query, cipher)).unwrap();
             if route.ends_with("/search") {
                 let keyword = params["keyword"].as_str().unwrap();
                 assert_eq!(
@@ -74,7 +101,7 @@ pub(super) fn respond(
                 "stickerId":30,"cateId":0,"type":7,"clientId":id,
                 "imei":"native-fixture","zsource":-1,"ttl":0
             });
-            if mode == 3 {
+            if matches!(mode, 3 | 4) {
                 expected["stickerId"] = json!(20695);
                 expected["cateId"] = json!(10047);
                 expected["type"] = json!(3);
@@ -106,6 +133,18 @@ pub(super) fn respond(
     stream.write_all(&response).unwrap();
     stream.flush().unwrap();
     true
+}
+
+fn read_catalog_params(headers: &str, query: &str, cipher: &SessionCipher) -> Vec<u8> {
+    assert!(headers.starts_with("GET "));
+    let params: Vec<_> = url::form_urlencoded::parse(query.as_bytes()).collect();
+    assert_eq!(params.len(), 3);
+    assert_eq!(params[0].0, "zpw_ver");
+    assert_eq!(params[0].1, "681");
+    assert_eq!(params[1].0, "zpw_type");
+    assert_eq!(params[1].1, "24");
+    assert_eq!(params[2].0, "params");
+    cipher.decrypt(&params[2].1).unwrap()
 }
 
 #[tokio::test]
@@ -388,6 +427,220 @@ async fn catalog_sticker_lookup_and_submit_require_exact_current_search_scope() 
         store.page("11", "d:22", None, 2).unwrap()[0].sticker,
         Some(sticker)
     );
+}
+
+#[tokio::test]
+async fn catalog_pack_browsing_only_authorizes_current_scoped_ordinary_stickers() {
+    let fixture = Fixture::new(Reply::StickerSend(4));
+    let config = ServerConfig::parse(&json!({
+        "zpw_service_map_v3":{
+            "sticker":["https://wpa.zaloapp.com"],
+            "chat":["https://wpa.zaloapp.com"],
+            "group":["https://wpa.zaloapp.com"],
+            "conversation":["https://wpa.zaloapp.com"],
+        },
+        "zpw_ws":["wss://wpa.zaloapp.com"],
+    }))
+    .unwrap();
+    let session = Arc::new(synthetic_session(fixture.profile.clone(), config));
+    let (commands, rx) = mpsc::channel(16);
+    let (tx, mut events) = mpsc::channel(64);
+    let (stop, cancel) = watch::channel(false);
+    let actor = tokio::spawn(run_with_transports(
+        fixture.profile.clone(),
+        session,
+        rx,
+        tx,
+        Arc::new(|| {}),
+        cancel,
+        fixture.transports(),
+    ));
+    let sticker = StickerDescriptor {
+        sticker_id: 20695,
+        category_id: 10047,
+        sticker_type: 3,
+    };
+    let list = |request_id, thread: &str| LiveCommand::ListStickerPacks {
+        request_id,
+        thread: thread.into(),
+    };
+    let browse =
+        |request_id, thread: &str, pack_list_id, category_id| LiveCommand::BrowseStickerPack {
+            request_id,
+            thread: thread.into(),
+            pack_list_id,
+            category_id,
+        };
+    let send = |request_id, search_id, thread: &str, sticker| LiveCommand::SendCatalogSticker {
+        request_id,
+        search_id,
+        thread: thread.into(),
+        sticker,
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (mut online, mut ready, mut advertised) = (false, 0, false);
+        while !online || ready < 2 || !advertised {
+            match events.recv().await.unwrap() {
+                LiveEvent::Connection {
+                    state: LiveConnection::Online,
+                    ..
+                } => online = true,
+                LiveEvent::PrivacyChanged {
+                    status: LivePrivacyStatus::Ready,
+                    ..
+                } => ready += 1,
+                LiveEvent::StickerSearchCapability { available, .. } => advertised = available,
+                LiveEvent::Fault { error, .. } => panic!("synthetic pack setup fault: {error}"),
+                _ => {}
+            }
+        }
+
+        commands.send(list(1, "d:22")).await.unwrap();
+        assert_pack_list(&mut events, 1, "d:22").await;
+        for (id, thread, token, category) in [
+            (2, "g:22", 1, 10047),
+            (3, "d:22", 99, 10047),
+            (4, "d:22", 1, 10048),
+        ] {
+            commands
+                .send(browse(id, thread, token, category))
+                .await
+                .unwrap();
+            assert_eq!(pack_result(&mut events, id, thread, category).await, None);
+        }
+
+        commands.send(browse(5, "d:22", 1, 10047)).await.unwrap();
+        assert_eq!(
+            pack_result(&mut events, 5, "d:22", 10047).await,
+            Some(vec![sticker])
+        );
+        commands.send(send(6, 5, "g:22", sticker)).await.unwrap();
+        assert_eq!(
+            outcome(&mut events, 6).await,
+            (StickerOutcome::Unavailable, None)
+        );
+        let hidden = StickerDescriptor {
+            sticker_id: 20696,
+            ..sticker
+        };
+        commands.send(send(7, 5, "d:22", hidden)).await.unwrap();
+        assert_eq!(
+            outcome(&mut events, 7).await,
+            (StickerOutcome::Unavailable, None)
+        );
+
+        commands.send(list(8, "d:22")).await.unwrap();
+        assert_pack_list(&mut events, 8, "d:22").await;
+        commands.send(send(9, 5, "d:22", sticker)).await.unwrap();
+        assert_eq!(
+            outcome(&mut events, 9).await,
+            (StickerOutcome::Unavailable, None)
+        );
+
+        commands.send(browse(10, "d:22", 8, 10047)).await.unwrap();
+        assert_eq!(
+            pack_result(&mut events, 10, "d:22", 10047).await,
+            Some(vec![sticker])
+        );
+        commands.send(send(11, 10, "d:22", sticker)).await.unwrap();
+        assert_eq!(
+            outcome(&mut events, 11).await,
+            (StickerOutcome::Accepted, Some(sticker))
+        );
+
+        commands.send(list(12, "g:22")).await.unwrap();
+        assert_pack_list(&mut events, 12, "g:22").await;
+        commands.send(browse(13, "g:22", 12, 10047)).await.unwrap();
+        assert_eq!(
+            pack_result(&mut events, 13, "g:22", 10047).await,
+            Some(vec![sticker])
+        );
+        commands.send(send(14, 13, "g:22", sticker)).await.unwrap();
+        assert_eq!(
+            outcome(&mut events, 14).await,
+            (StickerOutcome::Accepted, Some(sticker))
+        );
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    actor.await.unwrap();
+    assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), 2);
+    let requests = fixture.state.requests.lock().unwrap();
+    for route in [
+        "/api/message/sticker/category/list/v2?",
+        "/api/message/sticker/category/sticker_detail?",
+    ] {
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(path, _)| path.starts_with(route))
+                .count(),
+            3
+        );
+    }
+    assert!(!requests
+        .iter()
+        .any(|(path, _)| path.contains("untrusted-catalog")));
+    let store =
+        MessageStore::open(&fixture.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+    for thread in ["d:22", "g:22"] {
+        assert_eq!(
+            store.page("11", thread, None, 2).unwrap()[0].sticker,
+            Some(sticker)
+        );
+    }
+}
+
+async fn assert_pack_list(events: &mut mpsc::Receiver<LiveEvent>, id: u64, thread: &str) {
+    loop {
+        match events.recv().await.unwrap() {
+            LiveEvent::StickerPacksFound {
+                account_id,
+                request_id,
+                thread: actual,
+                packs,
+            } => {
+                assert_eq!(account_id, "11");
+                assert_eq!(request_id, id);
+                assert_eq!(actual, thread);
+                let packs = packs.expect("inline pack catalog");
+                assert_eq!(packs.len(), 1);
+                assert_eq!(packs[0].category_id, 10047);
+                assert_eq!(packs[0].name, "Gói thử");
+                return;
+            }
+            LiveEvent::Fault { error, .. } => panic!("synthetic pack list fault: {error}"),
+            _ => {}
+        }
+    }
+}
+
+async fn pack_result(
+    events: &mut mpsc::Receiver<LiveEvent>,
+    id: u64,
+    thread: &str,
+    category: u64,
+) -> Option<Vec<StickerDescriptor>> {
+    loop {
+        match events.recv().await.unwrap() {
+            LiveEvent::StickerPackFound {
+                account_id,
+                request_id,
+                thread: actual,
+                category_id,
+                stickers,
+            } => {
+                assert_eq!(account_id, "11");
+                assert_eq!(request_id, id);
+                assert_eq!(actual, thread);
+                assert_eq!(category_id, category);
+                return stickers;
+            }
+            LiveEvent::Fault { error, .. } => panic!("synthetic pack detail fault: {error}"),
+            _ => {}
+        }
+    }
 }
 
 async fn lookup_result(

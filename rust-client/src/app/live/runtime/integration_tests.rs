@@ -25,6 +25,7 @@ use std::{
 enum Reply {
     FileUpload(u8),
     PhotoUpload(u8),
+    VoiceSend(voice_send_tests::ReplyKind),
     Normal,
     #[cfg(feature = "signal-crypto")]
     EncryptedSend,
@@ -36,6 +37,8 @@ enum Reply {
     ConflictingReceive,
     Stickers,
     StickerSend(u8),
+    Mentions,
+    MentionAll,
     RuntimeStall,
     ControlHeartbeats,
     OfflinePages,
@@ -49,9 +52,17 @@ enum Reply {
     ReadStates,
     Forward(u8),
     Recall(u8),
+    GroupRecall(group_recall_tests::Mode),
+    MediaRecall(media_recall_tests::Operation),
+    DeleteForMe(bool),
+    SyncDeleteForMe,
+    GroupHistory,
+    GroupPoll,
+    GroupPollVote(group_poll_tests::VoteReply),
     Reactions,
     ReactionReplay,
     GroupActions(bool),
+    GroupPins(bool),
     UpgradeForbidden,
     DesktopHeaders,
     UpgradeStall,
@@ -77,6 +88,8 @@ struct State {
     observed_commands: Mutex<Vec<u16>>,
     pings: AtomicUsize,
     http_sends: AtomicUsize,
+    forward_ttl_reads: AtomicUsize,
+    forward_hold: AtomicBool,
     echoed: AtomicBool,
     privacy_requests: AtomicUsize,
     privacy_responses: AtomicUsize,
@@ -88,6 +101,7 @@ struct State {
     recall_source_at: OnceLock<i64>,
     reaction_first_client: OnceLock<u64>,
     release_reaction_removal: AtomicBool,
+    pin_fixture_board: AtomicUsize,
 }
 struct Fixture {
     addr: SocketAddr,
@@ -167,6 +181,9 @@ impl Fixture {
         Arc::new(synthetic_session(self.profile.clone(), config))
     }
     fn client(&self) -> reqwest::Client {
+        self.client_builder().build().unwrap()
+    }
+    fn client_builder(&self) -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -176,8 +193,6 @@ impl Fixture {
             .resolve("wpa.zaloapp.com", self.addr)
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(3))
-            .build()
-            .unwrap()
     }
     fn transports(&self) -> Transports {
         let mut roots = rustls::RootCertStore::empty();
@@ -193,6 +208,11 @@ impl Fixture {
         .with_no_client_auth();
         Transports {
             http: self.client(),
+            poll_vote_http: self
+                .client_builder()
+                .retry(reqwest::retry::never())
+                .build()
+                .unwrap(),
             local: Some((self.addr, Arc::new(tls))),
         }
     }
@@ -660,6 +680,10 @@ fn serve(
             file_fixture::socket(ws, state, mode, true);
             return;
         }
+        if matches!(reply, Reply::VoiceSend(_)) {
+            file_fixture::socket(ws, state, 0, false);
+            return;
+        }
         if matches!(reply, Reply::AuthExpired | Reply::AuthMalformed) {
             let payload = if matches!(reply, Reply::AuthExpired) {
                 json!({"error_code":102})
@@ -736,14 +760,26 @@ fn serve(
                 .unwrap();
             }
         }
-        if matches!(reply, Reply::Forward(_)) {
+        if let Reply::Forward(mode) = reply {
+            let group = mode >= 6;
             let payload = json!({"error_code":0,"data":{"msgs":[
                 {"uidFrom":"33","idTo":"11","msgId":"910","cliMsgId":"990","ts":1760000000001_i64,
                  "msgType":"webchat","content":"Tin tổng hợp được chuyển tiếp"}
             ]}});
+            let payload = if group {
+                let mut row = payload["data"]["msgs"][0].clone();
+                row["idTo"] = json!("22");
+                json!({"error_code":0,"data":{"groupMsgs":[row]}})
+            } else {
+                payload
+            };
             ws.send(tungstenite::Message::Binary(
-                wire::encode_frame(501, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
-                    .unwrap(),
+                wire::encode_frame(
+                    if group { 521 } else { 501 },
+                    0,
+                    &json!({"error_code":0,"encrypt":0,"data":payload}),
+                )
+                .unwrap(),
             ))
             .unwrap();
         }
@@ -776,6 +812,43 @@ fn serve(
             ws.send(tungstenite::Message::Binary(
                 wire::encode_frame(501, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
                     .unwrap(),
+            ))
+            .unwrap();
+        }
+        if let Some(mode) = match reply {
+            Reply::GroupRecall(mode) => Some(mode),
+            Reply::DeleteForMe(_) => Some(group_recall_tests::Mode::Peer),
+            _ => None,
+        } {
+            let payload = group_recall_tests::messages(&state, mode);
+            ws.send(tungstenite::Message::Binary(
+                wire::encode_frame(521, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        }
+        if matches!(reply, Reply::SyncDeleteForMe) {
+            for payload in delete_for_me_tests::synthetic_sync_queues() {
+                ws.send(tungstenite::Message::Binary(
+                    wire::encode_frame(521, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
+                        .unwrap(),
+                ))
+                .unwrap();
+            }
+        }
+        if matches!(reply, Reply::GroupHistory) {
+            ws.send(tungstenite::Message::Binary(
+                wire::encode_frame(521, 0, &json!({"error_code":0,"encrypt":0,
+                    "data":{"error_code":0,"data":{"groupMsgs":[
+                        {"uidFrom":"33","idTo":"22","msgId":"910","cliMsgId":"999",
+                         "ts":1760000000999_i64,"msgType":"webchat","content":"Tin mốc tổng hợp"}
+                    ]}}
+                })).unwrap(),
+            )).unwrap();
+        }
+        if matches!(reply, Reply::GroupPoll | Reply::GroupPollVote(_)) {
+            ws.send(tungstenite::Message::Binary(
+                wire::encode_frame(521, 0, &group_poll_tests::poll_notice()).unwrap(),
             ))
             .unwrap();
         }
@@ -1105,6 +1178,11 @@ fn serve(
             return;
         }
     }
+    if let Reply::VoiceSend(mode) = reply {
+        if voice_send_tests::respond(&mut stream, &state, mode, &path, &headers, &body) {
+            return;
+        }
+    }
     state
         .requests
         .lock()
@@ -1382,6 +1460,53 @@ fn serve(
             return;
         }
     }
+    if matches!(reply, Reply::Mentions | Reply::MentionAll)
+        && mention_tests::respond(
+            &mut stream,
+            &state,
+            &cipher,
+            &path,
+            &headers,
+            &body,
+            matches!(reply, Reply::MentionAll),
+        )
+    {
+        return;
+    }
+    if let Reply::GroupPins(lost) = reply {
+        if group_pin_tests::respond(&mut stream, &state, &cipher, lost, &path, &headers, &body) {
+            return;
+        }
+    }
+    match reply {
+        Reply::GroupPoll
+            if group_poll_tests::respond(
+                &mut stream,
+                &state,
+                &cipher,
+                &path,
+                &headers,
+                &body,
+                None,
+            ) =>
+        {
+            return
+        }
+        Reply::GroupPollVote(mode)
+            if group_poll_tests::respond(
+                &mut stream,
+                &state,
+                &cipher,
+                &path,
+                &headers,
+                &body,
+                Some(mode),
+            ) =>
+        {
+            return
+        }
+        _ => {}
+    }
     if matches!(reply, Reply::Reactions) {
         assert!(headers.starts_with("POST "));
         assert_eq!(path, "/api/message/reaction?zpw_ver=681&zpw_type=24");
@@ -1459,7 +1584,56 @@ fn serve(
         stream.flush().unwrap();
         return;
     }
+    if let Reply::GroupRecall(mode) = reply {
+        group_recall_tests::respond(&mut stream, &state, &cipher, mode, &path, &headers, &body);
+        return;
+    }
+    if let Reply::MediaRecall(operation) = reply {
+        operation.respond(&mut stream, &state, &cipher, &path, &headers, &body);
+        return;
+    }
+    if let Reply::DeleteForMe(drop_receipt) = reply {
+        if route == "/api/group/deletemsg" {
+            delete_for_me_tests::respond(
+                &mut stream,
+                &state,
+                &cipher,
+                drop_receipt,
+                &path,
+                &headers,
+                &body,
+            );
+        } else {
+            group_recall_tests::respond(
+                &mut stream,
+                &state,
+                &cipher,
+                group_recall_tests::Mode::Peer,
+                &path,
+                &headers,
+                &body,
+            );
+        }
+        return;
+    }
+    if matches!(reply, Reply::GroupHistory) {
+        group_history_tests::respond(&mut stream, &state, &cipher, &path, &headers, &body);
+        return;
+    }
     if let Reply::Forward(mode) = reply {
+        if mode >= 5
+            && forward_batch_tests::respond_group(
+                &mut stream,
+                &state,
+                &cipher,
+                &path,
+                &headers,
+                &body,
+                mode,
+            )
+        {
+            return;
+        }
         let get = route == "/api/conv/autodelete/getConvers";
         let form = if get {
             path.split_once('?').unwrap().1.as_bytes()
@@ -1475,8 +1649,15 @@ fn serve(
         let data = if get {
             assert!(headers.starts_with("GET "));
             assert_eq!(parameters, json!({}));
+            state.forward_ttl_reads.fetch_add(1, Ordering::SeqCst);
             if mode == 1 {
                 json!({"convers":[{"destId":"22","isGroup":false,"ttl":60000}]})
+            } else if mode == 3 {
+                json!({"convers":[{"destId":"66","isGroup":false,"ttl":60000}]})
+            } else if mode == 5 {
+                json!({"convers":[{"destId":"44","isGroup":true,"ttl":60000}]})
+            } else if mode == 8 {
+                json!({"convers":[{"destId":"22","isGroup":true,"ttl":60000}]})
             } else {
                 json!({"convers":[]})
             }
@@ -1484,7 +1665,14 @@ fn serve(
             assert_eq!(route, "/api/message/mforward");
             assert!(headers.starts_with("POST "));
             assert_eq!(parameters["imei"], "native-fixture");
-            assert_eq!(parameters["toIds"][0]["toUid"], "22");
+            assert_eq!(parameters["toIds"].as_array().unwrap().len(), 1);
+            assert_eq!(parameters["totalIds"], 1);
+            let target = parameters["toIds"][0]["toUid"].as_str().unwrap();
+            assert!(match mode {
+                3 => matches!(target, "22" | "44" | "55"),
+                4 => matches!(target, "22" | "44"),
+                _ => target == "22",
+            });
             assert_eq!(parameters["toIds"][0]["ttl"], 0);
             assert_eq!(parameters["msgType"], "1");
             let id = parameters["toIds"][0]["clientId"].as_str().unwrap();
@@ -1494,15 +1682,26 @@ fn serve(
             assert_eq!(info["message"], "Tin tổng hợp được chuyển tiếp");
             let reference: Value =
                 serde_json::from_str(info["reference"].as_str().unwrap()).unwrap();
-            assert!(matches!(
-                crate::protocol::forward::ForwardMarker::parse(&reference),
-                Some(crate::protocol::forward::ForwardMarker::Parsed(_))
-            ));
-            state.http_sends.fetch_add(1, Ordering::SeqCst);
-            if mode == 2 {
+            forward_batch_tests::assert_origin(&reference, mode);
+            let attempt = state.http_sends.fetch_add(1, Ordering::SeqCst);
+            if mode == 4 && target == "44" {
+                let started = std::time::Instant::now();
+                while state.forward_hold.load(Ordering::SeqCst)
+                    && started.elapsed() < Duration::from_secs(12)
+                {
+                    std::thread::park_timeout(Duration::from_millis(2));
+                }
+                return;
+            }
+            if mode == 2 || target == "55" {
                 return; // HTTP failed after receiving the exact request.
             }
-            json!({"success":[{"clientId":id,"msgId":"991","ts":1760000000099_i64}],"failed":[]})
+            if mode == 3 && target == "44" && attempt == 1 {
+                json!({"success":[],"failed":[{"clientId":id,"toUid":target,"error":{"code":211}}]})
+            } else {
+                let server_id = if target == "44" { "992" } else { "991" };
+                json!({"success":[{"clientId":id,"toUid":target,"msgId":server_id,"ts":1760000000099_i64}],"failed":[]})
+            }
         };
         let inner = json!({"error_code":0,"data":data});
         let response=serde_json::to_vec(&json!({"error_code":0,"data":cipher.encrypt(&serde_json::to_vec(&inner).unwrap()).unwrap()})).unwrap();
@@ -2298,7 +2497,7 @@ async fn info_preview_and_socket_orders_keep_identical_full_metadata_without_ack
             account: "11".into(),
             db: db.handle().unwrap(),
             updates,
-            recalls: mpsc::channel(1).0,
+            message_changes: mpsc::channel(1).0,
         };
         let fetcher = DirectoryFetcher::with_client(f.client());
         let session = f.directory_session(false);
@@ -2404,7 +2603,7 @@ async fn media_preview_and_socket_orders_preserve_complete_metadata_across_chunk
             account: "11".into(),
             db: db.handle().unwrap(),
             updates,
-            recalls: mpsc::channel(1).0,
+            message_changes: mpsc::channel(1).0,
         };
         let fetcher = DirectoryFetcher::with_client(f.client());
         let session = f.directory_session(false);
@@ -2608,7 +2807,7 @@ async fn http_media_refresh_enriches_durable_legacy_placeholders_without_rewindi
         account: "11".into(),
         db: db.handle().unwrap(),
         updates,
-        recalls: mpsc::channel(1).0,
+        message_changes: mpsc::channel(1).0,
     };
     let (_stop, cancel) = watch::channel(false);
     let report = DirectoryFetcher::with_client(f.client())
@@ -3935,6 +4134,7 @@ async fn terminal_transport_failures_keep_one_local_actor_alive_until_explicit_s
     ] {
         let f = Fixture::new(reply.unwrap_or(Reply::Normal));
         let cached = crate::domain::Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -4439,7 +4639,7 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
         account: "11".into(),
         db: db.handle().unwrap(),
         updates: directory.updates_tx.clone(),
-        recalls: directory.recalls_tx.clone(),
+        message_changes: directory.message_changes_tx.clone(),
     };
     sink.apply(DirectoryBatch {
         message_quotes: Vec::new(),
@@ -4462,6 +4662,7 @@ async fn delayed_directory_notification_reads_after_received_commit_instead_of_r
     .unwrap();
     directory.changed();
     let message = crate::domain::Message {
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         source_client_id: None,
@@ -5258,6 +5459,7 @@ async fn hidden_policy_real_tls_search_pin_cancel_scope_and_remote_revoke() {
     db.call(|s| {
         for (thread, id) in [("d:22", "1"), ("g:22", "2"), ("d:44", "3")] {
             s.insert_batch(&[crate::domain::Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 source_client_id: None,
@@ -5798,6 +6000,7 @@ async fn ordinary_reply_actual_tls_uses_canonical_scoped_target_and_retains_quot
         .into_iter()
         .map(
             |(thread, id, sender, client, text)| crate::domain::Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 account_id: "11".into(),
@@ -6016,12 +6219,21 @@ async fn opening_a_conversation_refreshes_names_and_avatars_at_most_every_two_mi
     assert_eq!(friend_lists(), 2);
 }
 
+mod delete_for_me_tests;
 mod file_fixture;
 mod file_upload_tests;
+mod forward_batch_tests;
 
+mod group_history_tests;
+mod group_pin_tests;
+mod group_poll_tests;
+mod group_recall_tests;
+mod media_recall_tests;
+mod mention_tests;
 mod photo_upload_tests;
 mod reaction_replay_tests;
 mod sticker_send_tests;
+mod voice_send_tests;
 
 #[tokio::test]
 async fn actual_forward_dispatch_uses_ttl_proof_and_retains_unknown_across_restart() {

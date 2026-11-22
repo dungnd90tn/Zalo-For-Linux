@@ -1,4 +1,5 @@
-//! Opaque previewed JPEG capability. Only the worker can construct/read its immutable spool.
+//! Opaque previewed photo capability with an immutable worker-owned upload spool.
+use crate::domain::PhotoResolution;
 use std::{
     fs::File,
     sync::{
@@ -59,6 +60,7 @@ impl std::fmt::Debug for PhotoThumbnail {
 }
 pub(super) struct PhotoData {
     pub file: File,
+    pub resolution: PhotoResolution,
     pub checksum: String,
     pub size: u64,
     pub width: u32,
@@ -90,6 +92,9 @@ impl std::fmt::Debug for PreparedPhoto {
     }
 }
 impl PreparedPhoto {
+    pub fn resolution(&self) -> PhotoResolution {
+        self.0.resolution
+    }
     pub fn width(&self) -> u32 {
         self.0.width
     }
@@ -112,6 +117,7 @@ impl PreparedPhoto {
             && self.0.source_width <= limits.input_width
             && self.0.source_height <= limits.input_height
             && self.0.source_size <= limits.input_size
+            && (self.resolution() == PhotoResolution::Hd || self.0.source_size <= limits.size)
     }
     pub(super) fn permits(&self, account: &str, thread: &str, lease: u64) -> bool {
         self.0.account == account && self.0.thread == thread && self.0.lease == lease
@@ -120,7 +126,10 @@ impl PreparedPhoto {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhotoPreparationFailure {
     Cancelled,
+    Unavailable,
     InvalidFormat,
+    OriginalFormat,
+    OriginalOrientation,
     Animated,
     Resource,
     Changed,
@@ -130,7 +139,14 @@ impl std::fmt::Display for PhotoPreparationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Cancelled => "Đã hủy chuẩn bị ảnh.",
+            Self::Unavailable => "Phiên này chưa hỗ trợ gửi ảnh gốc.",
             Self::InvalidFormat => "Chỉ hỗ trợ ảnh JPEG, PNG hoặc WebP tĩnh hợp lệ.",
+            Self::OriginalFormat => {
+                "Ảnh gốc cần là JPEG tĩnh hợp lệ. Bạn có thể gửi ảnh dưới dạng tệp."
+            }
+            Self::OriginalOrientation => {
+                "Ảnh JPEG có thông tin xoay hoặc lật. Hãy chọn ảnh thường hoặc gửi dưới dạng tệp."
+            }
             Self::Animated => "Ảnh động chưa được hỗ trợ; chọn gửi dưới dạng tệp.",
             Self::Resource => {
                 "Ảnh vượt giới hạn xử lý hoặc bộ nhớ bản nháp; hãy bỏ ảnh không dùng."

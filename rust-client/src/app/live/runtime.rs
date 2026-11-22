@@ -17,6 +17,7 @@ use tokio_tungstenite::{
 use url::Url;
 
 mod attention;
+mod delete_for_me;
 mod desktop;
 #[cfg(feature = "signal-crypto")]
 mod e2ee_compose;
@@ -37,13 +38,18 @@ mod e2ee_threads;
 mod echo_recovery;
 mod forward;
 mod group_actions;
+mod group_pins;
+mod group_poll;
 mod group_roster;
 #[cfg(test)]
 mod integration_tests;
+mod mentions;
+mod original_photo;
 pub(crate) mod photo;
 mod privacy;
 mod reactions;
 mod recall;
+mod remote_history;
 mod sticker_catalog;
 mod sticker_send;
 mod upload;
@@ -57,6 +63,7 @@ fn outgoing_mismatch_diagnostics_report_only_closed_field_flags() {
     store.record_outgoing_ack("11", id, "900").unwrap();
     store.accept_outgoing("11", id, "900", Some(1000)).unwrap();
     let message = crate::domain::Message {
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         source_client_id: None,
@@ -383,6 +390,7 @@ fn diagnostic_message_kind(value: wire::FrameMessageKind) -> crate::diagnostics:
         wire::FrameMessageKind::Webchat => crate::diagnostics::MessageKind::Webchat,
         wire::FrameMessageKind::WebchatInfo => crate::diagnostics::MessageKind::WebchatInfo,
         wire::FrameMessageKind::Photo => crate::diagnostics::MessageKind::Photo,
+        wire::FrameMessageKind::Voice => crate::diagnostics::MessageKind::Voice,
         wire::FrameMessageKind::WebContent => crate::diagnostics::MessageKind::WebContent,
         wire::FrameMessageKind::Recommended => crate::diagnostics::MessageKind::Recommended,
         wire::FrameMessageKind::Poll => crate::diagnostics::MessageKind::Poll,
@@ -575,8 +583,10 @@ impl Database {
                         s.reconcile_photos(&account)?;
                         s.recover_attachments(&account)?;
                         s.reconcile_attachments(&account)?;
+                        s.recover_voices(&account)?;
                         s.recover_forwards(&account)?;
                         s.recover_recalls(&account)?;
+                        s.recover_delete_for_me(&account)?;
                         s.recover_group_actions(&account)?;
                         Ok(s)
                     });
@@ -660,25 +670,16 @@ struct RuntimeDirectorySink {
     account: String,
     db: DatabaseHandle,
     updates: watch::Sender<u64>,
-    recalls: mpsc::Sender<crate::store::recall::RecallChange>,
+    message_changes: mpsc::Sender<DirectoryMessageChange>,
+}
+enum DirectoryMessageChange {
+    Recall(Box<crate::store::recall::RecallChange>),
+    DeleteForMe(crate::store::delete_for_me::DeleteForMeChange),
 }
 impl DirectorySink for RuntimeDirectorySink {
     async fn apply(&mut self, batch: DirectoryBatch) -> std::result::Result<(), DirectoryFailure> {
-        if batch.account_id != self.account {
-            return Err(directory_failure(DirectoryCategory::Storage));
-        }
-        self.db
-            .call_with(StorageOperation::DirectoryWrite, move |store| {
-                store.apply_directory_batch(&batch)?;
-                Ok(())
-            })
+        self.apply_preview(batch, Vec::new(), Vec::new(), Vec::new())
             .await
-            .map_err(|_| directory_failure(DirectoryCategory::Storage))?;
-        // Coalesce durable changes while the UI is slow. The directory task
-        // never reserves critical WebSocket event capacity.
-        self.updates
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
-        Ok(())
     }
 
     async fn apply_preview(
@@ -688,27 +689,33 @@ impl DirectorySink for RuntimeDirectorySink {
         forwards: Vec<crate::store::ForwardBinding>,
         recalls: Vec<crate::protocol::recall::RecallNotice>,
     ) -> std::result::Result<(), DirectoryFailure> {
-        if receipts.is_empty() && forwards.is_empty() && recalls.is_empty() {
-            return self.apply(batch).await;
-        }
         if batch.account_id != self.account {
             return Err(directory_failure(DirectoryCategory::Storage));
         }
-        let changes = self
+        let (_, recalls, deletions) = self
             .db
             .call_with(StorageOperation::DirectoryWrite, move |store| {
-                store
-                    .apply_directory_batch_with_forwards_and_recalls(
-                        &batch, &receipts, &forwards, &recalls,
-                    )
-                    .map(|(_, changes)| changes)
+                store.apply_directory_batch_with_forwards_and_recalls(
+                    &batch, &receipts, &forwards, &recalls,
+                )
             })
             .await
             .map_err(|_| directory_failure(DirectoryCategory::Storage))?;
+        // Coalesce durable changes while the UI is slow. The directory task
+        // never reserves critical WebSocket event capacity.
         self.updates
             .send_modify(|revision| *revision = revision.wrapping_add(1));
-        for change in changes {
-            self.recalls
+        for change in recalls
+            .into_iter()
+            .map(Box::new)
+            .map(DirectoryMessageChange::Recall)
+            .chain(
+                deletions
+                    .into_iter()
+                    .map(DirectoryMessageChange::DeleteForMe),
+            )
+        {
+            self.message_changes
                 .send(change)
                 .await
                 .map_err(|_| directory_failure(DirectoryCategory::Cancelled))?;
@@ -760,14 +767,14 @@ struct DirectorySync {
     updates_rx: watch::Receiver<u64>,
     status: Option<(u64, bool, DirectoryReport)>,
     conversations_changed: bool,
-    recalls_tx: mpsc::Sender<crate::store::recall::RecallChange>,
-    recalls_rx: mpsc::Receiver<crate::store::recall::RecallChange>,
-    pending_recall: Option<crate::store::recall::RecallChange>,
+    message_changes_tx: mpsc::Sender<DirectoryMessageChange>,
+    message_changes_rx: mpsc::Receiver<DirectoryMessageChange>,
+    pending_message_change: Option<DirectoryMessageChange>,
 }
 impl DirectorySync {
     fn new() -> Self {
         let (updates_tx, updates_rx) = watch::channel(0);
-        let (recalls_tx, recalls_rx) = mpsc::channel(32);
+        let (message_changes_tx, message_changes_rx) = mpsc::channel(32);
         Self {
             last_started: None,
             running: None,
@@ -776,9 +783,9 @@ impl DirectorySync {
             updates_rx,
             status: None,
             conversations_changed: false,
-            recalls_tx,
-            recalls_rx,
-            pending_recall: None,
+            message_changes_tx,
+            message_changes_rx,
+            pending_message_change: None,
         }
     }
     fn request(
@@ -852,7 +859,7 @@ impl DirectorySync {
             account: session.account_id().into(),
             db,
             updates: self.updates_tx.clone(),
-            recalls: self.recalls_tx.clone(),
+            message_changes: self.message_changes_tx.clone(),
         };
         let task = tokio::spawn(async move { fetcher.synchronize(&session, &mut sink, rx).await });
         self.running = Some(DirectoryRun {
@@ -901,7 +908,7 @@ impl DirectorySync {
         }
     }
     fn notifications_pending(&self) -> bool {
-        self.pending_recall.is_some() || self.status.is_some() || self.conversations_changed
+        self.pending_message_change.is_some() || self.status.is_some() || self.conversations_changed
     }
     async fn publish_notification(
         &mut self,
@@ -909,12 +916,21 @@ impl DirectorySync {
         db: &Database,
         events: &Events,
     ) -> Result<()> {
-        if let Some(change) = self.pending_recall.take() {
+        if let Some(change) = self.pending_message_change.take() {
+            let event = match change {
+                DirectoryMessageChange::Recall(change) => recall::projection(events, *change),
+                DirectoryMessageChange::DeleteForMe(change) => {
+                    // A socket commit can overtake a directory task's snapshot.
+                    // Keep the coalesced sidebar refresh after this projection.
+                    self.conversations_changed = true;
+                    delete_for_me::projection(events, change)
+                }
+            };
             if let Some(event) = events
                 .privacy
                 .read()
                 .map_err(|_| anyhow::anyhow!("Privacy state unavailable"))?
-                .event(recall::projection(events, change))
+                .event(event)
             {
                 permit.send(event);
             }
@@ -1016,6 +1032,7 @@ impl Events {
 }
 struct Transports {
     http: reqwest::Client,
+    poll_vote_http: reqwest::Client,
     #[cfg(test)]
     local: Option<(std::net::SocketAddr, Arc<rustls::ClientConfig>)>,
 }
@@ -1048,8 +1065,17 @@ pub(super) async fn run(
     repaint: Arc<dyn Fn() + Send + Sync>,
     cancel: watch::Receiver<bool>,
 ) {
-    let http = match client(session.client_type()) {
-        Ok(client) => client,
+    let clients = (|| {
+        Ok::<_, anyhow::Error>((
+            client(session.client_type())?,
+            client_builder(session.client_type())?
+                .retry(reqwest::retry::never())
+                .pool_max_idle_per_host(0)
+                .build()?,
+        ))
+    })();
+    let (http, poll_vote_http) = match clients {
+        Ok(clients) => clients,
         Err(_) => {
             let _ = events.try_send(LiveEvent::Fault {
                 account_id: session.account_id().into(),
@@ -1061,6 +1087,7 @@ pub(super) async fn run(
     };
     let transports = Transports {
         http,
+        poll_vote_http,
         #[cfg(test)]
         local: None,
     };
@@ -1115,6 +1142,11 @@ fn now_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 fn client(client_type: crate::protocol::client::ClientType) -> Result<reqwest::Client> {
+    Ok(client_builder(client_type)?.build()?)
+}
+fn client_builder(
+    client_type: crate::protocol::client::ClientType,
+) -> Result<reqwest::ClientBuilder> {
     Ok(reqwest::Client::builder()
         .no_proxy()
         .http1_only()
@@ -1122,8 +1154,7 @@ fn client(client_type: crate::protocol::client::ClientType) -> Result<reqwest::C
         .https_only(true)
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(15))
-        .user_agent(client_type.user_agent().ok_or(WireError::Unsupported)?)
-        .build()?)
+        .user_agent(client_type.user_agent().ok_or(WireError::Unsupported)?))
 }
 fn root_for(session: &VerifiedSession, name: &str) -> Result<Url> {
     session
@@ -1506,6 +1537,7 @@ impl Connection {
                 let wire::IncomingBatch {
                     messages: parsed,
                     recalls,
+                    deletes,
                     reactions: reaction_notices,
                 } = self
                     .decoder
@@ -1644,24 +1676,36 @@ impl Connection {
                     crate::domain::read_state::ReceiveContext::OfflineSync
                 };
                 attention::apply_status(db, events, &frame.payload).await?;
-                let (stored, new_unread, changes, changed_reactions) = db
+                let (stored, new_unread, changes, changed_reactions, deleted_changes) = db
                     .call_with(StorageOperation::ReceiveBatch, move |s| {
-                        let ((mut stored, new_unread, changes), changed_reactions) = s
-                            .receive_batch_with_notices(
-                                &account,
-                                &messages,
-                                cursor.as_ref().map(|(q, id)| (q.as_str(), id.as_str())),
-                                &receipts,
-                                context,
-                                crate::store::ReceiveNotices {
-                                    recalls: &recalls,
-                                    reactions: &reaction_notices,
-                                },
-                            )?;
+                        let (
+                            (mut stored, new_unread, changes),
+                            changed_reactions,
+                            mut deleted_changes,
+                        ) = s.receive_batch_with_notices(
+                            &account,
+                            &messages,
+                            cursor.as_ref().map(|(q, id)| (q.as_str(), id.as_str())),
+                            &receipts,
+                            context,
+                            crate::store::ReceiveNotices {
+                                recalls: &recalls,
+                                reactions: &reaction_notices,
+                                deletes: &deletes,
+                            },
+                        )?;
                         if !silent.is_empty() {
                             // Birthday cards and Official Account broadcasts never move a conversation in the list.
                             let refreshed = s.mark_list_silent(&account, &silent)?;
-                            for (_, conversation) in &mut stored {
+                            let conversations = stored
+                                .iter_mut()
+                                .map(|(_, conversation)| conversation)
+                                .chain(
+                                    deleted_changes
+                                        .iter_mut()
+                                        .map(|change| &mut change.conversation),
+                                );
+                            for conversation in conversations {
                                 if let Some(update) =
                                     refreshed.iter().find(|c| c.id == conversation.id)
                                 {
@@ -1669,7 +1713,13 @@ impl Connection {
                                 }
                             }
                         }
-                        Ok((stored, new_unread, changes, changed_reactions))
+                        Ok((
+                            stored,
+                            new_unread,
+                            changes,
+                            changed_reactions,
+                            deleted_changes,
+                        ))
                     })
                     .await?;
                 for (queue, id) in cursors.into_iter().skip(1) {
@@ -1717,6 +1767,11 @@ impl Connection {
                             message,
                             conversation,
                         })
+                        .await?;
+                }
+                for change in deleted_changes {
+                    events
+                        .emit(delete_for_me::projection(events, change))
                         .await?;
                 }
                 if offline_queue && more {
@@ -2060,12 +2115,19 @@ async fn handle_command(
         LiveCommand::React { .. }
         | LiveCommand::ReactionState { .. }
         | LiveCommand::GroupMembers { .. }
+        | LiveCommand::GroupPins { .. }
+        | LiveCommand::SetGroupPin { .. }
         | LiveCommand::CancelGroupMembers { .. }
         | LiveCommand::GroupInviteTargets { .. }
         | LiveCommand::GroupInvite { .. }
         | LiveCommand::GroupLeave { .. }
         | LiveCommand::Recall { .. }
+        | LiveCommand::DeleteForMe { .. }
+        | LiveCommand::LoadRemoteHistory { .. }
+        | LiveCommand::LoadPollDetail { .. }
+        | LiveCommand::VotePoll { .. }
         | LiveCommand::Forward { .. }
+        | LiveCommand::ForwardBatch { .. }
         | LiveCommand::ForwardTargets { .. } => {
             return Ok(CommandOutcome::Continue);
         }
@@ -2085,6 +2147,12 @@ async fn handle_command(
         LiveCommand::SendFile { .. }
         | LiveCommand::SendPhoto { .. }
         | LiveCommand::PreparePhoto { .. }
+        | LiveCommand::PrepareAlbum { .. }
+        | LiveCommand::SendAlbum { .. }
+        | LiveCommand::CancelAlbumPreparation { .. }
+        | LiveCommand::CancelAlbum { .. }
+        | LiveCommand::SendVoice { .. }
+        | LiveCommand::CancelVoice { .. }
         | LiveCommand::CancelPhotoPreparation { .. }
         | LiveCommand::CancelFile { .. } => return Ok(CommandOutcome::Continue),
         LiveCommand::Shutdown => return Ok(CommandOutcome::Shutdown),
@@ -2377,10 +2445,12 @@ async fn handle_command(
             )
             .await;
         }
-        LiveCommand::SearchStickers {
-            request_id, thread, ..
-        } => {
-            sticker_catalog::publish(events, request_id, thread, None).await?;
+        command @ (LiveCommand::SearchStickers { .. }
+        | LiveCommand::ListStickerPacks { .. }
+        | LiveCommand::BrowseStickerPack { .. }) => {
+            if let Some(request) = sticker_catalog::Request::from_command(&command) {
+                request.unavailable(events).await?;
+            }
         }
         LiveCommand::SendCatalogSticker {
             request_id,
@@ -2395,6 +2465,25 @@ async fn handle_command(
             }
             .finish(events, StickerOutcome::Unavailable)
             .await?;
+        }
+        LiveCommand::SendMentions {
+            generation,
+            thread,
+            text,
+            mentions,
+            privacy_revision,
+            request_id,
+        } => {
+            return mentions::Request {
+                generation,
+                thread,
+                text,
+                mentions,
+                privacy_revision,
+                request_id,
+            }
+            .unavailable(events)
+            .await;
         }
         LiveCommand::Send {
             generation,
@@ -2636,8 +2725,12 @@ async fn run_inner(
     let mut attention = attention::Attention::new(&db, events, desktop).await?;
     let mut forwards = forward::Forwarding::default();
     let mut recalls = recall::Recalls::default();
+    let mut deletes = delete_for_me::Deletes::default();
+    let mut history = remote_history::History::default();
+    let mut polls = group_poll::Polls::default();
     let mut reactions = reactions::Reactions::default();
     let mut groups = group_actions::Groups::default();
+    let mut pins = group_pins::Pins::default();
     let mut uploads = upload::Uploads::default();
     let mut photos = photo::Photos::default();
     let mut sticker_search = sticker_catalog::Search::default();
@@ -2650,6 +2743,12 @@ async fn run_inner(
         })
         .await?;
     events
+        .emit(LiveEvent::VoiceCapability {
+            account_id: events.account.clone(),
+            available: upload::voice_available(&session),
+        })
+        .await?;
+    events
         .emit(LiveEvent::ReactionCapability {
             account_id: events.account.clone(),
             available: root_for(&session, "reaction").is_ok(),
@@ -2659,12 +2758,34 @@ async fn run_inner(
         .emit(LiveEvent::PhotoCapability {
             account_id: events.account.clone(),
             available: session.config().photo_upload_route.is_some() && uploads.lease() != 0,
+            original_available: false,
+            album_max_count: uploads.album_max_count(&session),
         })
         .await?;
     events
         .emit(LiveEvent::StickerSearchCapability {
             account_id: events.account.clone(),
             available: root_for(&session, "sticker").is_ok(),
+        })
+        .await?;
+    events
+        .emit(LiveEvent::RemoteHistoryCapability {
+            account_id: events.account.clone(),
+            available: root_for(&session, crate::protocol::remote_history::SERVICE).is_ok(),
+        })
+        .await?;
+    if root_for(&session, crate::protocol::group_poll::SERVICE).is_ok() {
+        events
+            .emit(LiveEvent::PollDetailCapability {
+                account_id: events.account.clone(),
+                available: true,
+            })
+            .await?;
+    }
+    events
+        .emit(LiveEvent::DeleteForMeCapability {
+            account_id: events.account.clone(),
+            account_sync: session.config().delete_for_me_sync,
         })
         .await?;
     let mut directory = DirectorySync::new();
@@ -2676,6 +2797,15 @@ async fn run_inner(
     let mut next_connect = tokio::time::Instant::now();
     let mut next_ping = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
+        let original_epoch = connection
+            .as_ref()
+            .filter(|socket| socket.decoder.authenticated())
+            .and_then(|socket| socket.authenticated_at);
+        polls.retain(original_epoch, events);
+        uploads
+            .check_original_entitlement(original_epoch, &session, &client, events)
+            .await?;
+        let original_limits = uploads.original_limits(&session);
         let privacy_deadline = privacy.next_check;
         let attention_deadline = attention.next_wake(connection.as_ref(), events, &session);
         let privacy_ready = events
@@ -2691,13 +2821,14 @@ async fn run_inner(
                 changed.map_err(|_|anyhow::anyhow!("Directory stopped"))?;
                 directory.changed();
             },
-            change = directory.recalls_rx.recv(), if directory.pending_recall.is_none() => {
-                directory.pending_recall = change;
+            change = directory.message_changes_rx.recv(), if directory.pending_message_change.is_none() => {
+                directory.pending_message_change = change;
             },
             permit = events.tx.reserve(), if directory.notifications_pending() => {
                 directory.publish_notification(permit.map_err(|_|anyhow::anyhow!("UI stopped"))?,&db,events).await?;
             },
-            _ = upload_tick.tick(), if uploads.active() || photos.active() => { photos.poll(&profile,events,uploads.lease(),session.config().photo_limits).await?; uploads.poll(&mut connection,&db,events,&session,&client).await?; },
+            _ = upload_tick.tick(), if uploads.active() || photos.active() => { photos.poll(&profile,events,uploads.lease(),session.config().photo_limits,original_limits,uploads.album_max_count(&session)).await?; uploads.poll(&mut connection,&db,events,&session,&client).await?; },
+            paid = uploads.original_entitlement() => { uploads.set_original_entitlement(paid, &session, events).await?; },
             candidate = unread.recv() => {
                 if let Some(candidate) = candidate { attention.notify(candidate, events); }
             },
@@ -2721,8 +2852,11 @@ async fn run_inner(
             completed = recalls.next() => {
                 recall::complete(&db, events, completed).await?;
             },
+            completed = deletes.next() => {
+                delete_for_me::complete(&db, events, completed).await?;
+            },
             found = sticker_search.next() => {
-                sticker_search.complete(found, events).await?;
+                sticker_search.complete(found, sticker_catalog::authenticated_at(connection.as_ref()), events).await?;
             },
             completed = reactions.next() => {
                 reactions::complete(&db, events, completed).await?;
@@ -2730,22 +2864,40 @@ async fn run_inner(
             completed = groups.next() => {
                 events.emit(completed).await?;
             },
+            completed = pins.next() => {
+                events.emit(completed).await?;
+            },
             command = commands.recv() => {
                 let Some(command) = command else { return Ok(()) };
                 let online = connection.as_ref().is_some_and(|socket| socket.decoder.authenticated());
+                let Some(command) = pins.command(command, online, &db, events, &session, &client).await? else { continue; };
                 let Some(command) = groups.command(command, online, &db, events, &session, &client).await? else { continue; };
                 let Some(command) = attention.command(command, &db, events).await? else { continue; };
+                let Some(command) = history.command(command, remote_history::epoch(connection.as_ref()), &db, events, &session, &client).await? else { continue; };
+                let Some(command) = polls.command(command, original_epoch, &db, events, &session, transports).await? else { continue; };
                 let Some(command) = forwards.command(command, connection.as_ref(), &db, events, &session, &client).await? else { continue; };
+                let sticker_session = sticker_catalog::authenticated_at(connection.as_ref());
+                if let Some(request) = sticker_catalog::Request::from_command(&command) {
+                    sticker_search.start(request, sticker_session, events, &session, &client).await?;
+                    continue;
+                }
                 let command = match command {
-                    LiveCommand::SearchStickers { request_id, thread, query } => {
-                        sticker_search.start(
-                            sticker_catalog::Request { id: request_id, thread, query },
-                            online, events, &session, &client,
+                    LiveCommand::SendMentions { generation, thread, text, mentions, privacy_revision, request_id } => {
+                        let request = mentions::Request { generation, thread, text, mentions, privacy_revision, request_id };
+                        let outcome = mentions::handle(
+                            request, online && !uploads.active(), &mut groups.member_proof,
+                            &db, events, &session, &client,
                         ).await?;
+                        if matches!(outcome, CommandOutcome::PauseTransport) {
+                            uploads.invalidate();
+                            attention.reset_transport();
+                            connection = None;
+                            network_paused = true;
+                        }
                         continue;
                     }
                     LiveCommand::SendCatalogSticker { request_id, search_id, thread, sticker } => {
-                        let authorized = sticker_search.permits(search_id, &thread, sticker, events);
+                        let authorized = sticker_search.permits(search_id, &thread, sticker, sticker_session, events);
                         let socket = connection.as_mut().filter(|_| online && !uploads.active());
                         let outcome = sticker_send::handle(
                             sticker_send::Request { request_id, thread, sticker },
@@ -2791,6 +2943,18 @@ async fn run_inner(
                         continue;
                     }
                 };
+                let available = connection.as_mut().filter(|_| !uploads.active());
+                let command = match deletes.command(command, available, &db, events, &session, &client).await? {
+                    recall::Command::Continue(command) => command,
+                    recall::Command::Handled => continue,
+                    recall::Command::PauseTransport => {
+                        uploads.invalidate();
+                        attention.reset_transport();
+                        connection = None;
+                        network_paused = true;
+                        continue;
+                    }
+                };
                 let Some(command) = privacy.command(command,&db,events,&session,transports).await? else { continue; };
                 let Some(command) = photos.command(command,events).await? else {continue;};
                 let Some(command) = uploads.command(command,&profile,&session,&db,&client,events).await? else { continue; };
@@ -2805,6 +2969,7 @@ async fn run_inner(
                     trace(crate::diagnostics::Stage::Connection,crate::diagnostics::Reason::Requested);
                     uploads.invalidate();
                     attention.reset_transport();
+                    groups.member_proof = None;
                     connection = None;
                     network_paused = false;
                     retries = 0;
@@ -2828,6 +2993,12 @@ async fn run_inner(
                 }
             },
             result = privacy.result(), if privacy.running() => { privacy.completed(result,&db,events).await?; },
+            completed = history.next() => {
+                history.complete(completed, remote_history::epoch(connection.as_ref()), &db, events).await?;
+            },
+            completed = polls.next() => {
+                group_poll::Polls::complete(completed, original_epoch, &db, events).await?;
+            },
             _ = tokio::time::sleep_until(privacy_deadline), if !privacy.running() => { privacy.start(session.clone(),transports); },
             _ = tokio::time::sleep_until(next_connect), if connection.is_none() && !network_paused && privacy_ready => {
                 events.connection(if retries == 0 { LiveConnection::Connecting } else { LiveConnection::Reconnecting }).await?;
@@ -2845,13 +3016,13 @@ async fn run_inner(
                             changed.map_err(|_|anyhow::anyhow!("Directory stopped"))?;
                             directory.changed();
                         },
-                        change = directory.recalls_rx.recv(), if directory.pending_recall.is_none() => {
-                            directory.pending_recall = change;
+                        change = directory.message_changes_rx.recv(), if directory.pending_message_change.is_none() => {
+                            directory.pending_message_change = change;
                         },
                         permit = events.tx.reserve(), if directory.notifications_pending() => {
                             directory.publish_notification(permit.map_err(|_|anyhow::anyhow!("UI stopped"))?,&db,events).await?;
                         },
-                        _ = upload_tick.tick(), if uploads.active() || photos.active() => { photos.poll(&profile,events,uploads.lease(),session.config().photo_limits).await?; uploads.poll(&mut connection,&db,events,&session,&client).await?; },
+                        _ = upload_tick.tick(), if uploads.active() || photos.active() => { photos.poll(&profile,events,uploads.lease(),session.config().photo_limits,None,uploads.album_max_count(&session)).await?; uploads.poll(&mut connection,&db,events,&session,&client).await?; },
                         result = &mut connecting => break Some(result),
                         _ = attention::wait_until(attention_deadline) => {
                             attention.poll(None, &db, events, &session, &client).await?;
@@ -2865,8 +3036,11 @@ async fn run_inner(
                         completed = recalls.next() => {
                             recall::complete(&db, events, completed).await?;
                         },
+                        completed = deletes.next() => {
+                            delete_for_me::complete(&db, events, completed).await?;
+                        },
                         found = sticker_search.next() => {
-                            sticker_search.complete(found, events).await?;
+                            sticker_search.complete(found, None, events).await?;
                         },
                         completed = reactions.next() => {
                             reactions::complete(&db, events, completed).await?;
@@ -2874,11 +3048,21 @@ async fn run_inner(
                         completed = groups.next() => {
                             events.emit(completed).await?;
                         },
+                        completed = pins.next() => {
+                            events.emit(completed).await?;
+                        },
                         command = commands.recv() => {
                             let Some(command) = command else { return Ok(()) };
+                            let Some(command) = pins.command(command, false, &db, events, &session, &client).await? else { continue; };
                             let Some(command) = groups.command(command, false, &db, events, &session, &client).await? else { continue; };
                             let Some(command) = attention.command(command, &db, events).await? else { continue; };
+                            let Some(command) = history.command(command, None, &db, events, &session, &client).await? else { continue; };
+                            let Some(command) = polls.command(command, None, &db, events, &session, transports).await? else { continue; };
                             let Some(command) = forwards.command(command, None, &db, events, &session, &client).await? else { continue; };
+                            if let Some(request) = sticker_catalog::Request::from_command(&command) {
+                                sticker_search.start(request, None, events, &session, &client).await?;
+                                continue;
+                            }
                             let command = match reactions.command(command, None, &db, events, &session, &client).await? {
                                 recall::Command::Continue(command) => command,
                                 recall::Command::Handled => continue,
@@ -2888,6 +3072,14 @@ async fn run_inner(
                                 }
                             };
                             let command = match recalls.command(command, None, &db, events, &session, &client).await? {
+                                recall::Command::Continue(command) => command,
+                                recall::Command::Handled => continue,
+                                recall::Command::PauseTransport => {
+                                    network_paused = true;
+                                    break None;
+                                }
+                            };
+                            let command = match deletes.command(command, None, &db, events, &session, &client).await? {
                                 recall::Command::Continue(command) => command,
                                 recall::Command::Handled => continue,
                                 recall::Command::PauseTransport => {
@@ -2925,6 +3117,9 @@ async fn run_inner(
                             }
                         },
                         result = privacy.result(), if privacy.running() => { privacy.completed(result,&db,events).await?; },
+                        completed = history.next() => {
+                            history.complete(completed, None, &db, events).await?;
+                        },
                         _ = tokio::time::sleep_until(privacy_deadline), if !privacy.running() => { privacy.start(session.clone(),transports); },
                     }
                 };

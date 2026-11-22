@@ -6,7 +6,7 @@ use zalo_rust::{
     domain::{MediaDescriptor, MediaKind, MediaMessageContent, Message},
     store::{
         attachments::{AttachmentResource, AttachmentSpec, AttachmentState},
-        MessageStore,
+        MessageStore, SCHEMA_VERSION,
     },
 };
 
@@ -63,6 +63,7 @@ fn own(id: &str, content: &MediaMessageContent, ts: i64) -> Message {
         sender: "11".into(),
         text: MediaKind::File.legacy_placeholder().into(),
         source_client_id: None,
+        mentions: Vec::new(),
         reply_blocked: true,
         recalled: false,
         quote: None,
@@ -373,6 +374,7 @@ fn seed_v10(path: &Path) {
         sender: "22".into(),
         text: "Nguồn tổng hợp".into(),
         source_client_id: Some("8001".into()),
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         quote: None,
@@ -419,10 +421,11 @@ fn schema_ten_upgrade_and_failed_migration_preserve_quote_history_and_crypto_int
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            18
+            SCHEMA_VERSION
         );
     }
-    conn.execute_batch("PRAGMA user_version=19;").unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        .unwrap();
     assert!(MessageStore::open(&db.0).is_err());
     assert_eq!(rows(&db.0), before);
 }

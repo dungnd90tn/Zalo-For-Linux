@@ -256,6 +256,14 @@ impl NativeApp {
                                             ui.label(label);
                                         }
                                         #[cfg(feature = "messaging")]
+                                        if let Some(label) = self
+                                            .live
+                                            .as_ref()
+                                            .and_then(|state| state.delete_for_me.status_label())
+                                        {
+                                            ui.label(label);
+                                        }
+                                        #[cfg(feature = "messaging")]
                                         self.privacy_status_controls(ui);
                                         #[cfg(feature = "messaging")]
                                         if let Some(label) = self

@@ -7,6 +7,7 @@ use serde_json::json;
 
 fn message(account: &str, thread: &str, id: &str, time: i64) -> Message {
     Message {
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         source_client_id: None,
@@ -234,7 +235,7 @@ fn locked_receives_and_ack_keep_raw_history_cursors_and_outbox_without_projectio
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        18
+        crate::store::SCHEMA_VERSION
     );
     assert_eq!(
         store

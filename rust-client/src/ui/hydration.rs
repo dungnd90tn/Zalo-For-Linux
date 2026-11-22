@@ -52,6 +52,7 @@ fn is_media_placeholder(text: &str) -> bool {
         || text == MediaKind::Recommended.legacy_placeholder()
         || text == MediaKind::Poll.legacy_placeholder()
         || text == MediaKind::File.legacy_placeholder()
+        || text == MediaKind::Voice.legacy_placeholder()
 }
 struct Flight {
     epoch: u64,
@@ -244,6 +245,7 @@ mod tests {
     };
     fn message(id: &str) -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -266,6 +268,7 @@ mod tests {
             original_url: None,
             width: Some(640),
             height: Some(480),
+            album: None,
         })
     }
     fn model() -> Model {

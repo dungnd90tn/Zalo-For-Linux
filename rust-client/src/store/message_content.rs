@@ -93,6 +93,7 @@ mod tests {
     }
     fn message(id: &str, sticker: Option<StickerDescriptor>) -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

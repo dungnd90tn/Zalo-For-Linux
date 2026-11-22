@@ -22,4 +22,11 @@ Ba hạng mục đầu đã có trong bản thử `2.0.5-2` và qua kiểm thử
 
 ## Sau 2.0.5
 
-Ưu tiên nhắc tên thành viên trong nhóm, ghim tin, chuyển tiếp nhiều người và thu hồi trong nhóm. Sau đó đánh giá duyệt theo gói sticker, đồng bộ lịch sử từ xa, ảnh gốc, album và ghi âm. Thứ tự có thể đổi theo kết quả thử trên tài khoản thực.
+- Đã triển khai thu hồi ảnh và tệp có xác nhận gửi từ Linux, theo từng tin hoặc từng ảnh trong album. Cần đối chiếu kết quả trên Linux và điện thoại bằng tài khoản thử, trong chat cá nhân và nhóm.
+- Đã thêm xem chi tiết bình chọn trong nhóm thường. Cần đối chiếu số phiếu giữa Linux và điện thoại cho bình chọn công khai, ẩn danh và ẩn kết quả trước khi tham gia.
+- Đã triển khai gửi phiếu lần đầu trong bình chọn đang mở và chỉ cho chọn một phương án. Cần kiểm tra trên tài khoản thử trước khi mở rộng sang đổi, rút phiếu và bình chọn nhiều lựa chọn.
+- Đã mở rộng chuyển tiếp tin văn bản từ chat cá nhân đến nhóm thường dưới 100 thành viên. Cần đối chiếu trên tài khoản thử, gồm một lượt chọn cả bạn bè và nhóm.
+- Đã thêm tin văn bản gốc từ nhóm thường dưới 100 thành viên vào luồng chuyển tiếp. Cần xác nhận các trường hợp nhóm nguồn khóa gửi, người dùng đã rời nhóm và chọn cả đích cá nhân lẫn nhóm trên thiết bị thật.
+- Đã thêm **Nhắc tất cả · @All** từ bộ chọn nhắc tên. Cần đối chiếu hiển thị và thông báo trên thiết bị thứ hai với tài khoản thử, gồm cả nhóm vượt giới hạn được phép.
+
+Nhánh `v2.0.6` đã có nhắc tên và ghim tin văn bản trong nhóm thường, chuyển tiếp tin văn bản cá nhân đến tối đa 10 bạn bè, thu hồi tin văn bản của mình trong nhóm thường, duyệt bộ sticker khi phiên trả danh mục trực tiếp, tải từng trang tin văn bản cũ trong nhóm đủ điều kiện và gửi ảnh gốc JPEG trong chat riêng hoặc nhóm khi tài khoản có quyền Zalo Cloud. Nhánh này cũng gửi album từ 2 đến 6 ảnh HD và hiển thị các ảnh thuộc album trong khung chat. Cần xác nhận các luồng này trên tài khoản thử. Nhánh này cũng hỗ trợ thu, nghe lại và gửi tin thoại thường. Cần thử micro, loa và nhận tin thoại trên điện thoại trước khi chốt bản phát hành. Đã thêm xóa một tin văn bản ở phía mình, có xác nhận phạm vi và giữ dấu xóa khi tải lại lịch sử. Đã nối chiều nhận thao tác xóa tin văn bản từ thiết bị khác. Cần kiểm tra cả hai chiều trên tài khoản thử.

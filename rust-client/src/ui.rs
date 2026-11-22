@@ -2,12 +2,16 @@
 mod account;
 #[cfg(all(test, feature = "messaging"))]
 mod account_tests;
+#[cfg(feature = "messaging")]
+mod albums;
 mod attachments;
 mod attention;
 #[cfg(feature = "messaging")]
 mod avatars;
 #[cfg(test)]
 mod conversation_tests;
+#[cfg(feature = "messaging")]
+mod delete_for_me;
 #[cfg(feature = "messaging")]
 mod delivery;
 mod dialog;
@@ -22,6 +26,8 @@ mod group_actions;
 #[cfg(feature = "messaging")]
 mod group_members;
 #[cfg(feature = "messaging")]
+mod group_pins;
+#[cfg(feature = "messaging")]
 mod hydration;
 mod information;
 #[cfg(all(test, feature = "messaging"))]
@@ -32,6 +38,8 @@ mod live;
 mod login;
 #[cfg(feature = "messaging")]
 mod media;
+#[cfg(feature = "messaging")]
+mod mentions;
 mod message_actions;
 mod message_search;
 mod message_selection;
@@ -39,6 +47,8 @@ mod message_selection;
 mod modal_tests;
 #[cfg(feature = "messaging")]
 mod photos;
+#[cfg(feature = "messaging")]
+mod polls;
 #[cfg(feature = "messaging")]
 mod privacy;
 #[cfg(all(test, feature = "messaging"))]
@@ -49,6 +59,8 @@ mod privacy_tests;
 mod reactions;
 #[cfg(feature = "messaging")]
 mod recall;
+#[cfg(feature = "messaging")]
+mod remote_history;
 mod replies;
 mod senders;
 mod settings;
@@ -59,6 +71,8 @@ mod sticker_picker;
 #[cfg(feature = "messaging")]
 mod stickers;
 mod visuals;
+#[cfg(feature = "messaging")]
+mod voice;
 
 use crate::app::{Command, DraftBook, Event, Model, Worker, EVENTS_PER_FRAME};
 use crate::domain::{fold_search, Conversation, Message};
@@ -242,6 +256,7 @@ impl NativeApp {
                 || state.sticker_send.is_open()
                 || state.forwarding.is_open()
                 || state.recall.is_open()
+                || state.delete_for_me.is_open()
                 || state.groups.is_open()
             {
                 return true;
@@ -445,6 +460,10 @@ impl NativeApp {
     fn older_page(&mut self) {
         if let Some(cursor) = self.model.messages.first().map(Message::cursor) {
             self.load_page_before(cursor);
+        } else if self.model.has_older && !self.model.pending {
+            if let Some(thread) = self.model.selected.clone() {
+                self.load_latest(thread);
+            }
         }
     }
 
@@ -508,6 +527,13 @@ impl NativeApp {
         false
     }
 
+    fn has_draft_mentions(&self) -> bool {
+        #[cfg(feature = "messaging")]
+        return self.drafts.active.has_mentions();
+        #[cfg(not(feature = "messaging"))]
+        false
+    }
+
     fn send_local(&mut self) {
         if self.modal_blocked || self.modal_open() || self.selected_group_left() {
             return;
@@ -532,6 +558,15 @@ impl NativeApp {
             return;
         }
         #[cfg(feature = "messaging")]
+        if self.has_draft_mentions() && self.mention_scope().is_none() {
+            return;
+        }
+        #[cfg(feature = "messaging")]
+        if self.album_selected() && !self.demo {
+            self.send_live_album();
+            return;
+        }
+        #[cfg(feature = "messaging")]
         if self.photo_selected() && !self.demo {
             self.send_live_photo();
             return;
@@ -551,12 +586,14 @@ impl NativeApp {
                     return;
                 }
                 let mut submitted = None;
-                let result = self.drafts.active.send_live(
+                let result = self.drafts.active.send_live_in_scope(
                     self.model.generation,
                     thread.clone(),
+                    Some(state.privacy.revision),
                     |command| {
                         let request = match &command {
-                            crate::app::live::LiveCommand::Send { request_id, .. } => {
+                            crate::app::live::LiveCommand::Send { request_id, .. }
+                            | crate::app::live::LiveCommand::SendMentions { request_id, .. } => {
                                 Some(*request_id)
                             }
                             _ => None,
@@ -1246,7 +1283,9 @@ impl NativeApp {
         ui.painter()
             .rect_stroke(rect, 16.0, Stroke::new(1.0_f32, colors.border_strong));
         let attach_here = enabled && self.file_can_choose();
-        let attach_reason = if self.drafts.active.reply().is_some() {
+        let attach_reason = if self.has_draft_mentions() {
+            "Xóa phần nhắc thành viên để đính kèm tệp."
+        } else if self.drafts.active.reply().is_some() {
             "Chưa hỗ trợ gửi tệp kèm trích dẫn. Hủy trả lời trước khi chọn tệp."
         } else if self.file_upload_visible() {
             "Một lượt gửi tệp đang được xử lý hoặc cần kiểm tra kết quả."
@@ -1255,18 +1294,38 @@ impl NativeApp {
         };
         self.poll_attachments(ctx, attach_here, attach_reason);
         let reply_height = self.reply_tray_height();
-        let tray_height = reply_height + self.attachment_tray_height() + self.photo_tray_height();
-        #[cfg(feature = "messaging")]
-        self.photo_tray(ui, rect);
+        let photo_height = self.photo_tray_height();
+        let attachment_height = self.attachment_tray_height();
+        let tray_height =
+            reply_height + attachment_height + photo_height + self.voice_tray_height();
         if reply_height > 0.0 {
             self.reply_tray(ui, rect);
         }
-        if self.attachment_tray_height() > 0.0 {
+        if attachment_height > 0.0 {
             self.attachment_tray(
                 ui,
                 egui::Rect::from_min_max(rect.min + vec2(0.0, reply_height), rect.max),
             );
         }
+        #[cfg(feature = "messaging")]
+        if photo_height > 0.0 {
+            self.photo_tray(
+                ui,
+                egui::Rect::from_min_max(
+                    rect.min + vec2(0.0, reply_height + attachment_height),
+                    rect.max,
+                ),
+            );
+        }
+        #[cfg(feature = "messaging")]
+        self.voice_tray(
+            ui,
+            egui::Rect::from_min_max(
+                rect.min + vec2(0.0, reply_height + attachment_height + photo_height),
+                rect.max,
+            ),
+            enabled,
+        );
         if attach_here && ctx.input(|input| !input.raw.hovered_files.is_empty()) {
             ui.painter()
                 .rect_stroke(rect.shrink(1.0), 16.0, Stroke::new(2.0_f32, colors.primary));
@@ -1291,17 +1350,12 @@ impl NativeApp {
                     self.sticker_button(ui, enabled);
                     #[cfg(not(feature = "messaging"))]
                     icon_button(ui, Icon::Sticker, "Gửi nhãn dán · chưa khả dụng", false);
-                    if icon_button(
-                        ui,
-                        Icon::Image,
-                        "Ảnh HD · JPEG/PNG/WebP tĩnh, tối đa 20 MiB · nén JPEG, không gửi bản gốc",
-                        enabled && self.photo_can_choose() && !self.attachments.busy(),
-                    )
-                    .clicked()
-                    {
-                        #[cfg(feature = "messaging")]
-                        self.choose_hd_photo(ctx);
-                    }
+                    #[cfg(feature = "messaging")]
+                    self.photo_toolbar_buttons(ui, enabled);
+                    #[cfg(not(feature = "messaging"))]
+                    icon_button(ui, Icon::Image, "Gửi ảnh · chưa khả dụng", false);
+                    #[cfg(feature = "messaging")]
+                    self.voice_toolbar_button(ui, enabled);
                     if icon_button(
                         ui,
                         Icon::Paperclip,
@@ -1329,7 +1383,12 @@ impl NativeApp {
                             auth_generation,
                         );
                     }
-                    if rect.width() >= 480.0 {
+                    let shortcut_hint_min_width = if cfg!(feature = "messaging") {
+                        535.0
+                    } else {
+                        480.0
+                    };
+                    if rect.width() >= shortcut_hint_min_width {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(8.0);
                             ui.label(
@@ -1363,6 +1422,12 @@ impl NativeApp {
                         self.account_id(),
                         self.model.selected.as_deref(),
                     ));
+                    #[cfg(feature = "messaging")]
+                    let mention_choice = self.mention_keys(ctx, composer_id, enabled, ime_active);
+                    #[cfg(feature = "messaging")]
+                    let previous_text = self
+                        .has_draft_mentions()
+                        .then(|| self.drafts.active.text.clone());
                     // Enter sends; Ctrl+Enter and Shift+Enter insert a line break. Handle both before
                     // TextEdit sees them: a plain Enter is swallowed here (it never becomes a
                     // newline) and a modified Enter is handed on as the plain key TextEdit turns
@@ -1400,15 +1465,14 @@ impl NativeApp {
                         });
                     }
                     ui.set_clip_rect(ui.clip_rect().intersect(editor_rect));
-                    let response = egui::ScrollArea::vertical()
+                    let edit = egui::ScrollArea::vertical()
                         .id_salt("composer_scroll")
                         .auto_shrink([false, false])
                         .min_scrolled_height(editor_rect.height())
                         .max_height(editor_rect.height())
                         .show(ui, |ui| {
                             let size = vec2(ui.available_width(), editor_rect.height());
-                            ui.add_enabled(
-                                enabled,
+                            ui.add_enabled_ui(enabled, |ui| {
                                 egui::TextEdit::multiline(&mut self.drafts.active.text)
                                     .id(composer_id)
                                     .hint_text(if group_left {
@@ -1421,16 +1485,25 @@ impl NativeApp {
                                     .desired_width(size.x)
                                     .frame(false)
                                     .char_limit(crate::domain::MAX_TEXT_BYTES)
-                                    .margin(egui::Margin::ZERO),
-                            )
+                                    .margin(egui::Margin::ZERO)
+                                    .show(ui)
+                            })
+                            .inner
                         })
                         .inner;
-                    let response = response.on_hover_text(if group_left {
+                    let response = edit.response.on_hover_text(if group_left {
                         "Bản nháp được giữ trên máy"
                     } else {
                         "Enter để gửi · Ctrl+Enter để xuống dòng"
                     });
                     if response.changed() {
+                        #[cfg(feature = "messaging")]
+                        if let Some(previous_text) = previous_text {
+                            self.drafts.active.edit_with_mentions(&previous_text);
+                        } else {
+                            self.drafts.active.edited();
+                        }
+                        #[cfg(not(feature = "messaging"))]
                         self.drafts.active.edited();
                         #[cfg(feature = "messaging")]
                         if let (Some(state), Some(thread)) =
@@ -1443,9 +1516,27 @@ impl NativeApp {
                         response.request_focus();
                         self.focus_composer = false;
                     }
+                    #[cfg(feature = "messaging")]
+                    self.show_mentions(
+                        ctx,
+                        mentions::Editor {
+                            id: composer_id,
+                            rect: editor_rect,
+                            caret: edit.state.cursor.char_range(),
+                            focused: response.has_focus(),
+                        },
+                        mention_choice,
+                        ime_active,
+                    );
                 });
+                #[cfg(feature = "messaging")]
+                let mention_send_ready =
+                    !self.has_draft_mentions() || self.mention_scope().is_some();
+                #[cfg(not(feature = "messaging"))]
+                let mention_send_ready = true;
                 let can_send = enabled
                     && !ime_active
+                    && mention_send_ready
                     && (self.demo
                         || if self.photo_selected() {
                             self.photo_can_send()
@@ -1476,18 +1567,22 @@ impl NativeApp {
                     colors.primary
                 };
                 ui.painter().rect_filled(send_rect, 12.0, send_fill);
+                let send_label = if self.demo {
+                    "Lưu"
+                } else if self.photo_selected() {
+                    self.photo_send_label()
+                } else if self.drafts.active.attachment().is_some() {
+                    self.file_send_label()
+                } else {
+                    "Gửi"
+                };
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, can_send, send_label)
+                });
                 ui.painter().text(
                     send_rect.center(),
                     Align2::CENTER_CENTER,
-                    if self.demo {
-                        "Lưu"
-                    } else if self.photo_selected() {
-                        self.photo_send_label()
-                    } else if self.drafts.active.attachment().is_some() {
-                        self.file_send_label()
-                    } else {
-                        "Gửi"
-                    },
+                    send_label,
                     FontId::new(
                         visuals::TEXT_BODY,
                         egui::FontFamily::Name("Zalo Semibold".into()),
@@ -1526,6 +1621,8 @@ impl NativeApp {
                     "Hoàn tất phần nhập đang soạn trước khi gửi."
                 } else if self.drafts.active.in_flight() {
                     "Đang chờ kết quả lượt gửi trước; bản nháp được giữ nguyên."
+                } else if !mention_send_ready {
+                    "Cần kết nối và kiểm tra quyền nhóm để gửi phần nhắc thành viên."
                 } else if self.drafts.active.reply().is_some()
                     && self.drafts.active.attachment().is_some()
                 {
@@ -1533,7 +1630,7 @@ impl NativeApp {
                 } else if let Some(hint) = connection_hint {
                     hint
                 } else if self.photo_selected() {
-                    "Chờ xử lý và xem ảnh HD trước khi gửi; bỏ ảnh để chỉ gửi nội dung đang soạn."
+                    "Chờ xử lý và xem ảnh trước khi gửi; bỏ ảnh để chỉ gửi nội dung đang soạn."
                 } else if self.drafts.active.text.trim().is_empty()
                     && self.drafts.active.attachment().is_none()
                 {
@@ -1555,6 +1652,11 @@ impl NativeApp {
         }
     }
 
+    #[cfg(not(feature = "messaging"))]
+    fn voice_tray_height(&self) -> f32 {
+        0.0
+    }
+
     fn chat(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool) {
         let colors = crate::theme::palette(ctx);
         visuals::background(ui, ui.max_rect(), "--surface-background", colors.canvas);
@@ -1569,6 +1671,7 @@ impl NativeApp {
             composer_height(ui.available_height(), &self.drafts.active.text, compact)
                 + self.attachment_tray_height()
                 + self.photo_tray_height()
+                + self.voice_tray_height()
                 + self.reply_tray_height();
         let status = timeline_status(
             &self.model.status,
@@ -1578,11 +1681,15 @@ impl NativeApp {
         );
         #[cfg(feature = "messaging")]
         let status = status.or_else(|| {
-            [self.sticker_status(), self.reaction_status()]
-                .into_iter()
-                .flatten()
-                .max_by_key(|(_, updated_at)| *updated_at)
-                .map(|(status, _)| status)
+            [
+                self.sticker_status(),
+                self.reaction_status(),
+                self.group_pin_status(),
+            ]
+            .into_iter()
+            .flatten()
+            .max_by_key(|(_, updated_at)| *updated_at)
+            .map(|(status, _)| status)
         });
         let status = status.map(str::to_owned);
         let status_height = if status.is_some() { 29.0 } else { 0.0 };
@@ -1592,6 +1699,8 @@ impl NativeApp {
 
         let timeline_margin = if compact { 18.0 } else { 30.0 };
         let selecting = self.message_selection.is_some();
+        #[cfg(feature = "messaging")]
+        let poll_scope = self.live.as_ref().and_then(|state| self.poll_scope(state));
         let selection_gutter = if selecting {
             message_selection::GUTTER
         } else {
@@ -1641,25 +1750,34 @@ impl NativeApp {
                                         );
                                         ui.add_space(12.0);
                                     }
-                                    if self.model.has_older
-                                        || self.model.pending
-                                        || !self.latest_page
-                                    {
+                                    let local_controls = self.model.has_older || self.model.pending || !self.latest_page;
+                                    #[cfg(feature = "messaging")]
+                                    let remote_controls = self.remote_history_visible();
+                                    #[cfg(not(feature = "messaging"))]
+                                    let remote_controls = false;
+                                    if local_controls || remote_controls {
                                         ui.horizontal(|ui| {
-                                            older = ui
-                                                .add_enabled(
-                                                    self.model.has_older && !self.model.pending,
-                                                    egui::Button::new("Xem trang trước").small(),
-                                                )
-                                                .clicked();
-                                            latest = ui
-                                                .add_enabled(
-                                                    !self.model.pending,
-                                                    egui::Button::new("Về mới nhất").small(),
-                                                )
-                                                .clicked();
-                                            if self.model.pending {
-                                                ui.spinner();
+                                            if local_controls {
+                                                older = ui
+                                                    .add_enabled(
+                                                        self.model.has_older && !self.model.pending,
+                                                        egui::Button::new("Xem trang trước").small(),
+                                                    )
+                                                    .clicked();
+                                                latest = ui
+                                                    .add_enabled(
+                                                        !self.model.pending,
+                                                        egui::Button::new("Về mới nhất").small(),
+                                                    )
+                                                    .clicked();
+                                                if self.model.pending {
+                                                    ui.spinner();
+                                                }
+                                            }
+                                            #[cfg(feature = "messaging")]
+                                            if remote_controls {
+                                                ui.set_min_height(44.0);
+                                                self.remote_history_controls(ui);
                                             }
                                         });
                                     }
@@ -1680,7 +1798,9 @@ impl NativeApp {
                                     .map(|focus| (focus.message_id.clone(), focus.shown_at));
                                 let now = std::time::Instant::now();
                                 let mut focus_drawn = false;
-                                for message in &self.model.messages {
+                                let album_positions = album_positions(&self.model.messages);
+                                for (index, message) in self.model.messages.iter().enumerate() {
+                                    let album_position = album_positions.get(index).copied().unwrap_or(AlbumPosition::Single);
                                     let day = local_parts(message.sent_at_ms)
                                         .map(|parts| (parts.tm_year, parts.tm_yday));
                                     if previous_day != day || previous_day.is_none() {
@@ -1700,7 +1820,8 @@ impl NativeApp {
                                     #[cfg(feature = "messaging")]
                                     let avatar_texture = self.live.as_mut().and_then(|state| {
                                         let identity = format!("d:{}",message.sender);
-                                        (state.privacy.ready() && state.privacy.visible(&identity)
+                                        (album_position.starts_sender()
+                                            && state.privacy.ready() && state.privacy.visible(&identity)
                                             && ui.is_rect_visible(egui::Rect::from_min_size(ui.cursor().min,vec2(30.0,30.0))))
                                             .then(||state.avatars.visible(ui.ctx(), &identity)).flatten()
                                     });
@@ -1711,9 +1832,12 @@ impl NativeApp {
                                     #[cfg(not(feature = "messaging"))]
                                     let delivery_label = None;
                                     #[cfg(feature = "messaging")]
-                                    let (sticker_cache,media_cache) = match self.live.as_mut() {
-                                        Some(state) if state.account.is_some() => (Some(&mut state.stickers),Some(&mut state.media)),
-                                        _ => (None,None),
+                                    let (sticker_cache,media_cache,poll_access) = match self.live.as_mut() {
+                                        Some(state) if state.account.is_some() => (Some(&mut state.stickers),Some(&mut state.media),poll_scope.as_ref().map(|scope| polls::Access {
+                                            scope, polls: &mut state.polls,
+                                            worker: state.worker.as_ref().filter(|_| !selecting && ui.is_enabled()),
+                                        })),
+                                        _ => (None,None,None),
                                     };
                                     let focused = focus.as_ref().filter(|(id, _)| *id == message.id);
                                     let backdrop = ui.painter().add(egui::Shape::Noop);
@@ -1722,7 +1846,9 @@ impl NativeApp {
                                         sticker_cache,
                                         #[cfg(feature = "messaging")]
                                         media_cache,
-                                        self.model.generation, delivery_label,
+                                        #[cfg(feature = "messaging")]
+                                        poll_access,
+                                        self.model.generation, delivery_label, album_position,
                                     ));
                                     #[cfg(feature = "messaging")]
                                     if let Some(state) = self.live.as_mut().filter(|_| ui.is_enabled()) {
@@ -1766,7 +1892,7 @@ impl NativeApp {
                                             ),
                                         );
                                     }
-                                    ui.add_space(13.0);
+                                    ui.add_space(if matches!(album_position, AlbumPosition::First(_) | AlbumPosition::Continuation) { 6.0 } else { 13.0 });
                                 }
                                 if focus_drawn {
                                     self.model.focus_shown(now);
@@ -1853,6 +1979,10 @@ impl NativeApp {
         let show_directory = false;
         if privacy_pending || (compact && (show_directory || self.compact_list)) {
             self.message_selection = None;
+            #[cfg(feature = "messaging")]
+            if let Some(state) = &mut self.live {
+                state.mention_picker.set_scope(None);
+            }
         }
         if show_directory || (compact && self.compact_list) || self.bound_conversation().is_none() {
             self.conversation_details = None;
@@ -1933,6 +2063,10 @@ impl NativeApp {
                     }
                     if !dock_details && self.bound_conversation().is_some() {
                         self.message_selection = None;
+                        #[cfg(feature = "messaging")]
+                        if let Some(state) = &mut self.live {
+                            state.mention_picker.set_scope(None);
+                        }
                         self.conversation_information(ui, true);
                     } else {
                         self.chat(ui, ctx, compact);
@@ -2120,7 +2254,7 @@ impl NativeApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Frame::none().inner_margin(16.0).show(ui, |ui| {
-                    self.information_body(ui, &thread);
+                    self.information_body(ui, &thread, compact);
                 });
             });
     }
@@ -2169,9 +2303,15 @@ impl eframe::App for NativeApp {
             self.sync_sticker_picker(ctx);
             self.sync_forward();
             self.sync_recall();
+            self.sync_delete_for_me();
             self.sync_groups(ctx);
+            self.sync_group_pins();
+            self.sync_polls();
+            self.sync_remote_history();
         }
         self.update_modal_input(ctx);
+        #[cfg(feature = "messaging")]
+        self.sync_voice(ctx);
         #[cfg(feature = "messaging")]
         self.begin_attention_frame(ctx);
         #[cfg(feature = "live-login")]
@@ -2190,6 +2330,8 @@ impl eframe::App for NativeApp {
         }
         ctx.input(|input| update_ime_state(&mut self.ime_composing, &input.events));
         self.workspace(ctx);
+        #[cfg(feature = "messaging")]
+        self.sync_voice(ctx);
         if self.settings_open {
             self.latch_modal_input(ctx);
             self.settings
@@ -2200,6 +2342,7 @@ impl eframe::App for NativeApp {
             self.show_notification_settings(ctx);
             self.show_forward_picker(ctx);
             self.show_recall_confirmation(ctx);
+            self.show_delete_for_me(ctx);
             self.show_group_dialogs(ctx);
             self.sync_reactions(ctx);
             self.finish_attention_frame(ctx);
@@ -2421,6 +2564,112 @@ fn is_own_sender(sender: &str, account: Option<&str>) -> bool {
     account.map_or_else(|| sender == "You (local demo)", |account| sender == account)
 }
 
+fn message_body(
+    ui: &egui::Ui,
+    message: &Message,
+    width: f32,
+    ink: egui::Color32,
+    mention_ink: egui::Color32,
+) -> Arc<egui::Galley> {
+    let font = FontId::proportional(visuals::TEXT_MESSAGE);
+    if !message.mentions.is_empty() && !message.is_recalled() {
+        if let Ok(spans) = crate::domain::mention::byte_ranges(&message.text, &message.mentions) {
+            let normal = egui::TextFormat::simple(font.clone(), ink);
+            let emphasis = egui::TextFormat::simple(
+                FontId::new(
+                    visuals::TEXT_MESSAGE,
+                    egui::FontFamily::Name("Zalo Semibold".into()),
+                ),
+                mention_ink,
+            );
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = width;
+            let mut previous = 0;
+            for span in spans {
+                job.append(&message.text[previous..span.start], 0.0, normal.clone());
+                previous = span.end;
+                job.append(&message.text[span], 0.0, emphasis.clone());
+            }
+            job.append(&message.text[previous..], 0.0, normal);
+            return ui.painter().layout_job(job);
+        }
+    }
+    ui.painter().layout(message.text.clone(), font, ink, width)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AlbumPosition {
+    Single,
+    First(u32),
+    Continuation,
+    Last,
+}
+
+impl AlbumPosition {
+    fn starts_sender(self) -> bool {
+        matches!(self, Self::Single | Self::First(_))
+    }
+}
+
+fn album_positions(messages: &[Message]) -> Vec<AlbumPosition> {
+    fn member(message: &Message) -> Option<crate::domain::PhotoAlbumMember> {
+        if message.is_recalled() {
+            return None;
+        }
+        match &message.media {
+            Some(crate::domain::MediaDescriptor::Photo(photo)) => photo.album,
+            _ => None,
+        }
+    }
+    fn scope(message: &Message, id: u64) -> (&str, &str, &str, u64) {
+        (&message.account_id, &message.thread_id, &message.sender, id)
+    }
+    fn day(message: &Message) -> Option<(i32, i32)> {
+        local_parts(message.sent_at_ms).map(|parts| (parts.tm_year, parts.tm_yday))
+    }
+    let mut occurrences = std::collections::HashMap::new();
+    for message in messages {
+        if let Some(member) = member(message) {
+            *occurrences
+                .entry(scope(message, member.layout_id()))
+                .or_insert(0usize) += 1;
+        }
+    }
+    if occurrences.is_empty() {
+        return Vec::new();
+    }
+    let mut positions = vec![AlbumPosition::Single; messages.len()];
+    for (start, message) in messages.iter().enumerate() {
+        let Some(metadata) = member(message).filter(|member| member.index() == 0) else {
+            continue;
+        };
+        let key = scope(message, metadata.layout_id());
+        let count = metadata.count() as usize;
+        if count < 2 || occurrences.get(&key) != Some(&count) {
+            continue;
+        }
+        let Some(run) = messages.get(start..start + count) else {
+            continue;
+        };
+        let first_day = day(message);
+        if first_day.is_some()
+            && run.iter().enumerate().all(|(index, candidate)| {
+                member(candidate).is_some_and(|part| {
+                    scope(candidate, part.layout_id()) == key
+                        && part.count() == metadata.count()
+                        && part.index() as usize == index
+                        && day(candidate) == first_day
+                })
+            })
+        {
+            positions[start] = AlbumPosition::First(metadata.count());
+            positions[start + 1..start + count - 1].fill(AlbumPosition::Continuation);
+            positions[start + count - 1] = AlbumPosition::Last;
+        }
+    }
+    positions
+}
+
 #[allow(clippy::too_many_arguments)]
 fn message_bubble(
     ui: &mut egui::Ui,
@@ -2433,8 +2682,10 @@ fn message_bubble(
     avatar_texture: Option<&egui::TextureHandle>,
     #[cfg(feature = "messaging")] sticker_cache: Option<&mut stickers::StickerCache>,
     #[cfg(feature = "messaging")] media_cache: Option<&mut media::MediaCache>,
+    #[cfg(feature = "messaging")] poll_access: Option<polls::Access<'_>>,
     generation: u64,
     delivery: Option<&str>,
+    album_position: AlbumPosition,
 ) -> egui::Rect {
     let colors = crate::theme::palette(ui.ctx());
     let own = is_own_sender(&message.sender, account);
@@ -2463,11 +2714,16 @@ fn message_bubble(
         .min(490.0)
         .min((available - outside).max(1.0));
     let body = (message.media.is_none() && message.sticker.is_none()).then(|| {
-        ui.painter().layout(
-            message.text.clone(),
-            FontId::proportional(visuals::TEXT_MESSAGE),
-            ink,
+        message_body(
+            ui,
+            message,
             max_bubble,
+            ink,
+            if accent {
+                colors.on_color
+            } else {
+                colors.accent_ink
+            },
         )
     });
     let mut content_width = body
@@ -2538,7 +2794,9 @@ fn message_bubble(
         |ui| {
             if !own {
                 let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-                visuals::avatar_photo(ui, rect, sender_avatar, avatar_texture);
+                if album_position.starts_sender() {
+                    visuals::avatar_photo(ui, rect, sender_avatar, avatar_texture);
+                }
             }
             let frame = egui::Frame::none()
                 .fill(if bare {
@@ -2572,7 +2830,7 @@ fn message_bubble(
                     ui.set_max_width(content_width);
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 5.0;
-                        if !own {
+                        if !own && album_position.starts_sender() {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(sender_name)
@@ -2584,12 +2842,26 @@ fn message_bubble(
                             )
                             .on_hover_text(sender_name);
                         }
+                        if let AlbumPosition::First(count) = album_position {
+                            ui.label(
+                                RichText::new(format!("Album · {count} ảnh"))
+                                    .size(visuals::TEXT_SMALL)
+                                    .color(colors.text_secondary),
+                            );
+                        }
                         if let Some(quote) = &message.quote {
                             replies::quote_block(ui, quote_sender_name, &quote.text, content_width);
                         }
                         if message.media.is_some() {
                             #[cfg(feature = "messaging")]
-                            media::show(ui, message, generation, media_cache, max_bubble);
+                            media::show(
+                                ui,
+                                message,
+                                generation,
+                                media_cache,
+                                max_bubble,
+                                poll_access,
+                            );
                             #[cfg(not(feature = "messaging"))]
                             {
                                 let _ = generation;

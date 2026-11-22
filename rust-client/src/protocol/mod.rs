@@ -4,11 +4,17 @@ pub mod auth;
 pub mod bootstrap;
 pub mod client;
 #[cfg(feature = "messaging")]
+pub(crate) mod delete_for_me;
+#[cfg(feature = "messaging")]
 pub mod directory;
 #[cfg(feature = "messaging")]
 pub(crate) mod forward;
 #[cfg(feature = "messaging")]
 pub(crate) mod group_actions;
+#[cfg(feature = "messaging")]
+pub(crate) mod group_pins;
+#[cfg(feature = "messaging")]
+pub(crate) mod group_poll;
 #[cfg(feature = "messaging")]
 pub(crate) mod group_roster;
 #[cfg(feature = "messaging")]
@@ -16,7 +22,11 @@ pub(crate) mod hidden;
 #[cfg(feature = "network")]
 pub mod http;
 #[cfg(feature = "messaging")]
+pub(crate) mod mention;
+#[cfg(feature = "messaging")]
 pub mod messaging;
+#[cfg(feature = "messaging")]
+pub(crate) mod original_photo;
 #[cfg(feature = "messaging")]
 pub mod photo;
 pub mod qr;
@@ -26,6 +36,8 @@ pub(crate) mod reactions;
 pub(crate) mod read_state;
 #[cfg(feature = "messaging")]
 pub(crate) mod recall;
+#[cfg(feature = "messaging")]
+pub(crate) mod remote_history;
 #[cfg(feature = "live-login")]
 pub mod session;
 #[cfg(feature = "messaging")]
@@ -38,6 +50,8 @@ pub(crate) mod sticker_send;
 pub mod trust;
 #[cfg(feature = "messaging")]
 pub mod upload;
+#[cfg(feature = "messaging")]
+pub mod voice;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

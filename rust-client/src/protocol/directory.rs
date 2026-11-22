@@ -574,8 +574,7 @@ fn parse_previews_inner(
                 None => super::messaging::incoming_messages_detailed(account, &payload).map(
                     |messages| super::messaging::IncomingBatch {
                         messages,
-                        recalls: Vec::new(),
-                        reactions: Vec::new(),
+                        ..Default::default()
                     },
                 ),
             }
@@ -604,6 +603,9 @@ fn parse_previews_inner(
                             super::messaging::FrameMessageKind::Recommended
                         }
                         crate::domain::MediaKind::Poll => super::messaging::FrameMessageKind::Poll,
+                        crate::domain::MediaKind::Voice => {
+                            super::messaging::FrameMessageKind::Voice
+                        }
                         crate::domain::MediaKind::File => super::messaging::FrameMessageKind::File,
                     }
                 } else if incoming.message.sticker.is_some() {

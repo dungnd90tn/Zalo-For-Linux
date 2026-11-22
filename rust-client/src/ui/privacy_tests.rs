@@ -20,6 +20,7 @@ fn conversation(id: &str, title: &str) -> Conversation {
 }
 fn message() -> Message {
     Message {
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         source_client_id: None,

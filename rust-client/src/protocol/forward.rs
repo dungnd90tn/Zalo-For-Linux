@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub(crate) const DIRECT_PATH: &str = "/api/message/mforward";
+pub(crate) const GROUP_PATH: &str = "/api/group/mforward";
 const MAX_CLIENT_ID: u64 = 9_007_199_254_740_991;
 const MAX_REFERENCE_BYTES: usize = 4096;
 
@@ -113,16 +114,15 @@ fn valid_root(root: &ForwardRoot) -> bool {
         && root.log_src_type <= 5
 }
 
-pub(crate) fn direct_parameters(
+pub(crate) fn parameters(
     recipient: &Target,
     client_id: u64,
     imei: &str,
     text: &str,
     reference: &ForwardReference,
 ) -> Result<Value, WireError> {
-    if recipient.kind != ThreadKind::Direct
-        || !(1..=MAX_CLIENT_ID).contains(&client_id)
-        || imei.is_empty()
+    if !(1..=MAX_CLIENT_ID).contains(&client_id)
+        || (recipient.kind == ThreadKind::Direct && imei.is_empty())
         || text.len() > MAX_TEXT_BYTES
         || canonical_plain_text(text).is_empty()
         || text.chars().any(|c| matches!(c, '\u{0}'..='\u{7}'))
@@ -147,15 +147,25 @@ pub(crate) fn direct_parameters(
         }
     })
     .to_string();
-    Ok(json!({
-        "toIds": [{"toUid":recipient.remote_id,"clientId":client_id.to_string(),"ttl":0}],
-        "imei": imei,
+    let mut params = json!({
         "ttl": 0,
         "msgType": "1",
         "totalIds": 1,
         "msgInfo": json!({"message":text,"reference":inner_ref}).to_string(),
         "decorLog": decor_log,
-    }))
+    });
+    match recipient.kind {
+        ThreadKind::Direct => {
+            params["toIds"] =
+                json!([{"toUid":recipient.remote_id,"clientId":client_id.to_string(),"ttl":0}]);
+            params["imei"] = json!(imei);
+        }
+        ThreadKind::Group => {
+            params["grids"] =
+                json!([{"grid":recipient.remote_id,"clientId":client_id.to_string(),"ttl":0}]);
+        }
+    }
+    Ok(params)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -166,12 +176,12 @@ pub(crate) enum ForwardAck {
 
 /// The response is already authenticated and decrypted. Unbound or ambiguous
 /// rows are errors and the caller must retain the durable unknown-send state.
-pub(crate) fn direct_ack(
+pub(crate) fn ack(
     payload: &Value,
     recipient: &Target,
     expected_client_id: u64,
 ) -> Result<ForwardAck, WireError> {
-    if recipient.kind != ThreadKind::Direct || !(1..=MAX_CLIENT_ID).contains(&expected_client_id) {
+    if !(1..=MAX_CLIENT_ID).contains(&expected_client_id) {
         return Err(WireError::Invalid);
     }
     numeric_id(&recipient.remote_id)?;
@@ -195,8 +205,22 @@ pub(crate) fn direct_ack(
         return Err(WireError::Invalid);
     }
     if let Some(destination) = entry.get("toUid") {
-        if id_string(destination)? != recipient.remote_id {
+        let matches = match (
+            recipient.kind,
+            destination.as_str().and_then(|id| id.strip_prefix('g')),
+        ) {
+            (ThreadKind::Group, Some(id)) => id == recipient.remote_id,
+            _ => id_string(destination)? == recipient.remote_id,
+        };
+        if !matches {
             return Err(WireError::Invalid);
+        }
+    }
+    if recipient.kind == ThreadKind::Group {
+        if let Some(destination) = entry.get("grid") {
+            if id_string(destination)? != recipient.remote_id {
+                return Err(WireError::Invalid);
+            }
         }
     }
     if !accepted {
@@ -258,14 +282,14 @@ mod tests {
                 quote: None,
                 media: None,
                 sticker: None,
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
             };
             let reference = ForwardReference::from_source(&message).unwrap();
             let target = Target::new(ThreadKind::Direct, case["toUid"].as_str().unwrap()).unwrap();
             let request =
-                direct_parameters(&target, 7001, "synthetic-device", &message.text, &reference)
-                    .unwrap();
+                parameters(&target, 7001, "synthetic-device", &message.text, &reference).unwrap();
             let expected = expanded(case["wire"]["payload"].clone());
             assert_eq!(case["wire"]["endpoint"]["path"], DIRECT_PATH);
             assert_eq!(expanded(request), expected, "{}", case["name"]);
@@ -302,15 +326,21 @@ mod tests {
         };
         let accepted = json!({"clientId":"7001","msgId":"9001","ts":"1700000000123"});
         assert_eq!(
-            direct_ack(&envelope(json!([accepted]), json!([])), &target, 7001),
+            ack(&envelope(json!([accepted]), json!([])), &target, 7001),
             Ok(ForwardAck::Accepted(SendAck {
                 server_id: "9001".into(),
                 timestamp_ms: Some(1700000000123),
             }))
         );
+        let mut legacy = accepted.clone();
+        legacy["grid"] = Value::Null;
+        assert!(matches!(
+            ack(&envelope(json!([legacy]), json!([])), &target, 7001),
+            Ok(ForwardAck::Accepted(_))
+        ));
         let rejected = json!({"clientId":7001,"error":{"code":211}});
         assert_eq!(
-            direct_ack(&envelope(json!([]), json!([rejected])), &target, 7001),
+            ack(&envelope(json!([]), json!([rejected])), &target, 7001),
             Ok(ForwardAck::Rejected)
         );
         for ambiguous in [
@@ -326,10 +356,54 @@ mod tests {
             envelope(json!([]), json!([{"clientId":"7001","error":null}])),
             json!({"error_code":0,"data":{"msgId":"9001"}}),
         ] {
-            assert_eq!(
-                direct_ack(&ambiguous, &target, 7001),
-                Err(WireError::Invalid)
-            );
+            assert_eq!(ack(&ambiguous, &target, 7001), Err(WireError::Invalid));
         }
+    }
+
+    #[test]
+    fn group_forward_uses_grid_ttl_and_binds_any_explicit_ack_destination() {
+        let group = Target::new(ThreadKind::Group, "33").unwrap();
+        let root = ForwardRoot {
+            id: "11111111111111111111111111111111".into(),
+            ts: 1700000000000,
+            log_src_type: 1,
+        };
+        let reference = ForwardReference {
+            source: root.clone(),
+            root_msg_ref: root,
+            fw_lvl: 1,
+        };
+        let request =
+            parameters(&group, 7001, "not-a-group-field", "Tin nhắn", &reference).unwrap();
+        assert_eq!(
+            request["grids"],
+            json!([{"grid":"33","clientId":"7001","ttl":0}])
+        );
+        assert_eq!(request["ttl"], 0);
+        assert_eq!(request["totalIds"], 1);
+        assert!(request.get("toIds").is_none());
+        assert!(request.get("imei").is_none());
+        assert!(request.get("visibility").is_none());
+        let reply = |entry| json!({"error_code":0,"data":{"success":[entry],"failed":[]}});
+        let exact = json!({"clientId":"7001","msgId":"9001"});
+        assert!(matches!(
+            ack(&reply(exact.clone()), &group, 7001),
+            Ok(ForwardAck::Accepted(_))
+        ));
+        let mut bound = exact;
+        bound["grid"] = json!(33);
+        bound["toUid"] = json!("g33");
+        assert!(matches!(
+            ack(&reply(bound.clone()), &group, 7001),
+            Ok(ForwardAck::Accepted(_))
+        ));
+        bound["grid"] = json!("34");
+        assert_eq!(
+            ack(&reply(bound.clone()), &group, 7001),
+            Err(WireError::Invalid)
+        );
+        bound["grid"] = json!("33");
+        bound["toUid"] = json!("g34");
+        assert_eq!(ack(&reply(bound), &group, 7001), Err(WireError::Invalid));
     }
 }

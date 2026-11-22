@@ -17,7 +17,9 @@ use std::{
 };
 
 #[cfg(feature = "messaging")]
-use crate::app::live::{LiveCommand, LiveConnection, LiveEvent, LiveWorker, ThreadKind};
+use crate::app::live::{
+    LiveCommand, LiveConnection, LiveEvent, LivePrivacyStatus, LiveWorker, ThreadKind,
+};
 
 pub(super) struct Account {
     pub id: String,
@@ -53,11 +55,23 @@ pub(super) struct LiveState {
     #[cfg(feature = "messaging")]
     pub recall: super::recall::Recall,
     #[cfg(feature = "messaging")]
+    pub delete_for_me: super::delete_for_me::DeleteForMe,
+    #[cfg(feature = "messaging")]
     pub groups: super::group_members::Groups,
+    #[cfg(feature = "messaging")]
+    pub group_pins: super::group_pins::Pins,
+    #[cfg(feature = "messaging")]
+    pub polls: super::polls::Polls,
+    #[cfg(feature = "messaging")]
+    pub remote_history: super::remote_history::RemoteHistory,
+    #[cfg(feature = "messaging")]
+    pub mention_picker: super::mentions::Picker,
     #[cfg(feature = "messaging")]
     pub uploads: super::file_uploads::Uploads,
     #[cfg(feature = "messaging")]
     pub photo_preview: super::photos::Preview,
+    #[cfg(feature = "messaging")]
+    pub voice: super::voice::Composer,
     #[cfg(feature = "messaging")]
     pub directory: super::directory::DirectoryView,
     #[cfg(feature = "messaging")]
@@ -130,11 +144,23 @@ impl LiveState {
             #[cfg(feature = "messaging")]
             recall: Default::default(),
             #[cfg(feature = "messaging")]
+            delete_for_me: Default::default(),
+            #[cfg(feature = "messaging")]
             groups: Default::default(),
+            #[cfg(feature = "messaging")]
+            group_pins: Default::default(),
+            #[cfg(feature = "messaging")]
+            polls: Default::default(),
+            #[cfg(feature = "messaging")]
+            remote_history: Default::default(),
+            #[cfg(feature = "messaging")]
+            mention_picker: Default::default(),
             #[cfg(feature = "messaging")]
             uploads: Default::default(),
             #[cfg(feature = "messaging")]
             photo_preview: Default::default(),
+            #[cfg(feature = "messaging")]
+            voice: Default::default(),
             #[cfg(feature = "messaging")]
             directory: Default::default(),
             #[cfg(feature = "messaging")]
@@ -189,6 +215,25 @@ impl LiveState {
     }
 
     #[cfg(feature = "messaging")]
+    pub(super) fn group_pins_available(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.config().group_board_v2)
+    }
+
+    #[cfg(feature = "messaging")]
+    pub(super) fn group_recall_available(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            let config = session.config();
+            config.recall_max_age_ms.is_some()
+                && config
+                    .services
+                    .get("group")
+                    .is_some_and(|routes| !routes.is_empty())
+        })
+    }
+
+    #[cfg(feature = "messaging")]
     pub(super) fn ensure_worker(&mut self, profile: Arc<Profile>) -> bool {
         if self.worker.is_some() {
             return true;
@@ -205,6 +250,9 @@ impl LiveState {
         self.avatars = Default::default();
         self.stickers = Default::default();
         self.reactions.worker_closed();
+        self.group_pins.set_scope(None);
+        self.polls = Default::default();
+        self.remote_history.worker_closed();
         self.directory.privacy_reset(&self.context, false);
         match LiveWorker::start(
             profile,
@@ -250,7 +298,10 @@ impl LiveState {
                 self.reactions.worker_closed();
                 self.forwarding.worker_closed();
                 self.recall.worker_closed();
+                self.delete_for_me.interrupted();
                 self.groups.worker_closed();
+                self.remote_history.worker_closed();
+                self.mention_picker.set_scope(None);
                 self.photo_preview.clear();
             }
             _ => {}
@@ -279,7 +330,11 @@ impl LiveState {
         self.reactions.worker_closed();
         self.forwarding.worker_closed();
         self.recall.worker_closed();
+        self.delete_for_me.worker_closed();
         self.groups.worker_closed();
+        self.polls = Default::default();
+        self.remote_history.worker_closed();
+        self.mention_picker.set_scope(None);
         self.photo_preview.clear();
         self.directory.worker_closed();
         self.sender_names.worker_closed();
@@ -576,7 +631,12 @@ impl NativeApp {
                         state.attention = Default::default();
                         state.forwarding = Default::default();
                         state.recall = Default::default();
+                        state.delete_for_me = Default::default();
                         state.groups = Default::default();
+                        state.group_pins = Default::default();
+                        state.polls = Default::default();
+                        state.remote_history = Default::default();
+                        state.mention_picker = Default::default();
                         state.uploads = Default::default();
                         state.photo_preview.clear();
                         state.directory = Default::default();
@@ -674,12 +734,25 @@ impl NativeApp {
         let Some(account_id) = state.account.as_ref().map(|account| account.id.clone()) else {
             return;
         };
-        if event.account_id() != account_id {
+        if event.account_id() != account_id || self.apply_remote_history_event(state, &event) {
             return;
         }
         // Durable settlement is independent of whether its conversation is still visible.
         state.uploads.observe(&event);
-        state.sticker_send.observe(&event);
+        state.voice.observe(&event);
+        let sticker_catalog_thread = match &event {
+            LiveEvent::StickersFound { thread, .. }
+            | LiveEvent::StickerPacksFound { thread, .. }
+            | LiveEvent::StickerPackFound { thread, .. } => Some(thread.as_str()),
+            _ => None,
+        };
+        if sticker_catalog_thread.is_none_or(|thread| {
+            self.model.selected.as_deref() == Some(thread)
+                && state.privacy.status == LivePrivacyStatus::Ready
+                && state.privacy.list_visible(thread)
+        }) {
+            state.sticker_send.observe(&event);
+        }
         state.reactions.observe_outcome(&event);
         state
             .attention
@@ -687,15 +760,22 @@ impl NativeApp {
         state.attention.observe(&event, &self.model);
         state.forwarding.observe(&event);
         state.recall.observe(&event);
+        state.delete_for_me.observe(&event);
         if let LiveEvent::Recalled {
             thread,
             message_id,
-            actor_id,
+            actor_id: sender,
+            ..
+        }
+        | LiveEvent::DeletedForMe {
+            thread,
+            message_id,
+            sender_id: sender,
             ..
         } = &event
         {
             self.drafts
-                .remove_recalled_reply(&account_id, thread, message_id, actor_id);
+                .remove_message_reply(&account_id, thread, message_id, sender);
         }
         self.drafts.apply_live(&event, &account_id);
         match &event {
@@ -747,7 +827,10 @@ impl NativeApp {
             state.reactions.worker_closed();
             state.forwarding.worker_closed();
             state.recall.worker_closed();
+            state.delete_for_me.worker_closed();
             state.groups.worker_closed();
+            state.remote_history.worker_closed();
+            state.mention_picker.set_scope(None);
             state.privacy.reset_worker();
             state.privacy.status = crate::app::live::LivePrivacyStatus::Failed;
             self.quarantine_privacy(state, ctx, true);
@@ -790,6 +873,18 @@ impl NativeApp {
         let Some(event) = state.privacy.project(event) else {
             return;
         };
+        if matches!(
+            &event,
+            LiveEvent::PollDetail { .. }
+                | LiveEvent::PollDetailCapability { .. }
+                | LiveEvent::PollVoteFinished { .. }
+        ) {
+            let scope = self.poll_scope(state);
+            state
+                .polls
+                .observe(event, scope.as_ref(), &self.model.messages);
+            return;
+        }
         let reaction_scope = self
             .model
             .selected
@@ -805,15 +900,26 @@ impl NativeApp {
             .reactions
             .observe_snapshot(&event, reaction_scope.as_ref());
         state.groups.observe(&event);
+        if matches!(
+            &event,
+            LiveEvent::GroupPins { .. } | LiveEvent::GroupPinFinished { .. }
+        ) {
+            let pin_scope = self.group_pin_scope(state);
+            state.group_pins.set_scope(pin_scope);
+            state.group_pins.observe(&event);
+        }
+        state.mention_picker.observe(&event);
         state.privacy.observe_conversation(&event);
         self.quarantine_privacy(state, ctx, false);
         if let LiveEvent::Recalled {
             thread, message_id, ..
+        }
+        | LiveEvent::DeletedForMe {
+            thread, message_id, ..
         } = &event
         {
-            state
-                .media
-                .close_recalled_viewer(&account_id, thread, message_id);
+            state.media.forget_message(&account_id, thread, message_id);
+            state.group_pins.remove_preview(thread, message_id);
             if self.model.selected.as_deref() == Some(thread) {
                 self.model.overview = Default::default();
                 state.hydration.invalidate(&account_id, &self.model, ctx);
@@ -847,10 +953,30 @@ impl NativeApp {
             } if *generation == self.model.generation => Some(conversation.id.clone()),
             _ => None,
         };
-        if self.model.apply_live(event, &account_id, self.latest_page) && refresh_senders {
-            state
-                .sender_names
-                .prepare(&account_id, &self.model, force_names, ctx);
+        let deleted_selected = matches!(&event, LiveEvent::DeletedForMe { thread, .. }
+            if self.model.selected.as_deref() == Some(thread));
+        if self.model.apply_live(event, &account_id, self.latest_page) {
+            if refresh_senders {
+                state
+                    .sender_names
+                    .prepare(&account_id, &self.model, force_names, ctx);
+            }
+            // An empty page has no keyset cursor for the older-page control.
+            if deleted_selected
+                && self.model.messages.is_empty()
+                && self.model.has_older
+                && !self.model.pending
+            {
+                if let (Some(thread), Some(worker)) = (self.model.selected.clone(), &state.worker) {
+                    if self
+                        .model
+                        .select_live_if_accepted(thread, |command| worker.submit(command))
+                        .is_ok()
+                    {
+                        self.latest_page = true;
+                    }
+                }
+            }
         }
         self.quarantine_privacy(state, ctx, false);
         if let Some(thread) = opened {
@@ -936,7 +1062,12 @@ impl NativeApp {
                             state.attention = Default::default();
                             state.forwarding = Default::default();
                             state.recall = Default::default();
+                            state.delete_for_me = Default::default();
                             state.groups = Default::default();
+                            state.group_pins = Default::default();
+                            state.polls = Default::default();
+                            state.remote_history = Default::default();
+                            state.mention_picker = Default::default();
                             state.uploads = Default::default();
                             state.photo_preview.clear();
                             state.directory = Default::default();
@@ -1253,12 +1384,23 @@ pub(in crate::ui) mod tests {
                 trusted_qr: false,
                 server_time_seconds: None,
                 parameter_encryption: None,
-                services: Default::default(),
+                services: [(
+                    "group".into(),
+                    vec!["https://group.example.invalid".parse().unwrap()],
+                )]
+                .into(),
                 file_chunk_size: 256_000,
                 photo_upload_route: None,
                 photo_limits: Default::default(),
+                original_photo_limits: None,
+                photo_album_max_count: 9,
+                photo_album_extra_metadata: true,
+                voice_recording_allowed: false,
                 seen_v2: true,
+                group_board_v2: false,
+                mention_all_limit: None,
                 recall_max_age_ms: Some(300_000),
+                delete_for_me_sync: true,
                 chat_poll: vec![],
                 control_poll: vec![],
                 websocket: vec![],
@@ -1621,6 +1763,155 @@ pub(in crate::ui) mod tests {
         }
     }
     #[test]
+    fn synced_delete_updates_only_the_matching_message_and_its_projections() {
+        use crate::{
+            app::live::{GroupPinEntry, GroupPinSnapshot},
+            domain::{MessageHit, MessageQuote, MessageSearch, ReplyReference},
+        };
+
+        let ctx = egui::Context::default();
+        let (mut app, root) = fixture(&ctx);
+        let mut state = app.live.take().unwrap();
+        let chat = |id: &str| Conversation {
+            id: id.into(),
+            title: "Nhóm kiểm thử".into(),
+            last_text: "Tin còn lại".into(),
+            last_sender: "11".into(),
+            last_message_at_ms: 2,
+            group_left: false,
+        };
+        let message = |id: &str, sender: &str, text: &str, sent_at_ms| crate::domain::Message {
+            account_id: "11".into(),
+            thread_id: "g:70".into(),
+            id: id.into(),
+            sender: sender.into(),
+            text: text.into(),
+            sent_at_ms,
+            source_client_id: None,
+            reply_blocked: false,
+            recalled: false,
+            mentions: vec![],
+            quote: None,
+            media: None,
+            sticker: None,
+        };
+        let deleted = message("901", "22", "Tin bị xóa", 1);
+        let mut survivor = message("902", "11", "Tin còn lại", 2);
+        survivor.quote = Some(MessageQuote {
+            owner_id: "22".into(),
+            message_id: "901".into(),
+            client_id: None,
+            message_type: 1,
+            sent_at_ms: 1,
+            text: deleted.text.clone(),
+            ttl: None,
+        });
+        let hit = |message: &crate::domain::Message| MessageHit {
+            message_id: message.id.clone(),
+            sender: message.sender.clone(),
+            sent_at_ms: message.sent_at_ms,
+            snippet: message.text.clone(),
+            highlight: (0, 3),
+            jump: None,
+        };
+        let deleted_hit = hit(&deleted);
+        let survivor_hit = hit(&survivor);
+        let before = survivor.cursor();
+        app.model.conversations = vec![chat("g:70"), chat("g:71")];
+        app.model.selected = Some("g:70".into());
+        app.model.messages = vec![deleted, survivor];
+        app.model.status = "Đang soạn".into();
+        let original_generation = app.model.generation;
+        for thread in ["g:71", "g:70"] {
+            app.drafts.select(thread).unwrap();
+            thread.clone_into(&mut app.drafts.active.text);
+            app.drafts.active.set_reply(ReplyReference {
+                account_id: "11".into(),
+                thread_id: thread.into(),
+                message_id: "901".into(),
+                sender: "22".into(),
+                text: "Trích dẫn mẫu".into(),
+            });
+        }
+        let mut request = 0;
+        app.model
+            .request_search("g:70", "Tin", |id, _| {
+                request = id;
+                Ok(())
+            })
+            .unwrap();
+        let search = MessageSearch {
+            query: "Tin".into(),
+            hits: vec![survivor_hit.clone(), deleted_hit.clone()],
+            next: Some(before.clone()),
+            truncated: true,
+        };
+        assert!(app.model.apply_search(request, "g:70", search.clone()));
+        app.model.focus_hit("g:70", &deleted_hit);
+        app.model
+            .request_search_before("g:70", "Tin", Some(before), |id, _, _| {
+                request = id;
+                Ok(())
+            })
+            .unwrap();
+        let pins_scope = app.group_pin_scope(&state).unwrap();
+        state.group_pins.fixture(
+            pins_scope,
+            GroupPinSnapshot {
+                can_mutate: false,
+                entries: [deleted_hit, survivor_hit.clone()]
+                    .into_iter()
+                    .map(|hit| GroupPinEntry {
+                        message_id: hit.message_id.clone(),
+                        hit: Some(hit),
+                    })
+                    .collect(),
+                unresolved: vec![],
+            },
+        );
+        let event = |account: &str, thread: &str| LiveEvent::DeletedForMe {
+            account_id: account.into(),
+            thread: thread.into(),
+            message_id: "901".into(),
+            sender_id: "22".into(),
+            conversation: chat(thread),
+        };
+        app.apply_live_event(&mut state, event("12", "g:70"), &ctx);
+        assert_eq!(app.model.messages.len(), 2);
+        assert!(app.drafts.active.reply().is_some());
+        app.apply_live_event(&mut state, event("11", "g:70"), &ctx);
+        assert_eq!(app.model.selected.as_deref(), Some("g:70"));
+        assert_eq!(app.model.generation, original_generation);
+        assert_eq!(app.model.status, "Đang soạn");
+        assert_eq!(app.model.messages.len(), 1);
+        assert_eq!(app.model.messages[0].id, "902");
+        assert_eq!(
+            app.model.messages[0].quote.as_ref().unwrap().text,
+            crate::store::delete_for_me::DELETED_FOR_ME_TEXT
+        );
+        assert!(app.model.focus().is_none());
+        assert!(!app.model.search_pending("g:70"));
+        assert!(!app.model.apply_search(request, "g:70", search));
+        assert_eq!(
+            app.model.search_results("g:70").unwrap().hits.as_slice(),
+            std::slice::from_ref(&survivor_hit)
+        );
+        let entries = state.group_pins.fixture_entries();
+        assert!(entries[0].hit.is_none());
+        assert_eq!(entries[1].hit.as_ref(), Some(&survivor_hit));
+        assert!(!state.delete_for_me.is_open());
+        assert!(state.delete_for_me.status_label().is_none());
+        assert_eq!(app.drafts.active.text, "g:70");
+        assert!(app.drafts.active.reply().is_none());
+        app.drafts.select("g:71").unwrap();
+        assert_eq!(app.drafts.active.text, "g:71");
+        assert!(app.drafts.active.reply().is_some());
+        drop(state);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn accepted_send_failure_enters_review_without_losing_newer_draft_or_replaying_stale_events() {
         for edited in [false, true] {
             let ctx = egui::Context::default();
@@ -1764,6 +2055,7 @@ pub(in crate::ui) mod tests {
         let (mut app, root) = fixture(&ctx);
         let thread = "d:22";
         let original = crate::domain::Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -1939,6 +2231,7 @@ pub(in crate::ui) mod tests {
                 let (mut app, root) = fixture(&ctx);
                 app.live.as_mut().unwrap().connection = connection;
                 let message = crate::domain::Message {
+                    mentions: Vec::new(),
                     reply_blocked: false,
                     recalled: false,
                     source_client_id: None,
@@ -2279,9 +2572,18 @@ pub(in crate::ui) mod tests {
             geometry: Option<[f32; 4]>,
             grab: crate::ui::shot_fixture::Grabber,
             menu_opened: bool,
+            mention_scene: bool,
+            mention_caret_seeded: bool,
         }
         impl eframe::App for MeasuredFixture {
             fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+                if self.mention_scene {
+                    // A bare X11 test display may have no window manager to give us focus.
+                    input.focused = true;
+                    if let Some(viewport) = input.viewports.get_mut(&input.viewport_id) {
+                        viewport.focused = Some(true);
+                    }
+                }
                 self.app.raw_input_hook(ctx, input);
             }
 
@@ -2308,10 +2610,12 @@ pub(in crate::ui) mod tests {
                         }
                     }
                 }
-                let reaction_menu = std::env::var("ZALO_UI_FIXTURE_INTERACTIONS")
-                    .is_ok_and(|scene| scene == "reaction-menu");
+                let anchored_menu =
+                    std::env::var("ZALO_UI_FIXTURE_INTERACTIONS").is_ok_and(|scene| {
+                        matches!(scene.as_str(), "reaction-menu" | "group-pin-menu")
+                    }) || std::env::var("ZALO_UI_FIXTURE_DELETE").as_deref() == Ok("menu");
                 if !self.menu_opened
-                    && (reaction_menu || std::env::var_os("ZALO_UI_FIXTURE_MESSAGE_MENU").is_some())
+                    && (anchored_menu || std::env::var_os("ZALO_UI_FIXTURE_MESSAGE_MENU").is_some())
                 {
                     if let (Some(scope), Some(message)) = (
                         self.app.message_menu_scope(),
@@ -2320,7 +2624,7 @@ pub(in crate::ui) mod tests {
                         self.app.message_menu = Some(super::super::message_actions::Popup::new(
                             scope,
                             message.id.clone(),
-                            if reaction_menu {
+                            if anchored_menu {
                                 egui::pos2(screen.right() - 320.0, 80.0)
                             } else {
                                 screen.center()
@@ -2331,7 +2635,36 @@ pub(in crate::ui) mod tests {
                     }
                 }
                 self.app.update(ctx, frame);
-                self.grab.tick(ctx);
+                if self.mention_scene && !self.mention_caret_seeded {
+                    if let Some((id, mut editor)) =
+                        ctx.memory(|memory| memory.focused()).and_then(|id| {
+                            egui::TextEdit::load_state(ctx, id).map(|editor| (id, editor))
+                        })
+                    {
+                        let end = self.app.drafts.active.text.chars().count();
+                        editor
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::one(
+                                egui::text::CCursor::new(end),
+                            )));
+                        editor.store(ctx, id);
+                        self.mention_caret_seeded = true;
+                        ctx.request_repaint();
+                    }
+                }
+                self.grab.tick(ctx, || {
+                    if self.mention_scene {
+                        assert!(
+                            self.app
+                                .live
+                                .as_ref()
+                                .unwrap()
+                                .mention_picker
+                                .fixture_shown(),
+                            "mention fixture must capture the two visible member suggestions"
+                        );
+                    }
+                });
             }
         }
         let width = std::env::var("ZALO_UI_FIXTURE_WIDTH")
@@ -2345,14 +2678,24 @@ pub(in crate::ui) mod tests {
         let directory = std::env::var_os("ZALO_UI_FIXTURE_DIRECTORY").is_some();
         let sender_mode = std::env::var("ZALO_UI_FIXTURE_SENDERS").ok();
         let info_mode = std::env::var_os("ZALO_UI_FIXTURE_INFO").is_some();
+        let album_scene = std::env::var("ZALO_UI_FIXTURE_ALBUM").ok();
+        let voice_scene = std::env::var("ZALO_UI_FIXTURE_VOICE").ok();
         let media_mode = std::env::var("ZALO_UI_FIXTURE_MEDIA").ok();
+        let poll_details = matches!(
+            media_mode.as_deref(),
+            Some("poll-detail" | "poll-hidden" | "poll-vote" | "poll-vote-unknown")
+        );
         let attention_scene = std::env::var("ZALO_UI_FIXTURE_ATTENTION").ok();
         let forward_scene = std::env::var("ZALO_UI_FIXTURE_FORWARD").ok();
         let recall_scene = std::env::var("ZALO_UI_FIXTURE_RECALL").ok();
+        let delete_scene = std::env::var("ZALO_UI_FIXTURE_DELETE").ok();
         let group_scene = std::env::var("ZALO_UI_FIXTURE_GROUP").ok();
-        let cached = media_mode.is_some()
+        let cached = album_scene.is_some()
+            || voice_scene.is_some()
+            || media_mode.is_some()
             || forward_scene.is_some()
             || recall_scene.is_some()
+            || delete_scene.is_some()
             || group_scene.is_some()
             || attention_scene.is_some()
             || interactions_scene.is_some()
@@ -2396,6 +2739,8 @@ pub(in crate::ui) mod tests {
                             geometry: None,
                             grab: Default::default(),
                             menu_opened: false,
+                            mention_scene: false,
+                            mention_caret_seeded: false,
                         }) as Box<dyn eframe::App>
                     })
                     .map_err(Into::into);
@@ -2403,8 +2748,12 @@ pub(in crate::ui) mod tests {
                 let (mut app, path) = fixture(&cc.egui_ctx);
                 *root.lock().unwrap() = Some(path);
                 if online
+                    || album_scene.is_some()
+                    || voice_scene.is_some()
+                    || poll_details
                     || forward_scene.is_some()
                     || recall_scene.is_some()
+                    || delete_scene.is_some()
                     || group_scene.is_some()
                     || interactions_scene.is_some()
                 {
@@ -2420,6 +2769,7 @@ pub(in crate::ui) mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (thread, sender, text))| crate::domain::Message {
+                        mentions: Vec::new(),
                         reply_blocked: false,
                         recalled: false,
                         source_client_id: None,
@@ -2456,12 +2806,17 @@ pub(in crate::ui) mod tests {
                     app.drafts.active.text = "Bản nháp ngoại tuyến".into();
                 }
                 match interactions_scene.as_deref() {
-                    Some("stickers" | "stickers-search") => {
+                    Some(
+                        "stickers" | "stickers-search" | "sticker-packs" | "sticker-pack-detail",
+                    ) => {
                         let state = app.live.as_mut().unwrap();
                         state.sticker_fixture = true;
                         state.sticker_fixture_open = true;
-                        if interactions_scene.as_deref() == Some("stickers-search") {
-                            state.sticker_send.fixture_catalog();
+                        match interactions_scene.as_deref() {
+                            Some("stickers-search") => state.sticker_send.fixture_catalog(),
+                            Some("sticker-packs") => state.sticker_send.fixture_packs(false),
+                            Some("sticker-pack-detail") => state.sticker_send.fixture_packs(true),
+                            _ => {}
                         }
                         super::super::sticker_picker::fixture_thumbnails(
                             &mut state.stickers,
@@ -2499,6 +2854,104 @@ pub(in crate::ui) mod tests {
                         app.model.messages.push(last);
                         app.start_message_selection("fixture-1");
                     }
+                    Some("mentions" | "mention-all") => {
+                        let group = "g:44";
+                        app.model.conversations[0].id = group.into();
+                        app.model.conversations[0].title = "Nhóm kiểm thử nhắc tên".into();
+                        app.model.messages[0].thread_id = group.into();
+                        app.model.messages[0].text =
+                            "Chào @Tài khoản thử, nhóm mình xem bản thiết kế chiều nay nhé.".into();
+                        app.model.messages[0].mentions = vec![crate::domain::mention::Mention {
+                            uid: "11".into(),
+                            pos: 5,
+                            len: "@Tài khoản thử".encode_utf16().count() as u32,
+                        }];
+                        app.model.selected = Some(group.into());
+                        app.drafts.select(group).unwrap();
+                        let everyone = interactions_scene.as_deref() == Some("mention-all");
+                        app.drafts.active.text = if everyone {
+                            "Chào @all"
+                        } else {
+                            "Chào @nguy"
+                        }
+                        .into();
+                        app.focus_composer = true;
+                        let auth = app.auth_generation();
+                        let state = app.live.as_mut().unwrap();
+                        let scope = super::super::group_members::Scope {
+                            account: "11".into(),
+                            auth,
+                            thread: group.into(),
+                            generation: app.model.generation,
+                            privacy_revision: state.privacy.revision,
+                        };
+                        if everyone {
+                            state.mention_picker.fixture_everyone(scope);
+                        } else {
+                            state.mention_picker.fixture(scope);
+                        }
+                    }
+                    Some("group-pins" | "group-pin-menu") => {
+                        use crate::app::live::{GroupPinEntry, GroupPinSnapshot};
+                        let group = "g:44";
+                        app.model.conversations[0].id = group.into();
+                        app.model.conversations[0].title = "Nhóm lên kế hoạch".into();
+                        let message = &mut app.model.messages[0];
+                        message.thread_id = group.into();
+                        message.id = "901".into();
+                        message.source_client_id = Some("1901".into());
+                        message.text = "Lịch họp nhóm vào 14 giờ thứ Sáu.".into();
+                        let hit = crate::domain::MessageHit {
+                            message_id: message.id.clone(),
+                            sender: message.sender.clone(),
+                            sent_at_ms: message.sent_at_ms,
+                            snippet: message.text.clone(),
+                            highlight: (0, 0),
+                            jump: None,
+                        };
+                        app.model.selected = Some(group.into());
+                        app.drafts.select(group).unwrap();
+                        app.drafts.active.text = "Nhớ gửi lịch cho mọi người".into();
+                        if interactions_scene.as_deref() == Some("group-pins") {
+                            app.conversation_details = Some(("11".into(), group.into()));
+                        }
+                        let state = app.live.as_ref().unwrap();
+                        let scope = app.group_pin_scope(state).unwrap();
+                        app.live.as_mut().unwrap().group_pins.fixture(
+                            scope,
+                            GroupPinSnapshot {
+                                can_mutate: true,
+                                entries: vec![
+                                    GroupPinEntry {
+                                        message_id: hit.message_id.clone(),
+                                        hit: Some(hit),
+                                    },
+                                    GroupPinEntry {
+                                        message_id: "902".into(),
+                                        hit: None,
+                                    },
+                                ],
+                                unresolved: Vec::new(),
+                            },
+                        );
+                    }
+                    Some("remote-history" | "remote-history-saved" | "remote-history-offline") => {
+                        let group = "g:44";
+                        app.model.conversations[0].id = group.into();
+                        app.model.conversations[0].title = "Nhóm kiểm thử lịch sử".into();
+                        app.model.messages[0].thread_id = group.into();
+                        app.model.messages[0].id = "901".into();
+                        app.model.messages[0].text = "Tin cũ nhất hiện có trên máy.".into();
+                        app.model.selected = Some(group.into());
+                        app.drafts.select(group).unwrap();
+                        app.drafts.active.text = "Bản nháp giữ nguyên khi tải lịch sử".into();
+                        app.fixture_remote_history(
+                            interactions_scene.as_deref() == Some("remote-history-saved"),
+                        );
+                        if interactions_scene.as_deref() == Some("remote-history-offline") {
+                            app.fixture_connection = Some(LiveConnection::Offline);
+                        }
+                    }
                     _ => {}
                 }
                 if let Some(scene) = attention_scene.as_deref() {
@@ -2519,11 +2972,21 @@ pub(in crate::ui) mod tests {
                 if let Some(scene) = forward_scene.as_deref() {
                     app.model.messages[0].id = "901".into();
                     app.model.messages[0].source_client_id = Some("900".into());
+                    if scene == "group-source" {
+                        let group = "g:70";
+                        app.model.selected = Some(group.into());
+                        app.model.conversations[0].id = group.into();
+                        app.model.conversations[0].title = "Nhóm kiểm thử chuyển tiếp".into();
+                        app.model.messages[0].thread_id = group.into();
+                        app.drafts.select(group).unwrap();
+                        app.drafts.active.text = "Bản nháp đang nhập trong nhóm".into();
+                    }
                     let state = app.live.as_mut().unwrap();
                     state.forwarding.fixture(
                         "11",
                         Some(state.login.generation()),
                         app.model.generation,
+                        app.model.selected.as_deref().unwrap(),
                         scene,
                     );
                 }
@@ -2532,11 +2995,65 @@ pub(in crate::ui) mod tests {
                     message.id = "901".into();
                     message.sender = "11".into();
                     message.source_client_id = Some("900".into());
-                    if scene == "recalled" {
+                    if scene.starts_with("group-") {
+                        let group = "g:70";
+                        app.model.selected = Some(group.into());
+                        app.model.conversations[0].id = group.into();
+                        app.model.conversations[0].title = "Nhóm kiểm thử thu hồi".into();
+                        message.thread_id = group.into();
+                        app.drafts.select(group).unwrap();
+                        app.drafts.active.text = "Bản nháp cần giữ".into();
+                    }
+                    if scene.contains("photo") {
+                        use crate::domain::{
+                            MediaDescriptor, MediaKind, PhotoAlbumMember, PhotoDescriptor,
+                        };
+
+                        let url = "https://f12-zpcloud.zdn.vn/synthetic-recall.jpg";
+                        message.text = MediaKind::Photo.legacy_placeholder().into();
+                        message.media = Some(MediaDescriptor::Photo(PhotoDescriptor {
+                            title: String::new(),
+                            caption: "Ảnh thứ hai trong album mẫu".into(),
+                            thumbnail_url: Some(url.into()),
+                            original_url: Some(url.into()),
+                            width: Some(64),
+                            height: Some(40),
+                            album: PhotoAlbumMember::new(892, 1, 3),
+                        }));
+                        message.reply_blocked = true;
+                        app.live.as_mut().unwrap().media.seed(
+                            &cc.egui_ctx,
+                            crate::app::media::MediaKey {
+                                account_id: "11".into(),
+                                thread_id: message.thread_id.clone(),
+                                message_id: message.id.clone(),
+                                url: url.into(),
+                            },
+                            app.model.generation,
+                            64,
+                            40,
+                            [55, 112, 202, 255].repeat(64 * 40),
+                        );
+                    } else if scene.contains("file") {
+                        use crate::domain::{FileDescriptor, MediaDescriptor, MediaKind};
+
+                        message.text = MediaKind::File.legacy_placeholder().into();
+                        message.media = Some(MediaDescriptor::File(FileDescriptor {
+                            title: "Báo cáo kiểm thử.pdf".into(),
+                            extension: "pdf".into(),
+                            size_bytes: Some(16_384),
+                            url: Some("https://f12-zfile.zdn.vn/synthetic-recall.pdf".into()),
+                            encrypted: false,
+                            is_folder: false,
+                        }));
+                        message.reply_blocked = true;
+                    }
+                    if scene.ends_with("recalled") {
                         message.recalled = true;
                         message.text = crate::domain::RECALLED_TEXT.into();
                         message.reply_blocked = true;
                         message.source_client_id = None;
+                        message.media = None;
                         app.model.conversations[0].last_text = crate::domain::RECALLED_TEXT.into();
                         app.model.conversations[0].last_sender = "11".into();
                     } else {
@@ -2547,6 +3064,18 @@ pub(in crate::ui) mod tests {
                             scene,
                         );
                     }
+                }
+                if let Some(scene) = delete_scene.as_deref() {
+                    let message = &mut app.model.messages[0];
+                    message.id = "901".into();
+                    message.source_client_id = Some("900".into());
+                    app.drafts.active.text = "Bản nháp cần giữ".into();
+                    let scope = app.message_menu_scope().unwrap();
+                    app.live
+                        .as_mut()
+                        .unwrap()
+                        .delete_for_me
+                        .fixture(scope, scene);
                 }
                 if let Some(scene) = group_scene.as_deref() {
                     let group = "g:70";
@@ -2611,6 +3140,7 @@ pub(in crate::ui) mod tests {
                         .into_iter()
                         .enumerate()
                         .map(|(i, sticker)| Message {
+                            mentions: Vec::new(),
                             reply_blocked: false,
                             recalled: false,
                             source_client_id: None,
@@ -2734,6 +3264,7 @@ pub(in crate::ui) mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (sender, text))| Message {
+                        mentions: Vec::new(),
                         reply_blocked: false,
                         recalled: false,
                         source_client_id: None,
@@ -2854,6 +3385,7 @@ pub(in crate::ui) mod tests {
                 if std::env::var_os("ZALO_UI_FIXTURE_REPLY").is_some() {
                     use crate::domain::{Message, MessageQuote};
                     let original = Message {
+                        mentions: Vec::new(),
                         reply_blocked: false,
                         recalled: false,
                         account_id: "11".into(),
@@ -2873,6 +3405,7 @@ pub(in crate::ui) mod tests {
                     let messages = vec![
                         original.clone(),
                         Message {
+                            mentions: Vec::new(),
                             reply_blocked: false,
                             recalled: false,
                             account_id: "11".into(),
@@ -2887,6 +3420,7 @@ pub(in crate::ui) mod tests {
                             sent_at_ms: 1_700_000_060_000,
                         },
                         Message {
+                            mentions: Vec::new(),
                             reply_blocked: false,
                             recalled: false,
                             account_id: "11".into(),
@@ -2922,31 +3456,61 @@ pub(in crate::ui) mod tests {
                         .active
                         .set_reply(original.reply_reference().unwrap());
                 }
-                if std::env::var_os("ZALO_UI_FIXTURE_PHOTO").is_some() {
-                    let path = app._profile.paths.data_dir.join("synthetic-preview.png");
+                if let Some(scene) = &album_scene {
+                    super::super::albums::tests::scene(&mut app, &cc.egui_ctx, scene);
+                }
+                if let Some(scene) = &voice_scene {
+                    super::super::voice::tests::scene(&mut app, scene);
+                }
+                if let Ok(scene) = std::env::var("ZALO_UI_FIXTURE_PHOTO") {
+                    use crate::app::live::{PhotoPreparationFailure, PhotoResolution};
+                    let resolution = if matches!(scene.as_str(), "original" | "original-error") {
+                        PhotoResolution::Original
+                    } else {
+                        PhotoResolution::Hd
+                    };
+                    let path = app._profile.paths.data_dir.join(
+                        if resolution == PhotoResolution::Original {
+                            "synthetic-preview.jpg"
+                        } else {
+                            "synthetic-preview.png"
+                        },
+                    );
                     let image = image::RgbImage::from_fn(640, 400, |x, y| {
                         image::Rgb([(x * 200 / 640) as u8, (y * 200 / 400) as u8, 140])
                     });
                     image.save(&path).unwrap();
                     let source = crate::domain::Attachment::inspect(&path).unwrap();
-                    let photo = crate::app::live::runtime::photo::prepare_fixture(
-                        &app._profile,
-                        &source,
-                        "11",
-                        "d:22",
-                    )
-                    .unwrap();
+                    let photo = if scene == "original-error" {
+                        Err(PhotoPreparationFailure::OriginalOrientation)
+                    } else if resolution == PhotoResolution::Original {
+                        crate::app::live::runtime::photo::prepare_fixture_with_resolution(
+                            &app._profile,
+                            &source,
+                            "11",
+                            "d:22",
+                            resolution,
+                        )
+                    } else {
+                        crate::app::live::runtime::photo::prepare_fixture(
+                            &app._profile,
+                            &source,
+                            "11",
+                            "d:22",
+                        )
+                    };
                     app.model.selected = Some("d:22".into());
                     app.drafts.select("d:22").unwrap();
                     app.drafts.active.clear_reply();
-                    app.drafts.active.text = "Ảnh HD đã chuẩn bị · nội dung tổng hợp.".into();
+                    app.drafts.active.text = "Chú thích ảnh tổng hợp được giữ lại.".into();
                     let mut request = 0;
                     app.drafts
                         .active
-                        .prepare_live_photo(
+                        .prepare_live_photo_with_resolution(
                             app.model.generation,
                             "d:22".into(),
                             source,
+                            resolution,
                             |command| {
                                 if let LiveCommand::PreparePhoto { request_id, .. } = command {
                                     request = request_id;
@@ -2960,10 +3524,12 @@ pub(in crate::ui) mod tests {
                         generation: app.model.generation,
                         thread: "d:22".into(),
                         request_id: request,
-                        result: Ok(photo),
+                        result: photo,
                     };
                     app.drafts.apply_live(&event, "11");
-                    app.live.as_mut().unwrap().uploads.photo_available = true;
+                    let uploads = &mut app.live.as_mut().unwrap().uploads;
+                    uploads.photo_available = true;
+                    uploads.photo_original_available = resolution == PhotoResolution::Original;
                     if let Ok(mode) = std::env::var("ZALO_UI_FIXTURE_PHOTO_UPLOAD") {
                         use crate::app::live::{FileTransferPhase, TransferKind};
                         let prepared = app.drafts.active.photo().unwrap().clone();
@@ -3018,6 +3584,7 @@ pub(in crate::ui) mod tests {
                         sender: "22".into(),
                         source_client_id: None,
                         quote: None,
+                        mentions: Vec::new(),
                         reply_blocked: true,
                         recalled: false,
                         sticker: None,
@@ -3083,7 +3650,14 @@ pub(in crate::ui) mod tests {
                 if media_mode.as_deref() == Some("files")
                     || forward_scene.is_some()
                     || recall_scene.is_some()
+                    || delete_scene.is_some()
                     || group_scene.is_some()
+                    || matches!(
+                        interactions_scene.as_deref(),
+                        Some("remote-history" | "remote-history-saved" | "remote-history-offline")
+                    )
+                    || album_scene.is_some()
+                    || voice_scene.is_some()
                     || std::env::var_os("ZALO_UI_FIXTURE_AVATARS").is_some()
                 {
                     fixture_content_worker(&mut app, &cc.egui_ctx);
@@ -3114,6 +3688,11 @@ pub(in crate::ui) mod tests {
                     geometry: None,
                     grab: Default::default(),
                     menu_opened: false,
+                    mention_scene: matches!(
+                        interactions_scene.as_deref(),
+                        Some("mentions" | "mention-all")
+                    ),
+                    mention_caret_seeded: false,
                 }))
             }),
         )
@@ -3150,13 +3729,13 @@ pub(in crate::ui) mod tests {
                 }),
                 false,
             )],
-            "poll" => vec![(
+            "poll" | "poll-detail" | "poll-hidden" | "poll-vote" | "poll-vote-unknown" => vec![(
                 MediaKind::Poll,
                 serde_json::json!({"params":{
                     "msg":{"vi":"Đã tạo bình chọn mới cho nhóm"},
                     "question":"Mọi người muốn tổ chức buổi trao đổi kế hoạch vào thời gian nào trong tuần tới?",
                     "isAnonymous":true,
-                    "pollId":"synthetic-poll"
+                    "pollId":7601
                 }}),
                 false,
             )],
@@ -3189,7 +3768,10 @@ pub(in crate::ui) mod tests {
             ],
             _ => vec![(MediaKind::Photo, content("photo_object"), false)],
         };
-        let thread = if matches!(mode, "poll" | "files") {
+        let thread = if matches!(
+            mode,
+            "poll" | "poll-detail" | "poll-hidden" | "poll-vote" | "poll-vote-unknown" | "files"
+        ) {
             "g:90"
         } else {
             "d:22"
@@ -3200,6 +3782,7 @@ pub(in crate::ui) mod tests {
             .map(|(i, (kind, source, failed))| {
                 let content = MediaMessageContent::new(kind, &source).unwrap();
                 let message = Message {
+                    mentions: Vec::new(),
                     reply_blocked: false,
                     recalled: false,
                     source_client_id: None,
@@ -3226,6 +3809,7 @@ pub(in crate::ui) mod tests {
         if mode == "files" {
             messages.push((
                 Message {
+                    mentions: Vec::new(),
                     reply_blocked: false,
                     recalled: false,
                     source_client_id: None,
@@ -3252,6 +3836,57 @@ pub(in crate::ui) mod tests {
         app.model.messages = store.page("11", thread, None, 50).unwrap();
         app.drafts.select(thread).unwrap();
         app.compact_list = false;
+        if matches!(
+            mode,
+            "poll-detail" | "poll-hidden" | "poll-vote" | "poll-vote-unknown"
+        ) {
+            use crate::domain::poll::{PollDetails, PollOption};
+            let group = app
+                .model
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == thread)
+                .unwrap();
+            group.title = "Lịch họp nhóm · dữ liệu tổng hợp".into();
+            let scope = super::super::group_members::Scope {
+                account: "11".into(),
+                auth: app.auth_generation(),
+                thread: thread.into(),
+                generation: app.model.generation,
+                privacy_revision: super::super::privacy::Privacy::fixture_ready().revision,
+            };
+            let counts_visible = mode == "poll-detail";
+            let options = [
+                ("Sáng thứ Hai", 2),
+                (
+                    "Chiều thứ Tư sau cuộc họp triển khai và tổng kết định kỳ",
+                    5,
+                ),
+                ("Sáng thứ Sáu", 0),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (text, votes))| PollOption {
+                option_id: index as u64 + 1,
+                text: text.into(),
+                votes: counts_visible.then_some(votes),
+                voted: false,
+            })
+            .collect();
+            let polls = &mut app.live.as_mut().unwrap().polls;
+            polls.fixture(scope, &app.model.messages[0], PollDetails {
+                question: "Mọi người muốn tổ chức buổi trao đổi kế hoạch vào thời gian nào trong tuần tới?".into(),
+                options,
+                closed: counts_visible,
+                anonymous: true,
+                can_vote: mode == "poll-vote",
+                joined: Some(false),
+                vote_pending: mode == "poll-vote-unknown",
+            });
+            if mode == "poll-vote" {
+                polls.fixture_choice(1);
+            }
+        }
         let (width, height, rgba) = std::thread::spawn(|| {
             crate::app::media::decode_fixture(include_bytes!(
                 "../../tests/fixtures/media/photo.jxl"
@@ -3267,7 +3902,9 @@ pub(in crate::ui) mod tests {
                 MediaDescriptor::WebContent(c) | MediaDescriptor::Recommended(c) => {
                     c.image_url.as_ref()
                 }
-                MediaDescriptor::Poll(_) | MediaDescriptor::File(_) => None,
+                MediaDescriptor::Poll(_) | MediaDescriptor::File(_) | MediaDescriptor::Voice(_) => {
+                    None
+                }
             };
             if let Some(url) = url {
                 let key = crate::app::media::MediaKey {

@@ -30,6 +30,7 @@ pub struct Page {
     pub restricted: bool,
     pub next: Option<String>,
     pub permissions: GroupPermissions,
+    pub mention_all: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -43,10 +44,21 @@ pub(crate) struct VerifiedGroup {
     owner: String,
     admins: BTreeSet<String>,
     restricted: bool,
+    pub(crate) can_pin: bool,
+    pub(crate) can_forward: bool,
+    can_post: bool,
     pub permissions: GroupPermissions,
 }
 
 impl VerifiedGroup {
+    pub(crate) fn allows_mention_all(&self, limit: u32) -> bool {
+        self.can_post && self.versions.len() <= limit as usize
+    }
+
+    pub(crate) fn fits_forwarding_group(&self) -> bool {
+        self.versions.len() < MAX_MEMBERS
+    }
+
     pub(crate) fn contains(&self, member: &str) -> bool {
         self.versions.contains_key(member)
     }
@@ -228,58 +240,82 @@ pub(crate) fn verify_group(
     };
     let privileged = account == owner || admins.contains(account);
     let restricted = !disabled("lockViewMember") && !privileged;
+    // The board uses a strict numeric zero for the ordinary member allowance.
+    let can_pin = row
+        .get("setting")
+        .and_then(Value::as_object)
+        .is_some_and(|settings| {
+            privileged || settings.get("setTopicOnly").and_then(Value::as_u64) == Some(0)
+        });
     let permissions = GroupPermissions {
         invite: total < MAX_MEMBERS as u64
             && (privileged || (disabled("addMemberOnly") && disabled("joinAppr"))),
         leave: account != owner,
     };
+    // The source's ordinary multi-forward path falls back at 100 members.
+    // An absent send lock defaults to open in the original settings reader.
+    let can_post =
+        privileged || row.pointer("/setting/lockSendMsg").is_none() || disabled("lockSendMsg");
+    let can_forward = total < MAX_MEMBERS as u64 && can_post;
     Ok(VerifiedGroup {
         versions,
         owner,
         admins,
         restricted,
+        can_pin,
+        can_forward,
+        can_post,
         permissions,
     })
 }
 
+#[cfg(test)]
 pub(crate) fn roster_page(
     payload: &Value,
     account: &str,
     target: &Target,
     after: Option<&str>,
 ) -> Result<Page, WireError> {
-    let VerifiedGroup {
-        versions,
-        owner,
-        admins,
-        restricted,
-        permissions,
-    } = verify_group(payload, account, target)?;
-    let total = versions.len() as u32;
-    let mut selected: Vec<_> = versions
-        .into_iter()
+    project_page(
+        &verify_group(payload, account, target)?,
+        account,
+        target,
+        after,
+    )
+}
+
+pub(crate) fn project_page(
+    group: &VerifiedGroup,
+    account: &str,
+    target: &Target,
+    after: Option<&str>,
+) -> Result<Page, WireError> {
+    let total = group.versions.len() as u32;
+    let mut selected: Vec<_> = group
+        .versions
+        .iter()
         .filter_map(|(id, version)| {
-            let role = if id == owner {
+            let role = if *id == group.owner {
                 Role::Owner
-            } else if admins.contains(&id) {
+            } else if group.admins.contains(id) {
                 Role::Deputy
             } else {
                 Role::Member
             };
-            if restricted && role == Role::Member && id != account {
+            if group.restricted && role == Role::Member && id != account {
                 None
             } else {
                 Some((id, version, role))
             }
         })
         .collect();
-    selected.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    selected.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(b.0)));
     let mut fingerprint = Sha256::new();
     fingerprint.update(account.as_bytes());
     fingerprint.update(b":");
     fingerprint.update(target.remote_id.as_bytes());
     fingerprint.update(total.to_le_bytes());
-    fingerprint.update([u8::from(restricted)]);
+    fingerprint.update([u8::from(group.restricted)]);
     for (id, version, role) in &selected {
         fingerprint.update(id.as_bytes());
         fingerprint.update(b":");
@@ -300,7 +336,7 @@ pub(crate) fn roster_page(
         .skip(start)
         .take(PAGE_SIZE)
         .map(|(id, _, role)| Member {
-            id,
+            id: id.clone(),
             name: None,
             role: Some(role),
         })
@@ -308,9 +344,10 @@ pub(crate) fn roster_page(
     Ok(Page {
         members,
         total: Some(total),
-        restricted,
+        restricted: group.restricted,
         next,
-        permissions,
+        permissions: group.permissions,
+        mention_all: false,
     })
 }
 
@@ -363,6 +400,27 @@ mod tests {
             "setting": {"lockViewMember": 1},
             "memVerList": request_fixture()["sourceMembers"]
         })
+    }
+
+    #[test]
+    fn forwarding_requires_send_permission_and_fewer_than_a_hundred_members() {
+        let target = Target::new(ThreadKind::Group, GROUP).unwrap();
+        let mut row = locked_row();
+        row["setting"]["lockSendMsg"] = json!(true);
+        let payload = response(row);
+        let locked_member = verify_group(&payload, "22", &target).unwrap();
+        assert!(!locked_member.can_forward);
+        assert!(locked_member.fits_forwarding_group());
+        assert!(verify_group(&payload, "88", &target).unwrap().can_forward);
+
+        for (total, permitted) in [(99, true), (100, false)] {
+            let mut row = locked_row();
+            row["totalMember"] = json!(total);
+            row["memVerList"] = json!((1..=total).map(|id| format!("{id}_1")).collect::<Vec<_>>());
+            let group = verify_group(&response(row), "22", &target).unwrap();
+            assert_eq!(group.can_forward, permitted);
+            assert_eq!(group.fits_forwarding_group(), permitted);
+        }
     }
 
     #[test]

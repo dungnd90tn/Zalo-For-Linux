@@ -2,6 +2,8 @@
 //! external program (`zenity` or `kdialog`) and the file is only inspected, never read, so
 //! everything here runs on a short-lived background thread and reports back through a channel.
 use super::{visuals, NativeApp};
+#[cfg(feature = "messaging")]
+use crate::app::live::{PhotoResolution, MAX_ORIGINAL_PHOTO_BYTES};
 use crate::domain::Attachment;
 use eframe::egui::{self, pos2, vec2, FontId, Sense, Stroke};
 use std::{
@@ -15,6 +17,8 @@ use std::{
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Picked {
     File(Attachment),
+    #[cfg(feature = "messaging")]
+    Album(Vec<Attachment>),
     Cancelled,
     Failed(String),
 }
@@ -22,7 +26,25 @@ pub(super) enum Picked {
 enum PickerKind {
     #[default]
     File,
-    Photo,
+    #[cfg(feature = "messaging")]
+    Photo(PhotoResolution),
+    #[cfg(feature = "messaging")]
+    Photos(usize),
+}
+
+impl PickerKind {
+    fn is_photo(self) -> bool {
+        self != Self::File
+    }
+
+    #[cfg(feature = "messaging")]
+    fn resolution(self) -> Option<PhotoResolution> {
+        match self {
+            Self::Photo(resolution) => Some(resolution),
+            Self::Photos(_) => Some(PhotoResolution::Hd),
+            Self::File => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -33,6 +55,7 @@ pub(super) struct AttachmentPicker {
     for_thread: Option<String>,
     for_account: Option<String>,
     for_auth_generation: Option<u64>,
+    for_photo_generation: Option<u64>,
     /// The last problem, shown in the attachment tray until the user dismisses it or chooses again.
     pub notice: Option<String>,
 }
@@ -60,13 +83,19 @@ impl AttachmentPicker {
         thread: Option<&str>,
         account: &str,
         auth_generation: Option<u64>,
+        generation: u64,
+        selection: (PhotoResolution, Option<usize>),
     ) {
         if self.busy() {
             return;
         }
         self.for_account = Some(account.into());
         self.for_auth_generation = auth_generation;
-        self.kind = PickerKind::Photo;
+        self.for_photo_generation = Some(generation);
+        self.kind = match selection {
+            (PhotoResolution::Hd, Some(limit)) => PickerKind::Photos(limit),
+            (resolution, _) => PickerKind::Photo(resolution),
+        };
         self.open_dialog(ctx, thread);
     }
     fn photo_scope(
@@ -74,36 +103,52 @@ impl AttachmentPicker {
         account: &str,
         auth_generation: Option<u64>,
         thread: Option<&str>,
+        generation: u64,
     ) -> bool {
-        self.kind == PickerKind::Photo
+        self.kind.is_photo()
             && self.for_account.as_deref() == Some(account)
             && self.for_auth_generation == auth_generation
             && self.for_thread.as_deref() == thread
+            && self.for_photo_generation == Some(generation)
     }
     #[cfg(feature = "messaging")]
     pub fn invalidate_photo_choice(&mut self) {
-        if self.kind == PickerKind::Photo {
+        if self.kind.is_photo() {
             self.notice = None;
             self.for_thread = None;
             self.for_account = None;
+            self.for_photo_generation = None;
         }
     }
     #[cfg(feature = "messaging")]
     fn inspect_photo_scoped(
         &mut self,
         ctx: &egui::Context,
-        path: PathBuf,
+        selection: (Vec<PathBuf>, Option<usize>),
         thread: Option<&str>,
         account: &str,
         auth_generation: Option<u64>,
+        generation: u64,
     ) {
         if self.busy() {
             return;
         }
         self.for_account = Some(account.into());
         self.for_auth_generation = auth_generation;
-        self.kind = PickerKind::Photo;
-        self.inspect(ctx, path, thread);
+        self.for_photo_generation = Some(generation);
+        let (paths, limit) = selection;
+        self.kind = limit.map_or(PickerKind::Photo(PhotoResolution::Hd), PickerKind::Photos);
+        self.notice = None;
+        self.for_thread = thread.map(str::to_owned);
+        self.spawn(ctx, move || {
+            if paths.len() == 1 {
+                inspect_path_kind(&paths[0], PickerKind::Photo(PhotoResolution::Hd))
+            } else if let Some(limit) = limit {
+                inspect_album(paths.into_iter(), limit)
+            } else {
+                Picked::Failed("Chưa thể gửi album trong hội thoại này. Hãy chọn từng ảnh.".into())
+            }
+        });
     }
     fn inspect_scoped(
         &mut self,
@@ -131,28 +176,29 @@ impl AttachmentPicker {
         }
         self.notice = None;
         self.for_thread = thread.map(str::to_owned);
-        let Some((program, mut args)) = dialog_command() else {
+        let Some((program, args)) = dialog_command() else {
             self.notice = Some(
-                "Không tìm thấy zenity hoặc kdialog để mở hộp thoại. Hãy kéo thả tệp vào cửa sổ."
-                    .into(),
+                if self.kind.is_photo() {
+                    "Không tìm thấy zenity hoặc kdialog để mở hộp chọn ảnh."
+                } else {
+                    "Không tìm thấy zenity hoặc kdialog để mở hộp thoại. Hãy kéo thả tệp vào cửa sổ."
+                }.into(),
             );
             return;
         };
         let kind = self.kind;
-        if kind == PickerKind::Photo {
-            for arg in &mut args {
-                if arg == "--title=Chọn tệp để gửi" {
-                    *arg = "--title=Chọn ảnh HD".into();
-                }
-            }
-            if program.file_name().is_some_and(|name| name == "zenity") {
-                args.push("--file-filter=Ảnh JPEG, PNG, WebP | *.jpg *.jpeg *.png *.webp *.JPG *.JPEG *.PNG *.WEBP".into());
-            } else {
-                args.push("*.jpg *.jpeg *.png *.webp|Ảnh JPEG, PNG, WebP".into());
-            }
-        }
+        #[cfg(feature = "messaging")]
+        let args = match kind.resolution() {
+            Some(resolution) => photo_dialog_args(
+                &program,
+                args,
+                resolution,
+                matches!(kind, PickerKind::Photos(_)),
+            ),
+            None => args,
+        };
         self.spawn(ctx, move || {
-            if kind == PickerKind::Photo {
+            if kind.is_photo() {
                 run_dialog_kind(&program, &args, kind)
             } else {
                 run_dialog(&program, &args)
@@ -208,17 +254,72 @@ fn inspect_path(path: &Path) -> Picked {
 }
 fn inspect_path_kind(path: &Path, kind: PickerKind) -> Picked {
     let picked = inspect_path(path);
-    if kind == PickerKind::Photo {
-        if let Picked::File(file) = &picked {
-            if file.size_bytes > 20 * 1024 * 1024 {
-                return Picked::Failed("Ảnh nguồn lớn hơn 20 MiB; hãy chọn ảnh nhỏ hơn.".into());
+    #[cfg(not(feature = "messaging"))]
+    let _ = kind;
+    #[cfg(feature = "messaging")]
+    if let (PickerKind::Photo(resolution), Picked::File(file)) = (kind, &picked) {
+        let (limit, limit_label) = match resolution {
+            PhotoResolution::Hd => (20 * 1024 * 1024, "20 MiB"),
+            PhotoResolution::Original => (MAX_ORIGINAL_PHOTO_BYTES, "5 MiB"),
+        };
+        if file.size_bytes > limit {
+            return Picked::Failed(format!(
+                "Ảnh nguồn lớn hơn {limit_label}. Hãy chọn ảnh nhỏ hơn."
+            ));
+        }
+        let supported = match resolution {
+            PhotoResolution::Hd => {
+                matches!(file.extension.as_str(), "jpg" | "jpeg" | "png" | "webp")
             }
-            if !matches!(file.extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
-                return Picked::Failed("Ảnh HD chỉ nhận JPEG, PNG hoặc WebP tĩnh. Dùng Đính kèm tệp nếu muốn gửi định dạng khác.".into());
-            }
+            PhotoResolution::Original => matches!(file.extension.as_str(), "jpg" | "jpeg"),
+        };
+        if !supported {
+            return Picked::Failed(match resolution {
+                    PhotoResolution::Hd => "Ảnh HD chỉ nhận JPEG, PNG hoặc WebP tĩnh. Dùng Đính kèm tệp để gửi định dạng khác.",
+                    PhotoResolution::Original => "Ảnh gốc chỉ nhận JPEG hợp lệ. Dùng Đính kèm tệp để gửi định dạng khác.",
+                }.into());
         }
     }
     picked
+}
+
+#[cfg(feature = "messaging")]
+fn photo_dialog_args(
+    program: &Path,
+    mut args: Vec<OsString>,
+    resolution: PhotoResolution,
+    multiple: bool,
+) -> Vec<OsString> {
+    let (title, formats, extensions) = match resolution {
+        PhotoResolution::Hd => (
+            "Chọn ảnh HD",
+            "Ảnh JPEG, PNG, WebP",
+            "*.jpg *.jpeg *.png *.webp *.JPG *.JPEG *.PNG *.WEBP",
+        ),
+        PhotoResolution::Original => ("Chọn ảnh gốc", "Ảnh JPEG", "*.jpg *.jpeg *.JPG *.JPEG"),
+    };
+    for arg in &mut args {
+        if arg == "--title=Chọn tệp để gửi" {
+            *arg = format!("--title={title}").into();
+        } else if arg == "Chọn tệp để gửi" {
+            *arg = title.into();
+        }
+    }
+    let zenity = program.file_name().is_some_and(|name| name == "zenity");
+    args.push(if zenity {
+        format!("--file-filter={formats} | {extensions}").into()
+    } else {
+        format!("{extensions}|{formats}").into()
+    });
+    if multiple {
+        args.push("--multiple".into());
+        if zenity {
+            args.push("--separator=\u{1f}".into());
+        } else {
+            args.push("--separate-output".into());
+        }
+    }
+    args
 }
 
 /// The first dialog program found on `PATH` with its arguments, preferring the GNOME one.
@@ -278,14 +379,55 @@ fn run_dialog_kind(program: &Path, args: &[OsString], kind: PickerKind) -> Picke
         Some(1) => return Picked::Cancelled,
         _ => return Picked::Failed("Hộp thoại chọn tệp báo lỗi.".into()),
     }
-    let chosen = String::from_utf8_lossy(&output.stdout);
-    // A dialog may allow several files joined by `|`; only the first is attached.
-    let chosen = chosen.trim_end_matches(['\n', '\r']);
-    let first = chosen.split('|').next().unwrap_or("");
-    if first.is_empty() {
+    use std::os::unix::ffi::OsStrExt;
+    let chosen = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+    if chosen.is_empty() {
         return Picked::Cancelled;
     }
-    inspect_path_kind(Path::new(first), kind)
+    #[cfg(feature = "messaging")]
+    if let PickerKind::Photos(limit) = kind {
+        let separator = if program.file_name().is_some_and(|name| name == "zenity") {
+            0x1f
+        } else {
+            b'\n'
+        };
+        if chosen.contains(&separator) && Path::new(std::ffi::OsStr::from_bytes(chosen)).is_file() {
+            return Picked::Failed(
+                "Tên ảnh có ký tự phân cách của hộp chọn. Hãy đổi tên ảnh hoặc kéo thả.".into(),
+            );
+        }
+        return inspect_album(
+            chosen
+                .split(|byte| *byte == separator)
+                .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path))),
+            limit,
+        );
+    }
+    let first = chosen.split(|byte| *byte == b'|').next().unwrap_or(chosen);
+    inspect_path_kind(Path::new(std::ffi::OsStr::from_bytes(first)), kind)
+}
+
+#[cfg(feature = "messaging")]
+fn inspect_album(paths: impl Iterator<Item = PathBuf>, limit: usize) -> Picked {
+    let paths: Vec<_> = paths.take(limit + 1).collect();
+    if paths.len() > limit {
+        return Picked::Failed(format!("Chọn tối đa {limit} ảnh cho mỗi album."));
+    }
+    let mut photos = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !path.is_absolute() || photos.iter().any(|photo: &Attachment| photo.path == path) {
+            return Picked::Failed("Không đọc được danh sách ảnh đã chọn. Hãy chọn lại.".into());
+        }
+        match inspect_path_kind(&path, PickerKind::Photo(PhotoResolution::Hd)) {
+            Picked::File(photo) => photos.push(photo),
+            failure => return failure,
+        }
+    }
+    match photos.len() {
+        0 => Picked::Cancelled,
+        1 => Picked::File(photos.pop().unwrap()),
+        _ => Picked::Album(photos),
+    }
 }
 
 /// Height of the tray above the composer's toolbar while a file, a problem or a check is shown.
@@ -301,9 +443,14 @@ impl NativeApp {
             self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT),
             self.auth_generation(),
             self.model.selected.as_deref(),
+            self.model.generation,
         ) && (self.attachments.busy() || self.attachments.notice.is_some())
     }
     pub(super) fn photo_selected(&self) -> bool {
+        #[cfg(feature = "messaging")]
+        if self.album_selected() {
+            return true;
+        }
         self.drafts.active.has_photo_intent() || self.photo_picker_pending()
     }
     #[cfg(feature = "messaging")]
@@ -312,9 +459,13 @@ impl NativeApp {
             .then_some(self.attachments.notice.as_deref())
             .flatten()
     }
-    #[cfg(not(feature = "messaging"))]
-    pub(super) fn photo_can_choose(&self) -> bool {
-        false
+    #[cfg(feature = "messaging")]
+    pub(super) fn photo_picker_resolution(&self) -> Option<PhotoResolution> {
+        if self.photo_picker_pending() {
+            self.attachments.kind.resolution()
+        } else {
+            None
+        }
     }
     #[cfg(not(feature = "messaging"))]
     pub(super) fn photo_can_send(&self) -> bool {
@@ -374,32 +525,37 @@ impl NativeApp {
                 .unwrap_or(crate::app::DEMO_ACCOUNT)
                 .to_owned();
             let auth_generation = self.auth_generation();
-            let extension = first
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let image = matches!(
-                extension.as_str(),
-                "jpg" | "jpeg" | "png" | "webp" | "gif" | "jxl" | "bmp" | "avif" | "heic"
-            );
+            let image = dropped.iter().any(|path| {
+                let extension = path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                matches!(
+                    extension.as_str(),
+                    "jpg" | "jpeg" | "png" | "webp" | "gif" | "jxl" | "bmp" | "avif" | "heic"
+                )
+            });
             let photo_drop = !self.demo && image && !ctx.input(|input| input.modifiers.shift);
             #[cfg(feature = "messaging")]
             if photo_drop {
                 self.drafts.active.edited();
-                if self.photo_can_choose() {
+                if self.photo_can_choose(PhotoResolution::Hd) {
+                    let limit = self.album_limit();
                     self.attachments.inspect_photo_scoped(
                         ctx,
-                        first.clone(),
+                        (dropped.clone(), limit),
                         thread.as_deref(),
                         &account,
                         auth_generation,
+                        self.model.generation,
                     );
                 } else {
-                    self.attachments.kind = PickerKind::Photo;
+                    self.attachments.kind = PickerKind::Photo(PhotoResolution::Hd);
                     self.attachments.for_thread = thread.clone();
                     self.attachments.for_account = Some(account.clone());
                     self.attachments.for_auth_generation = auth_generation;
+                    self.attachments.for_photo_generation = Some(self.model.generation);
                     self.attachments.notice = Some(
                         "Chưa thể chọn ảnh HD. Bỏ tệp hoặc trích dẫn và kiểm tra kết nối.".into(),
                     );
@@ -418,22 +574,38 @@ impl NativeApp {
                     );
                 }
             }
-            if dropped.len() > 1 {
+            if !photo_drop && dropped.len() > 1 {
                 self.attachments.notice =
                     Some("Mỗi lần chỉ chọn một mục; đã chọn mục đầu tiên.".into());
             }
         }
         match self.attachments.poll() {
+            #[cfg(feature = "messaging")]
+            Some(Picked::Album(attachments)) => {
+                if self.attachments.photo_scope(
+                    self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT),
+                    self.auth_generation(),
+                    self.model.selected.as_deref(),
+                    self.model.generation,
+                ) {
+                    self.attachments.notice = None;
+                    self.begin_album_preparation(attachments);
+                }
+            }
             Some(Picked::File(attachment)) => {
                 let account = self.account_id().unwrap_or(crate::app::DEMO_ACCOUNT);
                 let scoped = self.attachments.for_thread.as_deref()
                     == self.model.selected.as_deref()
                     && self.attachments.for_account.as_deref() == Some(account)
-                    && self.attachments.for_auth_generation == self.auth_generation();
-                if scoped && self.attachments.kind == PickerKind::Photo {
+                    && self.attachments.for_auth_generation == self.auth_generation()
+                    && (!self.attachments.kind.is_photo()
+                        || self.attachments.for_photo_generation == Some(self.model.generation));
+                if scoped && self.attachments.kind.is_photo() {
                     self.attachments.notice = None;
                     #[cfg(feature = "messaging")]
-                    self.begin_photo_preparation(attachment);
+                    if let Some(resolution) = self.attachments.kind.resolution() {
+                        self.begin_photo_preparation(attachment, resolution);
+                    }
                 } else if scoped
                     && accepting
                     && self.drafts.active.reply().is_none()
@@ -475,6 +647,7 @@ impl NativeApp {
             self.live
                 .as_ref()
                 .and_then(|state| state.uploads.transfer.as_ref())
+                .filter(|job| !self.voice_tray_shows(job))
                 .filter(|job| {
                     job.busy()
                         || job.review()
@@ -647,6 +820,69 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn original_chooser_is_jpeg_only_and_drops_old_page_scope() {
+        let dir = temp_dir("original");
+        let file = dir.join("preview.png");
+        std::fs::write(&file, [1u8; 10]).unwrap();
+        assert!(matches!(
+            inspect_path_kind(&file, PickerKind::Photo(PhotoResolution::Hd)),
+            Picked::File(_)
+        ));
+        assert!(
+            matches!(inspect_path_kind(&file, PickerKind::Photo(PhotoResolution::Original)), Picked::Failed(message) if message.contains("chỉ nhận JPEG"))
+        );
+        let picker = AttachmentPicker {
+            kind: PickerKind::Photo(PhotoResolution::Original),
+            for_account: Some("11".into()),
+            for_thread: Some("d:22".into()),
+            for_auth_generation: Some(3),
+            for_photo_generation: Some(4),
+            ..Default::default()
+        };
+        assert!(picker.photo_scope("11", Some(3), Some("d:22"), 4));
+        assert!(!picker.photo_scope("11", Some(3), Some("d:22"), 5));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn native_album_choice_is_ordered_and_validates_the_whole_selection() {
+        let dir = temp_dir("album");
+        let first = dir.join("một|album.jpg");
+        let second = dir.join("hai.png");
+        let unsupported = dir.join("động.gif");
+        for file in [&first, &second, &unsupported] {
+            std::fs::write(file, b"synthetic paths only").unwrap();
+        }
+        let zenity = script(
+            &dir,
+            "zenity",
+            &format!(
+                "printf '%s\\037%s\\n' '{}' '{}'",
+                second.display(),
+                first.display()
+            ),
+        );
+        let picked = run_dialog_kind(&zenity, &[], PickerKind::Photos(2));
+        assert!(matches!(picked, Picked::Album(photos)
+            if photos.iter().map(|photo| photo.path.as_path()).eq([second.as_path(), first.as_path()])));
+        assert!(matches!(
+            run_dialog_kind(&zenity, &[], PickerKind::Photos(1)),
+            Picked::Failed(_)
+        ));
+        assert!(matches!(
+            inspect_album([first.clone(), unsupported].into_iter(), 2),
+            Picked::Failed(_)
+        ));
+        assert!(matches!(
+            inspect_album([first.clone(), first].into_iter(), 2),
+            Picked::Failed(_)
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

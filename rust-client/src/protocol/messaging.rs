@@ -298,6 +298,7 @@ pub enum FrameMessageKind {
     Webchat,
     WebchatInfo,
     Photo,
+    Voice,
     WebContent,
     Recommended,
     Poll,
@@ -612,6 +613,7 @@ pub struct Incoming {
 pub(crate) struct IncomingBatch {
     pub messages: Vec<Incoming>,
     pub recalls: Vec<super::recall::RecallNotice>,
+    pub deletes: Vec<super::delete_for_me::DeleteForMeNotice>,
     pub reactions: Vec<super::reactions::ReactionNotice>,
 }
 // Stickers carry a catalog address, never an image URL. Unknown/malformed media
@@ -658,7 +660,7 @@ pub(super) fn incoming_verified_preview(
     incoming_with_scope(
         session.account_id(),
         payload,
-        IncomingScope::AuthenticatedQueue,
+        IncomingScope::AuthenticatedPreview,
     )
 }
 /// Reports only the fixed field that failed, never its value or identifiers.
@@ -673,6 +675,7 @@ pub fn incoming_messages_detailed(
 enum IncomingScope {
     RecipientChecked,
     AuthenticatedQueue,
+    AuthenticatedPreview,
 }
 fn incoming_with_scope(
     account: &str,
@@ -703,10 +706,8 @@ fn incoming_with_reason(
     numeric_id(account)?;
     service_code(payload)?;
     context.field_type = Some(FrameValueType::of(payload.get("data")));
-    let data = payload
-        .get("data")
-        .and_then(Value::as_object)
-        .ok_or(WireError::Invalid)?;
+    let raw_data = payload.get("data").ok_or(WireError::Invalid)?;
+    let data = raw_data.as_object().ok_or(WireError::Invalid)?;
     let mut result = IncomingBatch::default();
     let mut rows = 0;
     let mut info_bytes = 0usize;
@@ -750,18 +751,42 @@ fn incoming_with_reason(
             {
                 return Err(WireError::Invalid);
             }
-            if scope == IncomingScope::AuthenticatedQueue
-                && field == "msgs"
-                && message_type == "chat.undo"
-            {
-                // A direct recall is a scoped action, never a second chat row.
-                // Unsupported or malformed actions cannot mutate history.
-                result
-                    .recalls
-                    .extend(super::recall::direct_notice(account, v).ok());
+            if message_type == "chat.delete" {
+                // Destructive controls have authority only from the verified
+                // message socket. Invalid or unsupported forms never become rows.
+                if scope == IncomingScope::AuthenticatedQueue
+                    && matches!(field, "msgs" | "groupMsgs")
+                    && super::delete_for_me::ordinary(raw_data)
+                {
+                    let remaining = super::delete_for_me::MAX_NOTICES - result.deletes.len();
+                    result
+                        .deletes
+                        .extend(super::delete_for_me::notices(account, kind, v, remaining));
+                }
                 continue;
             }
-            if scope == IncomingScope::AuthenticatedQueue && message_type == "chat.reaction" {
+            if scope != IncomingScope::RecipientChecked
+                && matches!(field, "msgs" | "groupMsgs")
+                && message_type == "chat.undo"
+            {
+                // Unsupported or malformed recalls never become timeline rows.
+                let notice = match kind {
+                    ThreadKind::Direct => super::recall::direct_notice(account, v).ok(),
+                    ThreadKind::Group
+                        if data.get("e2ee").is_none_or(|value| {
+                            value.is_null()
+                                || value.as_bool() == Some(false)
+                                || value.as_u64() == Some(0)
+                        }) =>
+                    {
+                        super::recall::group_notice(account, v).ok()
+                    }
+                    ThreadKind::Group => None,
+                };
+                result.recalls.extend(notice);
+                continue;
+            }
+            if scope != IncomingScope::RecipientChecked && message_type == "chat.reaction" {
                 // The old chat route carries reaction actions alongside messages.
                 // A notice never becomes an ordinary timeline row or a receipt.
                 if field != "pageMsgs" {
@@ -783,6 +808,7 @@ fn incoming_with_reason(
                 "webchat" => FrameMessageKind::Webchat,
                 "chat.sticker" => FrameMessageKind::Sticker,
                 "chat.photo" => FrameMessageKind::Photo,
+                "chat.voice" => FrameMessageKind::Voice,
                 "chat.webcontent" => FrameMessageKind::WebContent,
                 "chat.recommended" => FrameMessageKind::Recommended,
                 "group.poll" => FrameMessageKind::Poll,
@@ -876,7 +902,7 @@ fn incoming_with_reason(
                     })
                 });
             let content = v.get("content");
-            let structured_webchat = scope == IncomingScope::AuthenticatedQueue
+            let structured_webchat = scope != IncomingScope::RecipientChecked
                 && message_type == "webchat"
                 && info.is_none()
                 && legacy
@@ -890,7 +916,9 @@ fn incoming_with_reason(
                         && !text.trim().is_empty()
                         && !text.chars().any(|ch| matches!(ch, '\u{0}'..='\u{7}'))
                 });
-            let media = if let Some(kind) = MediaKind::from_wire(message_type) {
+            let media = if let Some(kind) = MediaKind::from_wire(message_type).filter(|kind| {
+                *kind != MediaKind::Voice || (legacy && content.is_some_and(Value::is_object))
+            }) {
                 // Encrypted messages cannot be projected into the legacy media path.
                 if v.get("e2eeExt").is_some()
                     || ["isE2EE", "isE2ee", "e2ee"].iter().any(|key| {
@@ -959,18 +987,32 @@ fn incoming_with_reason(
             if info_bytes > MAX_INFO_BATCH_BYTES {
                 return Err(WireError::Oversize);
             }
-            let reply_blocked = !(message_type == "webchat"
+            let ordinary_text = message_type == "webchat"
                 && info.is_none()
                 && !structured_webchat
                 && legacy
-                && v.get("mentions").is_none_or(|value| {
-                    value.is_null() || value.as_array().is_some_and(|items| items.is_empty())
-                })
                 && v.get("textProperties")
                     .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
                 && v.get("ttl")
-                    .is_none_or(|value| value.is_null() || value.as_u64() == Some(0)));
-            let source_client_id = if !reply_blocked {
+                    .is_none_or(|value| value.is_null() || value.as_u64() == Some(0));
+            let has_mentions = v.get("mentions").is_some_and(|value| {
+                !value.is_null() && !value.as_array().is_some_and(|items| items.is_empty())
+            });
+            let mentions = if scope != IncomingScope::RecipientChecked
+                && kind == ThreadKind::Group
+                && ordinary_text
+                && has_mentions
+            {
+                content
+                    .and_then(Value::as_str)
+                    .map_or_else(Vec::new, |text| {
+                        super::mention::incoming(text, v.get("mentions"))
+                    })
+            } else {
+                Vec::new()
+            };
+            let reply_blocked = !ordinary_text || has_mentions;
+            let source_client_id = if !reply_blocked || !mentions.is_empty() {
                 v.get("cliMsgId").and_then(|value| id_string(value).ok())
             } else {
                 None
@@ -979,6 +1021,7 @@ fn incoming_with_reason(
                 reply_blocked,
                 recalled: false,
                 source_client_id,
+                mentions,
                 quote,
                 account_id: account.into(),
                 thread_id: thread,
@@ -990,6 +1033,8 @@ fn incoming_with_reason(
                     rich_text
                         .unwrap_or("[Tin nhắn webchat chưa được hỗ trợ]")
                         .into()
+                } else if message_type == "chat.voice" {
+                    MediaKind::Voice.legacy_placeholder().into()
                 } else if let Some(text) = presented {
                     text
                 } else if message_type != "webchat" {
@@ -1013,7 +1058,10 @@ fn incoming_with_reason(
             // it independently from server msgId. Zero/null carry no usable
             // client-generated correlation. Never treat these sentinels
             // as an outbox identity; durable server binding remains authoritative.
-            let client_id = match v.get("cliMsgId").filter(|_| !structured_webchat) {
+            let client_id = match v
+                .get("cliMsgId")
+                .filter(|_| !structured_webchat && (!has_mentions || !message.mentions.is_empty()))
+            {
                 None | Some(Value::Null) => None,
                 Some(Value::Number(n)) if n.as_u64() == Some(0) => None,
                 Some(Value::String(s)) if s == "0" => None,
@@ -1045,6 +1093,7 @@ fn incoming_with_reason(
                     && !structured_webchat
                     && ((media.is_none() && message_type == "webchat")
                         || matches!(message_type, "share.file" | "chat.photo")
+                        || (message_type == "chat.voice" && media.is_some())
                         || (sticker.is_some_and(StickerDescriptor::can_send)
                             && legacy
                             && v.get("ttl")
@@ -1383,11 +1432,72 @@ pub fn legacy_group_allowed_detailed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_delete_controls_have_only_authenticated_message_queue_authority() {
+        let row = json!({"msgType":"chat.delete","uidFrom":"0","idTo":"22","content":[
+            {"type":1,"actionType":0,"globalDelMsgId":"701","clientDelMsgId":"801",
+                "uidFrom":"22","uidTo":"11"},
+            {"type":1,"actionType":1,"globalDelMsgId":"702","clientDelMsgId":"802",
+                "uidFrom":"22","uidTo":"11"},
+            {"type":2,"actionType":0,"globalDelMsgId":"703","clientDelMsgId":"803",
+                "uidFrom":"22","uidTo":"11"},
+            {"type":1,"globalDelMsgId":"704","clientDelMsgId":"804","uidFrom":"22","uidTo":"11"}
+        ]});
+        let mut payload = json!({"error_code":0,"data":{"msgs":[row.clone(),{
+            "msgType":"webchat","uidFrom":"22","idTo":"11","msgId":"710",
+            "cliMsgId":"810","ts":1760000000000_i64,"content":"saved"
+        }]}});
+        let parse = |payload: &Value, scope| incoming_with_scope("11", payload, scope).unwrap();
+        let accepted = parse(&payload, IncomingScope::AuthenticatedQueue);
+        assert_eq!(accepted.messages.len(), 1);
+        assert_eq!(accepted.deletes.len(), 1);
+        assert_eq!(accepted.deletes[0].message_id, "701");
+        for scope in [
+            IncomingScope::RecipientChecked,
+            IncomingScope::AuthenticatedPreview,
+        ] {
+            let ignored = parse(&payload, scope);
+            assert_eq!(ignored.messages.len(), 1);
+            assert!(ignored.deletes.is_empty());
+        }
+        payload["data"]["e2ee"] = json!(1);
+        assert!(parse(&payload, IncomingScope::AuthenticatedQueue)
+            .deletes
+            .is_empty());
+        let wrong_queue = json!({"error_code":0,"data":{"pageMsgs":[row]}});
+        let ignored = parse(&wrong_queue, IncomingScope::AuthenticatedQueue);
+        assert!(ignored.deletes.is_empty());
+        assert!(ignored.messages.is_empty());
+    }
     fn authenticated() -> FrameDecoder {
         FrameDecoder {
             key: (0..32).collect(),
             authenticated: true,
         }
+    }
+
+    #[test]
+    fn authenticated_plain_group_mentions_keep_text_when_span_is_malformed() {
+        let group = |id, pos| {
+            json!({
+                "uidFrom":"44","idTo":"33","msgId":id,"cliMsgId":"992","ts":17,
+                "msgType":"webchat","content":"😀 @Ánh",
+                "mentions":[{"pos":pos,"len":4,"uid":"22","type":0}]
+            })
+        };
+        let wire = json!({"error_code":0,"data":{"groupMsgs":[group("910",3),group("911",1)]}});
+        let messages = authenticated().incoming_messages("11", &wire).unwrap();
+        assert_eq!(messages[0].message.mentions[0].uid, "22");
+        assert_eq!(messages[0].client_id.as_deref(), Some("992"));
+        assert!(messages[0].message.reply_reference().is_none());
+        assert_eq!(messages[1].message.text, "😀 @Ánh");
+        assert!(messages[1].message.mentions.is_empty());
+        assert!(messages[1].client_id.is_none());
+        assert!(incoming_messages("11", &wire).unwrap()[0]
+            .message
+            .mentions
+            .is_empty());
     }
 
     #[test]

@@ -2225,6 +2225,7 @@ impl MessageStore {
         );
         let existing:Option<i64>=tx.query_row("SELECT sent_at_ms FROM messages WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",params![owner,thread,server_id],|r|r.get(0)).optional()?;
         let message = Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -2642,6 +2643,7 @@ mod tests {
     }
     fn message(id: &str) -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -3685,7 +3687,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
-                18
+                crate::store::SCHEMA_VERSION
             );
             for table in [
                 "e2ee_local_candidates",
@@ -3734,7 +3736,7 @@ mod tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                     .unwrap(),
-                18
+                crate::store::SCHEMA_VERSION
             );
             assert_eq!(
                 store.page("123", "d:456", None, 10).unwrap()[0].id,

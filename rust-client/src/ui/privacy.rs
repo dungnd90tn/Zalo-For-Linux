@@ -377,6 +377,7 @@ impl Privacy {
             | LiveEvent::SearchFailed { thread, .. }
             | LiveEvent::SenderNames { thread, .. }
             | LiveEvent::Recalled { thread, .. }
+            | LiveEvent::DeletedForMe { thread, .. }
             | LiveEvent::MessagesRefreshed { thread, .. }
             | LiveEvent::MessagesRefreshFailed { thread, .. }
             | LiveEvent::RequestFailed { thread, .. }
@@ -397,7 +398,11 @@ impl Privacy {
                 }
             }
             LiveEvent::ReactionState { thread, .. }
-            | LiveEvent::ReactionsChanged { thread, .. } => {
+            | LiveEvent::ReactionsChanged { thread, .. }
+            | LiveEvent::GroupPins { thread, .. }
+            | LiveEvent::GroupPinFinished { thread, .. }
+            | LiveEvent::PollDetail { thread, .. }
+            | LiveEvent::PollVoteFinished { thread, .. } => {
                 if !self.list_visible(thread) {
                     return None;
                 }
@@ -489,11 +494,16 @@ impl NativeApp {
             state.photo_preview.clear();
             state.avatars = Default::default();
             state.stickers = Default::default();
+            state.sticker_send.clear_picker();
             state.reactions.reset_view();
             state.directory.privacy_reset(ctx, state.privacy.ready());
             state.forwarding.clear_picker();
             state.recall.clear_confirmation();
             state.groups.clear_projection();
+            state.group_pins.set_scope(None);
+            state.polls.clear_view();
+            state.remote_history.clear_view();
+            state.mention_picker.set_scope(None);
         }
     }
     pub(super) fn relock_hidden(&mut self) {
@@ -515,6 +525,7 @@ impl NativeApp {
             state.forwarding.worker_closed();
             state.recall.worker_closed();
             state.groups.worker_closed();
+            state.remote_history.worker_closed();
             state.privacy.reset_worker();
             state.connection = crate::app::live::LiveConnection::Offline;
             state.reason = Some("Chưa xác nhận được trạng thái riêng tư. Hãy kết nối lại.".into());

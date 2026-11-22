@@ -1,5 +1,7 @@
 //! Full immutable media content and a separately bounded presentation snapshot.
 use super::FailureReason;
+use crate::domain::media::poll_id_in_notice;
+use crate::domain::poll::MAX_POLL_NOTICE_BYTES;
 use crate::domain::{
     MediaDescriptor, MediaKind, MediaMessageContent, Message, MAX_INFO_CONTENT_BYTES,
     MAX_MEDIA_DESCRIPTOR_BYTES, MAX_PREVIEW_CHARS,
@@ -11,23 +13,30 @@ const MAX_PROJECTION_BYTES: usize = MAX_MEDIA_DESCRIPTOR_BYTES;
 const MAX_PREVIEW_BYTES: usize = 4 * MAX_PREVIEW_CHARS;
 
 pub(super) fn initialize(conn: &Connection, version: i64) -> Result<()> {
-    // Extend the v6/v7 sidecar CHECK constraint inside the caller's transaction.
+    // Extend the sidecar CHECK constraint inside the caller's transaction.
     // INSERT...SELECT retains the original immutable JSON and presentation bytes.
-    if version == 6 || version == 7 {
-        conn.execute_batch("ALTER TABLE message_media RENAME TO message_media_v6;")?;
+    const VOICE_SCHEMA_VERSION: i64 = 22;
+    let migrate = version < VOICE_SCHEMA_VERSION
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_media')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+    if migrate {
+        conn.execute_batch("ALTER TABLE message_media RENAME TO message_media_legacy;")?;
     }
     conn.execute_batch("CREATE TABLE IF NOT EXISTS message_media(
         account_id TEXT NOT NULL,thread_id TEXT NOT NULL,message_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK(kind IN ('chat.photo','chat.webcontent','chat.recommended','group.poll','share.file')),
+        kind TEXT NOT NULL CHECK(kind IN ('chat.photo','chat.webcontent','chat.recommended','group.poll','share.file','chat.voice')),
         metadata TEXT NOT NULL CHECK(length(CAST(metadata AS BLOB))<=4194304),
         projection TEXT NOT NULL CHECK(length(CAST(projection AS BLOB))<=16384),
         preview TEXT NOT NULL CHECK(length(CAST(preview AS BLOB))<=1024),
         PRIMARY KEY(account_id,thread_id,message_id),
         FOREIGN KEY(account_id,thread_id,message_id) REFERENCES messages(account_id,thread_id,message_id) ON DELETE CASCADE);")?;
-    if version == 6 || version == 7 {
+    if migrate {
         conn.execute_batch("INSERT INTO message_media(account_id,thread_id,message_id,kind,metadata,projection,preview)
-            SELECT account_id,thread_id,message_id,kind,metadata,projection,preview FROM message_media_v6;
-            DROP TABLE message_media_v6;")?;
+            SELECT account_id,thread_id,message_id,kind,metadata,projection,preview FROM message_media_legacy;
+            DROP TABLE message_media_legacy;")?;
     }
     Ok(())
 }
@@ -35,6 +44,7 @@ pub(super) fn initialize(conn: &Connection, version: i64) -> Result<()> {
 /// Brings stored presentation snapshots up to the current reader. The full source content is immutable and is the
 /// only input; a row whose content no longer parses is left as it is. Runs once per reader revision.
 pub(super) fn reproject(conn: &Connection) -> Result<()> {
+    reproject_photo_albums(conn)?;
     // Bump the marker when a descriptor derivation changes (v1: call logs read their params).
     if conn.execute(
         "INSERT OR IGNORE INTO store_markers(name) VALUES('media_projection_v1')",
@@ -81,6 +91,64 @@ pub(super) fn reproject(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn reproject_photo_albums(conn: &Connection) -> Result<()> {
+    if conn.execute(
+        "INSERT OR IGNORE INTO store_markers(name) VALUES('media_photo_album_v1')",
+        [],
+    )? == 0
+    {
+        return Ok(());
+    }
+    // Params may be encoded as a JSON string with escaped keys, so inspect
+    // the source content one row at a time. Only replace the exact old projection.
+    let mut query = conn.prepare(
+        "SELECT rowid,metadata,projection,preview FROM message_media
+         WHERE rowid>?1 AND kind='chat.photo'
+         AND (instr(metadata,'group_layout_id')>0 OR instr(metadata,char(92)||'u')>0)
+         ORDER BY rowid LIMIT 1",
+    )?;
+    let mut cursor = i64::MIN;
+    while let Some((rowid, metadata, projection, stored_preview)) = query
+        .query_row([cursor], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .optional()?
+    {
+        cursor = rowid;
+        let Ok(value) = serde_json::from_str(&metadata) else {
+            continue;
+        };
+        let Ok(content) = MediaMessageContent::new(MediaKind::Photo, &value) else {
+            continue;
+        };
+        if content.album_member().is_none()
+            || content.as_json() != metadata
+            || preview(content.descriptor()) != stored_preview
+        {
+            continue;
+        }
+        let previous = crate::domain::media::legacy_photo_projection(&value);
+        if serde_json::from_str::<MediaDescriptor>(&projection)
+            .ok()
+            .as_ref()
+            != Some(&previous)
+        {
+            continue;
+        }
+        let next = serde_json::to_string(content.descriptor())?;
+        conn.execute(
+            "UPDATE message_media SET projection=?2 WHERE rowid=?1",
+            params![rowid, next],
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn exists(conn: &Connection, message: &Message) -> Result<bool> {
     Ok(conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM message_media WHERE account_id=?1 AND thread_id=?2 AND message_id=?3)")?.query_row(params![message.account_id,message.thread_id,message.id],|row|row.get(0))?)
 }
@@ -94,9 +162,10 @@ fn preview(descriptor: &MediaDescriptor) -> String {
 }
 
 pub(super) fn projection(conn: &Connection, message: &Message) -> Result<Option<MediaDescriptor>> {
-    let row: Option<(String, Option<String>, Option<String>)> = conn
+    let row: Option<Stored> = conn
         .prepare_cached(
             "SELECT kind,
+        CASE WHEN kind='group.poll' AND length(CAST(metadata AS BLOB))<=?6 THEN metadata END,
         CASE WHEN length(CAST(projection AS BLOB))<=?4 THEN projection END,
         CASE WHEN length(CAST(preview AS BLOB))<=?5 THEN preview END
         FROM message_media WHERE account_id=?1 AND thread_id=?2 AND message_id=?3",
@@ -107,14 +176,15 @@ pub(super) fn projection(conn: &Connection, message: &Message) -> Result<Option<
                 message.thread_id,
                 message.id,
                 MAX_PROJECTION_BYTES as i64,
-                MAX_PREVIEW_BYTES as i64
+                MAX_PREVIEW_BYTES as i64,
+                MAX_POLL_NOTICE_BYTES as i64
             ],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    row.map(|(kind, projection, stored_preview)| {
+    row.map(|(kind, notice, projection, stored_preview)| {
         let projection = projection.ok_or(FailureReason::ConflictingMetadata)?;
-        let descriptor: MediaDescriptor =
+        let mut descriptor: MediaDescriptor =
             serde_json::from_str(&projection).map_err(|_| FailureReason::ConflictingMetadata)?;
         descriptor
             .validate()
@@ -123,12 +193,56 @@ pub(super) fn projection(conn: &Connection, message: &Message) -> Result<Option<
             kind == descriptor.kind().as_str()
                 && stored_preview.as_deref() == Some(preview(&descriptor).as_str())
                 && message.sticker.is_none()
-                && message.text == format!("[Tin nhắn {kind} chưa được hỗ trợ]"),
+                && message.text == descriptor.kind().legacy_placeholder(),
             FailureReason::ConflictingMetadata
         );
+        if let MediaDescriptor::Poll(poll) = &mut descriptor {
+            poll.poll_id = notice
+                .as_deref()
+                .and_then(|raw| poll_id_in_notice(raw, poll));
+        }
         Ok(descriptor)
     })
     .transpose()
+}
+
+#[cfg(feature = "messaging")]
+impl super::MessageStore {
+    /// Resolve an opaque UI message key through the current account and visibility policy.
+    pub(crate) fn poll_detail_target(
+        &self,
+        account: &str,
+        thread: &str,
+        message_id: &str,
+    ) -> Result<Option<u64>> {
+        use crate::domain::reply::valid_source_id;
+
+        if !valid_source_id(account)
+            || !thread.strip_prefix("g:").is_some_and(valid_source_id)
+            || !valid_source_id(message_id)
+            || self.group_write_blocked(account, thread)?
+        {
+            return Ok(None);
+        }
+        let allowed: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM temp.live_privacy WHERE account_id=?1 AND ready=1)
+             AND NOT EXISTS(SELECT 1 FROM temp.live_hidden WHERE account_id=?1 AND thread_id=?2)
+             AND NOT EXISTS(SELECT 1 FROM e2ee_threads WHERE account_id=?1 AND thread_id=?2)",
+            params![account, thread],
+            |row| row.get(0),
+        )?;
+        if !allowed {
+            return Ok(None);
+        }
+        let mut messages = self.refresh_messages(account, thread, &[message_id.to_owned()])?;
+        let Some(message) = messages.pop().filter(|message| !message.is_recalled()) else {
+            return Ok(None);
+        };
+        Ok(match message.media {
+            Some(MediaDescriptor::Poll(poll)) => poll.poll_id,
+            _ => None,
+        })
+    }
 }
 
 type Stored = (String, Option<String>, Option<String>, Option<String>);
@@ -203,7 +317,7 @@ pub(super) fn persist(
     ensure!(
         message.media.as_ref() == Some(content.descriptor())
             && message.sticker.is_none()
-            && message.text == format!("[Tin nhắn {kind} chưa được hỗ trợ]"),
+            && message.text == content.kind().legacy_placeholder(),
         FailureReason::ConflictingMetadata
     );
     let projection =
@@ -259,6 +373,7 @@ mod tests {
         let content = media_content(kind, 1);
         (
             Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 source_client_id: None,
@@ -267,7 +382,7 @@ mod tests {
                 thread_id: "d:22".into(),
                 id: id.into(),
                 sender: "22".into(),
-                text: format!("[Tin nhắn {} chưa được hỗ trợ]", kind.as_str()),
+                text: kind.legacy_placeholder().into(),
                 sticker: None,
                 media: Some(content.descriptor().clone()),
                 sent_at_ms: 1000,
@@ -283,6 +398,65 @@ mod tests {
             content,
         }
     }
+
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn poll_detail_lookup_uses_the_saved_notice_and_live_privacy_scope() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let (mut notice, _) = message(MediaKind::Poll, "801");
+        notice.thread_id = "g:22".into();
+        let content = MediaMessageContent::new(
+            MediaKind::Poll,
+            &json!({"action":"create", "params":"{\"pollId\":42,\"question\":\"Họp lúc nào?\"}"}),
+        )
+        .unwrap();
+        notice.media = Some(content.descriptor().clone());
+        store
+            .receive_batch_with_media("11", &[(notice.clone(), None, None, Some(content))], None)
+            .unwrap();
+        assert_eq!(
+            store.page("11", "g:22", None, 10).unwrap(),
+            vec![notice.clone()]
+        );
+        let conflicting = MediaMessageContent::new(
+            MediaKind::Poll,
+            &json!({"action":"create", "params":"{\"pollId\":43,\"question\":\"Họp lúc nào?\"}"}),
+        )
+        .unwrap();
+        notice.media = Some(conflicting.descriptor().clone());
+        assert!(store
+            .receive_batch_with_media("11", &[(notice, None, None, Some(conflicting))], None)
+            .is_err());
+        store.begin_live_privacy("11").unwrap();
+        assert_eq!(store.poll_detail_target("11", "g:22", "801").unwrap(), None);
+        store.replace_live_privacy("11", &[], None).unwrap();
+        assert_eq!(
+            store.poll_detail_target("11", "g:22", "801").unwrap(),
+            Some(42)
+        );
+        for (account, thread, id) in [
+            ("33", "g:22", "801"),
+            ("11", "d:22", "801"),
+            ("11", "g:23", "801"),
+            ("11", "g:22", "42"),
+        ] {
+            assert_eq!(store.poll_detail_target(account, thread, id).unwrap(), None);
+        }
+        store
+            .replace_live_privacy("11", &["g:22".into()], None)
+            .unwrap();
+        assert_eq!(store.poll_detail_target("11", "g:22", "801").unwrap(), None);
+        store.unlock_live_thread("11", Some("g:22")).unwrap();
+        assert_eq!(store.poll_detail_target("11", "g:22", "801").unwrap(), None);
+        store.begin_live_privacy("11").unwrap();
+        assert_eq!(store.poll_detail_target("11", "g:22", "801").unwrap(), None);
+        store.replace_live_privacy("11", &[], None).unwrap();
+        store
+            .conn
+            .execute("INSERT INTO group_left VALUES('11','g:22',1000)", [])
+            .unwrap();
+        assert_eq!(store.poll_detail_target("11", "g:22", "801").unwrap(), None);
+    }
     #[test]
     fn stored_call_logs_are_reprojected_from_their_immutable_content() {
         let mut store = MessageStore::in_memory().unwrap();
@@ -292,6 +466,7 @@ mod tests {
         }))
         .unwrap();
         let m = Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -327,6 +502,89 @@ mod tests {
             store.conversations("11", 10).unwrap()[0].last_text,
             "Cuộc gọi thoại đến"
         );
+    }
+
+    #[test]
+    fn old_album_projections_upgrade_without_accepting_tampered_members() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let address = "https://f1.zdn.vn/";
+        let mut raw = json!({
+            "title":"\"".repeat(1024), "description":"\"".repeat(4096),
+            "href":address, "thumb":address
+        });
+        let base = MediaMessageContent::new(MediaKind::Photo, &raw).unwrap();
+        let base_bytes = serde_json::to_vec(base.descriptor()).unwrap().len();
+        let fill = (MAX_PROJECTION_BYTES - base_bytes - 8) / 2;
+        let address = format!("{address}{}", "x".repeat(fill));
+        raw["href"] = json!(address);
+        raw["thumb"] = json!(address);
+        let previous = MediaMessageContent::new(MediaKind::Photo, &raw)
+            .unwrap()
+            .descriptor()
+            .clone();
+        raw["params"] = json!(
+            r#"{"group_\u006cayout_id":"7001","id_in_group":0,"is_group_layout":1,"total_item_in_group":3}"#
+        );
+        let content = MediaMessageContent::new(MediaKind::Photo, &raw).unwrap();
+        assert!(content.album_member().is_some());
+        assert!(!content.as_json().contains("group_layout_id"));
+        let (MediaDescriptor::Photo(old), MediaDescriptor::Photo(new)) =
+            (&previous, content.descriptor())
+        else {
+            panic!("expected photo")
+        };
+        assert_eq!(old.caption.len(), 4096);
+        assert!(new.caption.len() < old.caption.len());
+        let (mut legacy, _) = message(MediaKind::Photo, "album-legacy");
+        legacy.media = Some(content.descriptor().clone());
+        let mut altered = legacy.clone();
+        altered.id = "album-altered".into();
+        store
+            .receive_batch_with_media(
+                "11",
+                &[
+                    (legacy.clone(), None, None, Some(content.clone())),
+                    (altered.clone(), None, None, Some(content.clone())),
+                ],
+                None,
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE message_media SET projection=?1 WHERE message_id='album-legacy'",
+                [serde_json::to_string(&previous).unwrap()],
+            )
+            .unwrap();
+        let mut tampered = serde_json::to_value(content.descriptor()).unwrap();
+        tampered["data"]["album"]["index"] = json!(1);
+        store
+            .conn
+            .execute(
+                "UPDATE message_media SET projection=?1 WHERE message_id='album-altered'",
+                [tampered.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM store_markers WHERE name='media_photo_album_v1'",
+                [],
+            )
+            .unwrap();
+        assert!(load(&store.conn, "11", "d:22", &legacy.id).is_err());
+        reproject(&store.conn).unwrap();
+        assert_eq!(
+            load(&store.conn, "11", "d:22", &legacy.id).unwrap(),
+            Some(content.clone())
+        );
+        assert_eq!(
+            projection(&store.conn, &legacy).unwrap().as_ref(),
+            Some(content.descriptor())
+        );
+        assert!(load(&store.conn, "11", "d:22", &altered.id).is_err());
+        assert!(persist(&store.conn, &altered, Some(&content), true).is_err());
+        persist(&store.conn, &legacy, Some(&content), true).unwrap();
     }
     #[test]
     fn legacy_media_enrichment_preserves_body_and_publishes_typed_history_and_preview() {
@@ -678,7 +936,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            18
+            crate::store::SCHEMA_VERSION
         );
     }
 
@@ -701,6 +959,61 @@ mod tests {
         conn.prepare("SELECT account_id,thread_id,message_id,kind,metadata,projection,preview FROM message_media ORDER BY account_id,thread_id,message_id")
             .unwrap().query_map([], |row| (0..7).map(|index| row.get(index)).collect())
             .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn schema_21_upgrade_preserves_album_and_enriches_saved_voice_on_replay() {
+        let mut previous = MessageStore::in_memory().unwrap();
+        let (mut album, _) = message(MediaKind::Photo, "album");
+        let album_content = MediaMessageContent::new(
+            MediaKind::Photo,
+            &json!({"params":{"group_layout_id":"100","id_in_group":0,"is_group_layout":1,"total_item_in_group":2}}),
+        )
+        .unwrap();
+        album.media = Some(album_content.descriptor().clone());
+        previous
+            .receive_batch_with_media(
+                "11",
+                &[(album.clone(), None, None, Some(album_content))],
+                None,
+            )
+            .unwrap();
+        let (mut voice, _) = message(MediaKind::Voice, "voice");
+        let mut old_voice = voice.clone();
+        old_voice.media = None;
+        previous
+            .receive_batch("11", &[(old_voice, None)], None)
+            .unwrap();
+        let old_schema: String = previous.conn.query_row(
+            "SELECT replace(sql, ',' || quote('chat.voice'), '') FROM sqlite_master WHERE name='message_media'",
+            [], |row| row.get(0)
+        ).unwrap();
+        previous
+            .conn
+            .execute_batch("ALTER TABLE message_media RENAME TO media_fixture;")
+            .unwrap();
+        previous.conn.execute_batch(&old_schema).unwrap();
+        previous.conn.execute_batch("INSERT INTO message_media SELECT * FROM media_fixture; DROP TABLE media_fixture; PRAGMA user_version=21;").unwrap();
+        let rows = media_rows(&previous.conn);
+        let mut store = MessageStore::initialize(previous.conn).unwrap();
+        assert_eq!(media_rows(&store.conn), rows);
+        let voice_content = MediaMessageContent::new(
+            MediaKind::Voice,
+            &json!({"href":"https://voice.talk.zdn.vn/synthetic.mp3","params":{"duration":4500}}),
+        )
+        .unwrap();
+        voice.media = Some(voice_content.descriptor().clone());
+        let received = store
+            .receive_batch_with_media(
+                "11",
+                &[(voice.clone(), None, None, Some(voice_content))],
+                None,
+            )
+            .unwrap();
+        assert_eq!(&received[0].0, &voice);
+        let page = store.page("11", "d:22", None, 20).unwrap();
+        assert!(page.contains(&album));
+        assert!(page.contains(&voice));
     }
 
     #[test]
@@ -731,7 +1044,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            18
+            crate::store::SCHEMA_VERSION
         );
         for m in originals {
             assert_eq!(
@@ -817,7 +1130,7 @@ mod tests {
         assert_eq!(media_rows(&conn), rows);
         assert_eq!(
             conn.query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name='message_media_v6'",
+                "SELECT count(*) FROM sqlite_master WHERE name='message_media_legacy'",
                 [],
                 |r| r.get::<_, i64>(0)
             )

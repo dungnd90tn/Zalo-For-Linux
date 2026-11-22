@@ -1,13 +1,15 @@
 //! Bounded rendering snapshots and complete immutable source media content.
-use super::{canonical_content_json, InfoContentError};
+use super::{canonical_content_json, poll, InfoContentError};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use url::Url;
 
 pub const MAX_MEDIA_DESCRIPTOR_BYTES: usize = 16 * 1024;
 pub const MAX_MEDIA_URL_BYTES: usize = 4096;
 pub const PHOTO_PREVIEW: &str = "[Hình ảnh]";
+pub const VOICE_PREVIEW: &str = "[Tin nhắn thoại]";
+const MAX_VOICE_DURATION_MS: u32 = 60 * 60 * 1000;
 pub const WEBCONTENT_PREVIEW: &str = "[Tin nhắn Media]";
 pub const RECOMMENDED_PREVIEW: &str = "[Nội dung được chia sẻ]";
 pub const POLL_PREVIEW: &str = "[Bình chọn]";
@@ -16,6 +18,7 @@ pub const POLL_PREVIEW: &str = "[Bình chọn]";
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
     Photo,
+    Voice,
     WebContent,
     Recommended,
     Poll,
@@ -25,6 +28,7 @@ impl MediaKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Photo => "chat.photo",
+            Self::Voice => "chat.voice",
             Self::WebContent => "chat.webcontent",
             Self::Recommended => "chat.recommended",
             Self::Poll => "group.poll",
@@ -34,6 +38,7 @@ impl MediaKind {
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
             "chat.photo" => Some(Self::Photo),
+            "chat.voice" => Some(Self::Voice),
             "chat.webcontent" => Some(Self::WebContent),
             "chat.recommended" => Some(Self::Recommended),
             "group.poll" => Some(Self::Poll),
@@ -44,12 +49,20 @@ impl MediaKind {
     pub fn legacy_placeholder(self) -> &'static str {
         match self {
             Self::Photo => "[Tin nhắn chat.photo chưa được hỗ trợ]",
+            Self::Voice => VOICE_PREVIEW,
             Self::WebContent => "[Tin nhắn chat.webcontent chưa được hỗ trợ]",
             Self::Recommended => "[Tin nhắn chat.recommended chưa được hỗ trợ]",
             Self::Poll => "[Tin nhắn group.poll chưa được hỗ trợ]",
             Self::File => "[Tin nhắn share.file chưa được hỗ trợ]",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceDescriptor {
+    pub url: Option<String>,
+    pub duration_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +74,149 @@ pub struct PhotoDescriptor {
     pub original_url: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<PhotoAlbumMember>,
+}
+
+pub const MAX_WIRE_ALBUM_PHOTOS: u32 = 9;
+const ALBUM_FIELDS: [&str; 5] = [
+    "groupLayoutId",
+    "idInGroup",
+    "isGroupLayout",
+    "totalItemInGroup",
+    "extMsgProp",
+];
+
+pub fn has_album_message_fields(parameters: &Value) -> bool {
+    ALBUM_FIELDS
+        .iter()
+        .any(|name| parameters.get(*name).is_some())
+}
+
+/// A per-message position in an album. The layout ID is scoped by sender and thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoAlbumMember {
+    layout_id: u64,
+    index: u32,
+    count: u32,
+}
+impl PhotoAlbumMember {
+    pub fn new(layout_id: u64, index: u32, count: u32) -> Option<Self> {
+        let member = Self {
+            layout_id,
+            index,
+            count,
+        };
+        member.is_valid().then_some(member)
+    }
+
+    pub(crate) fn is_valid(self) -> bool {
+        (1..=9_007_199_254_740_991).contains(&self.layout_id)
+            && (2..=100).contains(&self.count)
+            && self.index < self.count
+    }
+
+    pub fn layout_id(self) -> u64 {
+        self.layout_id
+    }
+
+    pub fn index(self) -> u32 {
+        self.index
+    }
+
+    pub fn count(self) -> u32 {
+        self.count
+    }
+
+    pub fn from_message_parameters(parameters: &Value) -> Option<Self> {
+        let layout = parameters.get("groupLayoutId")?.as_str()?;
+        let layout_id: u64 = layout.parse().ok()?;
+        if layout != layout_id.to_string() || parameters.get("isGroupLayout")?.as_u64()? != 1 {
+            return None;
+        }
+        let index = parameters.get("idInGroup")?.as_u64()?.try_into().ok()?;
+        let count = parameters
+            .get("totalItemInGroup")?
+            .as_u64()?
+            .try_into()
+            .ok()?;
+        if count > MAX_WIRE_ALBUM_PHOTOS {
+            return None;
+        }
+        if let Some(extra) = parameters.get("extMsgProp") {
+            let text = extra.as_str().filter(|text| text.len() <= 128)?;
+            if serde_json::from_str::<Value>(text).ok()?
+                != json!({"groupMediaMsg":{"groupLayoutId":layout}})
+            {
+                return None;
+            }
+        }
+        Self::new(layout_id, index, count)
+    }
+
+    fn from_photo_params(params: &Value) -> Option<Self> {
+        fn integer(value: &Value) -> Option<u64> {
+            value.as_u64().or_else(|| {
+                let value = value.as_str()?;
+                if value.is_empty()
+                    || value.len() > 16
+                    || !value.bytes().all(|byte| byte.is_ascii_digit())
+                    || (value.len() > 1 && value.starts_with('0'))
+                {
+                    return None;
+                }
+                value.parse().ok()
+            })
+        }
+        let layout_marker = params.get("is_group_layout")?;
+        if layout_marker.as_bool() != Some(true) && integer(layout_marker) != Some(1) {
+            return None;
+        }
+        Self::new(
+            integer(params.get("group_layout_id")?)?,
+            integer(params.get("id_in_group")?)?.try_into().ok()?,
+            integer(params.get("total_item_in_group")?)?
+                .try_into()
+                .ok()?,
+        )
+    }
+}
+
+#[cfg(test)]
+mod album_tests {
+    use super::*;
+
+    #[test]
+    fn album_projection_requires_bounded_unencrypted_member_metadata() {
+        let params = json!({
+            "group_layout_id":"7001","id_in_group":0,"is_group_layout":1,"total_item_in_group":3
+        });
+        let mut phone = params.clone();
+        phone["is_group_layout"] = json!(true);
+        for encoded in [params.clone(), json!(params.to_string()), phone] {
+            let raw = json!({"title":"Ảnh tổng hợp","params":encoded});
+            let media = MediaMessageContent::new(MediaKind::Photo, &raw).unwrap();
+            assert_eq!(media.album_member(), PhotoAlbumMember::new(7001, 0, 3));
+            assert_eq!(media.as_json(), canonical_content_json(&raw).unwrap());
+        }
+        for (field, invalid) in [
+            ("group_layout_id", json!("0007001")),
+            ("group_layout_id", json!("9007199254740992")),
+            ("id_in_group", json!(3)),
+            ("id_in_group", json!(-1)),
+            ("is_group_layout", json!(0)),
+            ("total_item_in_group", json!(101)),
+            ("total_item_in_group", Value::Null),
+            ("secureKey", json!("synthetic-protected")),
+        ] {
+            let mut raw = json!({"params": params});
+            raw["params"][field] = invalid;
+            let media = MediaMessageContent::new(MediaKind::Photo, &raw).unwrap();
+            assert_eq!(media.album_member(), None, "{field}");
+            assert_eq!(media.as_json(), canonical_content_json(&raw).unwrap());
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,6 +246,9 @@ pub struct PollDescriptor {
     pub title: String,
     pub question: String,
     pub anonymous: Option<bool>,
+    /// Recovered from the original notice only. Persisted summary bytes remain stable.
+    #[serde(skip)]
+    pub poll_id: Option<u64>,
 }
 /// A source file card, not permission to fetch or execute the attachment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +270,7 @@ pub struct FileDescriptor {
 )]
 pub enum MediaDescriptor {
     Photo(PhotoDescriptor),
+    Voice(VoiceDescriptor),
     WebContent(WebContentDescriptor),
     Recommended(WebContentDescriptor),
     Poll(PollDescriptor),
@@ -120,6 +280,7 @@ impl MediaDescriptor {
     pub fn kind(&self) -> MediaKind {
         match self {
             Self::Photo(_) => MediaKind::Photo,
+            Self::Voice(_) => MediaKind::Voice,
             Self::WebContent(_) => MediaKind::WebContent,
             Self::Recommended(_) => MediaKind::Recommended,
             Self::Poll(_) => MediaKind::Poll,
@@ -129,6 +290,7 @@ impl MediaDescriptor {
     pub fn preview_text(&self) -> &str {
         match self {
             Self::Photo(_) => PHOTO_PREVIEW,
+            Self::Voice(_) => VOICE_PREVIEW,
             Self::File(file) => &file.title,
             Self::WebContent(card) | Self::Recommended(card) => &card.title,
             Self::Poll(poll) => {
@@ -160,8 +322,21 @@ impl MediaDescriptor {
                         && url(&photo.thumbnail_url)
                         && url(&photo.original_url)
                         && photo.width.is_none_or(|n| n > 0 && n <= 65_535)
-                        && photo.height.is_none_or(|n| n > 0 && n <= 65_535),
+                        && photo.height.is_none_or(|n| n > 0 && n <= 65_535)
+                        && photo.album.is_none_or(PhotoAlbumMember::is_valid),
                     "Invalid photo descriptor"
+                );
+            }
+            Self::Voice(voice) => {
+                ensure!(
+                    voice
+                        .url
+                        .as_ref()
+                        .is_none_or(|url| voice_url(url).as_ref() == Some(url))
+                        && voice
+                            .duration_ms
+                            .is_none_or(|ms| (1..=MAX_VOICE_DURATION_MS).contains(&ms)),
+                    "Invalid voice descriptor"
                 );
             }
             Self::WebContent(card) | Self::Recommended(card) => {
@@ -201,7 +376,12 @@ impl MediaDescriptor {
             }
             Self::Poll(poll) => {
                 ensure!(
-                    !poll.title.is_empty() && text(&poll.title, 1024) && text(&poll.question, 4096),
+                    !poll.title.is_empty()
+                        && text(&poll.title, 1024)
+                        && text(&poll.question, 4096)
+                        && poll
+                            .poll_id
+                            .is_none_or(|id| (1..=super::poll::MAX_POLL_ID).contains(&id)),
                     "Invalid poll descriptor"
                 );
             }
@@ -254,9 +434,10 @@ impl MediaMessageContent {
         })?;
         let mut descriptor = match kind {
             MediaKind::Photo => MediaDescriptor::Photo(photo(content)),
+            MediaKind::Voice => MediaDescriptor::Voice(voice(content)),
             MediaKind::WebContent => MediaDescriptor::WebContent(web_content(content)),
             MediaKind::Recommended => MediaDescriptor::Recommended(recommended(content)),
-            MediaKind::Poll => MediaDescriptor::Poll(poll(content)),
+            MediaKind::Poll => MediaDescriptor::Poll(poll_notice(content, raw.len())),
             MediaKind::File => MediaDescriptor::File(file(content)),
         };
         fit_descriptor(&mut descriptor);
@@ -278,6 +459,13 @@ impl MediaMessageContent {
     pub fn descriptor(&self) -> &MediaDescriptor {
         &self.descriptor
     }
+
+    pub fn album_member(&self) -> Option<PhotoAlbumMember> {
+        match &self.descriptor {
+            MediaDescriptor::Photo(photo) => photo.album,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +474,15 @@ pub struct MessageMediaBinding {
     pub thread_id: String,
     pub message_id: String,
     pub content: MediaMessageContent,
+}
+
+/// Derive the exact projection that the reader before album support would have stored.
+pub(crate) fn legacy_photo_projection(content: &Value) -> MediaDescriptor {
+    let mut old_photo = photo(content);
+    old_photo.album = None;
+    let mut descriptor = MediaDescriptor::Photo(old_photo);
+    fit_descriptor(&mut descriptor);
+    descriptor
 }
 
 // Keep the rendering snapshot bounded even when legal raw fields contain many
@@ -323,6 +520,7 @@ fn fit_descriptor(descriptor: &mut MediaDescriptor) {
                 }
             }
             MediaDescriptor::File(file) => file.url.take().is_some(),
+            MediaDescriptor::Voice(voice) => voice.url.take().is_some(),
             MediaDescriptor::Poll(poll) => {
                 if !poll.question.is_empty() {
                     poll.question
@@ -388,6 +586,33 @@ pub fn safe_url(value: &str) -> Option<String> {
 }
 fn url(value: Option<&Value>) -> Option<String> {
     value.and_then(Value::as_str).and_then(safe_url)
+}
+
+/// Apply the playback origin boundary before a peer URL reaches the UI.
+pub fn voice_url(value: &str) -> Option<String> {
+    let normalized = safe_url(value)?;
+    let url = Url::parse(&normalized).ok()?;
+    let host = url.host_str()?;
+    (url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.fragment().is_none()
+        && (host.ends_with(".zdn.vn") || host.ends_with(".zadn.vn")))
+    .then_some(normalized)
+}
+
+fn voice(content: &Value) -> VoiceDescriptor {
+    let params = parsed(content.get("params")).unwrap_or(Value::Null);
+    let duration_ms = params.get("duration").and_then(|value| {
+        let duration = value.as_u64().or_else(|| value.as_str()?.parse().ok())?;
+        let duration = u32::try_from(duration).ok()?;
+        (1..=MAX_VOICE_DURATION_MS)
+            .contains(&duration)
+            .then_some(duration)
+    });
+    let url = (!has_encrypted_file_key(content, &params))
+        .then(|| content.get("href")?.as_str().and_then(voice_url))
+        .flatten();
+    VoiceDescriptor { url, duration_ms }
 }
 fn has_encrypted_file_key(content: &Value, params: &Value) -> bool {
     // Original getFileIdData and photo-upload normalization test key truthiness
@@ -476,11 +701,18 @@ fn photo(content: &Value) -> PhotoDescriptor {
         },
         original_url: if encrypted {
             None
+        } else if params.get("is_original").and_then(Value::as_u64) == Some(1) {
+            url(params.get("rawUrl")).or_else(|| url(content.get("href")))
         } else {
             url(params.get("hd")).or_else(|| url(content.get("href")))
         },
         width: dimension("width"),
         height: dimension("height"),
+        album: if encrypted {
+            None
+        } else {
+            PhotoAlbumMember::from_photo_params(&params)
+        },
     }
 }
 fn web_content(content: &Value) -> WebContentDescriptor {
@@ -634,7 +866,22 @@ fn call_duration(seconds: i64) -> String {
     parts.join(" ")
 }
 
-fn poll(content: &Value) -> PollDescriptor {
+pub(crate) fn poll_id_in_notice(raw: &str, summary: &PollDescriptor) -> Option<u64> {
+    if raw.len() > poll::MAX_POLL_NOTICE_BYTES {
+        return None;
+    }
+    let content: Value = serde_json::from_str(raw).ok()?;
+    let notice = poll_notice(&content, raw.len());
+    if notice.title != summary.title
+        || notice.question != summary.question
+        || notice.anonymous != summary.anonymous
+    {
+        return None;
+    }
+    notice.poll_id
+}
+
+fn poll_notice(content: &Value, raw_len: usize) -> PollDescriptor {
     // GroupPollInfoManager reads this embedded notice separately from fetched
     // getPollDetail options/votes. Project only fields present in the message.
     let params = parsed(content.get("params")).unwrap_or(Value::Null);
@@ -649,6 +896,11 @@ fn poll(content: &Value) -> PollDescriptor {
         },
         question: bounded(params.get("question"), 4096),
         anonymous: params.get("isAnonymous").and_then(Value::as_bool),
+        poll_id: if raw_len <= poll::MAX_POLL_NOTICE_BYTES {
+            poll::notice_id(&params)
+        } else {
+            None
+        },
     }
 }
 
@@ -656,6 +908,60 @@ fn poll(content: &Value) -> PollDescriptor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_poll_reference_is_transient_and_requires_the_exact_notice_field() {
+        let params = json!({"pollId": 42, "question": "Họp lúc nào?", "isAnonymous": true});
+        for params in [params.clone(), json!(params.to_string())] {
+            let notice = json!({"params": params, "poll_id": 99});
+            let content = MediaMessageContent::new(MediaKind::Poll, &notice).unwrap();
+            let MediaDescriptor::Poll(poll) = content.descriptor() else {
+                panic!("expected poll notice");
+            };
+            assert_eq!(poll.poll_id, Some(42));
+            assert_eq!(poll_id_in_notice(content.as_json(), poll), Some(42));
+            let summary = serde_json::to_value(content.descriptor()).unwrap();
+            assert_eq!(
+                summary,
+                json!({"kind":"poll", "data":{"title":POLL_PREVIEW,"question":"Họp lúc nào?","anonymous":true}})
+            );
+            let MediaDescriptor::Poll(restored) = serde_json::from_value(summary).unwrap() else {
+                panic!("expected stored poll descriptor");
+            };
+            assert_eq!(restored.poll_id, None);
+        }
+        for id in [
+            json!(0),
+            json!(-1),
+            json!(poll::MAX_POLL_ID + 1),
+            json!("+42"),
+            json!("04"),
+            json!("42x"),
+            json!(false),
+            json!(42.5),
+        ] {
+            let content = MediaMessageContent::new(
+                MediaKind::Poll,
+                &json!({"params": {"pollId": id, "question":"Tóm tắt"}}),
+            )
+            .unwrap();
+            assert_eq!(content.descriptor().preview_text(), "Tóm tắt");
+            let MediaDescriptor::Poll(poll) = content.descriptor() else {
+                panic!("expected poll notice");
+            };
+            assert_eq!(poll_id_in_notice(content.as_json(), poll), None);
+        }
+        let oversized = MediaMessageContent::new(
+            MediaKind::Poll,
+            &json!({"params": {"pollId": "42", "question":"Tóm tắt"}, "extra": "x".repeat(poll::MAX_POLL_NOTICE_BYTES)}),
+        )
+        .unwrap();
+        assert_eq!(oversized.descriptor().preview_text(), "Tóm tắt");
+        let MediaDescriptor::Poll(poll) = oversized.descriptor() else {
+            panic!("expected poll notice");
+        };
+        assert_eq!(poll_id_in_notice(oversized.as_json(), poll), None);
+    }
 
     #[test]
     fn source_files_match_original_title_url_readers_and_keep_complete_content() {

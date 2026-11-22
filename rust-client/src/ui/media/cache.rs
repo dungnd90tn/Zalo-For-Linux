@@ -55,6 +55,7 @@ pub(crate) struct MediaCache {
     downloads: LruCache<MediaKey, Download>,
     bytes: usize,
     pub(super) viewer: Option<Viewer>,
+    pub(in crate::ui) voice: crate::ui::voice::Playback,
     #[cfg(test)]
     fixture_only: bool,
 }
@@ -71,19 +72,43 @@ impl Default for MediaCache {
             downloads: LruCache::new(NonZeroUsize::new(STATES).unwrap()),
             bytes: 0,
             viewer: None,
+            voice: Default::default(),
             #[cfg(test)]
             fixture_only: false,
         }
     }
 }
 impl MediaCache {
-    pub(crate) fn close_recalled_viewer(&mut self, account: &str, thread: &str, id: &str) {
-        if self.viewer.as_ref().is_some_and(|viewer| {
-            viewer.key.account_id == account
-                && viewer.key.thread_id == thread
-                && viewer.key.message_id == id
-        }) {
+    pub(crate) fn forget_message(&mut self, account: &str, thread: &str, id: &str) {
+        let matches = |key: &MediaKey| {
+            key.account_id == account && key.thread_id == thread && key.message_id == id
+        };
+        if self
+            .viewer
+            .as_ref()
+            .is_some_and(|viewer| matches(&viewer.key))
+        {
             self.viewer = None;
+        }
+        self.voice.clear_message(account, thread, id);
+
+        let keys: Vec<_> = self
+            .textures
+            .iter()
+            .map(|(key, _)| key)
+            .chain(self.states.iter().map(|(key, _)| key))
+            .chain(self.downloads.iter().map(|(key, _)| key))
+            .filter(|key| matches(key))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(texture) = self.textures.pop(&key) {
+                self.bytes -= texture.bytes;
+            }
+            self.states.pop(&key);
+            if let Some(Download::Running(progress)) = self.downloads.pop(&key) {
+                progress.cancel();
+            }
         }
     }
 
@@ -101,17 +126,24 @@ impl MediaCache {
             self.loader = None;
             self.states.clear();
             self.viewer = None;
+            self.voice.clear();
             self.startup_retry = None;
             self.scope = Some((thread.into(), generation));
         }
     }
     fn matches(&self, key: &MediaKey, generation: u64) -> bool {
-        self.account.as_deref() == Some(key.account_id.as_str())
+        self.matches_scope(&key.account_id, &key.thread_id, generation)
+    }
+    pub(super) fn matches_scope(&self, account: &str, thread: &str, generation: u64) -> bool {
+        self.account.as_deref() == Some(account)
             && self
                 .scope
                 .as_ref()
                 .map(|(thread, revision)| (thread.as_str(), *revision))
-                == Some((key.thread_id.as_str(), generation))
+                == Some((thread, generation))
+    }
+    pub(in crate::ui) fn has_viewer(&self) -> bool {
+        self.viewer.is_some()
     }
     pub(super) fn visible(
         &mut self,
@@ -213,7 +245,12 @@ impl MediaCache {
         self.retire_closed_downloader();
         if let Some(event) = self.downloader.as_mut().and_then(FileDownloader::try_event) {
             *remaining -= 1;
-            self.apply_download(event);
+            let key = match &event {
+                DownloadEvent::Done { key, .. } | DownloadEvent::Failed { key, .. } => key,
+            };
+            if matches!(self.downloads.peek(key), Some(Download::Running(_))) {
+                self.apply_download(event);
+            }
             ctx.request_repaint();
             return;
         }
@@ -221,7 +258,12 @@ impl MediaCache {
             return;
         };
         *remaining -= 1;
-        self.apply(ctx, event);
+        let key = match &event {
+            MediaEvent::Ready { key, .. } | MediaEvent::Failed { key, .. } => key,
+        };
+        if matches!(self.states.peek(key), Some(State::Pending)) {
+            self.apply(ctx, event);
+        }
         ctx.request_repaint();
     }
     pub(super) fn download_view(&mut self, key: &MediaKey) -> DownloadView {
@@ -453,6 +495,47 @@ mod tests {
             height: side,
             rgba: Arc::new(vec![120; side as usize * side as usize * 4]),
         }
+    }
+
+    #[test]
+    fn recalling_media_releases_only_its_picture_and_transfer_state() {
+        let ctx = egui::Context::default();
+        let mut cache = MediaCache::default();
+        let recalled = key("901");
+        let sibling = key("902");
+        cache.scope("11", "d:22", 1);
+        cache.apply(&ctx, ready(recalled.clone(), 1, 2));
+        cache.apply(&ctx, ready(sibling.clone(), 1, 2));
+        cache.seed_viewer(recalled.clone(), String::new(), None);
+        let another_url = MediaKey {
+            url: "https://f12-zfile.zdn.vn/synthetic.pdf".into(),
+            ..recalled.clone()
+        };
+        cache.states.put(another_url.clone(), State::Pending);
+        cache.downloads.put(
+            another_url.clone(),
+            Download::Running(Arc::new(Progress::default())),
+        );
+        cache
+            .downloads
+            .put(sibling.clone(), Download::Saved("/tmp/sibling.pdf".into()));
+        cache.forget_message("11", "g:22", "901");
+        assert!(cache.has_viewer());
+        assert!(cache.texture(&recalled).is_some());
+        cache.forget_message("11", "d:22", "901");
+        assert!(!cache.has_viewer());
+        assert!(cache.texture(&recalled).is_none());
+        assert!(cache.texture(&sibling).is_some());
+        assert_eq!(cache.bytes, 16);
+        assert!(!cache.states.contains(&another_url));
+        assert!(matches!(
+            cache.download_view(&another_url),
+            DownloadView::Idle
+        ));
+        assert!(matches!(
+            cache.download_view(&sibling),
+            DownloadView::Saved(_)
+        ));
     }
     #[test]
     fn downloads_reject_foreign_scope_and_discard_late_events_after_account_change() {

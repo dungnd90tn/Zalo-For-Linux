@@ -1,12 +1,52 @@
-//! Durable ordinary processed-photo intent; independent from file and text correlation.
+//! Durable ordinary photo intent; independent from file and text correlation.
 use super::*;
-use crate::domain::{MediaDescriptor, MediaKind, MediaMessageContent};
+use crate::domain::{
+    MediaDescriptor, MediaKind, MediaMessageContent, PhotoAlbumMember, PhotoResolution,
+};
 use anyhow::ensure;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const MAX_PHOTO_BYTES: u64 = 5 * 1024 * 1024;
+pub const MAX_ALBUM_PHOTOS: usize = 6;
 const MAX_FINAL_BYTES: usize = 128 * 1024;
+// Pending rows keep only a mode marker. Ready rows carry sealed final JSON.
+// A recalled first member retains only its layout marker for the album tail.
+const ORIGINAL_RESERVATION: &[u8] = b"original-photo";
+const ALBUM_RESERVATION: &[u8] = b"album-photo:";
+
+#[derive(Clone, Copy)]
+pub(crate) struct AlbumPosition {
+    pub(crate) layout_id: Option<u64>,
+    pub(crate) index: u32,
+    pub(crate) count: u32,
+}
+
+fn album_reservation(member: PhotoAlbumMember) -> Vec<u8> {
+    let mut marker = ALBUM_RESERVATION.to_vec();
+    marker.extend(
+        format!(
+            "{}/{}/{}",
+            member.layout_id(),
+            member.index(),
+            member.count()
+        )
+        .bytes(),
+    );
+    marker
+}
+
+fn parse_album_reservation(marker: &[u8]) -> Option<PhotoAlbumMember> {
+    let mut fields = std::str::from_utf8(marker.strip_prefix(ALBUM_RESERVATION)?)
+        .ok()?
+        .split('/');
+    let member = PhotoAlbumMember::new(
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+    )?;
+    fields.next().is_none().then_some(member)
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PhotoSpec {
@@ -83,11 +123,34 @@ fn metadata(raw: &Value) -> Result<Value> {
         value.clone()
     })
 }
+
+fn parameter_resolution(value: &Value) -> Result<PhotoResolution> {
+    let Some(marker) = value.get("jcp") else {
+        return Ok(PhotoResolution::Hd);
+    };
+    let encoded = marker
+        .as_str()
+        .filter(|marker| marker.len() <= 64)
+        .ok_or(FailureReason::ConflictingMetadata)?;
+    let mode: Value = serde_json::from_str(encoded)?;
+    ensure!(
+        mode == serde_json::json!({"is_original":1}),
+        FailureReason::ConflictingMetadata
+    );
+    Ok(PhotoResolution::Original)
+}
+
+fn original_marker(metadata: &Value) -> bool {
+    metadata.get("is_original").and_then(Value::as_u64) == Some(1)
+}
+
 fn bound_resource(
     spec: &PhotoSpec,
     thread: &str,
     client: u64,
     resource: &PhotoResource,
+    resolution: PhotoResolution,
+    album: Option<PhotoAlbumMember>,
 ) -> Result<Vec<u8>> {
     spec.validate()?;
     ensure!(
@@ -122,6 +185,12 @@ fn bound_resource(
         "ttl",
         "toid",
         "grid",
+        "jcp",
+        "groupLayoutId",
+        "idInGroup",
+        "isGroupLayout",
+        "totalItemInGroup",
+        "extMsgProp",
     ];
     ensure!(
         params.keys().all(|key| allowed.contains(&key.as_str())),
@@ -130,6 +199,14 @@ fn bound_resource(
     let string = |key: &str| params.get(key).and_then(Value::as_str);
     let integer = |key: &str| params.get(key).and_then(Value::as_u64);
     ensure!(
+        PhotoAlbumMember::from_message_parameters(&resource.parameters) == album
+            && (album.is_some()
+                || !crate::domain::media::has_album_message_fields(&resource.parameters))
+            && resource.content.album_member() == album
+            && (album.is_none() || resolution == PhotoResolution::Hd),
+        "Photo album metadata differs from its intent"
+    );
+    ensure!(
         string("photoId") == Some(resource.photo_id.as_str())
             && integer("clientId") == Some(client)
             && string("desc") == Some(spec.caption.as_str())
@@ -137,6 +214,7 @@ fn bound_resource(
             && integer("height") == Some(u64::from(spec.height))
             && integer("ttl") == Some(0)
             && string("language") == Some("VN")
+            && parameter_resolution(&resource.parameters)? == resolution
             && string("imei").is_some_and(|v| !v.is_empty() && v.len() <= 256),
         "Photo parameters differ from their intent"
     );
@@ -184,6 +262,7 @@ fn bound_resource(
             && raw.get("thumb").and_then(Value::as_str) == string("thumbUrl")
             && meta.get("hd").and_then(Value::as_str) == string("hdUrl")
             && meta.get("rawUrl").and_then(Value::as_str) == string("rawUrl")
+            && original_marker(&meta) == (resolution == PhotoResolution::Original)
             && meta.get("width").and_then(Value::as_u64) == Some(u64::from(spec.width))
             && meta.get("height").and_then(Value::as_u64) == Some(u64::from(spec.height)),
         "Photo echo differs from resource"
@@ -191,11 +270,16 @@ fn bound_resource(
     let MediaDescriptor::Photo(photo) = resource.content.descriptor() else {
         bail!(FailureReason::Validation);
     };
+    let original = if resolution == PhotoResolution::Original {
+        "rawUrl"
+    } else {
+        "hdUrl"
+    };
     ensure!(
         photo.width == Some(spec.width)
             && photo.height == Some(spec.height)
             && photo.thumbnail_url.as_deref() == string("thumbUrl")
-            && photo.original_url.as_deref() == string("hdUrl"),
+            && photo.original_url.as_deref() == string(original),
         "Photo presentation differs from resource"
     );
     let bytes = serde_json::to_vec(&resource.parameters)?;
@@ -224,6 +308,14 @@ fn verify_echo(
         FailureReason::ConflictingEcho
     );
     let meta = metadata(&raw)?;
+    ensure!(
+        original_marker(&meta) == original_marker(&metadata(&expected_raw)?),
+        FailureReason::ConflictingEcho
+    );
+    ensure!(
+        incoming.album_member() == expected.album_member(),
+        FailureReason::ConflictingEcho
+    );
     if let Some(value) = meta.get("checksum") {
         ensure!(
             value
@@ -389,7 +481,9 @@ fn final_resource(conn: &Connection, account: &str, client: u64) -> Result<Final
             },
             &thread,
             client,
-            &resource
+            &resource,
+            parameter_resolution(&resource.parameters)?,
+            PhotoAlbumMember::from_message_parameters(&resource.parameters),
         )? == parameters,
         "Photo resource binding changed"
     );
@@ -402,6 +496,44 @@ fn final_resource(conn: &Connection, account: &str, client: u64) -> Result<Final
     })
 }
 
+#[cfg(feature = "messaging")]
+pub(super) fn scrub_recalled(conn: &Connection, message: &Message) -> Result<usize> {
+    let client = message
+        .source_client_id
+        .as_deref()
+        .ok_or(FailureReason::ConflictingEcho)?;
+    let anchor = final_resource(conn, &message.account_id, client.parse()?)?
+        .content
+        .album_member()
+        .filter(|member| member.index() == 0)
+        .map(album_reservation);
+    Ok(conn.execute(
+        "UPDATE photo_outbox SET caption='',photo_id=NULL,parameters=?5,parameters_hash=NULL,
+          media_metadata=NULL,checksum='00000000000000000000000000000000'
+         WHERE account_id=?1 AND thread_id=?2 AND server_id=?3 AND client_id=?4 AND state='accepted'",
+        params![message.account_id, message.thread_id, message.id, client, anchor],
+    )?)
+}
+
+fn check_reservations(
+    conn: &Connection,
+    account: &str,
+    thread: &str,
+    specs: &[PhotoSpec],
+) -> Result<()> {
+    ensure!(
+        !super::attachments::upload_active(conn, account)?,
+        "A photo upload is already active"
+    );
+    let unresolved:i64=conn.query_row("SELECT count(*) FROM photo_outbox WHERE account_id=?1 AND state IN ('unknown','acknowledged')",[account],|row|row.get(0))?;
+    ensure!(unresolved < 100, "Too many unresolved photo sends");
+    for spec in specs {
+        let duplicate:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM photo_outbox WHERE account_id=?1 AND thread_id=?2 AND width=?3 AND height=?4 AND checksum=?5 AND state IN ('unknown','acknowledged'))",params![account,thread,spec.width,spec.height,spec.checksum.to_ascii_lowercase()],|row|row.get(0))?;
+        ensure!(!duplicate, "This photo has an unresolved send");
+    }
+    Ok(())
+}
+
 impl MessageStore {
     pub fn reserve_photo(
         &mut self,
@@ -410,17 +542,72 @@ impl MessageStore {
         spec: &PhotoSpec,
         now_ms: i64,
     ) -> Result<u64> {
+        self.reserve_photo_resolution(account, thread, spec, PhotoResolution::Hd, now_ms)
+    }
+    pub(crate) fn reserve_photo_resolution(
+        &mut self,
+        account: &str,
+        thread: &str,
+        spec: &PhotoSpec,
+        resolution: PhotoResolution,
+        now_ms: i64,
+    ) -> Result<u64> {
+        Ok(self
+            .reserve_photo_intent(account, thread, spec, resolution, None, now_ms)?
+            .0)
+    }
+    #[cfg(feature = "messaging")]
+    pub(crate) fn preflight_album(
+        &self,
+        account: &str,
+        thread: &str,
+        specs: &[PhotoSpec],
+    ) -> Result<()> {
+        plain_visible(self, account, thread)?;
+        ensure!(
+            (2..=MAX_ALBUM_PHOTOS).contains(&specs.len()),
+            FailureReason::Validation
+        );
+        for spec in specs {
+            spec.validate()?;
+            ensure!(spec.caption.is_empty(), FailureReason::Validation);
+        }
+        check_reservations(&self.conn, account, thread, specs)
+    }
+    #[cfg(feature = "messaging")]
+    pub(crate) fn reserve_album_photo(
+        &mut self,
+        account: &str,
+        thread: &str,
+        spec: &PhotoSpec,
+        position: AlbumPosition,
+        now_ms: i64,
+    ) -> Result<(u64, PhotoAlbumMember)> {
+        let (id, album) = self.reserve_photo_intent(
+            account,
+            thread,
+            spec,
+            PhotoResolution::Hd,
+            Some(position),
+            now_ms,
+        )?;
+        Ok((id, album.ok_or(FailureReason::Validation)?))
+    }
+    fn reserve_photo_intent(
+        &mut self,
+        account: &str,
+        thread: &str,
+        spec: &PhotoSpec,
+        resolution: PhotoResolution,
+        position: Option<AlbumPosition>,
+        now_ms: i64,
+    ) -> Result<(u64, Option<PhotoAlbumMember>)> {
         plain_visible(self, account, thread)?;
         spec.validate()?;
         ensure!(now_ms > 0, "Invalid photo time");
         let checksum = spec.checksum.to_ascii_lowercase();
         let tx = self.conn.transaction()?;
-        let active:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM photo_outbox WHERE account_id=?1 AND state IN ('uploading','resource_ready','sending') UNION ALL SELECT 1 FROM attachment_outbox WHERE account_id=?1 AND state IN ('uploading','resource_ready','sending'))",[account],|row|row.get(0))?;
-        ensure!(!active, "A photo upload is already active");
-        let unresolved:i64=tx.query_row("SELECT count(*) FROM photo_outbox WHERE account_id=?1 AND state IN ('unknown','acknowledged')",[account],|row|row.get(0))?;
-        ensure!(unresolved < 100, "Too many unresolved photo sends");
-        let duplicate:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM photo_outbox WHERE account_id=?1 AND thread_id=?2 AND width=?3 AND height=?4 AND checksum=?5 AND state IN ('unknown','acknowledged'))",params![account,thread,spec.width,spec.height,checksum],|row|row.get(0))?;
-        ensure!(!duplicate, "This photo has an unresolved send");
+        check_reservations(&tx, account, thread, std::slice::from_ref(spec))?;
         let previous: Option<i64> = tx
             .query_row(
                 "SELECT last_id FROM outgoing_counters WHERE account_id=?1",
@@ -436,9 +623,52 @@ impl MessageStore {
         );
         ensure!(next <= 9_007_199_254_740_991, "Photo client ID exhausted");
         tx.execute("INSERT INTO outgoing_counters VALUES(?1,?2) ON CONFLICT(account_id) DO UPDATE SET last_id=excluded.last_id",params![account,next])?;
-        tx.execute("INSERT INTO photo_outbox(account_id,client_id,thread_id,caption,width,height,size,checksum,created_at_ms,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'uploading')",params![account,next.to_string(),thread,spec.caption,spec.width,spec.height,spec.size as i64,checksum,now_ms])?;
+        let album = position
+            .map(|position| -> Result<_> {
+                ensure!(
+                    (position.index == 0) == position.layout_id.is_none()
+                        && position.count <= MAX_ALBUM_PHOTOS as u32
+                        && resolution == PhotoResolution::Hd
+                        && spec.caption.is_empty(),
+                    FailureReason::Validation
+                );
+                if let Some(layout_id) = position.layout_id {
+                    let marker: Option<Vec<u8>> = tx.query_row(
+                        "SELECT CASE WHEN p.media_metadata IS NULL AND p.parameters_hash IS NULL
+                            AND EXISTS(SELECT 1 FROM recall_tombstones r
+                                WHERE r.account_id=p.account_id AND r.thread_id=p.thread_id
+                                  AND r.message_id=p.server_id AND r.actor_id=p.account_id
+                                  AND r.source_client_id=p.client_id AND r.materialized=1)
+                            THEN p.parameters END FROM photo_outbox p
+                         WHERE p.account_id=?1 AND p.thread_id=?2 AND p.client_id=?3 AND p.state='accepted'",
+                        params![account, thread, layout_id.to_string()],
+                        |row| row.get(0),
+                    ).optional()?.ok_or(FailureReason::ConflictingMetadata)?;
+                    let first = if let Some(marker) = marker {
+                        parse_album_reservation(&marker)
+                    } else {
+                        final_resource(&tx, account, layout_id)?.content.album_member()
+                    };
+                    ensure!(
+                        first == PhotoAlbumMember::new(layout_id, 0, position.count),
+                        FailureReason::ConflictingMetadata
+                    );
+                }
+                PhotoAlbumMember::new(
+                    position.layout_id.unwrap_or(next as u64),
+                    position.index,
+                    position.count,
+                )
+                .ok_or_else(|| FailureReason::Validation.into())
+            })
+            .transpose()?;
+        let album_marker = album.map(album_reservation);
+        let intent = album_marker
+            .as_deref()
+            .or_else(|| (resolution == PhotoResolution::Original).then_some(ORIGINAL_RESERVATION));
+        tx.execute("INSERT INTO photo_outbox(account_id,client_id,thread_id,caption,width,height,size,checksum,created_at_ms,state,parameters) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'uploading',?10)",params![account,next.to_string(),thread,spec.caption,spec.width,spec.height,spec.size as i64,checksum,now_ms,intent])?;
         tx.commit()?;
-        Ok(next as u64)
+        Ok((next as u64, album))
     }
     pub fn photo_state(&self, account: &str, client: u64) -> Result<Option<PhotoState>> {
         validate_id(account)?;
@@ -471,6 +701,24 @@ impl MessageStore {
         );
         let (thread,caption,width,height,size,checksum,state,old):Row=self.conn.query_row("SELECT thread_id,caption,width,height,size,checksum,state,parameters FROM photo_outbox WHERE account_id=?1 AND client_id=?2",params![account,client.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))?;
         plain_visible(self, account, &thread)?;
+        let (resolution, album) = match (state.as_str(), old.as_deref()) {
+            ("uploading", Some(marker)) if marker == ORIGINAL_RESERVATION => {
+                (PhotoResolution::Original, None)
+            }
+            ("uploading", Some(marker)) => (
+                PhotoResolution::Hd,
+                Some(parse_album_reservation(marker).ok_or(FailureReason::ConflictingMetadata)?),
+            ),
+            ("uploading", None) => (PhotoResolution::Hd, None),
+            ("resource_ready", Some(previous)) => {
+                let previous = serde_json::from_slice(previous)?;
+                (
+                    parameter_resolution(&previous)?,
+                    PhotoAlbumMember::from_message_parameters(&previous),
+                )
+            }
+            _ => bail!(FailureReason::ConflictingMetadata),
+        };
         let bytes = bound_resource(
             &PhotoSpec {
                 caption,
@@ -482,6 +730,8 @@ impl MessageStore {
             &thread,
             client,
             resource,
+            resolution,
+            album,
         )?;
         let hash = Sha256::digest(&bytes);
         if state == "resource_ready" {
@@ -548,7 +798,10 @@ impl MessageStore {
     pub fn accept_photo(&mut self, account: &str, client: u64) -> Result<(Message, Conversation)> {
         validate_id(account)?;
         let tx = self.conn.transaction()?;
-        let (thread,server,created,timestamp,raw):(String,String,i64,Option<i64>,String)=tx.query_row("SELECT thread_id,server_id,created_at_ms,server_ts,media_metadata FROM photo_outbox WHERE account_id=?1 AND client_id=?2 AND state IN ('acknowledged','accepted')",params![account,client.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        let (thread,server,created,timestamp,raw):(String,String,i64,Option<i64>,Option<String>)=tx.query_row("SELECT thread_id,server_id,created_at_ms,server_ts,media_metadata FROM photo_outbox WHERE account_id=?1 AND client_id=?2 AND state IN ('acknowledged','accepted')",params![account,client.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
+        let Some(raw) = raw else {
+            return super::recall::accepted_media_replay(&tx, account, &thread, &server, client);
+        };
         ensure!(raw.len() <= MAX_FINAL_BYTES, "Photo echo exceeds limit");
         ensure!(
             !super::forward::server_reserved(&tx, account, &thread, &server)?,
@@ -572,6 +825,7 @@ impl MessageStore {
             sender: account.into(),
             text: MediaKind::Photo.legacy_placeholder().into(),
             source_client_id: Some(client.to_string()),
+            mentions: Vec::new(),
             reply_blocked: true,
             recalled: false,
             quote: None,
@@ -583,6 +837,15 @@ impl MessageStore {
         insert_validated_with_media(&tx, std::iter::once((&message, None, Some(&content))))?;
         super::message_reply::hydrate(&tx, &mut message)?;
         ensure!(tx.execute("UPDATE photo_outbox SET state='accepted' WHERE account_id=?1 AND client_id=?2 AND state IN ('acknowledged','accepted')",params![account,client.to_string()])?==1,"Photo acceptance conflict");
+        #[cfg(feature = "messaging")]
+        if let Some(change) = super::recall::materialize_pending_media(&tx, &message)? {
+            let recalled = change
+                .message
+                .zip(change.conversation)
+                .ok_or(FailureReason::ConflictingEcho)?;
+            tx.commit()?;
+            return Ok(recalled);
+        }
         let conversation = tx.query_row(
             CONVERSATION_SQL,
             params![account, thread, MAX_PREVIEW_CHARS as i64],
@@ -609,6 +872,190 @@ impl MessageStore {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(feature = "messaging")]
+    #[test]
+    fn album_member_metadata_is_bound_through_resource_and_receipt_recovery() {
+        let previous = MessageStore::in_memory().unwrap();
+        previous.conn.execute_batch(
+            "PRAGMA user_version=20; DELETE FROM store_markers WHERE name='media_photo_album_v1';",
+        ).unwrap();
+        let mut store = MessageStore::initialize(previous.conn).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            crate::store::SCHEMA_VERSION
+        );
+        let spec = PhotoSpec {
+            caption: String::new(),
+            width: 80,
+            height: 60,
+            size: 1000,
+            checksum: "a".repeat(32),
+        };
+        store
+            .preflight_album("11", "d:22", &[spec.clone(), spec.clone()])
+            .unwrap();
+        let (first, member) = store
+            .reserve_album_photo(
+                "11",
+                "d:22",
+                &spec,
+                AlbumPosition {
+                    layout_id: None,
+                    index: 0,
+                    count: 3,
+                },
+                1000,
+            )
+            .unwrap();
+        assert_eq!(member.layout_id(), first);
+        let resource = |client, member: PhotoAlbumMember| {
+            let url = "https://files.zdn.vn/album.jpg";
+            let mut parameters = json!({
+                "photoId":"synthetic-photo","clientId":client,"desc":"",
+                "width":80,"height":60,"rawUrl":url,"thumbUrl":url,"hdUrl":url,
+                "normalUrl":url,"language":"VN","imei":"synthetic-device","ttl":0,"toid":"22"
+            });
+            member
+                .apply_to_message_parameters(&mut parameters, true)
+                .unwrap();
+            let content = MediaMessageContent::new(
+                MediaKind::Photo,
+                &json!({
+                    "title":"","description":"","href":url,"thumb":url,
+                    "params":{"width":80,"height":60,"hd":url,"rawUrl":url}
+                }),
+            )
+            .unwrap();
+            PhotoResource {
+                photo_id: "synthetic-photo".into(),
+                parameters,
+                content: member.apply_to_media_content(&content).unwrap(),
+            }
+        };
+        let other = PhotoAlbumMember::new(first, 1, 3).unwrap();
+        assert!(store
+            .photo_resource_ready("11", first, &resource(first, other))
+            .is_err());
+        let rendered = resource(first, member);
+        store.photo_resource_ready("11", first, &rendered).unwrap();
+        let canonical = store.begin_photo_dispatch("11", first).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&canonical).unwrap(),
+            rendered.parameters
+        );
+        store
+            .record_photo_ack("11", first, "901", Some(1020))
+            .unwrap();
+        let mut reopened = MessageStore::initialize(store.conn).unwrap();
+        reopened.recover_photos("11").unwrap();
+        reopened.reconcile_photos("11").unwrap();
+        let messages = reopened.page("11", "d:22", None, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        let Some(MediaDescriptor::Photo(photo)) = &messages[0].media else {
+            panic!("Expected photo")
+        };
+        assert_eq!(photo.album, Some(member));
+        assert!(reopened
+            .reserve_album_photo(
+                "11",
+                "d:22",
+                &spec,
+                AlbumPosition {
+                    layout_id: Some(first),
+                    index: 1,
+                    count: 4
+                },
+                1030
+            )
+            .is_err());
+        let (second, second_member) = reopened
+            .reserve_album_photo(
+                "11",
+                "d:22",
+                &spec,
+                AlbumPosition {
+                    layout_id: Some(first),
+                    index: 1,
+                    count: 3,
+                },
+                1030,
+            )
+            .unwrap();
+        assert_eq!(second_member, other);
+        reopened
+            .photo_resource_ready("11", second, &resource(second, other))
+            .unwrap();
+        reopened.begin_photo_dispatch("11", second).unwrap();
+        reopened.recover_photos("11").unwrap();
+        assert_eq!(
+            reopened.photo_state("11", second).unwrap(),
+            Some(PhotoState::Unknown)
+        );
+        assert!(reopened
+            .preflight_album("11", "d:22", &[spec.clone(), spec])
+            .is_err());
+
+        // The desktop can receive recall before the typed echo that proves
+        // which locally submitted album member the notice names.
+        let second_resource = resource(second, other);
+        let echo = Message {
+            account_id: "11".into(),
+            thread_id: "d:22".into(),
+            id: "903".into(),
+            sender: "11".into(),
+            text: MediaKind::Photo.legacy_placeholder().into(),
+            sent_at_ms: 1040,
+            source_client_id: None,
+            mentions: Vec::new(),
+            reply_blocked: true,
+            recalled: false,
+            quote: None,
+            sticker: None,
+            media: Some(second_resource.content.descriptor().clone()),
+        };
+        let notice = crate::protocol::recall::RecallNotice {
+            thread_id: "d:22".into(),
+            message_id: "903".into(),
+            actor_id: "11".into(),
+            client_id: Some(second.to_string()),
+            event_id: "904".into(),
+            occurred_at_ms: 1050,
+        };
+        let (stored, _, recalls) = reopened
+            .receive_batch_with_recalls(
+                "11",
+                &[(
+                    (
+                        echo,
+                        Some(second.to_string()),
+                        None,
+                        Some(second_resource.content),
+                        None,
+                    ),
+                    None,
+                )],
+                Some(("510:1", "904")),
+                &[],
+                ReceiveContext::OfflineSync,
+                &[notice],
+            )
+            .unwrap();
+        assert!(stored[0].0.is_recalled());
+        assert_eq!(recalls.len(), 1);
+        assert!(recalls[0].message.as_ref().unwrap().is_recalled());
+        assert_eq!(reopened.receive_cursor("11", "510:1").unwrap(), "904");
+        reopened
+            .record_photo_ack("11", second, "903", Some(1040))
+            .unwrap();
+        assert!(reopened.accept_photo("11", second).unwrap().0.is_recalled());
+        let saved = reopened.page("11", "d:22", None, 10).unwrap();
+        assert!(saved[0].media.is_some());
+        assert!(saved[1].is_recalled());
+        assert!(saved[1].media.is_none());
+    }
     #[test]
     fn final_photo_dispatch_rechecks_private_visibility_and_encryption() {
         for privacy in 0..3 {
@@ -641,5 +1088,92 @@ mod tests {
                 Some(PhotoState::ResourceReady)
             );
         }
+    }
+
+    #[test]
+    fn original_photo_mode_is_bound_before_upload_and_through_ack_recovery() {
+        let mut store = MessageStore::in_memory().unwrap();
+        let spec = PhotoSpec {
+            caption: "Ảnh tổng hợp".into(),
+            width: 80,
+            height: 60,
+            size: 1000,
+            checksum: "a".repeat(32),
+        };
+        let raw_url = "https://files.zdn.vn/original.jpg";
+        let thumb_url = "https://files.zdn.vn/thumb.jpg";
+        let hd_url = "https://files.zdn.vn/hd.jpg";
+        let resource = |client, original| {
+            let mut parameters = json!({
+                "photoId":"synthetic-photo","clientId":client,"desc":spec.caption,
+                "width":80,"height":60,"rawUrl":raw_url,"thumbUrl":thumb_url,"hdUrl":hd_url,
+                "normalUrl":raw_url,"language":"VN","imei":"synthetic-device","ttl":0,"toid":"22"
+            });
+            let mut content = json!({
+                "title":"","description":spec.caption,"href":raw_url,"thumb":thumb_url,
+                "params":{"width":80,"height":60,"hd":hd_url,"rawUrl":raw_url}
+            });
+            if original {
+                parameters["jcp"] = json!("{\"is_original\":1}");
+                content["params"]["is_original"] = json!(1);
+            }
+            PhotoResource {
+                photo_id: "synthetic-photo".into(),
+                parameters,
+                content: MediaMessageContent::new(MediaKind::Photo, &content).unwrap(),
+            }
+        };
+        let client = store.reserve_photo("11", "d:22", &spec, 1000).unwrap();
+        assert!(store
+            .photo_resource_ready("11", client, &resource(client, true))
+            .is_err());
+        store.interrupt_photo("11", client).unwrap();
+
+        let client = store
+            .reserve_photo_resolution("11", "d:22", &spec, PhotoResolution::Original, 1010)
+            .unwrap();
+        let hd = resource(client, false);
+        let original = resource(client, true);
+        assert!(store.photo_resource_ready("11", client, &hd).is_err());
+        assert!(verify_echo(
+            &original.content,
+            &hd.content,
+            &original.photo_id,
+            &spec.checksum
+        )
+        .is_err());
+        let mut wrong_meta: Value = serde_json::from_str(original.content.as_json()).unwrap();
+        wrong_meta["params"]["is_original"] = json!(0);
+        assert!(store
+            .photo_resource_ready(
+                "11",
+                client,
+                &PhotoResource {
+                    photo_id: original.photo_id.clone(),
+                    parameters: original.parameters.clone(),
+                    content: MediaMessageContent::new(MediaKind::Photo, &wrong_meta).unwrap(),
+                }
+            )
+            .is_err());
+        store.photo_resource_ready("11", client, &original).unwrap();
+        let parameters = store.begin_photo_dispatch("11", client).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&parameters).unwrap(),
+            original.parameters
+        );
+        store
+            .record_photo_ack("11", client, "901", Some(1020))
+            .unwrap();
+        let mut reopened = MessageStore::initialize(store.conn).unwrap();
+        reopened.reconcile_photos("11").unwrap();
+        let messages = reopened.page("11", "d:22", None, 2).unwrap();
+        let Some(MediaDescriptor::Photo(photo)) = &messages[0].media else {
+            panic!("expected a persisted photo");
+        };
+        assert_eq!(photo.original_url.as_deref(), Some(raw_url));
+        assert_eq!(
+            reopened.photo_state("11", client).unwrap(),
+            Some(PhotoState::Accepted)
+        );
     }
 }

@@ -1,14 +1,49 @@
 //! Authenticated read-only group member pages. Run on a background worker task.
 use super::*;
 use crate::protocol::group_roster as roster;
+use tokio::time::Instant;
 
 const DEADLINE: Duration = Duration::from_secs(10);
+const MENTION_PROOF_AGE: Duration = Duration::from_secs(20);
 const CURSOR_BYTES: usize = 67;
 
 pub(super) struct Request {
     pub thread: String,
     pub privacy_revision: u64,
     pub after: Option<String>,
+}
+
+pub(super) struct Proof {
+    account: String,
+    thread: String,
+    revision: u64,
+    checked_at: Instant,
+    roster: roster::VerifiedGroup,
+}
+
+impl Proof {
+    pub(super) fn applies(&self, request: &Request, account: &str) -> bool {
+        self.account == account
+            && self.thread == request.thread
+            && self.revision == request.privacy_revision
+            && self.checked_at.elapsed() <= MENTION_PROOF_AGE
+    }
+
+    pub(super) fn member_visible(&self, uid: &str) -> bool {
+        uid != self.account && self.roster.contains(uid) && self.roster.can_view(&self.account, uid)
+    }
+
+    pub(super) fn allows_mention_all(&self, limit: Option<u32>) -> bool {
+        limit.is_some_and(|limit| self.roster.allows_mention_all(limit))
+    }
+
+    pub(super) fn allows_forward(&self, request: &Request, account: &str) -> bool {
+        self.applies(request, account) && self.roster.can_forward
+    }
+
+    pub(super) fn allows_forward_source(&self, request: &Request, account: &str) -> bool {
+        self.applies(request, account) && self.roster.fits_forwarding_group()
+    }
 }
 
 impl Request {
@@ -67,11 +102,53 @@ pub(super) async fn load_page(
     session: &VerifiedSession,
     policy: &std::sync::RwLock<privacy::Projection>,
     request: &Request,
-) -> Result<roster::Page> {
+) -> Result<(roster::Page, Proof)> {
+    let proof = verify_members(client, session, policy, request).await?;
+    let target = request.target()?;
+    let mut page = roster::project_page(
+        &proof.roster,
+        session.account_id(),
+        &target,
+        request.after.as_deref(),
+    )?;
+    if !request.permits(policy) {
+        return Err(WireError::Unsupported.into());
+    }
+    let load_profiles = async {
+        if !page.members.is_empty() {
+            let parameters = roster::profile_parameters(&page.members)?;
+            // Verified member IDs remain usable without optional profile metadata.
+            let profiles = post(client, session, "profile", roster::PROFILE_PATH, parameters).await;
+            if let Ok(profiles) = profiles {
+                let _ = roster::apply_profiles(&profiles, &mut page.members);
+            }
+        }
+        Ok::<(), WireError>(())
+    };
+    let load_mention_all = async {
+        proof.allows_mention_all(session.config().mention_all_limit)
+            && matches!(verify_group(client, session, &target).await, Ok(0))
+    };
+    let (profiles, mention_all) = tokio::join!(load_profiles, load_mention_all);
+    profiles?;
+    if !request.permits(policy) {
+        return Err(WireError::Unsupported.into());
+    }
+    page.mention_all = mention_all && proof.applies(request, session.account_id());
+    Ok((page, proof))
+}
+
+pub(super) async fn verify_members(
+    client: &reqwest::Client,
+    session: &VerifiedSession,
+    policy: &std::sync::RwLock<privacy::Projection>,
+    request: &Request,
+) -> Result<Proof> {
     let target = request.target()?;
     if !request.permits(policy) {
         return Err(WireError::Unsupported.into());
     }
+    let checked_at = Instant::now();
     let payload = post(
         client,
         session,
@@ -80,28 +157,17 @@ pub(super) async fn load_page(
         roster::roster_parameters(&target)?,
     )
     .await?;
-    let mut page = roster::roster_page(
-        &payload,
-        session.account_id(),
-        &target,
-        request.after.as_deref(),
-    )?;
+    let roster = roster::verify_group(&payload, session.account_id(), &target)?;
     if !request.permits(policy) {
         return Err(WireError::Unsupported.into());
     }
-    if !page.members.is_empty() {
-        let parameters = roster::profile_parameters(&page.members)?;
-        // Optional photos and names are deliberately not persisted. If the
-        // profile endpoint is unavailable the verified roster is usable.
-        let profiles = post(client, session, "profile", roster::PROFILE_PATH, parameters).await;
-        if let Ok(profiles) = profiles {
-            let _ = roster::apply_profiles(&profiles, &mut page.members);
-        }
-    }
-    if !request.permits(policy) {
-        return Err(WireError::Unsupported.into());
-    }
-    Ok(page)
+    Ok(Proof {
+        account: session.account_id().into(),
+        thread: request.thread.clone(),
+        revision: request.privacy_revision,
+        checked_at,
+        roster,
+    })
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
-//! One-recipient ordinary forward preflight and authenticated HTTP dispatch.
+//! Ordinary text forwarding with scoped source and recipient preflight.
 use super::*;
 use crate::protocol::forward::{self as wire_forward, ForwardAck, ForwardReference};
+use std::collections::{HashMap, VecDeque};
 use tokio::time::Instant;
 
 const TTL_PATH: &str = "/api/conv/autodelete/getConvers";
@@ -25,10 +26,8 @@ impl ForwardRequest {
         wire::numeric_id(&self.source_message_id)?;
         let source = Target::from_thread(&self.source_thread)?;
         let target = Target::from_thread(&self.target_thread)?;
-        if source.kind != ThreadKind::Direct
-            || target.kind != ThreadKind::Direct
-            || target.remote_id == account
-            || source.remote_id == account
+        if (source.kind == ThreadKind::Direct && source.remote_id == account)
+            || (target.kind == ThreadKind::Direct && target.remote_id == account)
         {
             return Err(WireError::Unsupported);
         }
@@ -48,6 +47,15 @@ pub(super) fn normal_scope_revision(
     .then_some(scope.revision)
 }
 
+fn normal_source_revision(
+    scope: &std::sync::RwLock<privacy::Projection>,
+    thread: &str,
+) -> Option<u64> {
+    let scope = scope.read().ok()?;
+    (scope.confirmed && scope.status == LivePrivacyStatus::Ready && !scope.hidden.contains(thread))
+        .then_some(scope.revision)
+}
+
 pub(super) struct TargetTtlProof {
     target: Target,
     checked_at: Instant,
@@ -59,7 +67,34 @@ impl TargetTtlProof {
     }
 }
 
-fn ttl_enabled(payload: &Value, target: &Target) -> Result<bool, WireError> {
+struct TtlSnapshot {
+    // None means a duplicated destination row whose effective TTL cannot be proven.
+    rows: HashMap<String, Option<bool>>,
+    checked_at: Instant,
+}
+
+impl TtlSnapshot {
+    fn enabled(&self, target: &Target) -> Result<bool, WireError> {
+        // The source resets its entire TTL map on a verified snapshot.
+        self.rows
+            .get(&target.thread_id())
+            .copied()
+            .unwrap_or(Some(false))
+            .ok_or(WireError::Invalid)
+    }
+
+    fn proof(&self, target: &Target) -> Result<TargetTtlProof, WireError> {
+        if self.enabled(target)? {
+            return Err(WireError::Unsupported);
+        }
+        Ok(TargetTtlProof {
+            target: target.clone(),
+            checked_at: self.checked_at,
+        })
+    }
+}
+
+fn parse_ttl_snapshot(payload: &Value, checked_at: Instant) -> Result<TtlSnapshot, WireError> {
     wire::service_code(payload)?;
     let rows = payload
         .pointer("/data/convers")
@@ -68,7 +103,7 @@ fn ttl_enabled(payload: &Value, target: &Target) -> Result<bool, WireError> {
     if rows.len() > MAX_AUTO_DELETE_THREADS {
         return Err(WireError::Oversize);
     }
-    let mut target_ttl = None;
+    let mut destinations = HashMap::with_capacity(rows.len());
     for row in rows {
         let remote = wire::id_string(row.get("destId").ok_or(WireError::Invalid)?)?;
         let kind = match row.get("isGroup").ok_or(WireError::Invalid)? {
@@ -82,12 +117,21 @@ fn ttl_enabled(payload: &Value, target: &Target) -> Result<bool, WireError> {
             .get("ttl")
             .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
             .ok_or(WireError::Invalid)?;
-        if kind == target.kind && remote == target.remote_id && target_ttl.replace(ttl).is_some() {
-            return Err(WireError::Invalid);
-        }
+        let thread = Target::new(kind, &remote)?.thread_id();
+        destinations
+            .entry(thread)
+            .and_modify(|previous| *previous = None)
+            .or_insert(Some(ttl > 0));
     }
-    // The source resets its entire TTL map on a verified getConvers snapshot.
-    Ok(target_ttl.is_some_and(|ttl| ttl > 0))
+    Ok(TtlSnapshot {
+        rows: destinations,
+        checked_at,
+    })
+}
+
+#[cfg(test)]
+fn ttl_enabled(payload: &Value, target: &Target) -> Result<bool, WireError> {
+    parse_ttl_snapshot(payload, Instant::now())?.enabled(target)
 }
 
 fn service_url(session: &VerifiedSession, service: &str, path: &str) -> Result<Url> {
@@ -106,6 +150,13 @@ pub(super) async fn verify_target_ttl(
     session: &VerifiedSession,
     target: &Target,
 ) -> Result<TargetTtlProof> {
+    Ok(fetch_ttl_snapshot(client, session).await?.proof(target)?)
+}
+
+async fn fetch_ttl_snapshot(
+    client: &reqwest::Client,
+    session: &VerifiedSession,
+) -> Result<TtlSnapshot> {
     let mut url = service_url(session, "conversation", TTL_PATH)?;
     let params = session.encrypt_payload(b"{}")?;
     url.query_pairs_mut().append_pair("params", &params);
@@ -115,13 +166,7 @@ pub(super) async fn verify_target_ttl(
         authenticated_request(client, session, url, None),
     )
     .await??;
-    if ttl_enabled(&response, target)? {
-        return Err(WireError::Unsupported.into());
-    }
-    Ok(TargetTtlProof {
-        target: target.clone(),
-        checked_at,
-    })
+    Ok(parse_ttl_snapshot(&response, checked_at)?)
 }
 
 pub(super) enum ForwardDispatch {
@@ -131,8 +176,79 @@ pub(super) enum ForwardDispatch {
     Unknown,
 }
 
-pub(super) struct PreparedDispatch {
+struct GroupProof {
+    request: group_roster::Request,
+    roster: group_roster::Proof,
+}
+
+struct DispatchProof {
+    ttl: TargetTtlProof,
+    group: Option<GroupProof>,
+    source_group: Option<GroupSourceProof>,
+}
+
+struct GroupSourceProof {
+    ttl: TargetTtlProof,
+    group: Arc<GroupProof>,
+}
+
+#[derive(Clone, Copy)]
+struct Transport<'a> {
+    session: &'a Arc<VerifiedSession>,
+    client: &'a reqwest::Client,
+}
+
+impl GroupProof {
+    fn spawn(
+        transport: Transport<'_>,
+        events: &Events,
+        target: Target,
+        revision: u64,
+    ) -> tokio::task::JoinHandle<Result<Self>> {
+        let (client, session, scope) = (
+            transport.client.clone(),
+            transport.session.clone(),
+            events.privacy.clone(),
+        );
+        let request = group_roster::Request {
+            thread: target.thread_id(),
+            privacy_revision: revision,
+            after: None,
+        };
+        tokio::spawn(async move { Self::verify(&client, &session, &scope, &target, request).await })
+    }
+
+    async fn verify(
+        client: &reqwest::Client,
+        session: &VerifiedSession,
+        scope: &std::sync::RwLock<privacy::Projection>,
+        target: &Target,
+        request: group_roster::Request,
+    ) -> Result<Self> {
+        let (visibility, roster) = tokio::try_join!(
+            verify_group(client, session, target),
+            group_roster::verify_members(client, session, scope, &request),
+        )?;
+        if visibility != 0 {
+            return Err(WireError::Unsupported.into());
+        }
+        Ok(Self { request, roster })
+    }
+
+    fn applies_destination(&self, account: &str, target: &Target) -> bool {
+        self.request.thread == target.thread_id()
+            && self.roster.allows_forward(&self.request, account)
+    }
+
+    fn applies_source(&self, account: &str, source: &Target) -> bool {
+        self.request.thread == source.thread_id()
+            && self.roster.allows_forward_source(&self.request, account)
+    }
+}
+
+struct PreparedDispatch {
     client_id: u64,
+    source: Target,
     target: Target,
     url: Url,
     body: String,
@@ -140,41 +256,58 @@ pub(super) struct PreparedDispatch {
 
 impl PreparedDispatch {
     /// Call with the immutable intent returned by the source-validation transaction.
-    pub fn new(
+    fn new(
         session: &VerifiedSession,
         request: &ForwardRequest,
         client_id: u64,
         text: &str,
         reference: &ForwardReference,
     ) -> Result<Self> {
-        let (_, target) = request.targets(session.account_id())?;
-        let url = service_url(session, "file", wire_forward::DIRECT_PATH)?;
-        let params =
-            wire_forward::direct_parameters(&target, client_id, session.imei(), text, reference)?;
+        let (source, target) = request.targets(session.account_id())?;
+        let path = match target.kind {
+            ThreadKind::Direct => wire_forward::DIRECT_PATH,
+            ThreadKind::Group => wire_forward::GROUP_PATH,
+        };
+        let url = service_url(session, "file", path)?;
+        let params = wire_forward::parameters(&target, client_id, session.imei(), text, reference)?;
         let encrypted = session.encrypt_payload(&serde_json::to_vec(&params)?)?;
         let body = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("params", &encrypted)
             .finish();
         Ok(Self {
             client_id,
+            source,
             target,
             url,
             body,
         })
     }
 
-    /// Start only after fresh authenticated direct capability verification.
+    /// Start only after fresh authenticated capability verification.
     /// A failure after handing the request to HTTP is not proof of rejection.
-    pub async fn send(
+    async fn send(
         self,
         client: &reqwest::Client,
         session: &VerifiedSession,
         request: &ForwardRequest,
         privacy: &std::sync::RwLock<privacy::Projection>,
         revision: u64,
-        ttl: TargetTtlProof,
+        proof: DispatchProof,
     ) -> ForwardDispatch {
-        if !ttl.applies(&self.target) || normal_scope_revision(privacy, request) != Some(revision) {
+        if !proof.ttl.applies(&self.target)
+            || normal_scope_revision(privacy, request) != Some(revision)
+            || self.target.kind == ThreadKind::Group
+                && !proof.group.is_some_and(|group| {
+                    group.applies_destination(session.account_id(), &self.target)
+                })
+            || self.source.kind == ThreadKind::Group
+                && !proof.source_group.is_some_and(|proof| {
+                    proof.ttl.applies(&self.source)
+                        && proof
+                            .group
+                            .applies_source(session.account_id(), &self.source)
+                })
+        {
             return ForwardDispatch::NotSent;
         }
         let response = tokio::time::timeout(
@@ -183,20 +316,21 @@ impl PreparedDispatch {
         )
         .await;
         match response {
-            Ok(Ok(payload)) => {
-                match wire_forward::direct_ack(&payload, &self.target, self.client_id) {
-                    Ok(ForwardAck::Accepted(ack)) => ForwardDispatch::Accepted(ack),
-                    Ok(ForwardAck::Rejected) => ForwardDispatch::Rejected,
-                    Err(_) => ForwardDispatch::Unknown,
-                }
-            }
+            Ok(Ok(payload)) => match wire_forward::ack(&payload, &self.target, self.client_id) {
+                Ok(ForwardAck::Accepted(ack)) => ForwardDispatch::Accepted(ack),
+                Ok(ForwardAck::Rejected) => ForwardDispatch::Rejected,
+                Err(_) => ForwardDispatch::Unknown,
+            },
             _ => ForwardDispatch::Unknown,
         }
     }
 }
 
 enum Task {
-    Ttl(tokio::task::JoinHandle<Result<TargetTtlProof>>),
+    Ttl(tokio::task::JoinHandle<Result<TtlSnapshot>>),
+    SourceGroup(tokio::task::JoinHandle<Result<GroupProof>>),
+    Group(tokio::task::JoinHandle<Result<GroupProof>>),
+    Ready,
     Dispatch {
         id: u64,
         task: tokio::task::JoinHandle<ForwardDispatch>,
@@ -205,8 +339,6 @@ enum Task {
 
 struct Running {
     request: ForwardRequest,
-    revision: u64,
-    authenticated_at: Instant,
     task: Task,
 }
 
@@ -214,27 +346,108 @@ impl Drop for Running {
     fn drop(&mut self) {
         match &self.task {
             Task::Ttl(task) => task.abort(),
+            Task::SourceGroup(task) | Task::Group(task) => task.abort(),
             Task::Dispatch { task, .. } => task.abort(),
+            Task::Ready => {}
         }
         // A durable sending row is recovered as unknown after cancellation.
     }
 }
 
-pub(super) enum Phase {
-    Ttl(Option<TargetTtlProof>),
+enum Phase {
+    Ttl(Option<TtlSnapshot>),
+    SourceGroup(Result<GroupProof>),
+    Group(Result<GroupProof>),
+    Ready,
     Dispatch { id: u64, result: ForwardDispatch },
 }
 
 pub(super) struct Completion {
     request: ForwardRequest,
-    revision: u64,
-    authenticated_at: Instant,
     phase: Phase,
+}
+
+struct Work {
+    request_id: u64,
+    source_thread: String,
+    source_message_id: String,
+    batch: bool,
+    pending: VecDeque<String>,
+    results: Vec<ForwardBatchResult>,
+    revision: u64,
+    authenticated_at: Option<Instant>,
+    ttl: Option<TtlSnapshot>,
+    source_group: Option<Arc<GroupProof>>,
+}
+
+impl Work {
+    fn next(&mut self) -> Option<ForwardRequest> {
+        Some(ForwardRequest {
+            request_id: self.request_id,
+            source_thread: self.source_thread.clone(),
+            source_message_id: self.source_message_id.clone(),
+            target_thread: self.pending.pop_front()?,
+        })
+    }
+
+    fn record(&mut self, target_thread: String, outcome: ForwardOutcome) {
+        self.results.push(ForwardBatchResult {
+            target_thread,
+            outcome,
+        });
+    }
+
+    fn skip(&mut self) {
+        self.results.extend(
+            self.pending
+                .drain(..)
+                .map(|target_thread| ForwardBatchResult {
+                    target_thread,
+                    outcome: ForwardOutcome::Unavailable,
+                }),
+        );
+    }
+
+    async fn finish(mut self, events: &Events) -> Result<()> {
+        let event = if self.batch {
+            LiveEvent::ForwardBatchFinished {
+                account_id: events.account.clone(),
+                request_id: self.request_id,
+                source_thread: self.source_thread,
+                source_message_id: self.source_message_id,
+                results: self.results,
+            }
+        } else {
+            let result = self.results.pop().expect("single forward has one result");
+            LiveEvent::ForwardFinished {
+                account_id: events.account.clone(),
+                request_id: self.request_id,
+                source_thread: self.source_thread,
+                source_message_id: self.source_message_id,
+                target_thread: result.target_thread,
+                outcome: result.outcome,
+            }
+        };
+        events.emit(event).await
+    }
 }
 
 #[derive(Default)]
 pub(super) struct Forwarding {
+    work: Option<Work>,
     running: Option<Running>,
+}
+
+enum Attempt {
+    Dispatched,
+    Finished(ForwardOutcome),
+    Pause(anyhow::Error),
+}
+
+fn authenticated_at(connection: Option<&Connection>) -> Option<Instant> {
+    connection
+        .filter(|socket| socket.decoder.authenticated())
+        .and_then(|socket| socket.authenticated_at)
 }
 
 impl Forwarding {
@@ -244,6 +457,15 @@ impl Forwarding {
         };
         let phase = match &mut job.task {
             Task::Ttl(task) => Phase::Ttl(task.await.ok().and_then(Result::ok)),
+            Task::SourceGroup(task) => {
+                Phase::SourceGroup(task.await.unwrap_or_else(|error| Err(error.into())))
+            }
+            Task::Group(task) => Phase::Group(task.await.unwrap_or_else(|error| Err(error.into()))),
+            Task::Ready => {
+                // Give queued local work a turn before another synchronous socket proof.
+                tokio::task::yield_now().await;
+                Phase::Ready
+            }
             Task::Dispatch { id, task } => Phase::Dispatch {
                 id: *id,
                 result: task.await.unwrap_or(ForwardDispatch::Unknown),
@@ -252,8 +474,6 @@ impl Forwarding {
         let job = self.running.take().expect("awaited forward has an owner");
         Completion {
             request: job.request.clone(),
-            revision: job.revision,
-            authenticated_at: job.authenticated_at,
             phase,
         }
     }
@@ -267,18 +487,14 @@ impl Forwarding {
         session: &Arc<VerifiedSession>,
         client: &reqwest::Client,
     ) -> Result<Option<LiveCommand>> {
-        match command {
+        let (request_id, source_thread, source_message_id, target_threads, batch) = match command {
             LiveCommand::ForwardTargets {
                 generation,
                 source_thread,
                 source_message_id,
                 query,
             } => {
-                let permitted = events.privacy.read().is_ok_and(|scope| {
-                    scope.confirmed
-                        && scope.status == LivePrivacyStatus::Ready
-                        && !scope.hidden.contains(&source_thread)
-                });
+                let permitted = normal_source_revision(&events.privacy, &source_thread).is_some();
                 let result = if permitted {
                     let (account, source, message, query) = (
                         events.account.clone(),
@@ -303,44 +519,107 @@ impl Forwarding {
                         failed,
                     })
                     .await?;
+                return Ok(None);
             }
             LiveCommand::Forward {
                 request_id,
                 source_thread,
                 source_message_id,
                 target_thread,
-            } => {
-                let request = ForwardRequest {
-                    request_id,
-                    source_thread,
-                    source_message_id,
-                    target_thread,
-                };
-                let Some((revision, authenticated_at, target)) = ({
-                    let target = request.targets(&events.account).ok().map(|(_, t)| t);
-                    let at = connection
-                        .filter(|socket| socket.decoder.authenticated())
-                        .and_then(|socket| socket.authenticated_at);
-                    let revision = normal_scope_revision(&events.privacy, &request);
-                    revision.zip(at).zip(target).map(|((r, at), t)| (r, at, t))
-                })
-                .filter(|_| self.running.is_none() && root_for(session, "file").is_ok()) else {
-                    finish(events, request, ForwardOutcome::Unavailable).await?;
-                    return Ok(None);
-                };
-                let (session, client) = (session.clone(), client.clone());
-                self.running = Some(Running {
-                    request,
-                    revision,
-                    authenticated_at,
-                    task: Task::Ttl(tokio::spawn(async move {
-                        verify_target_ttl(&client, &session, &target).await
-                    })),
-                });
-            }
+            } => (
+                request_id,
+                source_thread,
+                source_message_id,
+                vec![target_thread],
+                false,
+            ),
+            LiveCommand::ForwardBatch {
+                request_id,
+                source_thread,
+                source_message_id,
+                target_threads,
+            } => (
+                request_id,
+                source_thread,
+                source_message_id,
+                target_threads,
+                true,
+            ),
             other => return Ok(Some(other)),
+        };
+        let revision = normal_source_revision(&events.privacy, &source_thread);
+        let valid = request_id != 0
+            && Target::from_thread(&source_thread).is_ok_and(|target| {
+                target.kind == ThreadKind::Group || target.remote_id != events.account
+            })
+            && wire::numeric_id(&source_message_id).is_ok()
+            && valid_forward_targets(&target_threads, &events.account);
+        let at = authenticated_at(connection);
+        let mut work = Work {
+            request_id,
+            source_thread,
+            source_message_id,
+            batch,
+            pending: target_threads.into_iter().take(MAX_FORWARD_BATCH).collect(),
+            results: Vec::new(),
+            revision: revision.unwrap_or_default(),
+            authenticated_at: at,
+            ttl: None,
+            source_group: None,
+        };
+        if !valid
+            || revision.is_none()
+            || at.is_none()
+            || self.work.is_some()
+            || root_for(session, "file").is_err()
+        {
+            work.skip();
+            work.finish(events).await?;
+        } else {
+            self.work = Some(work);
+            self.advance(at, events, session, client).await?;
         }
         Ok(None)
+    }
+
+    async fn advance(
+        &mut self,
+        at: Option<Instant>,
+        events: &Events,
+        session: &Arc<VerifiedSession>,
+        client: &reqwest::Client,
+    ) -> Result<()> {
+        let work = self.work.as_mut().expect("forward has an active request");
+        if at != work.authenticated_at
+            || normal_source_revision(&events.privacy, &work.source_thread) != Some(work.revision)
+        {
+            work.skip();
+        }
+        while let Some(request) = work.next() {
+            if normal_scope_revision(&events.privacy, &request) != Some(work.revision) {
+                work.record(request.target_thread, ForwardOutcome::Unavailable);
+                continue;
+            }
+            let task = if work
+                .ttl
+                .as_ref()
+                .is_some_and(|ttl| ttl.checked_at.elapsed() <= TTL_SNAPSHOT_AGE)
+            {
+                Task::Ready
+            } else {
+                let (session, client) = (session.clone(), client.clone());
+                Task::Ttl(tokio::spawn(async move {
+                    fetch_ttl_snapshot(&client, &session).await
+                }))
+            };
+            self.running = Some(Running { request, task });
+            return Ok(());
+        }
+        self.work
+            .take()
+            .expect("drained forward has an owner")
+            .finish(events)
+            .await
     }
 
     pub async fn complete(
@@ -352,119 +631,268 @@ impl Forwarding {
         session: &Arc<VerifiedSession>,
         client: &reqwest::Client,
     ) -> Result<CommandOutcome> {
-        let Completion {
-            request,
-            revision,
-            authenticated_at,
-            phase,
-        } = completion;
-        match phase {
-            Phase::Ttl(Some(ttl)) => {
-                let (_, target) = request.targets(&events.account)?;
-                let socket = connection.filter(|socket| {
-                    socket.decoder.authenticated()
-                        && socket.authenticated_at == Some(authenticated_at)
-                });
-                let Some(socket) = socket.filter(|_| {
-                    ttl.applies(&target)
-                        && normal_scope_revision(&events.privacy, &request) == Some(revision)
-                }) else {
-                    finish(events, request, ForwardOutcome::Unavailable).await?;
-                    return Ok(CommandOutcome::Continue);
-                };
-                if let Err(error) = socket.verify_direct(&target, db, events).await {
-                    finish(events, request, ForwardOutcome::Unavailable).await?;
-                    if error.downcast_ref::<StorageContext>().is_some() {
-                        events
-                            .diagnostic(diagnostic(&error, LiveStage::Storage))
-                            .await?;
-                        events.connection(LiveConnection::Offline).await?;
-                        return Ok(CommandOutcome::PauseTransport);
-                    }
-                    if wire_error(&error) == Some(&WireError::Authentication) {
-                        events
-                            .diagnostic(diagnostic(&error, LiveStage::Authentication))
-                            .await?;
-                        events.connection(LiveConnection::Expired).await?;
-                        return Ok(CommandOutcome::PauseTransport);
-                    }
-                    return Ok(CommandOutcome::Continue);
-                }
-                if !ttl.applies(&target)
-                    || normal_scope_revision(&events.privacy, &request) != Some(revision)
-                {
-                    finish(events, request, ForwardOutcome::Unavailable).await?;
-                    return Ok(CommandOutcome::Continue);
-                }
-                let (account, source, message, target) = (
-                    events.account.clone(),
-                    request.source_thread.clone(),
-                    request.source_message_id.clone(),
-                    request.target_thread.clone(),
-                );
-                let prepared = db
-                    .call(move |store| {
-                        store.prepare_forward(&account, &source, &message, &target, now_ms())
-                    })
-                    .await;
-                let prepared = match prepared {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        let outcome = if error
-                            .downcast_ref::<crate::store::forward::ForwardFailure>()
-                            == Some(&crate::store::forward::ForwardFailure::Unresolved)
-                        {
-                            ForwardOutcome::Unknown
-                        } else {
-                            ForwardOutcome::Unavailable
-                        };
-                        finish(events, request, outcome).await?;
-                        return Ok(CommandOutcome::Continue);
-                    }
-                };
-                let id = prepared.client_id;
-                let dispatch = PreparedDispatch::new(
-                    session,
-                    &request,
-                    id,
-                    &prepared.text,
-                    &prepared.reference,
-                );
-                let Ok(dispatch) = dispatch else {
-                    settle(db, events, request, id, ForwardDispatch::NotSent).await?;
-                    return Ok(CommandOutcome::Continue);
-                };
-                let (session, client, scope) =
-                    (session.clone(), client.clone(), events.privacy.clone());
-                let submitted = request.clone();
-                self.running = Some(Running {
-                    request,
-                    revision,
-                    authenticated_at,
-                    task: Task::Dispatch {
-                        id,
-                        task: tokio::spawn(async move {
-                            dispatch
-                                .send(&client, &session, &submitted, &scope, revision, ttl)
-                                .await
-                        }),
-                    },
-                });
+        let Completion { request, phase } = completion;
+        let at = authenticated_at(connection.as_deref());
+        let transport = Transport { session, client };
+        let attempt = match phase {
+            Phase::Ttl(None) => {
+                // A failed full snapshot cannot certify any remaining peer.
+                let mut work = self.work.take().expect("TTL belongs to a forward");
+                work.record(request.target_thread, ForwardOutcome::Unavailable);
+                work.skip();
+                work.finish(events).await?;
+                return Ok(CommandOutcome::Continue);
             }
-            Phase::Ttl(None) => finish(events, request, ForwardOutcome::Unavailable).await?,
-            Phase::Dispatch { id, result } => settle(db, events, request, id, result).await?,
+            Phase::Ttl(Some(ttl)) => {
+                self.work.as_mut().expect("TTL belongs to a forward").ttl = Some(ttl);
+                self.launch(&request, connection, db, events, transport, None)
+                    .await?
+            }
+            Phase::Ready => {
+                self.launch(&request, connection, db, events, transport, None)
+                    .await?
+            }
+            Phase::SourceGroup(Ok(proof))
+                if request
+                    .targets(&events.account)
+                    .is_ok_and(|(source, _)| proof.applies_source(&events.account, &source)) =>
+            {
+                self.work
+                    .as_mut()
+                    .expect("proof belongs to a forward")
+                    .source_group = Some(Arc::new(proof));
+                self.launch(&request, connection, db, events, transport, None)
+                    .await?
+            }
+            Phase::Group(Ok(proof)) => {
+                self.launch(&request, connection, db, events, transport, Some(proof))
+                    .await?
+            }
+            Phase::SourceGroup(Err(error)) | Phase::Group(Err(error))
+                if wire_error(&error) == Some(&WireError::Authentication) =>
+            {
+                Attempt::Pause(error)
+            }
+            Phase::SourceGroup(_) => {
+                let mut work = self.work.take().expect("proof belongs to a forward");
+                work.record(request.target_thread, ForwardOutcome::Unavailable);
+                work.skip();
+                work.finish(events).await?;
+                return Ok(CommandOutcome::Continue);
+            }
+            Phase::Group(Err(_)) => Attempt::Finished(ForwardOutcome::Unavailable),
+            Phase::Dispatch { id, result } => {
+                Attempt::Finished(settle(db, events, id, result).await?)
+            }
+        };
+        match attempt {
+            Attempt::Dispatched => {}
+            Attempt::Finished(outcome) => {
+                self.work
+                    .as_mut()
+                    .expect("active forward")
+                    .record(request.target_thread, outcome);
+                self.advance(at, events, session, client).await?;
+            }
+            Attempt::Pause(error) => {
+                let mut work = self.work.take().expect("active forward");
+                work.record(request.target_thread, ForwardOutcome::Unavailable);
+                work.skip();
+                work.finish(events).await?;
+                let (stage, connection_state) = if error.downcast_ref::<StorageContext>().is_some()
+                {
+                    (LiveStage::Storage, LiveConnection::Offline)
+                } else {
+                    (LiveStage::Authentication, LiveConnection::Expired)
+                };
+                events.diagnostic(diagnostic(&error, stage)).await?;
+                events.connection(connection_state).await?;
+                return Ok(CommandOutcome::PauseTransport);
+            }
         }
         Ok(CommandOutcome::Continue)
+    }
+
+    async fn launch(
+        &mut self,
+        request: &ForwardRequest,
+        connection: Option<&mut Connection>,
+        db: &Database,
+        events: &Events,
+        transport: Transport<'_>,
+        group: Option<GroupProof>,
+    ) -> Result<Attempt> {
+        let Transport { session, client } = transport;
+        let work = self.work.as_ref().expect("preflight belongs to a forward");
+        let revision = work.revision;
+        let (source, target) = request.targets(&events.account)?;
+        let ttl = work
+            .ttl
+            .as_ref()
+            .and_then(|snapshot| snapshot.proof(&target).ok());
+        let at = authenticated_at(connection.as_deref());
+        let (Some(ttl), Some(socket)) = (ttl, connection) else {
+            return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
+        };
+        let permits_dispatch = || {
+            ttl.applies(&target)
+                && normal_scope_revision(&events.privacy, request) == Some(revision)
+        };
+        if at != work.authenticated_at || !permits_dispatch() {
+            return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
+        }
+        let source_group = if source.kind == ThreadKind::Group {
+            let Some(ttl) = work
+                .ttl
+                .as_ref()
+                .and_then(|snapshot| snapshot.proof(&source).ok())
+            else {
+                return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
+            };
+            let Some(group) = work
+                .source_group
+                .as_ref()
+                .filter(|proof| proof.applies_source(&events.account, &source))
+            else {
+                self.running = Some(Running {
+                    request: request.clone(),
+                    task: Task::SourceGroup(GroupProof::spawn(transport, events, source, revision)),
+                });
+                return Ok(Attempt::Dispatched);
+            };
+            Some(GroupSourceProof {
+                ttl,
+                group: group.clone(),
+            })
+        } else {
+            None
+        };
+        match target.kind {
+            ThreadKind::Direct => {
+                if let Err(error) = socket.verify_direct(&target, db, events).await {
+                    return Ok(
+                        if error.downcast_ref::<StorageContext>().is_some()
+                            || wire_error(&error) == Some(&WireError::Authentication)
+                        {
+                            Attempt::Pause(error)
+                        } else {
+                            Attempt::Finished(ForwardOutcome::Unavailable)
+                        },
+                    );
+                }
+            }
+            ThreadKind::Group => match &group {
+                None => {
+                    self.running = Some(Running {
+                        request: request.clone(),
+                        task: Task::Group(GroupProof::spawn(transport, events, target, revision)),
+                    });
+                    return Ok(Attempt::Dispatched);
+                }
+                Some(proof) if !proof.applies_destination(&events.account, &target) => {
+                    return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
+                }
+                Some(_) => {}
+            },
+        }
+        if authenticated_at(Some(socket)) != at || !permits_dispatch() {
+            return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
+        }
+        let (account, source, message, destination) = (
+            events.account.clone(),
+            request.source_thread.clone(),
+            request.source_message_id.clone(),
+            request.target_thread.clone(),
+        );
+        let prepared = db
+            .call(move |store| {
+                store.prepare_forward(&account, &source, &message, &destination, now_ms())
+            })
+            .await;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                use crate::store::forward::ForwardFailure;
+                let outcome = if error.downcast_ref::<ForwardFailure>()
+                    == Some(&ForwardFailure::Unresolved)
+                {
+                    ForwardOutcome::Unknown
+                } else {
+                    ForwardOutcome::Unavailable
+                };
+                return Ok(Attempt::Finished(outcome));
+            }
+        };
+        let id = prepared.client_id;
+        let Ok(dispatch) =
+            PreparedDispatch::new(session, request, id, &prepared.text, &prepared.reference)
+        else {
+            return Ok(Attempt::Finished(
+                settle(db, events, id, ForwardDispatch::NotSent).await?,
+            ));
+        };
+        let (session, client, scope, submitted) = (
+            session.clone(),
+            client.clone(),
+            events.privacy.clone(),
+            request.clone(),
+        );
+        let db = db.handle()?;
+        self.running = Some(Running {
+            request: request.clone(),
+            task: Task::Dispatch {
+                id,
+                task: tokio::spawn(async move {
+                    let check_source = source_group.is_some();
+                    let check_destination = group.is_some();
+                    if check_source || check_destination {
+                        let account = session.account_id().to_owned();
+                        let source = submitted.source_thread.clone();
+                        let message = submitted.source_message_id.clone();
+                        let destination = submitted.target_thread.clone();
+                        if db
+                            .call(move |store| {
+                                if check_source {
+                                    store.forward_source_valid(&account, &source, &message)?;
+                                }
+                                if check_destination {
+                                    store.forward_destination_valid(&account, &destination)?;
+                                }
+                                Ok(())
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return ForwardDispatch::NotSent;
+                        }
+                    }
+                    dispatch
+                        .send(
+                            &client,
+                            &session,
+                            &submitted,
+                            &scope,
+                            revision,
+                            DispatchProof {
+                                ttl,
+                                group,
+                                source_group,
+                            },
+                        )
+                        .await
+                }),
+            },
+        });
+        Ok(Attempt::Dispatched)
     }
 }
 
 async fn settle(
     db: &Database,
     events: &Events,
-    request: ForwardRequest,
     id: u64,
     dispatch: ForwardDispatch,
-) -> Result<()> {
+) -> Result<ForwardOutcome> {
     use crate::store::forward::ForwardOutcome as Stored;
     let account = events.account.clone();
     let (outcome, projection) = db
@@ -509,25 +937,35 @@ async fn settle(
             })
             .await?;
     }
-    finish(events, request, outcome).await
-}
-
-async fn finish(events: &Events, request: ForwardRequest, outcome: ForwardOutcome) -> Result<()> {
-    events
-        .emit(LiveEvent::ForwardFinished {
-            account_id: events.account.clone(),
-            request_id: request.request_id,
-            source_thread: request.source_thread,
-            source_message_id: request.source_message_id,
-            target_thread: request.target_thread,
-            outcome,
-        })
-        .await
+    Ok(outcome)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ready_recipient_yields_to_queued_control() {
+        let mut forwarding = Forwarding {
+            running: Some(Running {
+                request: ForwardRequest {
+                    request_id: 1,
+                    source_thread: "d:22".into(),
+                    source_message_id: "7001".into(),
+                    target_thread: "d:33".into(),
+                },
+                task: Task::Ready,
+            }),
+            ..Default::default()
+        };
+
+        tokio::select! {
+            biased;
+            _ = forwarding.next() => panic!("the next recipient ran ahead of queued control"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(matches!(forwarding.next().await.phase, Phase::Ready));
+    }
 
     #[test]
     fn ttl_policy_rejects_positive_target_and_does_not_guess_missing_snapshot() {

@@ -205,6 +205,7 @@ impl NativeApp {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 for hit in &results.hits {
                     let probe = Message {
+                        mentions: Vec::new(),
                         reply_blocked: false,
                         recalled: false,
                         source_client_id: None,

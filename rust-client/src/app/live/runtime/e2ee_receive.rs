@@ -360,6 +360,7 @@ impl Receiver {
         let plaintext = String::from_utf8(verified.plaintext().to_vec())
             .map_err(|_| anyhow::anyhow!("the decrypted message is not text"))?;
         let stored = Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

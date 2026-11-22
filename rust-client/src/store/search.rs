@@ -21,6 +21,7 @@ fn searchable(body: String, sticker: bool, projection: Option<String>) -> Option
             .filter(|descriptor| descriptor.validate().is_ok())?;
         let text = match descriptor {
             MediaDescriptor::Photo(photo) => photo.caption,
+            MediaDescriptor::Voice(_) => return None,
             MediaDescriptor::File(file) => file.title,
             MediaDescriptor::Recommended(card) | MediaDescriptor::WebContent(card) => {
                 format!("{}\n{}", card.title, card.description)
@@ -147,7 +148,7 @@ impl MessageStore {
 
     /// Cursor whose page shows the message with [`JUMP_CONTEXT`] newer ones after it, or `None`
     /// when there are not that many newer ones and the newest page already contains it.
-    fn jump_cursor(
+    pub(super) fn jump_cursor(
         &self,
         account: &str,
         thread: &str,
@@ -178,6 +179,7 @@ mod tests {
 
     fn message(id: &str, text: &str, at: i64) -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

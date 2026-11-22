@@ -91,6 +91,51 @@ pub(super) fn merge_quote(old: &MessageQuote, incoming: &MessageQuote) -> Result
     Ok(merged)
 }
 
+pub(super) fn redact_quote(
+    conn: &Connection,
+    account: &str,
+    thread: &str,
+    quote: &mut MessageQuote,
+) -> Result<bool> {
+    if delete_for_me::redact_quote(conn, account, thread, quote)? {
+        return Ok(true);
+    }
+    #[cfg(feature = "messaging")]
+    return recall::redact_quote(conn, account, thread, quote);
+    #[cfg(not(feature = "messaging"))]
+    Ok(false)
+}
+
+#[cfg(feature = "messaging")]
+pub(super) fn redact_copies(
+    conn: &Connection,
+    account: &str,
+    thread: &str,
+    id: &str,
+    actor: &str,
+    replacement: &str,
+) -> Result<()> {
+    let args = params![account, thread, id, actor, replacement];
+    conn.execute(
+        "UPDATE message_reply SET quote_projection=json_set(quote_projection,'$.text',?5,'$.message_type',0),
+           quote_metadata=NULL,quote_source=0
+         WHERE account_id=?1 AND thread_id=?2 AND json_valid(quote_projection)
+           AND json_extract(quote_projection,'$.message_id')=?3
+           AND json_extract(quote_projection,'$.owner_id')=?4",
+        args,
+    )?;
+    conn.execute(
+        "UPDATE outgoing_reply SET quote_projection=json_set(quote_projection,'$.text',?5,'$.message_type',0),
+           quote_metadata=json_object('globalMsgId',?3,'ownerId',?4,'cliMsgType',0,'msg',?5)
+         WHERE account_id=?1 AND json_valid(quote_projection)
+           AND client_id IN (SELECT client_id FROM outgoing WHERE account_id=?1 AND thread_id=?2)
+           AND json_extract(quote_projection,'$.message_id')=?3
+           AND json_extract(quote_projection,'$.owner_id')=?4",
+        args,
+    )?;
+    Ok(())
+}
+
 pub(super) fn persist(
     conn: &Connection,
     message: &Message,
@@ -100,21 +145,13 @@ pub(super) fn persist(
         .map(|raw| raw.projection(&message.account_id))
         .transpose()?;
     let mut projected = message.quote.clone();
-    #[cfg(feature = "messaging")]
     let (content, quote_redacted) = {
         let mut redacted = false;
         for candidate in [&mut incoming, &mut projected].into_iter().flatten() {
-            redacted |= super::recall::redact_quote(
-                conn,
-                &message.account_id,
-                &message.thread_id,
-                candidate,
-            )?;
+            redacted |= redact_quote(conn, &message.account_id, &message.thread_id, candidate)?;
         }
         (content.filter(|_| !redacted), redacted)
     };
-    #[cfg(not(feature = "messaging"))]
-    let quote_redacted = false;
     incoming = match (projected.take(), incoming) {
         (Some(projected), Some(raw)) => Some(merge_quote(&raw, &projected)?),
         (Some(projected), None) => Some(projected),
@@ -204,6 +241,7 @@ pub(super) fn hydrate(conn: &Connection, message: &mut Message) -> Result<()> {
         message.source_client_id = client;
         message.quote = quote.as_deref().map(decode).transpose()?;
         message.reply_blocked |= blocked;
+        super::mention::hydrate(conn, message)?;
     }
     Ok(())
 }
@@ -267,6 +305,7 @@ mod tests {
     use super::*;
     fn source() -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             account_id: "11".into(),

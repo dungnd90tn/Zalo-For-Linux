@@ -1572,3 +1572,441 @@ pointer click on the demo composer button saved exactly one committed draft.
 The user confirmed sticker sending and adding/removing reactions between Linux
 and phone on 2.0.5-2. Detailed direct/group, catalog search and offline reaction
 catch-up acceptance remain tracked in the [release plan](PLAN_2.0.5.md).
+
+## Ordinary group mentions (2.0.6 development branch)
+
+Individual mentions use the `/api/group/mention` payload in the PC bundle at
+N399977–399996. The composer filters the verified, visible membership of an
+ordinary group with up to 100 members. Its scoped picker lists up to five
+matches and accepts a click or arrow keys followed by Enter. Each message can
+carry up to 32 annotations. The initial implementation covers plain text in
+visible groups with a verified ordinary route and zero auto-delete TTL.
+
+Local TLS/WSS exercises the encrypted request path, the exact offsets for
+Vietnamese names after emoji, and rejection of stale privacy revisions and IDs
+outside the current roster. The worker can reuse an authenticated roster proof
+for up to 20 seconds. Storage tests cover the schema 18 upgrade, typed own-echo
+matching after an uncertain send and ACK recovery across restart. An unsupported
+or malformed inbound annotation leaves the message text readable.
+
+Four isolated X11 captures at 640×480 and 1200×780 verified the picker and
+mention highlighting in both themes. The fixture requires
+`ZALO_UI_FIXTURE_READY=1 ZALO_UI_FIXTURE_INTERACTIONS=mentions` and the ignored
+`ui::live::tests::signed_in_offline_native_window_fixture` test. Connection
+traces showed no IPv4 or IPv6 connections. UI tests cover the Enter guard while
+IME is composing and preservation of existing whitespace when choosing a name
+in the middle of a draft. Zalo service acceptance and a real x-unikey pass for
+this new picker remain pending.
+
+The default `scripts/rust/check.sh` checks passed, including 307 Rust tests
+and 19 Python tooling tests. `cargo test --locked --offline --all-features`
+passed 840 tests with five opt-in tests ignored. Strict all-feature,
+all-target Clippy passed. The optimized `live` build passed
+`scripts/rust/smoke-release.py --expect-live`, including upgrade from schema 18
+to 19, preservation of saved messages and idempotent restart.
+
+## Ordinary group text pins (2.0.6 development branch)
+
+The authenticated `group_board` v2 service uses `/api/board/pin/list`,
+`/api/board/topic/createv2` and `/api/board/unpinv2` (PC bundle N398353 and
+N401244–401353). The session must advertise an enabled production v2 board.
+The worker checks visible ordinary groups of up to 100 members. A write
+requires an eligible saved message, verified group permission and zero
+auto-delete TTL. The list opens only locally saved messages with matching
+server, sender and client IDs. Changes from other clients are fetched on
+demand using **Cập nhật tin ghim**.
+
+Local TLS/WSS fixtures exercise the encrypted request fields, stale privacy
+and missing-source rejection, pin and unpin confirmation, and a lost reply
+across a restart. Only unresolved intents are stored in schema 20. The worker
+releases one such intent when a newer authoritative board proves its requested
+state. It leaves other messages available for independent actions.
+
+Four native UI tests exercise scope, permissions, late list arrival while a
+menu is open and navigation to a saved message without losing the draft.
+Eight isolated X11 captures covered `group-pins` and `group-pin-menu` in
+both themes at 640×480 and 1200×780 using `ZALO_UI_FIXTURE_READY=1` and
+`ZALO_UI_FIXTURE_INTERACTIONS`. The traces had no IPv4 or IPv6 connections.
+
+The default checks passed with 308 Rust and 19 Python tests. The all-feature
+suite passed 850 Rust tests with five opt-in tests ignored. Strict all-feature,
+all-target Clippy passed. The optimized live binary preserved history and
+restarted cleanly after upgrading schema 19 to 20 in the release smoke test.
+Acceptance on the Zalo service remains pending.
+
+## Direct text forwarding to several friends (2.0.6 development branch)
+
+One eligible saved direct text message can be forwarded to up to ten verified
+friends. The worker sends serial single-recipient requests to
+`/api/message/mforward`, using one durable client ID per recipient. A fresh
+account-wide auto-delete snapshot can serve multiple recipients within 20
+seconds. Each send still checks its recipient's WSS eligibility, original
+authenticated socket, privacy revision and canonical source. The existing
+forward outbox remains at schema 20.
+
+TLS/WSS fixtures cover mixed acceptance, rejection, unknown delivery and a
+target with auto-delete enabled. They verify that the same-batch retry sends
+only eligible failures, uses unique IDs and never replays an unresolved
+send after restart. A cancellation fixture stops the actor after the first
+ACK and while the second request is pending. The third request never reaches
+the fixture. The runtime also yields to queued actor work between recipients
+when reusing a TTL snapshot.
+
+UI tests verify retained selections across searches, stale-response rejection,
+and reopening the same message to consult a batch result in the current
+conversation. The results panel is session-local. An explicit new batch can
+forward the same message again, subject to the durable unresolved-send guard.
+Isolated X11 captures of `ZALO_UI_FIXTURE_FORWARD=batch` and `mixed` covered
+both themes at 640×480 and 1200×780, with no IPv4 or IPv6 connections.
+
+The all-feature suite passed 854 Rust tests with five opt-in tests ignored.
+The default checks passed 308 Rust and 19 Python tests. Strict all-feature,
+all-target Clippy and the optimized live release smoke passed. Real-account
+acceptance remains pending.
+
+## Ordinary group text recall (2.0.6 development branch)
+
+The message menu offers **Thu hồi** for eligible saved text authored by the
+current account. The group confirmation states that recall applies to all
+members. The worker requires a visible ordinary group of up to 100 members,
+recent membership and visibility checks, and the session's recall window. The
+encrypted group request to `/api/group/undomsg` uses the message and client
+IDs from the saved source (PC bundle N401877–401897). Storage uses the existing
+recall ledger and schema 20.
+
+The TLS/WSS fixture covers accepted, rejected and missing replies, a restart
+with an unresolved recall, and recovery via an authenticated group notice.
+Storage tests check that an early notice waits for the exact ordinary source,
+that historical text and quotes stay redacted after replay, and that a group
+notice cannot affect another chat or settle a typed mention send. UI tests
+cover scope, draft preservation and a pin snapshot that arrives after recall.
+Isolated X11 captures of `ZALO_UI_FIXTURE_RECALL=group-confirm` and
+`group-unknown` covered both themes at 640×480 and 1200×780. The captures used
+synthetic conversations and made no IPv4 or IPv6 connections.
+
+The all-feature suite passed 864 Rust tests with five opt-in tests ignored.
+Default checks passed 308 Rust and 19 Python tests. Strict Clippy passed with
+all features and targets. The optimized live binary passed the profile upgrade
+and restart smoke tests with schema 20.
+
+Real-account verification remains pending. Use a disposable profile and a
+group with a second test account. Confirm both clients show the same recall,
+then reopen the thread and check that the original text stays hidden in local
+history, search, quotes and pinned-message previews.
+
+## Public sticker pack browsing (2.0.6 development branch)
+
+The native composer has a **Bộ nhãn dán** tab alongside the default set and
+keyword search. It uses the authenticated sticker service's category list v2
+and category sticker detail (PC bundle N398920–398946 and N519921–519993).
+The list accepts public packs from the authenticated inline array. A response
+with only an external manifest is shown as unavailable. The picker filters
+hidden packs and sends ordinary type-3 stickers through the existing outbox.
+It uses the same profile schema and loads thumbnails only for visible tiles.
+
+The parser and loopback fixtures exercise the encrypted category requests,
+scope and proof invalidation on a newer request, excluded packs, foreign or
+unsupported stickers, and sends to both a direct chat and a group. The
+fixture supplies an untrusted catalog URL and expects zero requests to it.
+Isolated X11 captures of `ZALO_UI_FIXTURE_INTERACTIONS=sticker-packs` and
+`sticker-pack-detail` covered both themes at 640×480 and 1200×780. Connection
+traces contained no IPv4 or IPv6 connections.
+
+The all-feature suite passed 869 Rust tests with five opt-in tests ignored.
+Default checks passed 308 Rust and 19 Python tests. Strict all-feature,
+all-target Clippy and the offline source oracle passed. The optimized live
+binary passed the schema 20 profile upgrade and restart smoke test.
+
+Real-account catalog availability and cross-device sending remain pending.
+
+## Loading older group text from Zalo (2.0.6 development branch)
+
+The timeline offers **Tải tin cũ từ Zalo** at the oldest saved message in an
+eligible group. One click requests up to 50 rows from the advertised
+`group_cloud_message` service when both cloud flags permit scrolling back.
+The worker verifies visibility and membership against the current session.
+The request starts on `/api/cm/getrecentv2`, uses `/api/cm/getoldv2` when the
+server indicates the archive, and carries its cursor across local page
+navigation (PC bundle N401643–401657 and N330032–330057).
+
+Only ordinary plain text older than the bound anchor is saved. The parser
+checks group and sender aliases, skips unsupported rows and rejects pages
+with unsupported deletion or recall controls. Existing local tombstones keep
+recalled content redacted. The transaction commits without updating unread
+counts, live queue offsets or outgoing acknowledgements. **Xem trang trước**
+reads the committed rows, while the current pane and draft remain in place.
+The database schema stays at 20.
+
+The parser, store and TLS/WSS fixtures cover exact numeric cursors and
+same-anchor archive transitions, wrong groups, privacy changes, rollback,
+typed rows, local paging after an import, and preservation of live state.
+Isolated X11 captures covered `remote-history`, `remote-history-saved` and
+`remote-history-offline` at 640×480 and 1200×780 in both themes. Connection
+traces contained no IPv4 or IPv6 traffic. Real-account availability and
+archive paging remain pending. The scope is limited to ordinary joined
+groups verified by the existing roster gate, with up to 100 members.
+
+The all-feature suite passed 878 Rust tests with five opt-in tests ignored.
+Default checks passed 309 Rust and 19 Python tests. Strict all-feature,
+all-target Clippy and the offline PC bundle request oracle passed. The
+optimized live binary passed the schema 20 profile upgrade and restart smoke
+test.
+
+## Sending one original JPEG (2.0.6 development branch)
+
+**Ảnh gốc** is offered when the authenticated Cloud usage response identifies
+paid plan `0` and the session advertises both eligible services and the
+original-upload flag. The worker rechecks the entitlement before sending
+image bytes. The viewer key and usage decryption key stay in memory during
+that lookup. The upload uses `/api/{message,group}/zcloud-upload/photo` and
+the final send uses `/api/{message,group}/photo_original/send` with
+`jcp={"is_original":1}` (PC bundle N123045–123092, N399808–399822,
+N401545–401577 and N493214–493248).
+
+The preparation worker accepts static JPEGs up to 5 MiB and 2560 px per
+dimension, subject to smaller service limits. It removes APP1 segments
+without recompressing the image. JPEGs requiring EXIF rotation or reflection
+can be sent byte-for-byte using file attachment. Upload, preview and checksum
+use the same private prepared JPEG. The final photo record requires an explicit
+original URL and the expected resource size. The existing photo ledger binds
+the mode before upload and keeps the original URL through ACK recovery.
+
+The synthetic TLS/WSS test covers direct and group sends, exact prepared
+bytes, paid entitlement revocation before upload and rejection of a response
+without original-resource evidence. Eight offline native captures cover
+the ready and EXIF error states in both themes at 640×480 and 1200×780.
+The all-feature suite passed 884 Rust tests with five opt-in tests ignored.
+Default checks passed 310 Rust and 19 Python tests. Strict all-target,
+all-feature Clippy and the PC bundle photo request oracle passed.
+The optimized live binary passed the offline schema 20 upgrade and restart
+smoke test, preserving saved originals and local history.
+
+Real Zalo Cloud entitlement and downloading the sent photo on a second
+device remain to be verified on a test account.
+
+## Sending an HD album (2.0.6 development branch)
+
+The native picker previews 2–6 static images in selection order, subject to
+smaller session limits. A single selection keeps the existing HD flow. Text
+stays in its draft. The worker waits for durable acceptance of each album member
+before starting the next. A rejected or uncertain member stops the upload.
+Schema 21 reprojects legacy album data and makes older clients refuse the
+upgraded profile.
+
+The bundle oracle passed four album cases across direct and group sends. The
+synthetic TLS/WSS test passed exact prepared-byte uploads, shared layout IDs,
+distinct indexes and client IDs, and stopping after the second photo was
+rejected or its confirmation was lost. Eight offline native captures cover the
+ready and partial states in both themes at 640×480 and 1200×780. The album UI
+unit tests passed separately, including pointer dismissal with draft retention.
+The final default checks passed 312 Rust and 19 Python tests. Separate
+all-feature runs passed 161 store tests and 32 integration tests that require
+no network. The optimized live binary passed the disposable-profile smoke
+test, including schema 20 to 21. The prior schema-20 binary refused the
+upgraded profile, and all 19 synthetic messages remained in the database.
+
+The first all-feature run passed the album TLS/WSS test and found stale schema
+assertions and a synthetic click exceeding egui's click threshold. Those
+checks passed in targeted reruns after the test-only fixes. The final complete
+loopback rerun is pending renewed permission after automatic review timed out.
+
+To reproduce the captures, set `ZALO_UI_FIXTURE_ALBUM=ready|partial`,
+`ZALO_UI_FIXTURE_READY=1`, `ZALO_UI_FIXTURE_WIDTH=640|1200`,
+`ZALO_UI_FIXTURE_THEME=light|dark` and `ZALO_UI_SHOT=/tmp/album.ppm`.
+Run the ignored `ui::live::tests::signed_in_offline_native_window_fixture` under
+an isolated X11 display. Receiving the album on a real Zalo device remains
+to be verified.
+
+## Recording and sending a voice message (2.0.6 development branch)
+
+The recorder only starts on an explicit action and keeps MP3 bytes in memory.
+Playback depends on local FFmpeg and a PulseAudio-compatible audio server.
+Ordinary direct and group sends use the authenticated FILE origin and a scoped
+voice receipt ledger. An uncertain result keeps the current clip available
+for review and blocks automatic resend. Text drafts remain independent.
+
+The focused all-feature tests cover the direct/group request parameters,
+strict HTTPS media projection, explicit server disable, scope and receipt
+matching, and rejection of an uncertain duplicate after restart. The
+optional FFmpeg test generated an in-memory synthetic tone and validated its
+MP3 frames and duration. No microphone or sound output was used.
+The default checks passed 317 Rust and 19 Python tests. Focused all-feature
+checks passed 13 voice tests and 166 store tests in separate runs. The
+schema 21 fixture upgraded to schema 22 with all 19 synthetic messages
+intact, and the previous optimized binary refused the upgraded profile.
+Strict all-target, all-feature Clippy and the final optimized binary's
+offline schema 22 and restart smoke checks passed.
+
+Native fixtures use `ZALO_UI_FIXTURE_VOICE=ready|received|unknown` with
+`ZALO_UI_FIXTURE_READY=1` in the ignored X11 screenshot test above. Both
+themes were reviewed at 640×480 and 1200×780. The unknown state has one
+review row, and the test confirms it dismisses the matching recording
+without resending. The captures used no network or audio-device connections.
+
+The voice TLS/WSS integration case was compiled. Its permission review
+timed out, so the loopback run is pending renewed permission. Microphone
+and speaker checks and Zalo phone-to-Linux acceptance remain pending.
+
+## Deleting one ordinary text message for me (2.0.6 development branch)
+
+The message menu confirms account or device scope. Account mode requires an
+affirmative server flag and sends `onlyMe:1` for a bound message. Device
+mode stores suppression locally. The confirmation is invalidated if the
+account, message, conversation or offered mode changes before submission.
+
+The synthetic TLS/WSS case verified the GROUP request, exact scoped IDs,
+device mode without an HTTP request, rejection after capability mismatch,
+and no retry after a lost acknowledgement and restart. The wire unit cases
+also cover sent and received direct messages. Storage tests exercise
+late replay, stale quote IDs, unread counts, search and failed local
+projection after a durable acknowledgement.
+
+The default checks passed 318 Rust and 19 Python tests. Separate all-feature
+runs passed six focused cases and 168 store tests, and strict all-feature
+Clippy passed. Upgrading a disposable schema 22 profile preserved all 19
+synthetic messages. The previous optimized binary refused schema 23.
+The final optimized live build passed offline startup and restart smoke checks.
+
+The ignored X11 fixture uses `ZALO_UI_FIXTURE_DELETE=menu|account|device|unknown`
+with `ZALO_UI_FIXTURE_READY=1`. Sixteen synthetic captures cover 640×480
+and 1200×780 in both themes. Account mode still needs real Zalo acceptance.
+
+## Receiving account-only deletions from another device
+
+The authenticated TLS/WSS fixture confirmed one committed deletion, a
+persisted receive cursor, preservation of a neighboring message, and zero
+outgoing delete requests. The offline cases cover queue trust, exact
+message binding, notice-before-source ordering, receipt recovery,
+transaction rollback and projecting redacted quotes on later directory
+import. An unsolicited UI event removes only the matching history, search,
+pin preview and quote references. Four X11 captures verified the existing
+confirmation layout at 640×480 and 1200×780 in both themes.
+
+Default verification passed 318 Rust and 19 Python tests. The all-feature
+checks passed 172 store tests and 13 focused wire, store and UI cases in
+separate runs. Strict Clippy passed. The optimized live binary passed the
+schema 24 startup and restart smoke test. A disposable schema 23 profile
+kept all 19 synthetic messages on upgrade, and the previous binary
+refused the upgraded profile. Phone-to-Linux verification on a real Zalo
+account remains pending.
+
+## Recalling photos and files sent from Linux
+
+Scope is one ordinary photo or file with a matching accepted upload receipt
+in a direct chat or an eligible group. Each album member is an independent
+target. The storage fixtures cover an exact recall received before the typed
+echo, a late upload acknowledgement, and a neighboring album image that
+remains visible. A recall notice arriving while history is present and the
+typed receipt is still unavailable can require a later verified notice.
+
+The default checks passed 318 Rust and 19 Python tests. The all-feature
+checks passed 173 store tests, five targeted UI and cache tests, and strict
+Clippy. Three exact loopback tests passed. They cover
+direct photo and group file recall, a lost reply without redispatch on
+restart, recalling the first photo while the rest of its album is still
+uploading, and cancellation of a stalled download.
+The optimized live binary passed the offline startup, restart and profile
+compatibility smoke checks at schema 24.
+
+The ignored X11 fixture supports `ZALO_UI_FIXTURE_RECALL=photo-confirm`,
+`group-photo-confirm`, `group-file-confirm` and `photo-recalled`. Sixteen
+offline captures cover both themes at 640×480 and 1200×780. The confirmation
+identifies the chosen item and conversation scope. The recalled row shows
+only the recall label. Real-service testing with Linux and a phone is pending.
+
+## Read-only group poll details
+
+The synthetic TLS/WSS test receives and saves a group poll notice, then
+checks the exact authenticated detail request. Wrong groups, missing
+messages and stale privacy revisions send no detail request. A mismatched
+response poll ID yields the unavailable state. The verified result hides
+counts before joining a restricted poll and preserves explicit zero counts.
+
+Default verification passed 319 Rust and 19 Python tests. The all-feature
+checks passed 174 store tests, 17 offline poll-related tests, and strict
+Clippy. The optimized live binary passed startup and restart
+smoke checks at schema 24. Twelve offline X11 captures show the summary, results
+and hidden counts in both themes at 640×480 and 1200×780. At 640×480 the
+expanded card can extend above the visible chat area. Real-service
+comparison with a second device remains pending.
+
+## First vote in a single-choice group poll
+
+The synthetic TLS/WSS cases reject a stale option label, confirm a matching
+first vote, and keep an interrupted dispatch blocked after restart. They
+observe one mutation request for each synthetic poll and exercise the
+existing read-only result and privacy behavior. The store regression covers
+upgrade from schema 24, same-poll notice aliases and account isolation.
+
+Three focused UI tests, three protocol tests and 175 all-feature store
+tests passed. Eight X11 captures cover the selected option and the
+uncertain outcome at 640×480 and 1200×780 in both themes. The interaction
+test verifies selection alone queues nothing and confirmation queues one
+vote. The default checks passed 319 Rust and 19 Python tests, and strict
+all-feature Clippy passed. An offline release smoke and a separate migration
+from the previous binary preserved all 19 synthetic messages at schema 25.
+The previous binary refused the upgraded profile. Real-service verification
+remains pending.
+
+## Forwarding direct text to ordinary groups
+
+The mixed TLS/WSS fixture selected a friend and a group with the same numeric
+ID and gave both the same mock server message ID. Native saved each under its
+own thread. It held an unacknowledged group send across restart and issued no
+mutation for the TTL-enabled or encrypted groups. Two other TLS/WSS cases
+covered the existing friend-only batch and cancellation. Offline roster
+tests cover the send lock, privileged role and 99/100-member boundary.
+The other offline cases cover response binding, cache privacy, departure
+and per-target retry. Eight X11 captures cover recipient selection and
+results in both themes at 640×480 and 1200×780.
+
+Default checks passed 319 Rust and 19 Python tests. The all-feature run
+passed 176 store tests, four picker tests, seven protocol/roster tests and
+strict Clippy. The live release passed the schema 25 offline smoke.
+Verification on a real Zalo account remains pending.
+
+## Forwarding ordinary text from groups
+
+The synthetic TLS/WSS case saves a group message as verified ordinary text
+and forwards it to one friend and one group. Both requests carry the exact
+group source reference. The group that supplied the original blocks posting
+for ordinary members, while allowing an active member to read the source.
+Encrypted and auto-delete source variants produce zero mutation requests.
+The verified destination copies remain in their respective threads.
+
+Offline tests cover the committed ordinary source, privacy, departure and
+group-size checks, and picker dismissal after a source scope change. Four
+offline X11 captures show the picker at 640×480 and 1200×780 in both themes.
+Default checks passed 319 Rust and 19 Python tests. The all-feature checks
+passed 177 store tests, five picker tests, seven protocol and roster tests,
+and strict Clippy. The optimized live build passed the schema 25 offline
+startup and restart smoke. Real-service confirmation remains pending.
+
+## Mentioning everyone in a group
+
+The TLS/WSS fixture tests an absent limit, an advertised limit below the
+verified member count, and an eligible group. Only the eligible case sends
+an authenticated mention request with UTF-16 position `3`, length `4`,
+`uid: "-1"` and `type: 1`. A stale privacy revision sends nothing. The
+selected span persists after reopening the profile. The earlier individual
+mention TLS fixture also passed.
+
+Four offline X11 captures show the picker at 640×480 and 1200×780 in both
+themes. Keyboard regression tests distinguish Enter used to send plain
+`@All` from explicit selection in the picker. The schema 25 upgrade test
+preserves previously saved individual mentions.
+
+Default verification passed 321 Rust and 19 Python tests. The targeted
+all-feature cases passed 179 store tests, five picker tests, three draft
+tests and 22 protocol/configuration tests. Strict all-feature Clippy passed.
+
+The stripped Ubuntu-built 2.0.6 executable passed the offline release smoke.
+An independent upgrade from the previous schema 25 binary preserved all 19
+synthetic messages. The older binary refused the upgraded schema 26 profile.
+
+The 2.0.6-1 DEB passed package installation, offline startup, desktop and
+icon checks, and removal on Ubuntu 20.04, 22.04, 24.04 and Debian 12. The RPM
+passed the same checks on Fedora 42 and AlmaLinux 9. Both packages contain
+the same executable. Ubuntu 20.04 also upgraded the previous published
+2.0.5-2 DEB from schema 18 while preserving its synthetic history. Both
+installer SHA-256 hashes verified. Real-service verification remains pending.

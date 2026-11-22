@@ -1,17 +1,30 @@
-//! HD photo selection and bounded, already-decoded preview. Encoding and file I/O stay in the worker.
+//! HD and original JPEG photo selection. File I/O and preview preparation stay in the worker.
 use super::{visuals, NativeApp};
-use crate::app::live::{FileTransferPhase, LiveCommand, PreparedPhoto};
+use crate::app::live::{FileTransferPhase, LiveCommand, PhotoResolution, PreparedPhoto};
 use crate::domain::Attachment;
 use eframe::egui::{self, pos2, vec2, FontId, Sense};
 
 const HEIGHT: f32 = 84.0;
 
+pub(super) fn resolution_title(resolution: PhotoResolution) -> &'static str {
+    match resolution {
+        PhotoResolution::Hd => "Ảnh HD",
+        PhotoResolution::Original => "Ảnh gốc",
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Preview {
+    single: PhotoTexture,
+    album: Vec<PhotoTexture>,
+    scope: Option<(String, String, Option<u64>)>,
+}
+
+#[derive(Default)]
+struct PhotoTexture {
     identity: Option<std::sync::Weak<[u8]>>,
     texture: Option<egui::TextureHandle>,
     shown_at: Option<f64>,
-    scope: Option<(String, String, Option<u64>)>,
 }
 impl Preview {
     pub fn clear(&mut self) {
@@ -24,6 +37,30 @@ impl Preview {
         }
     }
     pub fn presented(&self, photo: &PreparedPhoto, now: f64) -> bool {
+        self.single.presented(photo, now)
+    }
+    pub fn album_presented(&self, photos: &[PreparedPhoto], now: f64) -> bool {
+        self.album.len() == photos.len()
+            && self
+                .album
+                .iter()
+                .zip(photos)
+                .all(|(view, photo)| view.presented(photo, now))
+    }
+    pub fn album_textures<'a>(
+        &'a mut self,
+        ctx: &'a egui::Context,
+        photos: &'a [PreparedPhoto],
+    ) -> impl Iterator<Item = Option<egui::TextureHandle>> + 'a {
+        self.album.resize_with(photos.len(), PhotoTexture::default);
+        self.album
+            .iter_mut()
+            .zip(photos)
+            .map(move |(view, photo)| view.texture(ctx, photo))
+    }
+}
+impl PhotoTexture {
+    fn presented(&self, photo: &PreparedPhoto, now: f64) -> bool {
         self.identity
             .as_ref()
             .is_some_and(|key| key.ptr_eq(&std::sync::Arc::downgrade(&photo.thumbnail().rgba)))
@@ -40,9 +77,7 @@ impl Preview {
             .as_ref()
             .is_some_and(|key| key.ptr_eq(&std::sync::Arc::downgrade(&photo.thumbnail().rgba)))
         {
-            let scope = self.scope.take();
-            self.clear();
-            self.scope = scope;
+            *self = Self::default();
             let thumbnail = photo.thumbnail();
             let pixels = (thumbnail.width as usize).checked_mul(thumbnail.height as usize)?;
             if thumbnail.width == 0
@@ -54,7 +89,7 @@ impl Preview {
                 return None;
             }
             self.texture = Some(ctx.load_texture(
-                "selected_hd_photo",
+                "selected_photo",
                 egui::ColorImage::from_rgba_unmultiplied(
                     [thumbnail.width as usize, thumbnail.height as usize],
                     &thumbnail.rgba,
@@ -70,38 +105,96 @@ impl Preview {
 }
 
 impl NativeApp {
-    pub(super) fn photo_can_choose(&self) -> bool {
+    pub(super) fn photo_can_choose(&self, resolution: PhotoResolution) -> bool {
         !self.demo
+            && !self.selected_group_left()
+            && self
+                .model
+                .selected
+                .as_deref()
+                .is_some_and(|thread| self.privacy_visible(thread))
             && self.drafts.active.reply().is_none()
+            && !self.has_draft_mentions()
             && self.drafts.active.attachment().is_none()
             && !self.drafts.active.photo_preparing()
-            && self
-                .live
-                .as_ref()
-                .is_some_and(|state| state.uploads.photo_available && state.worker.is_some())
+            && !self.drafts.active.album_preparing()
+            && self.voice_tray_height() == 0.0
+            && self.live.as_ref().is_some_and(|state| {
+                state.uploads.supports_photo(resolution)
+                    && !state.uploads.blocked()
+                    && state.worker.is_some()
+            })
     }
     pub(super) fn photo_can_send(&self) -> bool {
+        if self.album_selected() {
+            return self.album_can_send();
+        }
         !self.photo_picker_pending()
             && self.live_can_send()
-            && self.photo_can_choose()
             && self.live.as_ref().is_some_and(|state| {
                 !state.uploads.blocked()
                     && self.drafts.active.photo().is_some_and(|photo| {
-                        state
-                            .photo_preview
-                            .presented(photo, state.context.input(|input| input.time))
+                        self.photo_can_choose(photo.resolution())
+                            && state
+                                .photo_preview
+                                .presented(photo, state.context.input(|input| input.time))
                     })
             })
     }
     pub(super) fn photo_tray_height(&self) -> f32 {
-        if self.photo_selected() {
+        if self.album_selected() && !self.photo_picker_pending() {
+            super::albums::HEIGHT
+        } else if self.photo_selected() {
             HEIGHT
         } else {
             0.0
         }
     }
-    pub(super) fn choose_hd_photo(&mut self, ctx: &egui::Context) {
-        if !self.photo_can_choose() || self.attachments.busy() {
+    pub(super) fn photo_toolbar_buttons(&mut self, ui: &mut egui::Ui, enabled: bool) {
+        let available = enabled && !self.attachments.busy();
+        if visuals::icon_button(
+            ui,
+            visuals::Icon::Image,
+            if self.has_draft_mentions() {
+                "Xóa phần nhắc thành viên để gửi ảnh HD."
+            } else if self.album_limit().is_some() {
+                "Chọn một ảnh HD hoặc chọn nhiều ảnh để gửi album."
+            } else {
+                "Ảnh HD · JPEG, PNG hoặc WebP tĩnh, tối đa 20 MiB."
+            },
+            available && self.photo_can_choose(PhotoResolution::Hd),
+        )
+        .clicked()
+        {
+            self.choose_photo(ui.ctx(), PhotoResolution::Hd);
+        }
+        if self.live.as_ref().is_some_and(|state| {
+            state.uploads.photo_available || state.uploads.photo_original_available
+        }) {
+            let response = ui.add_enabled(
+                available && self.photo_can_choose(PhotoResolution::Original),
+                egui::Button::new("Ảnh gốc").min_size(vec2(80.0, 44.0)),
+            );
+            visuals::focus_outline(ui, &response, response.rect, 12.0);
+            if response.clicked() {
+                self.choose_photo(ui.ctx(), PhotoResolution::Original);
+            }
+            let unavailable = if self
+                .live
+                .as_ref()
+                .is_some_and(|state| state.uploads.photo_original_available)
+            {
+                "Bỏ tệp, trích dẫn hoặc phần nhắc tên và chờ xử lý ảnh trước khi chọn ảnh gốc."
+            } else {
+                "Zalo chưa cấp quyền gửi ảnh gốc cho phiên này."
+            };
+            response.on_hover_text("JPEG tối đa 5 MiB, 2560 px mỗi chiều. Giữ nguyên dữ liệu ảnh và bỏ metadata APP1.")
+                .on_disabled_hover_text(unavailable);
+        }
+    }
+
+    fn choose_photo(&mut self, ctx: &egui::Context, resolution: PhotoResolution) {
+        if !self.photo_can_choose(resolution) || self.attachments.busy() {
             return;
         }
         let thread = self.model.selected.clone();
@@ -110,14 +203,25 @@ impl NativeApp {
             .unwrap_or(crate::app::DEMO_ACCOUNT)
             .to_owned();
         let auth_generation = self.auth_generation();
+        let limit = self.album_limit();
         // A new selection is a draft intent even before its background result.
         // A late ACK for the previous photo must not erase this caption.
         self.drafts.active.edited();
-        self.attachments
-            .open_photo_dialog(ctx, thread.as_deref(), &account, auth_generation);
+        self.attachments.open_photo_dialog(
+            ctx,
+            thread.as_deref(),
+            &account,
+            auth_generation,
+            self.model.generation,
+            (resolution, limit),
+        );
     }
-    pub(super) fn begin_photo_preparation(&mut self, attachment: Attachment) {
-        if !self.photo_can_choose() {
+    pub(super) fn begin_photo_preparation(
+        &mut self,
+        attachment: Attachment,
+        resolution: PhotoResolution,
+    ) {
+        if !self.photo_can_choose(resolution) {
             self.model.status = "Chưa thể chuẩn bị ảnh. Bỏ tệp hoặc trích dẫn, rồi thử lại.".into();
             return;
         }
@@ -130,10 +234,11 @@ impl NativeApp {
         let Some(worker) = &state.worker else {
             return;
         };
-        match self.drafts.active.prepare_live_photo(
+        match self.drafts.active.prepare_live_photo_with_resolution(
             self.model.generation,
             thread,
             attachment,
+            resolution,
             |command| worker.submit(command),
         ) {
             Ok(()) => state.photo_preview.clear(),
@@ -142,6 +247,11 @@ impl NativeApp {
         self.focus_composer = true;
     }
     pub(super) fn remove_selected_photo(&mut self) {
+        if self.album_selected() && self.photo_picker_pending() {
+            self.attachments.invalidate_photo_choice();
+            self.focus_composer = true;
+            return;
+        }
         let pending = self.drafts.active.photo_preparation_request();
         if let Some(state) = &mut self.live {
             if let (Some(request_id), Some(worker)) = (pending, state.worker.as_ref()) {
@@ -193,6 +303,9 @@ impl NativeApp {
         self.focus_composer = true;
     }
     pub(super) fn photo_send_label(&self) -> &'static str {
+        if self.album_selected() {
+            return self.album_send_label();
+        }
         if self
             .live
             .as_ref()
@@ -217,6 +330,10 @@ impl NativeApp {
         if !self.photo_selected() {
             return;
         }
+        if self.album_selected() && !self.photo_picker_pending() {
+            self.album_tray(ui, card);
+            return;
+        }
         let colors = crate::theme::palette(ui.ctx());
         let tray = egui::Rect::from_min_size(card.min, vec2(card.width(), HEIGHT));
         let preview = egui::Rect::from_min_size(tray.min + vec2(12.0, 10.0), vec2(64.0, 64.0));
@@ -225,7 +342,9 @@ impl NativeApp {
             vec2(44.0, 44.0),
         );
         let picker_problem = self.photo_picker_notice().map(str::to_owned);
-        let prepared = if picker_problem.is_some() {
+        let picker_resolution = self.photo_picker_resolution();
+        let resolution = picker_resolution.unwrap_or_else(|| self.drafts.active.photo_resolution());
+        let prepared = if picker_resolution.is_some() {
             None
         } else {
             self.drafts.active.photo().cloned()
@@ -239,6 +358,9 @@ impl NativeApp {
             .map(str::to_owned)
             .or(picker_problem);
         let retry = !preparing && prepared.is_none() && problem.is_some();
+        let retry_same_source = resolution == PhotoResolution::Hd
+            && picker_resolution.is_none()
+            && self.drafts.active.photo_source().is_some();
         let retry_rect = egui::Rect::from_center_size(
             pos2(close.left() - 40.0, tray.center().y),
             vec2(72.0, 44.0),
@@ -273,7 +395,7 @@ impl NativeApp {
             });
         let texture = self.live.as_mut().and_then(|state| {
             if let Some(photo) = &prepared {
-                state.photo_preview.texture(ui.ctx(), photo)
+                state.photo_preview.single.texture(ui.ctx(), photo)
             } else {
                 state.photo_preview.clear();
                 None
@@ -305,12 +427,25 @@ impl NativeApp {
         }
         let title = prepared
             .as_ref()
-            .map(|photo| format!("Ảnh HD · {} × {}", photo.width(), photo.height()))
+            .map(|photo| {
+                format!(
+                    "{} · {} × {}",
+                    resolution_title(photo.resolution()),
+                    photo.width(),
+                    photo.height()
+                )
+            })
             .unwrap_or_else(|| {
                 if preparing {
-                    "Đang xử lý ảnh HD…".into()
+                    format!(
+                        "Đang chuẩn bị {}…",
+                        match resolution {
+                            PhotoResolution::Hd => "ảnh HD",
+                            PhotoResolution::Original => "ảnh gốc",
+                        }
+                    )
                 } else {
-                    "Chưa chuẩn bị được ảnh".into()
+                    format!("{} · chưa chuẩn bị được", resolution_title(resolution))
                 }
             });
         let detail = if let Some((label, ..)) = &job {
@@ -340,6 +475,12 @@ impl NativeApp {
             ),
             colors.text_primary,
         );
+        ui.interact(
+            egui::Rect::from_min_size(pos2(left, tray.top() + 30.0), vec2(width, 44.0)),
+            ui.id().with("photo_detail"),
+            Sense::hover(),
+        )
+        .on_hover_text(&detail);
         super::row_text(
             ui,
             pos2(left, tray.top() + 34.0),
@@ -356,7 +497,16 @@ impl NativeApp {
             ui,
             pos2(left, tray.top() + 55.0),
             width,
-            "Nén JPEG HD · không gửi bản gốc",
+            match resolution {
+                PhotoResolution::Hd => "Nén JPEG HD",
+                PhotoResolution::Original if prepared.is_some() => {
+                    "JPEG không nén lại · bỏ metadata APP1"
+                }
+                PhotoResolution::Original if problem.is_some() => {
+                    "Bỏ ảnh để đính kèm dưới dạng tệp"
+                }
+                PhotoResolution::Original => "JPEG · tối đa 5 MiB, 2560 px mỗi chiều",
+            },
             FontId::proportional(visuals::TEXT_SMALL),
             colors.text_secondary,
         );
@@ -369,10 +519,10 @@ impl NativeApp {
         }
         if retry {
             let response = ui
-                .add_enabled_ui(self.photo_can_choose(), |ui| {
+                .add_enabled_ui(self.photo_can_choose(resolution), |ui| {
                     ui.put(
                         retry_rect,
-                        egui::Button::new(if self.drafts.active.photo_source().is_some() {
+                        egui::Button::new(if retry_same_source {
                             "Thử lại"
                         } else {
                             "Chọn lại"
@@ -381,10 +531,16 @@ impl NativeApp {
                 })
                 .inner;
             if response.clicked() {
-                if let Some(source) = self.drafts.active.photo_source().cloned() {
-                    self.begin_photo_preparation(source);
+                if let Some(source) = self
+                    .drafts
+                    .active
+                    .photo_source()
+                    .cloned()
+                    .filter(|_| retry_same_source)
+                {
+                    self.begin_photo_preparation(source, resolution);
                 } else {
-                    self.choose_hd_photo(ui.ctx());
+                    self.choose_photo(ui.ctx(), resolution);
                 }
             }
         }
@@ -435,6 +591,8 @@ impl NativeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::live::{LiveEvent, LiveWorker, PhotoPreparationFailure};
+
     #[test]
     fn gpu_preview_does_not_retain_prepared_capability_and_scope_clears_texture() {
         let root = std::env::temp_dir().join(format!(
@@ -455,7 +613,7 @@ mod tests {
         let mut preview = Preview::default();
         preview.scope(Some(("11".into(), "d:22".into(), Some(1))));
         let _ = ctx.run(Default::default(), |ctx| {
-            assert!(preview.texture(ctx, &photo).is_some());
+            assert!(preview.single.texture(ctx, &photo).is_some());
         });
         drop(photo);
         assert!(
@@ -463,9 +621,77 @@ mod tests {
             "GPU cache must not keep prepared snapshot or its thumbnail alive"
         );
         preview.scope(Some(("11".into(), "d:33".into(), Some(1))));
-        assert!(preview.texture.is_none());
-        assert!(preview.identity.is_none());
+        assert!(preview.single.texture.is_none());
+        assert!(preview.single.identity.is_none());
         drop(profile);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn original_uses_its_own_capability_and_preserves_caption_after_preparation_failure() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = super::super::live::tests::fixture(&ctx);
+        let (worker, mut commands, _events) = LiveWorker::presentation_fixture("11");
+        let state = app.live.as_mut().unwrap();
+        state.worker = Some(worker);
+        state.uploads.observe(&LiveEvent::PhotoCapability {
+            account_id: "11".into(),
+            available: true,
+            original_available: false,
+            album_max_count: 0,
+        });
+        app.model.selected = Some("d:22".into());
+        app.drafts.select("d:22").unwrap();
+        app.drafts.active.text = "Chú thích đang soạn".into();
+        let file = root.join("preview.jpg");
+        std::fs::write(&file, b"synthetic picker metadata").unwrap();
+        let attachment = Attachment::inspect(&file).unwrap();
+        assert!(app.photo_can_choose(PhotoResolution::Hd));
+        assert!(!app.photo_can_choose(PhotoResolution::Original));
+        app.begin_photo_preparation(attachment.clone(), PhotoResolution::Original);
+        assert!(commands.try_recv().is_err());
+        app.live
+            .as_mut()
+            .unwrap()
+            .uploads
+            .observe(&LiveEvent::PhotoCapability {
+                account_id: "11".into(),
+                available: false,
+                original_available: true,
+                album_max_count: 0,
+            });
+        assert!(!app.photo_can_choose(PhotoResolution::Hd));
+        assert!(app.photo_can_choose(PhotoResolution::Original));
+        app.begin_photo_preparation(attachment, PhotoResolution::Original);
+        let Ok(LiveCommand::PreparePhoto {
+            request_id,
+            generation,
+            thread,
+            resolution,
+            ..
+        }) = commands.try_recv()
+        else {
+            panic!("expected an original photo preparation");
+        };
+        assert_eq!(thread, "d:22");
+        assert_eq!(resolution, PhotoResolution::Original);
+        app.drafts.apply_live(
+            &LiveEvent::PhotoPrepared {
+                account_id: "11".into(),
+                generation,
+                thread,
+                request_id,
+                result: Err(PhotoPreparationFailure::OriginalOrientation),
+            },
+            "11",
+        );
+        assert_eq!(
+            app.drafts.active.photo_resolution(),
+            PhotoResolution::Original
+        );
+        assert!(app.drafts.active.photo_problem().is_some());
+        assert_eq!(app.drafts.active.text, "Chú thích đang soạn");
+        assert!(!app.photo_can_send());
+        drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

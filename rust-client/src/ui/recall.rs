@@ -1,10 +1,54 @@
-//! Confirmation and scoped settlement for recalling a previously sent direct message.
+//! Confirmation and scoped settlement for recalling an ordinary direct or group message.
 use super::{visuals, NativeApp};
 use crate::{
-    app::live::{LiveCommand, LiveConnection, LiveEvent, RecallOutcome},
-    domain::{reply::valid_source_id, Message},
+    app::live::{LiveCommand, LiveConnection, LiveEvent, LivePrivacyStatus, RecallOutcome},
+    domain::{reply::valid_source_id, MediaDescriptor, Message},
 };
 use eframe::egui::{self, vec2, RichText};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Text,
+    Photo,
+    File,
+}
+
+impl Kind {
+    fn of(message: &Message) -> Option<Self> {
+        match &message.media {
+            // Live media has a projected source ID only after matching a
+            // committed PHOTO or FILE receipt in the worker.
+            Some(MediaDescriptor::Photo(photo))
+                if message.reply_blocked && photo.original_url.is_some() =>
+            {
+                Some(Self::Photo)
+            }
+            Some(MediaDescriptor::File(file))
+                if message.reply_blocked
+                    && file.url.is_some()
+                    && !file.encrypted
+                    && !file.is_folder =>
+            {
+                Some(Self::File)
+            }
+            None if !message.reply_blocked
+                && !message.text.trim().is_empty()
+                && !message.text.starts_with("[Tin nhắn ") =>
+            {
+                Some(Self::Text)
+            }
+            _ => None,
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Text => "tin nhắn",
+            Self::Photo => "ảnh này",
+            Self::File => "tệp này",
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct Subject {
@@ -13,6 +57,8 @@ struct Subject {
     thread: String,
     page: u64,
     message: String,
+    source_client_id: String,
+    kind: Kind,
 }
 
 impl Subject {
@@ -126,43 +172,70 @@ impl Recall {
         let subject = Subject {
             account: "11".into(),
             auth,
-            thread: "d:22".into(),
+            thread: if scene.starts_with("group-") {
+                "g:70"
+            } else {
+                "d:22"
+            }
+            .into(),
             page,
             message: "901".into(),
+            source_client_id: "900".into(),
+            kind: if scene.contains("photo") {
+                Kind::Photo
+            } else if scene.contains("file") {
+                Kind::File
+            } else {
+                Kind::Text
+            },
         };
         self.confirmation = Some(Confirmation {
             subject,
-            result: (scene == "unknown").then_some(RecallOutcome::Unknown),
+            result: scene.ends_with("unknown").then_some(RecallOutcome::Unknown),
             busy_queue: false,
         });
     }
 }
 
 impl NativeApp {
+    fn recall_thread(&self, thread: &str, account: &str) -> bool {
+        if !self.privacy_list_visible(thread) {
+            return false;
+        }
+        if let Some(peer) = thread.strip_prefix("d:") {
+            return peer != account && valid_source_id(peer);
+        }
+        thread.strip_prefix("g:").is_some_and(valid_source_id)
+            && self
+                .model
+                .conversations
+                .iter()
+                .any(|group| group.id == thread && !group.group_left)
+            && self.live.as_ref().is_some_and(|state| {
+                state.privacy.status == LivePrivacyStatus::Ready && state.group_recall_available()
+            })
+    }
+
     fn recall_subject(&self, message: &Message) -> Option<Subject> {
         let account = self.account_id()?;
         let thread = self.model.selected.as_ref()?;
-        let peer = thread.strip_prefix("d:")?;
+        let source_client_id = message
+            .source_client_id
+            .as_deref()
+            .filter(|id| valid_source_id(id))?;
+        let kind = Kind::of(message)?;
         if self.demo
             || self.model.pending
-            || peer == account
-            || !self.privacy_list_visible(thread)
+            || !self.recall_thread(thread, account)
             || message.account_id != account
             || message.sender != account
             || message.thread_id != *thread
-            || !valid_source_id(peer)
             || !valid_source_id(&message.id)
-            || !message
-                .source_client_id
-                .as_deref()
-                .is_some_and(valid_source_id)
             || message.is_recalled()
-            || message.reply_blocked
+            || !message.mentions.is_empty()
             || message.quote.is_some()
-            || message.media.is_some()
             || message.sticker.is_some()
-            || message.text.trim().is_empty()
-            || message.text.starts_with("[Tin nhắn ")
+            || message.sent_at_ms <= 0
         {
             return None;
         }
@@ -172,6 +245,8 @@ impl NativeApp {
             thread: thread.clone(),
             page: self.model.generation,
             message: message.id.clone(),
+            source_client_id: source_client_id.into(),
+            kind,
         })
     }
 
@@ -182,6 +257,29 @@ impl NativeApp {
                 && state.recall.flight.is_none()
                 && self.recall_subject(message).is_some()
         })
+    }
+
+    pub(super) fn recall_unavailable(&self) -> &'static str {
+        if self.selected_group_left() {
+            "Bạn đã rời nhóm. Chỉ có thể xem lịch sử trên máy."
+        } else if self.live.as_ref().is_none_or(|state| {
+            state.connection != LiveConnection::Online || state.worker.is_none()
+        }) {
+            "Kết nối lại để thu hồi tin nhắn."
+        } else if self
+            .model
+            .selected
+            .as_deref()
+            .is_some_and(|thread| thread.starts_with("g:"))
+            && !self
+                .live
+                .as_ref()
+                .is_some_and(|state| state.group_recall_available())
+        {
+            "Phiên này chưa đủ điều kiện thu hồi tin nhắn nhóm."
+        } else {
+            "Chỉ thu hồi tin văn bản, ảnh hoặc tệp bạn đã gửi, đủ dữ liệu gốc và còn trong thời hạn."
+        }
     }
 
     pub(super) fn open_recall(&mut self, id: &str) {
@@ -223,7 +321,7 @@ impl NativeApp {
             && self.auth_generation() == subject.auth
             && self.model.selected.as_deref() == Some(subject.thread.as_str())
             && self.model.generation == subject.page
-            && self.privacy_list_visible(&subject.thread);
+            && self.recall_thread(&subject.thread, &subject.account);
         let eligible = confirmation.result.is_some()
             || self
                 .model
@@ -252,14 +350,26 @@ impl NativeApp {
             .model
             .messages
             .iter()
-            .find(|message| message.id == confirmation.subject.message)
-            .map(Message::preview_text);
+            .find(|message| {
+                let subject = &confirmation.subject;
+                message.account_id == subject.account
+                    && message.thread_id == subject.thread
+                    && message.id == subject.message
+                    && message.sender == subject.account
+                    && message.source_client_id.as_deref()
+                        == Some(subject.source_client_id.as_str())
+                    && Kind::of(message) == Some(subject.kind)
+            })
+            .map(|message| match &message.media {
+                Some(MediaDescriptor::Photo(photo)) if !photo.caption.trim().is_empty() => {
+                    photo.caption.as_str()
+                }
+                _ => message.preview_text(),
+            });
         let pending = recall.flight.is_some();
         let ready = confirmation.result.is_none();
-        let can_submit = ready
-            && !pending
-            && state.connection == LiveConnection::Online
-            && state.worker.is_some();
+        let online = state.connection == LiveConnection::Online && state.worker.is_some();
+        let can_submit = ready && !pending && online;
         let mut send = false;
         let mut dismiss = false;
 
@@ -286,10 +396,16 @@ impl NativeApp {
                             .wrap(),
                         );
                     } else {
+                        let audience = if confirmation.subject.thread.starts_with("g:") {
+                            "tất cả thành viên trong nhóm"
+                        } else {
+                            "mọi người trong cuộc trò chuyện"
+                        };
                         ui.add(
-                            egui::Label::new(
-                                "Thu hồi tin nhắn đối với mọi người trong cuộc trò chuyện?",
-                            )
+                            egui::Label::new(format!(
+                                "Thu hồi {} đối với {audience}?",
+                                confirmation.subject.kind.noun()
+                            ))
                             .wrap(),
                         );
                         if let Some(preview) = preview {
@@ -300,7 +416,9 @@ impl NativeApp {
                                 .truncate(),
                             );
                         }
-                        if confirmation.busy_queue {
+                        if !online {
+                            ui.label("Kết nối lại để thu hồi tin nhắn.");
+                        } else if confirmation.busy_queue {
                             ui.colored_label(
                                 colors.error,
                                 "Chưa gửi yêu cầu thu hồi. Hãy thử lại.",
@@ -349,22 +467,106 @@ impl NativeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{FileDescriptor, MediaKind, PhotoAlbumMember, PhotoDescriptor};
+
+    #[test]
+    fn committed_photo_and_file_recall_keeps_the_exact_selected_source() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = super::super::live::tests::fixture(&ctx);
+        let (worker, _commands, _events) = crate::app::live::LiveWorker::presentation_fixture("11");
+        let state = app.live.as_mut().unwrap();
+        state.connection = LiveConnection::Online;
+        state.worker = Some(worker);
+        app.model.selected = Some("d:22".into());
+        app.drafts.select("d:22").unwrap();
+        app.drafts.active.text = "Bản nháp cần giữ".into();
+        let photo = MediaDescriptor::Photo(PhotoDescriptor {
+            title: String::new(),
+            caption: "Ảnh trong album".into(),
+            thumbnail_url: None,
+            original_url: Some("https://f12-zpcloud.zdn.vn/synthetic-recall.jpg".into()),
+            width: Some(100),
+            height: Some(100),
+            album: PhotoAlbumMember::new(777, 1, 3),
+        });
+        let file = MediaDescriptor::File(FileDescriptor {
+            title: "Bao cao.pdf".into(),
+            extension: "pdf".into(),
+            size_bytes: Some(16_384),
+            url: Some("https://f12-zfile.zdn.vn/synthetic-recall.pdf".into()),
+            is_folder: false,
+            encrypted: false,
+        });
+        for media in [photo, file] {
+            let kind = media.kind();
+            let mut message = Message {
+                account_id: "11".into(),
+                thread_id: "d:22".into(),
+                id: "901".into(),
+                sender: "11".into(),
+                text: kind.legacy_placeholder().into(),
+                sent_at_ms: 1,
+                source_client_id: None,
+                reply_blocked: true,
+                recalled: false,
+                mentions: vec![],
+                quote: None,
+                media: Some(media),
+                sticker: None,
+            };
+            assert!(!app.can_recall(&message));
+            message.source_client_id = Some("900".into());
+            let mut foreign = message.clone();
+            foreign.sender = "22".into();
+            assert!(!app.can_recall(&foreign));
+            if let Some(MediaDescriptor::File(descriptor)) = message.media.as_ref() {
+                let mut encrypted = descriptor.clone();
+                encrypted.encrypted = true;
+                let mut candidate = message.clone();
+                candidate.media = Some(MediaDescriptor::File(encrypted));
+                assert!(!app.can_recall(&candidate));
+            }
+            assert!(app.can_recall(&message));
+            app.model.messages = vec![message];
+            app.open_recall("901");
+            let state = &app.live.as_ref().unwrap().recall;
+            let subject = &state.confirmation.as_ref().unwrap().subject;
+            assert!(matches!(
+                (kind, subject.kind),
+                (MediaKind::Photo, Kind::Photo) | (MediaKind::File, Kind::File)
+            ));
+            assert_eq!(subject.source_client_id, "900");
+            app.model.messages[0].source_client_id = Some("911".into());
+            app.sync_recall();
+            assert!(!app.live.as_ref().unwrap().recall.is_open());
+        }
+        assert_eq!(app.drafts.active.text, "Bản nháp cần giữ");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn unrelated_replies_cannot_settle_recall_and_durable_update_can_resolve_unknown() {
         let mut state = Recall::default();
-        state.fixture(Some(3), 4, "confirm");
+        state.fixture(Some(3), 4, "group-confirm");
         let subject = state.confirmation.as_ref().unwrap().subject.clone();
         state.flight = Some((10, subject));
         let finish = |account: &str, request_id, outcome| LiveEvent::RecallFinished {
             account_id: account.into(),
             request_id,
-            thread: "d:22".into(),
+            thread: "g:70".into(),
             message_id: "901".into(),
             outcome,
         };
         state.observe(&finish("12", 10, RecallOutcome::Accepted));
         state.observe(&finish("11", 9, RecallOutcome::Accepted));
+        state.observe(&LiveEvent::RecallFinished {
+            account_id: "11".into(),
+            request_id: 10,
+            thread: "d:22".into(),
+            message_id: "901".into(),
+            outcome: RecallOutcome::Accepted,
+        });
         assert!(state.flight.is_some());
         state.observe(&finish("11", 10, RecallOutcome::Unknown));
         assert_eq!(
@@ -374,7 +576,7 @@ mod tests {
         state.clear_confirmation();
         state.observe(&LiveEvent::Recalled {
             account_id: "11".into(),
-            thread: "d:22".into(),
+            thread: "g:70".into(),
             message_id: "901".into(),
             actor_id: "11".into(),
             message: None,
@@ -382,6 +584,55 @@ mod tests {
         });
         assert_eq!(state.status_label(), Some("Tin nhắn đã được thu hồi."));
         assert!(!state.is_open());
+    }
+
+    #[test]
+    fn group_recall_requires_the_own_message_in_a_joined_visible_group() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = super::super::live::tests::fixture(&ctx);
+        let (worker, _commands, _events) = crate::app::live::LiveWorker::presentation_fixture("11");
+        let state = app.live.as_mut().unwrap();
+        state.connection = LiveConnection::Online;
+        state.worker = Some(worker);
+        app.model.selected = Some("g:70".into());
+        app.drafts.select("g:70").unwrap();
+        app.drafts.active.text = "Nháp đang nhập".into();
+        app.model.conversations.push(crate::domain::Conversation {
+            id: "g:70".into(),
+            title: "Nhóm kiểm thử".into(),
+            last_message_at_ms: 1,
+            last_text: "Tin nhắn thử".into(),
+            last_sender: "11".into(),
+            group_left: false,
+        });
+        app.model.messages.push(Message {
+            mentions: Vec::new(),
+            reply_blocked: false,
+            recalled: false,
+            source_client_id: Some("900".into()),
+            quote: None,
+            account_id: "11".into(),
+            thread_id: "g:70".into(),
+            id: "901".into(),
+            sender: "11".into(),
+            text: "Tin nhắn thử".into(),
+            sticker: None,
+            media: None,
+            sent_at_ms: 1,
+        });
+        let mut other = app.model.messages[0].clone();
+        other.sender = "22".into();
+        assert!(!app.can_recall(&other));
+        assert!(app.can_recall(&app.model.messages[0]));
+        app.open_recall("901");
+        assert!(app.live.as_ref().unwrap().recall.is_open());
+        app.model.conversations[0].group_left = true;
+        app.sync_recall();
+        assert!(!app.can_recall(&app.model.messages[0]));
+        assert!(!app.live.as_ref().unwrap().recall.is_open());
+        assert_eq!(app.drafts.active.text, "Nháp đang nhập");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -400,11 +651,11 @@ mod tests {
         drafts.select("d:33").unwrap();
         drafts.active.set_reply(quote("d:33", "33"));
 
-        drafts.remove_recalled_reply("11", "d:22", "901", "11");
+        drafts.remove_message_reply("11", "d:22", "901", "11");
         drafts.select("d:22").unwrap();
         assert!(drafts.active.reply().is_some());
         drafts.select("d:33").unwrap();
-        drafts.remove_recalled_reply("11", "d:22", "901", "22");
+        drafts.remove_message_reply("11", "d:22", "901", "22");
         assert!(drafts.active.reply().is_some());
         drafts.select("d:22").unwrap();
         assert_eq!(drafts.active.text, "Nháp cần giữ");

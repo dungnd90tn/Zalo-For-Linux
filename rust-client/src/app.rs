@@ -7,9 +7,13 @@ pub mod download;
 pub mod live;
 #[cfg(feature = "messaging")]
 pub mod media;
+#[cfg(feature = "messaging")]
+mod mention_draft;
 pub mod search;
 #[cfg(feature = "live-login")]
 pub mod stickers;
+#[cfg(feature = "messaging")]
+pub mod voice;
 
 use crate::domain::{
     local_message_id, validate_id, Conversation, ConversationOverview, Cursor, Message,
@@ -366,9 +370,9 @@ impl Drop for Worker {
 
 pub fn seed_demo(store: &mut MessageStore) -> Result<()> {
     let messages=[
-        Message{reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-1".into(),sender:"Demo guide".into(),text:"Offline native client. These messages are synthetic and stay in this demo profile.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_000},
-        Message{reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-2".into(),sender:"Demo guide".into(),text:"Try writing a message. The button stores it locally; it does not send to Zalo.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_001},
-        Message{reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"architecture".into(),id:"demo-3".into(),sender:"Demo guide".into(),text:"The UI uses bounded queues. SQLite runs on a dedicated worker, and conversation pages use indexed cursors.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_002},
+        Message{mentions: Vec::new(), reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-1".into(),sender:"Demo guide".into(),text:"Offline native client. These messages are synthetic and stay in this demo profile.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_000},
+        Message{mentions: Vec::new(), reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"welcome".into(),id:"demo-2".into(),sender:"Demo guide".into(),text:"Try writing a message. The button stores it locally; it does not send to Zalo.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_001},
+        Message{mentions: Vec::new(), reply_blocked: false, recalled: false, source_client_id:None, quote:None, account_id:DEMO_ACCOUNT.into(),thread_id:"architecture".into(),id:"demo-3".into(),sender:"Demo guide".into(),text:"The UI uses bounded queues. SQLite runs on a dedicated worker, and conversation pages use indexed cursors.".into(),sticker:None,media:None,sent_at_ms:1_700_000_000_002},
     ];
     store.insert_batch(&messages)?;
     store.set_title(DEMO_ACCOUNT, "welcome", "Getting started")?;
@@ -405,6 +409,7 @@ pub fn seed_demo(store: &mut MessageStore) -> Result<()> {
     for (thread, title, entries, start) in rooms {
         for (index, (sender, text)) in entries.into_iter().enumerate() {
             additional.push(Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 source_client_id: None,
@@ -444,6 +449,7 @@ fn store_demo_file(
         &serde_json::json!({"title": name, "params": params.to_string()}),
     )?;
     let message = Message {
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         source_client_id: None,
@@ -482,6 +488,7 @@ fn store_demo_message(
         .as_millis();
     let sent_at_ms = i64::try_from(now)?;
     let conversation = store.insert_with_conversation(&Message {
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         source_client_id: None,
@@ -501,12 +508,16 @@ fn store_demo_message(
 #[derive(Default)]
 pub struct Composer {
     pub text: String,
+    #[cfg(feature = "messaging")]
+    mentions: Vec<mention_draft::Span>,
     reply: Option<crate::domain::ReplyReference>,
     /// A file chosen to be sent with the next send; it belongs to this draft like the text does.
     attachment: Option<crate::domain::Attachment>,
     attachment_revision: u64,
     #[cfg(feature = "messaging")]
     photo_source: Option<crate::domain::Attachment>,
+    #[cfg(feature = "messaging")]
+    photo_resolution: crate::domain::PhotoResolution,
     #[cfg(feature = "messaging")]
     photo: Option<live::PreparedPhoto>,
     #[cfg(feature = "messaging")]
@@ -515,6 +526,8 @@ pub struct Composer {
     photo_problem: Option<String>,
     #[cfg(feature = "messaging")]
     photo_revision: u64,
+    #[cfg(feature = "messaging")]
+    album: AlbumDraft,
     #[cfg(feature = "messaging")]
     pending_file: Option<PendingFile>,
     next_request_id: u64,
@@ -538,11 +551,19 @@ struct PendingPhotoPreparation {
     generation: u64,
     revision: u64,
 }
+#[cfg(feature = "messaging")]
+#[derive(Default)]
+struct AlbumDraft {
+    sources: Vec<crate::domain::Attachment>,
+    photos: Vec<live::PreparedPhoto>,
+    preparation: Option<PendingPhotoPreparation>,
+    problem: Option<String>,
+}
 impl Composer {
     pub fn has_photo_intent(&self) -> bool {
         #[cfg(feature = "messaging")]
         {
-            self.photo_source.is_some()
+            self.photo_source.is_some() || !self.album.sources.is_empty()
         }
         #[cfg(not(feature = "messaging"))]
         {
@@ -572,9 +593,41 @@ impl Composer {
     #[cfg(feature = "messaging")]
     pub fn clear_photo(&mut self) {
         if self.photo_source.take().is_some() {
+            self.photo_resolution = crate::domain::PhotoResolution::Hd;
             self.photo = None;
             self.photo_preparation = None;
             self.photo_problem = None;
+            self.photo_revision = self.photo_revision.wrapping_add(1);
+            self.edited();
+        }
+    }
+    #[cfg(feature = "messaging")]
+    pub fn album(&self) -> Option<&[live::PreparedPhoto]> {
+        (!self.album.photos.is_empty()).then_some(self.album.photos.as_slice())
+    }
+    #[cfg(feature = "messaging")]
+    pub fn album_sources(&self) -> &[crate::domain::Attachment] {
+        &self.album.sources
+    }
+    #[cfg(feature = "messaging")]
+    pub fn album_preparing(&self) -> bool {
+        self.album.preparation.is_some()
+    }
+    #[cfg(feature = "messaging")]
+    pub fn album_preparation_request(&self) -> Option<u64> {
+        self.album
+            .preparation
+            .as_ref()
+            .map(|pending| pending.request_id)
+    }
+    #[cfg(feature = "messaging")]
+    pub fn album_problem(&self) -> Option<&str> {
+        self.album.problem.as_deref()
+    }
+    #[cfg(feature = "messaging")]
+    pub fn clear_album(&mut self) {
+        if !self.album.sources.is_empty() {
+            self.album = AlbumDraft::default();
             self.photo_revision = self.photo_revision.wrapping_add(1);
             self.edited();
         }
@@ -620,6 +673,10 @@ impl Composer {
         thread: String,
         enqueue: impl FnOnce(Command) -> std::result::Result<(), SubmitError>,
     ) -> std::result::Result<(), SubmitError> {
+        #[cfg(feature = "messaging")]
+        if self.has_mentions() {
+            return Err(SubmitError::Invalid);
+        }
         if self.reply.is_some() || self.has_photo_intent() {
             // The local demo has no server reference to quote. Never silently
             // turn an unsupported reply into an ordinary message.
@@ -697,12 +754,12 @@ impl DraftBook {
     }
 
     #[cfg(feature = "messaging")]
-    pub(crate) fn remove_recalled_reply(
+    pub(crate) fn remove_message_reply(
         &mut self,
         account: &str,
         thread: &str,
         id: &str,
-        actor: &str,
+        sender: &str,
     ) {
         let composer = if self.thread.as_deref() == Some(thread) {
             Some(&mut self.active)
@@ -714,7 +771,7 @@ impl DraftBook {
                 reply.account_id == account
                     && reply.thread_id == thread
                     && reply.message_id == id
-                    && reply.sender == actor
+                    && reply.sender == sender
             }) {
                 composer.clear_reply();
             }
@@ -1217,6 +1274,7 @@ mod tests {
         let mut store = MessageStore::open(&path).unwrap();
         let messages: Vec<_> = (0..75)
             .map(|i| Message {
+                mentions: Vec::new(),
                 reply_blocked: false,
                 recalled: false,
                 source_client_id: None,
@@ -1491,6 +1549,7 @@ mod tests {
     }
     fn message(id: &str) -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,

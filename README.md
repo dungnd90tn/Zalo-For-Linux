@@ -15,18 +15,27 @@ Dự án kết hợp giao diện `egui`/`eframe`, lịch sử trò chuyện lưu
 - **Tôn trọng hội thoại đã ẩn trên Zalo:** loại khỏi danh sách thông thường; tìm tên và nhập PIN Zalo hiện có để mở riêng hội thoại được chọn.
 - **Hiển thị nội dung nhận được:** văn bản, thông báo hệ thống, sticker (tĩnh và động, hiển thị không nền), ảnh và một số thẻ OA/nội dung được chia sẻ. Hỗ trợ PNG/JPEG/WebP và một phần JPEG XL tĩnh; ảnh đã tải có thể mở trong khung xem của ứng dụng.
 - **Trả lời và gửi tệp:** trả lời tin văn bản thường, gửi một tệp tối đa 100 MiB hoặc một ảnh HD tĩnh, có tiến độ và nút hủy. Ảnh HD có bản xem trước và chú thích.
-- **Sticker và cảm xúc.** Gửi sticker mặc định hoặc tìm theo từ khóa khi phiên Zalo hỗ trợ danh mục. Menu chuột phải có sáu cảm xúc và thao tác sao chép nhiều tin văn bản trên trang hiện tại.
-- **Chuyển tiếp và thu hồi:** chuyển tiếp một tin văn bản cá nhân thông thường đến một bạn bè. Thu hồi tin văn bản do bạn gửi trong hội thoại cá nhân khi còn trong thời hạn cho phép.
+- **Gửi album ảnh HD** (bản đang phát triển). Dùng nút ảnh để chọn từ 2 đến 6 ảnh, trong giới hạn tài khoản. Kiểm tra thứ tự trên khay xem trước rồi chọn **Gửi album**. Phần chữ đang soạn được giữ riêng. Nếu album chỉ gửi được một phần, ứng dụng báo số ảnh đã xác nhận và dừng các ảnh còn lại.
+- **Tin nhắn thoại** (bản đang phát triển). Bấm nút mic để thu tối đa 60 giây, rồi nghe lại, hủy hoặc gửi. Phần chữ đang soạn được giữ riêng. Thu và phát cần FFmpeg và hệ thống âm thanh tương thích PulseAudio, chẳng hạn PipeWire có `pipewire-pulse`. Thu MP3 dùng bộ mã hóa `libmp3lame`.
+- **Xóa tin ở phía mình** (bản đang phát triển). Bấm chuột phải vào một tin văn bản thường đủ điều kiện, chọn xóa và xác nhận phạm vi. **Xóa chỉ ở phía tôi** gửi yêu cầu đến Zalo khi phiên hỗ trợ đồng bộ. **Xóa trên thiết bị này** chỉ cập nhật hồ sơ Linux hiện tại.
+- **Nhận thao tác xóa từ thiết bị khác.** Với tin văn bản thường có đủ định danh, Linux tự cập nhật khi nhận được sự kiện xóa phía mình từ cùng tài khoản. Phần chữ đang soạn được giữ riêng.
+- **Gửi ảnh gốc** (bản đang phát triển). Chọn **Ảnh gốc** khi Zalo xác nhận quyền cho tài khoản. Chế độ này giữ dữ liệu nén của JPEG tối đa 5 MiB và 2560 px mỗi chiều, bỏ metadata APP1. Dùng nút đính kèm tệp để gửi nguyên từng byte, kể cả metadata.
+- **Sticker và cảm xúc.** Gửi sticker mặc định, tìm theo từ khóa hoặc mở **Bộ nhãn dán** để duyệt và gửi từ các bộ công khai mà phiên Zalo trả trực tiếp trong danh mục. Menu chuột phải có sáu cảm xúc và thao tác sao chép nhiều tin văn bản trên trang hiện tại.
+- **Chuyển tiếp và thu hồi:** chuyển tiếp một tin văn bản đủ điều kiện từ chat cá nhân hoặc nhóm thường dưới 100 thành viên đến tối đa 10 đích. Có thể chọn cả bạn bè và nhóm đủ điều kiện, rồi xem kết quả từng đích. Bấm chuột phải và chọn **Thu hồi** cho tin văn bản thông thường do bạn gửi còn trong thời hạn cho phép. Thu hồi áp dụng trong chat cá nhân và nhóm thường tối đa 100 thành viên mà bạn vẫn tham gia.
+- **Thu hồi ảnh và tệp** (bản đang phát triển). Bấm chuột phải vào ảnh hoặc tệp đã gửi từ ứng dụng Linux và được Zalo xác nhận, rồi chọn **Thu hồi** trong thời hạn cho phép. Với album, chọn từng ảnh cần thu hồi. Sau khi Zalo xác nhận, khung xem đóng và lượt tải đang chạy của tin đó dừng. Các bản đã tải ra máy vẫn ở thư mục lưu.
 - **Theo dõi tin mới:** lọc hội thoại **Chưa đọc** theo các tin mới nhận trên máy này. Tin gửi hiện trạng thái chuyển/đã xem khi có dữ liệu xác nhận.
 - **Thông báo Linux:** mặc định chỉ báo **Bạn có tin nhắn mới**. Bật xem trước nội dung ở **bánh răng → Thông báo**. Hội thoại ẩn hoặc đang tắt thông báo không phát cảnh báo.
 - **Thành viên nhóm:** mở **Thông tin hội thoại → Thành viên** để xem danh sách theo quyền của bạn, tối đa 50 người mỗi trang. Với nhóm thường tối đa 100 thành viên, bạn có thể mời một người bạn hoặc rời nhóm nếu quyền hiện tại cho phép. Hội thoại đã rời vẫn mở được để đọc lịch sử đã lưu.
+- **Nhắc tên trong nhóm.** Gõ `@` rồi chọn thành viên bằng chuột hoặc phím ↑/↓ và Enter. Chọn **Nhắc tất cả · @All** khi nhóm nằm trong giới hạn Zalo xác nhận và bạn có quyền gửi. Gõ `@All` mà chưa chọn gợi ý chỉ gửi văn bản thường.
+- **Ghim tin nhắn nhóm** (bản đang phát triển). Bấm chuột phải vào tin văn bản để ghim hoặc bỏ ghim nếu có quyền. Mở **Thông tin hội thoại → Tin nhắn đã ghim** để cập nhật danh sách và đi đến tin đã lưu trên máy. Tính năng cần dịch vụ bảng nhóm v2 của Zalo.
+- **Tải tin cũ trong nhóm** (bản đang phát triển). Khi tới đầu lịch sử đã lưu, chọn **Tải tin cũ từ Zalo**, rồi **Xem trang trước** để đọc phần vừa lưu. Tính năng tải từng trang tin văn bản trong nhóm thường đủ điều kiện và cần phiên Zalo bật lịch sử nhóm.
 - **Thông tin hội thoại:** số tin và khoảng thời gian đã lưu, cùng danh sách ảnh, tệp và liên kết từng xuất hiện trong lịch sử; bấm một mục để mở trong trình duyệt.
 - **Thích ứng với kích thước cửa sổ:** bố cục rộng và gọn giữ lại hội thoại đang chọn cùng bản nháp. Cỡ chữ và giới hạn khung ảnh được giữ nhất quán khi thay đổi kích thước.
 - **Giao diện thiết kế lại, sáng và tối:** có chế độ sáng, tối, theo hệ thống và tùy chỉnh; nút **Sáng/Tối** ở thanh bên đổi nhanh, lựa chọn được lưu theo từng hồ sơ. Phông chữ và biểu tượng vẫn là bộ Zalo có sẵn.
 - **Phím tắt soạn tin:** `Enter` gửi, `Ctrl+Enter` (hoặc `Shift+Enter`) xuống dòng. Ứng dụng không gửi khi bộ gõ tiếng Việt đang soạn chữ.
 - **Có thông tin chẩn đoán:** lỗi kết nối hiển thị giai đoạn/nhóm lỗi, kèm nhật ký có giới hạn dung lượng để hỗ trợ điều tra.
 
-Tin nhắn bình chọn hiện hiển thị thông báo/câu hỏi đính kèm; chưa có chi tiết, kết quả hay thao tác bỏ phiếu. Với mẫu thẻ chưa hỗ trợ, ứng dụng thông báo rõ thay vì hiển thị các thao tác không hoạt động.
+Trong nhóm thường đủ điều kiện, bấm **Xem bình chọn** để tải câu hỏi và các lựa chọn. Số phiếu hiện khi Zalo cho phép. Nếu chưa tham gia bình chọn đang mở và chỉ cho chọn một phương án, chọn phương án rồi bấm **Gửi phiếu**. Khi chưa rõ kết quả, dùng **Cập nhật bình chọn** để kiểm tra trạng thái.
 
 ## Ảnh chụp giao diện
 
@@ -46,14 +55,14 @@ Các ảnh dưới đây là **ảnh giả lập**: chụp từ chế độ `--d
 
 ## Cài đặt nhanh bằng gói `.deb` / `.rpm`
 
-Gói thử **2.0.5-2** dành cho x86_64, cần glibc 2.31 trở lên. Đã thử nâng cấp trên Ubuntu 20.04 và cài/gỡ trên Ubuntu 22.04/24.04, Debian 12, Fedora 42 và AlmaLinux 9. [Ghi chú 2.0.5](changelogs/RELEASE-v2.0.5.md)
+Gói **2.0.6-1** dành cho Linux x86_64, dựng trên Ubuntu 20.04 với glibc 2.31. Khi mở hồ sơ bằng bản này, ứng dụng nâng cơ sở dữ liệu lên schema 26. [Ghi chú 2.0.6](changelogs/RELEASE-v2.0.6.md)
 
 ```bash
 # Ubuntu / Debian
-sudo apt install ./zalo-native_2.0.5-2_amd64.deb
+sudo apt install ./zalo-native_2.0.6-1_amd64.deb
 
 # Fedora / RHEL / AlmaLinux / Rocky (yum dùng cùng lệnh)
-sudo dnf install ./zalo-native-2.0.5-2.x86_64.rpm
+sudo dnf install ./zalo-native-2.0.6-1.x86_64.rpm
 ```
 
 Mở **Zalo Native** từ menu ứng dụng hoặc chạy `zalo-native --live`; `zalo-native --demo` mở bản dùng thử. Gỡ cài đặt bằng `sudo apt remove zalo-native` hoặc `sudo dnf remove zalo-native`. Gói độc lập với gói Electron `zalo` và có thể cài cùng lúc. Hiện chưa có kho `apt`/`dnf` để tự cập nhật: muốn nâng cấp, cài gói mới hơn theo cùng lệnh.
@@ -171,11 +180,11 @@ Sau mỗi lần biên dịch bản mới, chạy lại trình cài đặt để 
 | Nhóm | Phần còn thiếu hoặc cần xác nhận |
 | --- | --- |
 | Nhắn tin | Xác nhận đầy đủ gửi–nhận cá nhân/nhóm với tài khoản thực, kết nối lại và vận hành lâu dài |
-| Đồng bộ | Toàn bộ lịch sử từ máy chủ, thành viên nhóm lớn và cộng đồng, xác nhận tải ảnh đại diện trên tài khoản thực |
-| Nội dung | Gửi ảnh gốc, gửi nhiều ảnh/tệp, ghi âm, tiếp tục lượt tải dở và các mẫu thẻ OA còn lại |
-| Thao tác tin nhắn | Chuyển tiếp nhiều người hoặc nhóm, nhắc tên, thu hồi nhóm hoặc xóa cục bộ, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
+| Đồng bộ | Lịch sử chat cá nhân, lịch sử ngoài phần văn bản nhóm được hỗ trợ, thành viên nhóm lớn và cộng đồng, xác nhận tải ảnh đại diện trên tài khoản thực |
+| Nội dung | Gửi ảnh gốc ngoài phạm vi JPEG hiện tại, gửi nhiều tệp, tin thoại mã hóa, tiếp tục lượt tải dở và các mẫu thẻ OA còn lại |
+| Thao tác tin nhắn | Ghim trong chat cá nhân, cập nhật tin ghim theo thời gian thực, chuyển tiếp ảnh/tệp, thu hồi ảnh và tệp gửi từ thiết bị khác, xác nhận nhắc tất cả/chuyển tiếp/thu hồi/đồng bộ xóa trên thiết bị thật, nhập số chưa đọc từ lịch sử và xác nhận lấy bù cảm xúc khi kết nối lại |
 | Quản lý nhóm | Tạo nhóm, xóa thành viên, chuyển quyền trưởng nhóm, mời nhiều người và tham gia lại nhóm đã rời |
-| Bình chọn và tìm kiếm | Chi tiết/kết quả/bỏ phiếu và tìm kiếm toàn bộ tin nhắn |
+| Bình chọn và tìm kiếm | Tạo bình chọn, chọn nhiều phương án, đổi hoặc rút phiếu, cập nhật kết quả tự động, xác nhận trên tài khoản thật và tìm kiếm toàn bộ tin nhắn |
 | Tích hợp Linux | Khay hệ thống, thông báo sau khi thoát hẳn, chụp màn hình và kiểm tra trên nhiều môi trường desktop |
 | Đăng nhập và mã hóa | Đăng nhập số điện thoại và nhắn tin Signal/E2EE trong bản sử dụng thực tế |
 | Phân phối | Kho `apt`/`dnf` và cập nhật tự động (đã có gói `.deb`/`.rpm` cài thủ công), nhập bản sao lưu/lịch sử |
@@ -266,7 +275,7 @@ Xử lý mạng, truy cập dữ liệu và giải mã ảnh phải chạy ngoà
 - [Quy ước nội dung đa phương tiện](rust-client/PROTOCOL_MEDIA.md): định dạng hỗ trợ, giải mã và giới hạn tài nguyên.
 - [Kiểm chứng](rust-client/VALIDATION.md): lệnh kiểm thử và bằng chứng kiểm tra trên desktop.
 - [Tiến độ phát triển](rust-client/MIGRATION_STATUS.md): các mốc triển khai và lịch sử kiểm chứng.
-- [Nhật ký thay đổi](rust-client/CHANGELOG.md) và [ghi chú 2.0.5](changelogs/RELEASE-v2.0.5.md).
+- [Nhật ký thay đổi](rust-client/CHANGELOG.md) và [ghi chú 2.0.6](changelogs/RELEASE-v2.0.6.md).
 - [Hướng dẫn áp dụng thiết kế mới](rust-client/UI_REDESIGN_GUIDE.md): màu, kích thước và các điểm lệch có chủ ý so với bản thiết kế.
 
 Thương hiệu Zalo và tài nguyên đi kèm thuộc về chủ sở hữu tương ứng. Việc tích hợp không thể hiện sự liên kết hay bảo chứng; mã bên thứ ba giữ nguyên các thông báo bản quyền/giấy phép của mình.

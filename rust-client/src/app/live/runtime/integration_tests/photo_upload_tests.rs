@@ -32,8 +32,27 @@ async fn prepare(
     thread: &str,
     request_id: u64,
 ) -> Result<PreparedPhoto, PhotoPreparationFailure> {
+    prepare_resolution(
+        commands,
+        events,
+        attachment,
+        thread,
+        request_id,
+        PhotoResolution::Hd,
+    )
+    .await
+}
+async fn prepare_resolution(
+    commands: &mpsc::Sender<LiveCommand>,
+    events: &mut mpsc::Receiver<LiveEvent>,
+    attachment: Attachment,
+    thread: &str,
+    request_id: u64,
+    resolution: PhotoResolution,
+) -> Result<PreparedPhoto, PhotoPreparationFailure> {
     commands
         .send(LiveCommand::PreparePhoto {
+            resolution,
             generation: 1,
             thread: thread.into(),
             attachment,
@@ -245,6 +264,306 @@ async fn photo_tls_preview_is_exact_uploaded_jpeg_oriented_and_metadata_free_wit
     }
 }
 
+async fn prepare_album(
+    commands: &mpsc::Sender<LiveCommand>,
+    events: &mut mpsc::Receiver<LiveEvent>,
+    attachments: Vec<Attachment>,
+    thread: &str,
+) -> Result<Vec<PreparedPhoto>, PhotoPreparationFailure> {
+    commands
+        .send(LiveCommand::PrepareAlbum {
+            generation: 1,
+            thread: thread.into(),
+            attachments,
+            request_id: 901,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            match events.recv().await.unwrap() {
+                LiveEvent::AlbumPrepared {
+                    request_id: 901,
+                    generation: 1,
+                    thread: selected,
+                    result,
+                    ..
+                } => {
+                    assert_eq!(selected, thread);
+                    return result;
+                }
+                LiveEvent::Fault { error, .. } => panic!("album preparation: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn photo_album_tls_groups_three_members_and_stops_before_the_tail_after_uncertain_delivery() {
+    use super::file_fixture::{
+        ALBUM_ACCEPT, ALBUM_LOSE_SECOND_ACK, ALBUM_RECALL_FIRST, ALBUM_REJECT_SECOND,
+    };
+    for (thread, new_route, mode, extra_metadata, expected_states) in [
+        (
+            "d:22",
+            false,
+            ALBUM_ACCEPT,
+            true,
+            &["accepted", "accepted", "accepted"][..],
+        ),
+        (
+            "d:22",
+            false,
+            ALBUM_RECALL_FIRST,
+            true,
+            &["accepted", "accepted", "accepted"][..],
+        ),
+        (
+            "g:22",
+            true,
+            ALBUM_ACCEPT,
+            false,
+            &["accepted", "accepted", "accepted"][..],
+        ),
+        (
+            "d:22",
+            false,
+            ALBUM_REJECT_SECOND,
+            true,
+            &["accepted", "rejected"][..],
+        ),
+        (
+            "g:22",
+            true,
+            ALBUM_LOSE_SECOND_ACK,
+            false,
+            &["accepted", "unknown"][..],
+        ),
+    ] {
+        let f = Fixture::new(Reply::PhotoUpload(mode));
+        let (commands, rx) = mpsc::channel(16);
+        let (tx, mut events) = mpsc::channel(128);
+        let (stop, cancel) = watch::channel(false);
+        let task = tokio::spawn(run_with_transports(
+            f.profile.clone(),
+            f.album_session(new_route, 3, extra_metadata),
+            rx,
+            tx,
+            Arc::new(|| {}),
+            cancel,
+            f.transports(),
+        ));
+        online(&mut events).await;
+        let synthetic = (0..4)
+            .map(|index| {
+                let pixels = image::RgbImage::from_pixel(
+                    20 + index,
+                    16,
+                    image::Rgb([50 * index as u8, 200, 30]),
+                );
+                let mut jpeg = Vec::new();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+                    .encode_image(&image::DynamicImage::ImageRgb8(pixels))
+                    .unwrap();
+                selected(&f, &format!("synthetic-{index}.jpg"), &jpeg)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            prepare_album(&commands, &mut events, synthetic.clone(), thread)
+                .await
+                .is_err()
+        );
+        assert!(f.state.photo.uploads.lock().unwrap().is_empty());
+        let photos = prepare_album(
+            &commands,
+            &mut events,
+            synthetic.into_iter().take(3).collect(),
+            thread,
+        )
+        .await
+        .unwrap();
+        let previews = photos
+            .iter()
+            .map(|photo| {
+                let mut preview = vec![0; photo.size_bytes() as usize];
+                std::os::unix::fs::FileExt::read_exact_at(&photo.0.file, &mut preview, 0).unwrap();
+                preview
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(previews.len(), 3);
+        commands
+            .send(LiveCommand::SendAlbum {
+                generation: 1,
+                thread: thread.into(),
+                photos,
+                request_id: 902,
+            })
+            .await
+            .unwrap();
+        let mut accepted = Vec::new();
+        let mut recalled_before_publish = false;
+        let phase = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    LiveEvent::FileAccepted {
+                        kind: TransferKind::Album,
+                        request_id: 902,
+                        message,
+                        ..
+                    } => {
+                        if mode == ALBUM_RECALL_FIRST && message.id == "901" {
+                            assert!(recalled_before_publish);
+                        }
+                        accepted.push(message);
+                    }
+                    LiveEvent::Recalled { message, .. }
+                        if message.as_ref().is_some_and(|message| message.id == "901") =>
+                    {
+                        recalled_before_publish = true;
+                    }
+                    LiveEvent::FileTransfer {
+                        kind: TransferKind::Album,
+                        request_id: 902,
+                        phase,
+                        ..
+                    } if matches!(
+                        phase,
+                        FileTransferPhase::Accepted
+                            | FileTransferPhase::Partial
+                            | FileTransferPhase::Cancelled
+                            | FileTransferPhase::Failed
+                            | FileTransferPhase::Unknown
+                            | FileTransferPhase::AcceptedLocalFailure
+                    ) =>
+                    {
+                        break phase
+                    }
+                    LiveEvent::Fault { error, .. } => panic!("album upload: {error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let successful = matches!(mode, ALBUM_ACCEPT | ALBUM_RECALL_FIRST);
+        assert_eq!(
+            phase,
+            if successful {
+                FileTransferPhase::Accepted
+            } else {
+                FileTransferPhase::Partial
+            }
+        );
+        assert_eq!(accepted.len(), if successful { 3 } else { 1 });
+        let expected_attempts = expected_states.len();
+        let finals = f.state.photo.finals.lock().unwrap().clone();
+        assert_eq!(finals.len(), expected_attempts);
+        let uploads = f.state.photo.uploads.lock().unwrap().clone();
+        assert_eq!(uploads.len(), expected_attempts);
+        let prefix = if thread.starts_with("g:") {
+            "/api/group"
+        } else {
+            "/api/message"
+        };
+        let paths = f.state.photo.paths.lock().unwrap().clone();
+        assert_eq!(
+            paths,
+            [
+                format!(
+                    "{prefix}{}",
+                    if new_route {
+                        "/upload/photo"
+                    } else {
+                        "/photo_original/upload"
+                    }
+                ),
+                format!("{prefix}/photo_original/send"),
+            ]
+            .into_iter()
+            .cycle()
+            .take(expected_attempts * 2)
+            .collect::<Vec<_>>()
+        );
+        let layout_id = finals[0]["groupLayoutId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut clients = std::collections::HashSet::new();
+        for (index, (payload, (upload, bytes))) in finals.iter().zip(&uploads).enumerate() {
+            let album = crate::domain::PhotoAlbumMember::new(layout_id, index as u32, 3).unwrap();
+            assert_eq!(
+                crate::domain::PhotoAlbumMember::from_message_parameters(payload),
+                Some(album)
+            );
+            assert_eq!(payload["clientId"], upload["clientId"]);
+            assert!(clients.insert(payload["clientId"].as_u64().unwrap()));
+            assert_eq!(payload["groupLayoutId"], finals[0]["groupLayoutId"]);
+            assert_eq!(
+                payload["photoId"],
+                format!("album-{}", payload["clientId"].as_u64().unwrap())
+            );
+            assert_eq!(payload["desc"], "");
+            assert_eq!(payload["width"], 20 + index);
+            assert_eq!(payload["height"], 16);
+            assert_eq!(payload.get("extMsgProp").is_some(), extra_metadata);
+            assert_eq!(payload[if new_route { "grid" } else { "toid" }], "22");
+            assert!(!crate::protocol::photo::has_album_message_fields(upload));
+            assert_eq!(bytes, &previews[index]);
+            if let Some(message) = accepted.get(index) {
+                assert_eq!(message.thread_id, thread);
+                assert_eq!(message.id, (901 + index).to_string());
+                if mode == ALBUM_RECALL_FIRST && index == 0 {
+                    assert!(message.is_recalled());
+                    assert!(message.media.is_none());
+                    continue;
+                }
+                let Some(crate::domain::MediaDescriptor::Photo(photo)) = &message.media else {
+                    panic!("missing accepted photo");
+                };
+                assert_eq!(photo.album, Some(album));
+            }
+        }
+        stop.send(true).unwrap();
+        task.await.unwrap();
+        let db =
+            rusqlite::Connection::open(f.profile.paths.data_dir.join("messages.sqlite")).unwrap();
+        let mut read = db
+            .prepare(
+                "SELECT state,checksum,CASE WHEN media_metadata IS NULL AND parameters_hash IS NULL
+                    THEN parameters END FROM photo_outbox ORDER BY CAST(client_id AS INTEGER)",
+            )
+            .unwrap();
+        let rows = read
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), expected_attempts);
+        for (index, (state, checksum, anchor)) in rows.iter().enumerate() {
+            assert_eq!(state, expected_states[index]);
+            if mode == ALBUM_RECALL_FIRST && index == 0 {
+                assert_eq!(checksum, &"0".repeat(32));
+                assert_eq!(
+                    anchor.as_deref(),
+                    Some(format!("album-photo:{layout_id}/0/3").as_bytes())
+                );
+            } else {
+                assert_eq!(checksum, &format!("{:x}", Md5::digest(&previews[index])));
+            }
+        }
+    }
+}
+
 #[test]
 fn retained_preview_charge_is_checked_and_released_only_after_the_last_shared_owner() {
     use crate::app::live::photo::{CacheCharge, MAX_PREPARED_BYTES};
@@ -334,6 +653,130 @@ fn prepared_bytes(photo: &PreparedPhoto) -> Vec<u8> {
     let mut bytes = vec![0; photo.size_bytes() as usize];
     std::os::unix::fs::FileExt::read_exact_at(&photo.0.file, &mut bytes, 0).unwrap();
     bytes
+}
+
+#[tokio::test]
+async fn original_photo_tls_requires_current_plan_and_exact_original_resource() {
+    let mut clean = Vec::new();
+    let pixels = image::RgbImage::from_pixel(64, 32, image::Rgb([23, 110, 180]));
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut clean, 94)
+        .encode_image(&image::DynamicImage::ImageRgb8(pixels))
+        .unwrap();
+    let mut source = clean[..2].to_vec();
+    let metadata = b"http://ns.adobe.com/xap/1.0/\0synthetic-private-photo-metadata";
+    source.extend_from_slice(&[255, 225]);
+    source.extend_from_slice(&((metadata.len() + 2) as u16).to_be_bytes());
+    source.extend_from_slice(metadata);
+    source.extend_from_slice(&clean[2..]);
+    for (mode, thread) in [(10, "d:22"), (10, "g:22"), (11, "d:22"), (12, "d:22")] {
+        let f = Fixture::new(Reply::PhotoUpload(mode));
+        let origin = json!(["https://wpa.zaloapp.com"]);
+        let config = ServerConfig::parse(&json!({
+            "zpw_service_map_v3":{
+                "chat":origin,"group":origin,"conversation":origin,"file":origin,
+                "zcloud":origin,"zcloud_up_file":origin
+            },
+            "zpw_ws":["wss://wpa.zaloapp.com"],
+            "settings":{"features":{"file_photo_limit":{"enable_upload_original":1}}}
+        }))
+        .unwrap();
+        let session = Arc::new(synthetic_session(f.profile.clone(), config));
+        let (commands, requests) = mpsc::channel(16);
+        let (events, mut incoming) = mpsc::channel(64);
+        let (stop, cancel) = watch::channel(false);
+        let task = tokio::spawn(run_with_transports(
+            f.profile.clone(),
+            session,
+            requests,
+            events,
+            Arc::new(|| {}),
+            cancel,
+            f.transports(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut connected, mut paid) = (false, false);
+            while !connected || !paid {
+                match incoming.recv().await.unwrap() {
+                    LiveEvent::Connection {
+                        state: LiveConnection::Online,
+                        ..
+                    } => connected = true,
+                    LiveEvent::PhotoCapability {
+                        original_available,
+                        available,
+                        ..
+                    } => {
+                        assert!(available);
+                        paid = original_available;
+                    }
+                    LiveEvent::Fault { error, .. } => panic!("original photo entitlement: {error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let photo = prepare_resolution(
+            &commands,
+            &mut incoming,
+            selected(&f, "synthetic-original.jpg", &source),
+            thread,
+            901,
+            PhotoResolution::Original,
+        )
+        .await
+        .unwrap();
+        assert_eq!(photo.resolution(), PhotoResolution::Original);
+        assert_eq!(prepared_bytes(&photo), clean);
+        commands
+            .send(LiveCommand::SendPhoto {
+                generation: 1,
+                thread: thread.into(),
+                photo,
+                caption: "Ảnh tổng hợp gốc".into(),
+                request_id: 902,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal(&mut incoming, 902).await,
+            if mode == 10 {
+                FileTransferPhase::Accepted
+            } else {
+                FileTransferPhase::Failed
+            }
+        );
+        assert_eq!(
+            f.state.photo.original_plan_requests.load(Ordering::SeqCst),
+            2
+        );
+        let uploads = f.state.photo.uploads.lock().unwrap().clone();
+        assert_eq!(uploads.len(), usize::from(mode != 11));
+        if let Some((params, bytes)) = uploads.first() {
+            assert_eq!(bytes, &clean);
+            assert_eq!(params["fileName"], "photo.jpg");
+            assert_eq!(params["totalSize"], clean.len());
+            assert!(params.get("checksum").is_none());
+        }
+        let finals = f.state.photo.finals.lock().unwrap().clone();
+        assert_eq!(finals.len(), usize::from(mode == 10));
+        if let Some(final_params) = finals.first() {
+            assert_eq!(final_params["jcp"], "{\"is_original\":1}");
+            assert_eq!(final_params["fileSize"], clean.len());
+            assert_eq!(
+                final_params["rawUrl"],
+                "https://files.example.test/uploaded"
+            );
+            let db = rusqlite::Connection::open(f.profile.paths.data_dir.join("messages.sqlite"))
+                .unwrap();
+            let hash: String = db
+                .query_row("SELECT checksum FROM photo_outbox", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(hash, format!("{:x}", Md5::digest(&clean)));
+        }
+        stop.send(true).unwrap();
+        task.await.unwrap();
+    }
 }
 
 #[tokio::test]

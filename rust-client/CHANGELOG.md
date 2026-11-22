@@ -4,6 +4,29 @@ Nhật ký thay đổi của **Zalo Native** (ứng dụng Rust trong `rust-clie
 [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/); phiên bản theo `Cargo.toml`.
 Xem [ghi chú đóng gói bản trước](../changelogs/RELEASE-v2.0.4-3.md) để đối chiếu khi nâng cấp.
 
+## 2.0.6 — gói 2.0.6-1
+
+- Xem câu hỏi, các lựa chọn và số phiếu được Zalo cho phép hiển thị ngay trên thẻ bình chọn trong nhóm thường đủ điều kiện. Bấm **Cập nhật bình chọn** để đọc kết quả mới nhất.
+- Chọn một phương án rồi bấm **Gửi phiếu** để tham gia lần đầu vào bình chọn đang mở và chỉ cho chọn một phương án. Ứng dụng giữ trạng thái chưa xác nhận qua lần mở lại để tránh gửi lặp.
+
+- Gõ `@` để chọn và nhắc từng thành viên trong nhóm thường có tối đa 100 người. Chọn bằng chuột hoặc phím ↑/↓ và Enter. Ứng dụng giữ bản nháp khi lượt gửi bị từ chối hoặc chưa xác định được kết quả.
+- Chọn **Nhắc tất cả · @All** trong danh sách gợi ý khi nhóm có quyền gửi và nằm trong giới hạn Zalo xác nhận. Gõ `@All` rồi Enter mà chưa chọn mục này sẽ gửi văn bản thường.
+- Làm nổi bật phần nhắc tên đã xác minh trong tin nhắn nhóm, kể cả khi mở lại lịch sử.
+- Ghim và bỏ ghim tin văn bản trong nhóm thường theo quyền Zalo. Xem danh sách trong **Thông tin hội thoại** và bấm để mở tin đã lưu. Nếu ghim trên thiết bị khác, dùng **Cập nhật tin ghim** để tải trạng thái mới.
+- Chuyển tiếp một tin văn bản cá nhân đến tối đa 10 bạn bè. Giữ lựa chọn khi tìm kiếm, hiển thị kết quả từng người và chỉ cho thử lại các lượt bị từ chối hoặc xác định chưa gửi.
+- Hộp **Chuyển tiếp** cũng hỗ trợ nhóm thường đủ điều kiện dưới 100 thành viên. Bạn bè và nhóm dùng chung giới hạn 10 đích. Kết quả của từng nhóm được ghi riêng và lượt chưa xác định được giữ qua lần mở lại.
+- **Chuyển tiếp** hỗ trợ lấy tin văn bản gốc từ nhóm thường dưới 100 thành viên. Ứng dụng kiểm tra lại tư cách thành viên và trạng thái nhóm nguồn trước khi gửi.
+- Thu hồi tin văn bản do bạn gửi trong nhóm thường tối đa 100 thành viên khi còn trong thời hạn. Khi xác nhận thu hồi, ứng dụng cập nhật bong bóng và bỏ nội dung gốc khỏi trích dẫn, kết quả tìm kiếm và bản xem trước tin ghim trên máy.
+- Thu hồi ảnh hoặc tệp do bạn gửi từ Linux và đã được xác nhận trong chat cá nhân hoặc nhóm thường đủ điều kiện. Với album, chọn từng ảnh. Khi thu hồi thành công, ứng dụng đóng khung xem và dừng lượt tải của tin đã chọn.
+- Duyệt các bộ nhãn dán công khai được trả trực tiếp từ danh mục Zalo. Mở một bộ, cuộn xem và gửi sticker đủ điều kiện vào hội thoại hiện tại. Phần chữ, trích dẫn và tệp đang soạn được giữ lại.
+- Tải từng trang tin văn bản cũ trong nhóm thường đủ điều kiện khi Zalo bật dịch vụ lịch sử nhóm. Ứng dụng giữ nguyên trang đang đọc và bản nháp, rồi mở phần đã lưu qua **Xem trang trước**.
+- Gửi một ảnh gốc JPEG tối đa 5 MiB và 2560 px mỗi chiều khi tài khoản có quyền Zalo Cloud. Ảnh có xem trước và chú thích. Ứng dụng bỏ metadata APP1 mà không nén lại ảnh. JPEG cần xoay hoặc lật theo EXIF có thể gửi dưới dạng tệp.
+- Gửi album từ 2 đến 6 ảnh HD trong chat cá nhân và nhóm đủ điều kiện. Khay xem trước giữ thứ tự chọn và phần chữ đang soạn. Nếu một ảnh lỗi hoặc chưa rõ kết quả, ứng dụng báo số ảnh đã xác nhận và dừng các ảnh còn lại.
+- Thu, nghe lại và gửi tin nhắn thoại MP3 tối đa 60 giây qua chat cá nhân và nhóm đủ điều kiện. Có nút phát tin thoại nhận được và giữ bản nháp chữ khi gửi hoặc hủy bản ghi.
+- Xóa một tin văn bản thường ở phía mình. Hộp xác nhận nêu phạm vi thiết bị hoặc tài khoản. Tin đã xóa được bỏ khỏi lịch sử, tìm kiếm và xem trước hội thoại.
+- Nhận sự kiện xóa tin văn bản ở phía mình từ thiết bị khác. Nếu sự kiện đến trước tin gốc, ứng dụng lưu chờ đến khi có tin khớp để đối chiếu.
+- Hồ sơ nâng lên **schema 26** để hỗ trợ lưu nhắc tất cả, giữ dấu chống gửi lặp phiếu và các sự kiện xóa đang chờ đối chiếu. Quá trình nâng cấp giữ lịch sử đã lưu. Bản cũ dùng schema 25 trở xuống sẽ từ chối mở hồ sơ đã nâng cấp.
+
 ## 2.0.5 — gói thử 2.0.5-2
 
 Xem [ghi chú 2.0.5](../changelogs/RELEASE-v2.0.5.md) và các mục kiểm thử còn mở trong [kế hoạch 2.0.5](PLAN_2.0.5.md).

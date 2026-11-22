@@ -4,7 +4,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use zalo_rust::{
     domain::{MediaKind, MediaMessageContent, Message},
-    store::MessageStore,
+    store::{MessageStore, SCHEMA_VERSION},
 };
 
 struct Database(PathBuf);
@@ -49,6 +49,7 @@ fn seed_v7(path: &std::path::Path) {
         )
         .unwrap();
         let message = Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -105,7 +106,7 @@ fn populated_v7_keeps_exact_bytes_pending_state_and_cascades_then_accepts_files(
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            18
+            SCHEMA_VERSION
         );
         for (table, expected) in tables.iter().zip(&before) {
             assert_eq!(&rows(&conn, table), expected, "changed {table}");
@@ -123,6 +124,7 @@ fn populated_v7_keeps_exact_bytes_pending_state_and_cascades_then_accepts_files(
     let mut store = MessageStore::open(&db.0).unwrap();
     let content = MediaMessageContent::new(MediaKind::File, &json!({"title":"Tài liệu.pdf", "href":"https://files.zdn.vn/synthetic.pdf", "params":"{\"fileExt\":\"pdf\",\"fileSize\":123}"})).unwrap();
     let message = Message {
+        mentions: Vec::new(),
         reply_blocked: false,
         recalled: false,
         source_client_id: None,
@@ -186,7 +188,8 @@ fn newer_schema_is_refused_without_downgrade_or_row_changes() {
     let db = Database::new();
     seed_v7(&db.0);
     let conn = Connection::open(&db.0).unwrap();
-    conn.execute_batch("PRAGMA user_version=19").unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        .unwrap();
     let before = rows(&conn, "message_media");
     drop(conn);
     assert!(MessageStore::open(&db.0).is_err());
@@ -195,6 +198,6 @@ fn newer_schema_is_refused_without_downgrade_or_row_changes() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        19
+        SCHEMA_VERSION + 1
     );
 }

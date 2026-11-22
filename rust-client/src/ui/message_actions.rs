@@ -1,7 +1,7 @@
 //! Explicit clipboard actions for the currently visible, scoped message. No I/O or raw sidecars.
 use super::{visuals, ModalFocus, NativeApp};
 use crate::domain::{MediaDescriptor, Message};
-use eframe::egui::{self, pos2, vec2, Align2, FontId, Rect, Sense, Stroke};
+use eframe::egui::{self, pos2, vec2, FontId, Rect, Sense, Stroke};
 
 const MENU_WIDTH: f32 = 216.0;
 const ROW_HEIGHT: f32 = 32.0;
@@ -81,6 +81,7 @@ fn actions(message: &Message) -> Vec<Action> {
             vec![poll.title.as_str(), poll.question.as_str()],
             None,
         ),
+        Some(MediaDescriptor::Voice(_)) => return result,
         None if message.sticker.is_none()
             && !(message.text.starts_with("[Tin nhắn ")
                 && message.text.ends_with(" chưa được hỗ trợ]")) =>
@@ -118,9 +119,20 @@ pub(super) fn action_row(
     enabled: bool,
     destructive: bool,
 ) -> egui::Response {
+    action_row_height(ui, label, glyph, enabled, destructive, ROW_HEIGHT)
+}
+
+pub(super) fn action_row_height(
+    ui: &mut egui::Ui,
+    label: &str,
+    glyph: &str,
+    enabled: bool,
+    destructive: bool,
+    height: f32,
+) -> egui::Response {
     let (rect, response) = ui
         .add_enabled_ui(enabled, |ui| {
-            ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click())
+            ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click())
         })
         .inner;
     let colors = crate::theme::palette(ui.ctx());
@@ -144,11 +156,17 @@ pub(super) fn action_row(
         glyph,
         icon,
     );
-    ui.painter().text(
-        pos2(rect.left() + 39.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
+    let mut label_job = egui::text::LayoutJob::simple_singleline(
+        label.into(),
         FontId::proportional(visuals::TEXT_BODY),
+        ink,
+    );
+    label_job.wrap.max_width = (rect.width() - 50.0).max(1.0);
+    label_job.wrap.max_rows = 1;
+    let galley = ui.painter().layout_job(label_job);
+    ui.painter().galley(
+        pos2(rect.left() + 39.0, rect.center().y - galley.size().y / 2.0),
+        galley,
         ink,
     );
     visuals::focus_outline(ui, &response, row, 7.0);
@@ -331,6 +349,7 @@ impl NativeApp {
                 || state.privacy.prompt.is_some()
                 || state.forwarding.is_open()
                 || state.recall.is_open()
+                || state.delete_for_me.is_open()
                 || state.groups.is_open();
             open
         });
@@ -371,6 +390,14 @@ impl NativeApp {
         #[cfg(feature = "messaging")]
         let mut recall_selected = false;
         #[cfg(feature = "messaging")]
+        let delete_for_me = self.delete_for_me_menu(message);
+        #[cfg(feature = "messaging")]
+        let mut delete_selected = None;
+        #[cfg(feature = "messaging")]
+        let pin_action = self.pin_menu_action(message);
+        #[cfg(feature = "messaging")]
+        let mut pin_selected = None;
+        #[cfg(feature = "messaging")]
         let own = self.account_id() == Some(message.sender.as_str());
         let reply = message.reply_reference();
         #[cfg(feature = "messaging")]
@@ -383,12 +410,15 @@ impl NativeApp {
         let can_reply = !self.demo
             && !group_left
             && reply.is_some()
+            && !self.has_draft_mentions()
             && self.drafts.active.attachment().is_none()
             && !self.photo_selected();
         let reply_unavailable = if self.demo {
             "Bản demo chưa hỗ trợ trả lời tin nhắn Zalo."
         } else if group_left {
             "Bạn đã rời nhóm. Lịch sử vẫn có thể xem."
+        } else if self.has_draft_mentions() {
+            "Xóa phần nhắc thành viên để viết trả lời."
         } else if message.media.is_some() || message.sticker.is_some() {
             "Hiện chỉ hỗ trợ trả lời tin nhắn văn bản."
         } else if self.photo_selected() {
@@ -467,8 +497,20 @@ impl NativeApp {
                         }
                         forward_selected = button.clicked();
                         button.on_disabled_hover_text(
-                            "Chỉ hỗ trợ tin văn bản cá nhân đủ dữ liệu gốc khi đang kết nối.",
+                            "Cần kết nối và tin văn bản gốc đủ điều kiện trong chat cá nhân hoặc nhóm.",
                         );
+                    }
+                    #[cfg(feature = "messaging")]
+                    if let Some(action) = &pin_action {
+                        let button =
+                            action_row(ui, action.label, "fa-outline-pin", action.enabled, false);
+                        if action.enabled {
+                            buttons.push(button.id);
+                        }
+                        if button.clicked() {
+                            pin_selected = Some(action.pinned);
+                        }
+                        button.on_disabled_hover_text(action.reason);
                     }
                     if can_select_many {
                         let button = action_row(
@@ -482,17 +524,33 @@ impl NativeApp {
                         select_many = button.clicked();
                     }
                     #[cfg(feature = "messaging")]
-                    if !self.demo && own {
+                    if !self.demo && (own || delete_for_me.is_some()) {
                         menu_separator(ui);
-                        let button =
-                            action_row(ui, "Thu hồi", "fa-outline-recall", can_recall, true);
-                        if can_recall {
-                            buttons.push(button.id);
+                        if own {
+                            let button =
+                                action_row(ui, "Thu hồi", "fa-outline-recall", can_recall, true);
+                            if can_recall {
+                                buttons.push(button.id);
+                            }
+                            recall_selected = button.clicked();
+                            button.on_disabled_hover_text(self.recall_unavailable());
                         }
-                        recall_selected = button.clicked();
-                        button.on_disabled_hover_text(
-                            "Chỉ hỗ trợ tin văn bản cá nhân đã gửi khi đang kết nối.",
-                        );
+                        if let Some((mode, enabled)) = delete_for_me {
+                            let button = action_row(
+                                ui,
+                                super::delete_for_me::menu_label(mode),
+                                "fa-outline-trash",
+                                enabled,
+                                true,
+                            );
+                            if enabled {
+                                buttons.push(button.id);
+                            }
+                            if button.clicked() {
+                                delete_selected = Some(mode);
+                            }
+                            button.on_disabled_hover_text("Chưa thể xóa tin nhắn lúc này.");
+                        }
                     }
                 });
         });
@@ -530,6 +588,18 @@ impl NativeApp {
             self.open_recall(&popup.message);
             return;
         }
+        #[cfg(feature = "messaging")]
+        if let Some(mode) = delete_selected {
+            self.message_menu = None;
+            self.open_delete_for_me(&popup.message, mode);
+            return;
+        }
+        #[cfg(feature = "messaging")]
+        if let Some(pinned) = pin_selected {
+            self.message_menu = None;
+            self.change_group_pin(&popup.message, pinned);
+            return;
+        }
         if copied
             || reply_selected
             || escape
@@ -549,6 +619,7 @@ mod tests {
 
     fn message() -> Message {
         Message {
+            mentions: Vec::new(),
             reply_blocked: false,
             recalled: false,
             source_client_id: None,
@@ -577,6 +648,7 @@ mod tests {
             thumbnail_url: Some("https://f1.zdn.vn/thumbnail.jpg".into()),
             width: None,
             height: None,
+            album: None,
         }));
         let photo = actions(&message);
         assert_eq!(photo.len(), 2);

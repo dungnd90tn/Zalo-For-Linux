@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import tempfile
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 26
 
 def require(condition, message):
     if not condition:
@@ -59,22 +59,49 @@ def main():
             originals = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()
         require((count, accounts, threads) == (19, 1, 6), "repeated demo startup changed seeded message identity/count")
         require(len(originals) == 3, "legacy demo messages disappeared")
-        # Simulate an existing v1 profile plus one user-created local message.
-        # Reuse the real profile/schema and verify additive migration preserves
-        # original immutable bodies and local history, rather than resetting it.
         with sqlite3.connect(data / "messages.sqlite3") as conn:
+            conn.execute("PRAGMA user_version=25")
+        require(json.loads(run("--demo", "--headless").stdout)["messages_loaded"] == 2, "schema 25 upgrade lost demo history")
+        with sqlite3.connect(f"file:{data / 'messages.sqlite3'}?mode=ro", uri=True) as conn:
+            require(conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION, "profile did not upgrade from schema 25")
+            preserved = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()
+        require(preserved == originals, "mention compatibility upgrade changed existing history")
+        with sqlite3.connect(data / "messages.sqlite3") as conn:
+            conn.execute("DROP TABLE poll_vote_guards")
+            conn.execute("PRAGMA user_version=24")
+        require(json.loads(run("--demo", "--headless").stdout)["messages_loaded"] == 2, "schema 24 upgrade lost demo history")
+        with sqlite3.connect(f"file:{data / 'messages.sqlite3'}?mode=ro", uri=True) as conn:
+            require(conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION, "profile did not upgrade from schema 24")
+            guard_count = conn.execute("SELECT count(*) FROM poll_vote_guards").fetchone()[0]
+            preserved = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()
+        require(guard_count == 0 and preserved == originals, "poll vote upgrade changed existing history or created vote guards")
+        # Recreate schema 19 without the new pin ledger and retain a local
+        # message to detect data loss during the upgrade.
+        with sqlite3.connect(data / "messages.sqlite3") as conn:
+            conn.execute("DROP TABLE group_pin_intent")
+            conn.execute("PRAGMA user_version=19")
             conn.execute("DELETE FROM messages WHERE thread_id NOT IN ('welcome','architecture')")
             conn.execute("DELETE FROM conversations WHERE thread_id NOT IN ('welcome','architecture')")
             conn.execute("INSERT INTO messages(account_id,thread_id,message_id,sender,body,sent_at_ms) VALUES ('0','welcome','qa-legacy-preserved','Local smoke','Existing local history',1700000000002)")
         for _ in range(2):
             require(json.loads(run("--demo", "--headless").stdout)["messages_loaded"] == 3, "legacy local history was not loaded after upgrade")
         with sqlite3.connect(f"file:{data / 'messages.sqlite3'}?mode=ro", uri=True) as conn:
+            require(conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION, "profile did not upgrade from schema 19")
+            pin_ledger = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='group_pin_intent'").fetchone()
+            require(pin_ledger == ("group_pin_intent",), "upgrade did not create the pin ledger")
             upgraded_count = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
             upgraded_threads = conn.execute("SELECT count(*) FROM conversations").fetchone()[0]
             upgraded_originals = conn.execute("SELECT * FROM messages WHERE message_id IN ('demo-1','demo-2','demo-3') ORDER BY message_id").fetchall()
             local_history = conn.execute("SELECT body FROM messages WHERE account_id='0' AND thread_id='welcome' AND message_id='qa-legacy-preserved'").fetchall()
         require((upgraded_count, upgraded_threads) == (20, 6), "legacy upgrade was not additive and idempotent")
         require(upgraded_originals == originals and local_history == [("Existing local history",)], "legacy upgrade changed existing message contents")
+        with sqlite3.connect(data / "messages.sqlite3") as conn:
+            conn.execute("PRAGMA user_version=20")
+            conn.execute("DELETE FROM store_markers WHERE name='media_photo_album_v1'")
+        require(json.loads(run("--demo", "--headless").stdout)["messages_loaded"] == 3, "schema 20 upgrade lost local history")
+        with sqlite3.connect(f"file:{data / 'messages.sqlite3'}?mode=ro", uri=True) as conn:
+            require(conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION, "profile did not upgrade from schema 20")
+            require(conn.execute("SELECT 1 FROM store_markers WHERE name='media_photo_album_v1'").fetchone() == (1,), "album projection migration was not recorded")
         with (data / ".profile.lock").open("r+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             refused = run("--demo", "--headless", check=False)
