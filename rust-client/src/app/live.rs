@@ -1309,7 +1309,7 @@ impl LiveWorker {
             } => {
                 *request_id > 0
                     && Target::from_thread(source_thread)
-                        .is_ok_and(|t| t.kind == ThreadKind::Direct)
+                        .is_ok_and(|t| t.kind == ThreadKind::Group || t.remote_id != self.account)
                     && Target::from_thread(target_thread)
                         .is_ok_and(|t| t.kind == ThreadKind::Group || t.remote_id != self.account)
                     && crate::protocol::messaging::numeric_id(source_message_id).is_ok()
@@ -1322,7 +1322,7 @@ impl LiveWorker {
             } => {
                 *request_id > 0
                     && Target::from_thread(source_thread).is_ok_and(|target| {
-                        target.kind == ThreadKind::Direct && target.remote_id != self.account
+                        target.kind == ThreadKind::Group || target.remote_id != self.account
                     })
                     && crate::protocol::messaging::numeric_id(source_message_id).is_ok()
                     && valid_forward_targets(target_threads, &self.account)
@@ -1335,7 +1335,7 @@ impl LiveWorker {
             } => {
                 *generation > 0
                     && Target::from_thread(source_thread)
-                        .is_ok_and(|t| t.kind == ThreadKind::Direct)
+                        .is_ok_and(|t| t.kind == ThreadKind::Group || t.remote_id != self.account)
                     && crate::protocol::messaging::numeric_id(source_message_id).is_ok()
                     && query.len() <= 512
                     && query.chars().count() <= 128

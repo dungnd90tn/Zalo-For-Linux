@@ -1964,3 +1964,20 @@ Default checks passed 319 Rust and 19 Python tests. The all-feature run
 passed 176 store tests, four picker tests, seven protocol/roster tests and
 strict Clippy. The live release passed the schema 25 offline smoke.
 Verification on a real Zalo account remains pending.
+
+## Forwarding ordinary text from groups
+
+The synthetic TLS/WSS case saves a group message as verified ordinary text
+and forwards it to one friend and one group. Both requests carry the exact
+group source reference. The group that supplied the original blocks posting
+for ordinary members, while allowing an active member to read the source.
+Encrypted and auto-delete source variants produce zero mutation requests.
+The verified destination copies remain in their respective threads.
+
+Offline tests cover the committed ordinary source, privacy, departure and
+group-size checks, and picker dismissal after a source scope change. Four
+offline X11 captures show the picker at 640×480 and 1200×780 in both themes.
+Default checks passed 319 Rust and 19 Python tests. The all-feature checks
+passed 177 store tests, five picker tests, seven protocol and roster tests,
+and strict Clippy. The optimized live build passed the schema 25 offline
+startup and restart smoke. Real-service confirmation remains pending.

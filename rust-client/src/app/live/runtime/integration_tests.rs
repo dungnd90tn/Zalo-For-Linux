@@ -759,14 +759,26 @@ fn serve(
                 .unwrap();
             }
         }
-        if matches!(reply, Reply::Forward(_)) {
+        if let Reply::Forward(mode) = reply {
+            let group = mode >= 6;
             let payload = json!({"error_code":0,"data":{"msgs":[
                 {"uidFrom":"33","idTo":"11","msgId":"910","cliMsgId":"990","ts":1760000000001_i64,
                  "msgType":"webchat","content":"Tin tổng hợp được chuyển tiếp"}
             ]}});
+            let payload = if group {
+                let mut row = payload["data"]["msgs"][0].clone();
+                row["idTo"] = json!("22");
+                json!({"error_code":0,"data":{"groupMsgs":[row]}})
+            } else {
+                payload
+            };
             ws.send(tungstenite::Message::Binary(
-                wire::encode_frame(501, 0, &json!({"error_code":0,"encrypt":0,"data":payload}))
-                    .unwrap(),
+                wire::encode_frame(
+                    if group { 521 } else { 501 },
+                    0,
+                    &json!({"error_code":0,"encrypt":0,"data":payload}),
+                )
+                .unwrap(),
             ))
             .unwrap();
         }
@@ -1600,7 +1612,7 @@ fn serve(
         return;
     }
     if let Reply::Forward(mode) = reply {
-        if mode == 5
+        if mode >= 5
             && forward_batch_tests::respond_group(
                 &mut stream,
                 &state,
@@ -1608,6 +1620,7 @@ fn serve(
                 &path,
                 &headers,
                 &body,
+                mode,
             )
         {
             return;
@@ -1634,6 +1647,8 @@ fn serve(
                 json!({"convers":[{"destId":"66","isGroup":false,"ttl":60000}]})
             } else if mode == 5 {
                 json!({"convers":[{"destId":"44","isGroup":true,"ttl":60000}]})
+            } else if mode == 8 {
+                json!({"convers":[{"destId":"22","isGroup":true,"ttl":60000}]})
             } else {
                 json!({"convers":[]})
             }
@@ -1658,10 +1673,7 @@ fn serve(
             assert_eq!(info["message"], "Tin tổng hợp được chuyển tiếp");
             let reference: Value =
                 serde_json::from_str(info["reference"].as_str().unwrap()).unwrap();
-            assert!(matches!(
-                crate::protocol::forward::ForwardMarker::parse(&reference),
-                Some(crate::protocol::forward::ForwardMarker::Parsed(_))
-            ));
+            forward_batch_tests::assert_origin(&reference, mode);
             let attempt = state.http_sends.fetch_add(1, Ordering::SeqCst);
             if mode == 4 && target == "44" {
                 let started = std::time::Instant::now();

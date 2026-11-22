@@ -114,6 +114,23 @@ mod live {
         )?)
     }
 
+    fn normal_group_source(conn: &Connection, account: &str, thread: &str) -> Result<bool> {
+        if !thread.strip_prefix("g:").is_some_and(valid_source_id)
+            || group_actions::write_blocked(conn, account, thread)?
+        {
+            return Ok(false);
+        }
+        // A cached group size can exclude a source. The live worker proves
+        // current membership and group size even when the directory is absent.
+        Ok(conn.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM directory_entries
+             WHERE account_id=?1 AND thread_id=?2 AND is_group=1
+             AND member_count NOT BETWEEN 1 AND ?3)",
+            params![account, thread, MAX_GROUP_MEMBERS],
+            |row| row.get(0),
+        )?)
+    }
+
     fn source(
         conn: &Connection,
         account: &str,
@@ -121,9 +138,11 @@ mod live {
         id: &str,
     ) -> Result<(String, ForwardReference)> {
         ensure!(
-            direct_peer(account, thread).is_some()
+            valid_source_id(account)
                 && valid_source_id(id)
-                && normal_thread(conn, account, thread)?,
+                && normal_thread(conn, account, thread)?
+                && (direct_peer(account, thread).is_some()
+                    || normal_group_source(conn, account, thread)?),
             ForwardFailure::Source
         );
         let mut source = conn.query_row(
@@ -449,6 +468,15 @@ mod live {
     }
 
     impl MessageStore {
+        pub(crate) fn forward_source_valid(
+            &self,
+            account: &str,
+            thread: &str,
+            id: &str,
+        ) -> Result<()> {
+            source(&self.conn, account, thread, id).map(|_| ())
+        }
+
         pub(crate) fn forward_destination_valid(&self, account: &str, thread: &str) -> Result<()> {
             destination(&self.conn, account, thread)
         }
@@ -864,6 +892,61 @@ mod tests {
         );
         store.prepare_group_leave("11", "g:33", 2).unwrap();
         assert!(store.forward_destination_valid("11", "g:33").is_err());
+    }
+
+    #[test]
+    fn group_source_requires_committed_ordinary_text_and_remains_scoped_at_dispatch() {
+        let (mut store, _) = fixture();
+        let source = message("g:22", "100", "24", "200");
+        store.insert_batch(std::slice::from_ref(&source)).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
+        store.replace_live_privacy("11", &[], None).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
+        receive(&mut store, source, Some(ForwardMarker::Ordinary), None).unwrap();
+        let targets = store.forward_targets("11", "g:22", "100", "Bảo").unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].thread_id, "d:33");
+        let send = store
+            .prepare_forward("11", "g:22", "100", "d:33", 1000)
+            .unwrap();
+        assert_eq!(send.text, "Xin chào đầu tiên");
+        assert!(store.forward_source_valid("11", "d:22", "100").is_err());
+        store.replace_live_privacy("77", &[], None).unwrap();
+        assert!(store.forward_source_valid("77", "g:22", "100").is_err());
+
+        let mut mention = message("g:22", "101", "24", "201");
+        mention.text = "@An xem".into();
+        mention.reply_blocked = true;
+        mention.mentions = vec![crate::domain::mention::Mention {
+            uid: "25".into(),
+            pos: 0,
+            len: 3,
+        }];
+        receive(&mut store, mention, Some(ForwardMarker::Ordinary), None).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "101").is_err());
+
+        store
+            .replace_live_privacy("11", &["g:22".into()], Some("g:22"))
+            .unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
+        store.replace_live_privacy("11", &[], None).unwrap();
+        store.conn.execute_batch(
+            "INSERT INTO directory_entries(account_id,thread_id,remote_id,is_group,display_name,search_name,member_count,observed_at_ms)
+             VALUES('11','g:22','22',1,'Nhóm','nhom',100,1);",
+        ).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
+        store.conn.execute_batch(
+            "UPDATE directory_entries SET member_count=99 WHERE account_id='11' AND thread_id='g:22';
+             INSERT INTO e2ee_threads VALUES ('11','g:22');",
+        ).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
+        store
+            .conn
+            .execute_batch("DELETE FROM e2ee_threads WHERE account_id='11' AND thread_id='g:22';")
+            .unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_ok());
+        store.prepare_group_leave("11", "g:22", 1001).unwrap();
+        assert!(store.forward_source_valid("11", "g:22", "100").is_err());
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub(super) fn respond_group(
     path: &str,
     headers: &str,
     body: &[u8],
+    mode: u8,
 ) -> bool {
     let (route, query) = path.split_once('?').unwrap();
     if !matches!(
@@ -26,7 +27,7 @@ pub(super) fn respond_group(
         "/api/group/getgi/v2" => {
             let id = params["grid"].as_str().unwrap();
             assert!(matches!(id, "22" | "44" | "55" | "66"));
-            json!({"groupId":id,"visibility":0,"e2ee":id=="66"})
+            json!({"groupId":id,"visibility":0,"e2ee":id=="66" || (mode==7 && id=="22")})
         }
         "/api/group/getmg-v2" => {
             let map: Value = serde_json::from_str(params["gridVerMap"].as_str().unwrap()).unwrap();
@@ -34,7 +35,8 @@ pub(super) fn respond_group(
             let id = map.as_object().unwrap().keys().next().unwrap();
             assert!(matches!(id.as_str(), "22" | "44" | "55" | "66"));
             json!({"gridInfoMap":{(id): {"groupId":id,"type":1,"creatorId":"33",
-                "totalMember":2,"memVerList":["33_1","11_1"],"adminIds":[]}}})
+                "totalMember":2,"memVerList":["33_1","11_1"],"adminIds":[],
+                "setting":{"lockSendMsg":mode>=6 && id=="22"}}}})
         }
         "/api/group/mforward" => {
             assert_eq!(query, "zpw_ver=681&zpw_type=24");
@@ -56,12 +58,9 @@ pub(super) fn respond_group(
             assert_eq!(info["message"], "Tin tổng hợp được chuyển tiếp");
             let reference: Value =
                 serde_json::from_str(info["reference"].as_str().unwrap()).unwrap();
-            assert!(matches!(
-                crate::protocol::forward::ForwardMarker::parse(&reference),
-                Some(crate::protocol::forward::ForwardMarker::Parsed(_))
-            ));
+            assert_origin(&reference, mode);
             state.http_sends.fetch_add(1, Ordering::SeqCst);
-            if grid == "55" {
+            if mode == 5 && grid == "55" {
                 return true;
             }
             json!({"success":[{"clientId":client,"msgId":"991","ts":1760000000099_i64}],"failed":[]})
@@ -84,9 +83,36 @@ pub(super) fn respond_group(
     true
 }
 
+pub(super) fn assert_origin(reference: &Value, mode: u8) {
+    assert!(matches!(
+        crate::protocol::forward::ForwardMarker::parse(reference),
+        Some(crate::protocol::forward::ForwardMarker::Parsed(_))
+    ));
+    if mode >= 6 {
+        use md5::{Digest, Md5};
+
+        let origin: Value = serde_json::from_str(reference["data"].as_str().unwrap()).unwrap();
+        let id = format!("{:x}", Md5::digest(b"99033g22"));
+        assert_eq!(
+            origin,
+            json!({"id":id,"ts":1760000000001_i64,"logSrcType":2,"fwLvl":1,
+            "rootMsgRef":{"id":id,"ts":1760000000001_i64,"logSrcType":2}})
+        );
+    }
+}
+
 async fn expect_forward_batch(
     incoming: &mut mpsc::Receiver<LiveEvent>,
     request_id: u64,
+    expected: &[(&str, ForwardOutcome)],
+) {
+    expect_forward_from(incoming, request_id, "d:33", expected).await;
+}
+
+async fn expect_forward_from(
+    incoming: &mut mpsc::Receiver<LiveEvent>,
+    request_id: u64,
+    expected_source: &str,
     expected: &[(&str, ForwardOutcome)],
 ) {
     loop {
@@ -105,7 +131,7 @@ async fn expect_forward_batch(
                         source_thread.as_str(),
                         source_message_id.as_str()
                     ),
-                    ("11", "d:33", "910"),
+                    ("11", expected_source, "910"),
                 );
                 let actual: Vec<_> = results
                     .iter()
@@ -200,6 +226,68 @@ async fn await_source(incoming: &mut mpsc::Receiver<LiveEvent>, restored: bool) 
             } => online = true,
             LiveEvent::Received { message, .. } if message.id == "910" => source = true,
             _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn forwarding_group_origin_checks_scope_before_any_recipient_dispatch() {
+    use ForwardOutcome::{Accepted, Unavailable};
+
+    for (mode, expected) in [(6, Accepted), (7, Unavailable), (8, Unavailable)] {
+        let fixture = Fixture::new(Reply::Forward(mode));
+        let (session, db_path) = session_with_targets(&fixture, true);
+        let (commands, requests) = mpsc::channel(16);
+        let (events, mut incoming) = mpsc::channel(64);
+        let (stop, cancel) = watch::channel(false);
+        let actor = tokio::spawn(run_with_transports(
+            fixture.profile.clone(),
+            session,
+            requests,
+            events,
+            Arc::new(|| {}),
+            cancel,
+            fixture.transports(),
+        ));
+        tokio::time::timeout(Duration::from_secs(12), async {
+            await_source(&mut incoming, false).await;
+            commands
+                .send(LiveCommand::ForwardBatch {
+                    request_id: 1,
+                    source_thread: "g:22".into(),
+                    source_message_id: "910".into(),
+                    target_threads: vec!["d:22".into(), "g:55".into()],
+                })
+                .await
+                .unwrap();
+            expect_forward_from(
+                &mut incoming,
+                1,
+                "g:22",
+                &[("d:22", expected), ("g:55", expected)],
+            )
+            .await;
+        })
+        .await
+        .unwrap();
+        stop.send(true).unwrap();
+        actor.await.unwrap();
+
+        let copies = if mode == 6 { 2 } else { 0 };
+        assert_eq!(fixture.state.http_sends.load(Ordering::SeqCst), copies);
+        let store = MessageStore::open(&db_path).unwrap();
+        let source = store.page("11", "g:22", None, 10).unwrap();
+        assert_eq!(source.len(), 1);
+        assert_eq!(source[0].id, "910");
+        assert_eq!(source[0].sender, "33");
+        for target in ["d:22", "g:55"] {
+            let messages = store.page("11", target, None, 10).unwrap();
+            assert_eq!(messages.len(), copies / 2);
+            if let Some(copy) = messages.first() {
+                assert_eq!(copy.id, "991");
+                assert_eq!(copy.sender, "11");
+                assert_eq!(copy.text, source[0].text);
+            }
         }
     }
 }

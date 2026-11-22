@@ -204,6 +204,20 @@ One picker can mix up to ten recipients. Each recipient has its own request
 and outcome. Unknown delivery does not redispatch after restart. The source
 is a saved ordinary direct text message, and the profile remains on schema 25.
 
+## Forwarding text from an ordinary group
+
+The source can also be a saved, verified first-generation text message in a
+visible ordinary group of fewer than 100 members. The worker verifies active
+membership, plaintext capability and disabled auto-delete in the source
+group before dispatch. Source read access is checked independently of the
+destination's send permission. A stale proof is renewed between recipients,
+and the committed source is revalidated immediately before sending.
+
+The original reference builder (N480089–480156) uses the group source type
+`2` and hashes the source client ID, effective sender ID and `g<grid>`.
+Native uses that reference with the existing direct or group destination
+route and the account/thread-scoped forward outbox. Schema 25 is compatible.
+
 ## Ordinary direct text recall (2026-11-19)
 
 The original direct composer checks message age at N136319. N401877–401897

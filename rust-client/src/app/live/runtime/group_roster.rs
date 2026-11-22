@@ -36,6 +36,10 @@ impl Proof {
     pub(super) fn allows_forward(&self, request: &Request, account: &str) -> bool {
         self.applies(request, account) && self.roster.can_forward
     }
+
+    pub(super) fn allows_forward_source(&self, request: &Request, account: &str) -> bool {
+        self.applies(request, account) && self.roster.fits_forwarding_group()
+    }
 }
 
 impl Request {

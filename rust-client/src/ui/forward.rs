@@ -1,9 +1,9 @@
-//! Scoped recipient selection and results for forwarding one ordinary direct text message.
+//! Scoped recipient selection and results for forwarding one ordinary text message.
 use super::{visuals, NativeApp};
 use crate::{
     app::live::{
         ForwardBatchResult, ForwardOutcome, ForwardTarget, LiveCommand, LiveConnection, LiveEvent,
-        LiveWorker, MAX_FORWARD_BATCH,
+        LivePrivacyStatus, LiveWorker, MAX_FORWARD_BATCH,
     },
     domain::{reply::valid_source_id, Conversation, Message},
 };
@@ -325,11 +325,18 @@ impl Forwarding {
     }
 
     #[cfg(test)]
-    pub(super) fn fixture(&mut self, account: &str, auth: Option<u64>, page: u64, scene: &str) {
+    pub(super) fn fixture(
+        &mut self,
+        account: &str,
+        auth: Option<u64>,
+        page: u64,
+        thread: &str,
+        scene: &str,
+    ) {
         let mut picker = Picker::new(Source {
             account: account.into(),
             auth,
-            thread: "d:22".into(),
+            thread: thread.into(),
             page,
             message: "901".into(),
         });
@@ -345,7 +352,7 @@ impl Forwarding {
             ("g:50", "Nhóm kiểm thử cùng khách hàng"),
             friends[1],
         ];
-        picker.entries = if matches!(scene, "group-targets" | "group-results") {
+        picker.entries = if matches!(scene, "group-targets" | "group-results" | "group-source") {
             mixed
         } else {
             friends
@@ -358,7 +365,7 @@ impl Forwarding {
         .collect();
         let count = match scene {
             "mixed" | "group-results" => 4,
-            "batch" | "group-targets" => 2,
+            "batch" | "group-targets" | "group-source" => 2,
             _ => 1,
         };
         for index in 0..count {
@@ -398,22 +405,31 @@ impl NativeApp {
     fn forward_source(&self, message: &Message) -> Option<Source> {
         let account = self.account_id()?;
         let thread = self.model.selected.as_ref()?;
-        let peer = thread.strip_prefix("d:")?;
+        let (kind, remote) = thread.split_once(':')?;
+        let source_visible = match kind {
+            "d" => remote != account,
+            "g" => {
+                self.live
+                    .as_ref()
+                    .is_some_and(|state| state.privacy.status == LivePrivacyStatus::Ready)
+                    && self
+                        .model
+                        .conversations
+                        .iter()
+                        .any(|group| group.id == *thread && !group.group_left)
+            }
+            _ => false,
+        };
         if self.demo
             || self.model.pending
-            || peer == account
-            || (message.sender != account && message.sender != peer)
+            || !source_visible
             || message.thread_id != *thread
             || message.account_id != account
             || !self.privacy_list_visible(thread)
-            || message.is_recalled()
             || message.quote.is_some()
-            || message.media.is_some()
-            || message.sticker.is_some()
-            || message.reply_blocked
-            || message.source_client_id.is_none()
+            || !(1..=9_007_199_254_740_991).contains(&message.sent_at_ms)
             || message.text.trim().is_empty()
-            || message.text.starts_with("[Tin nhắn ")
+            || message.reply_reference().is_none()
         {
             return None;
         }
@@ -838,6 +854,86 @@ mod tests {
             thread_id: format!("g:{id}"),
             title: format!("Kế hoạch {id}"),
         }
+    }
+
+    #[test]
+    fn group_source_picker_binds_original_message_and_closes_when_scope_changes() {
+        let ctx = egui::Context::default();
+        let (mut app, root) = super::super::live::tests::fixture(&ctx);
+        let (worker, mut commands, _events) = LiveWorker::presentation_fixture("11");
+        let state = app.live.as_mut().unwrap();
+        state.connection = LiveConnection::Online;
+        state.worker = Some(worker);
+        app.model.selected = Some("g:70".into());
+        app.drafts.select("g:70").unwrap();
+        app.drafts.active.text = "Bản nháp đang nhập".into();
+        app.model.conversations.push(Conversation {
+            id: "g:70".into(),
+            title: "Nhóm kiểm thử".into(),
+            last_message_at_ms: 1,
+            last_text: "Tin nhắn thử".into(),
+            last_sender: "44".into(),
+            group_left: false,
+        });
+        let message = Message {
+            account_id: "11".into(),
+            thread_id: "g:70".into(),
+            id: "901".into(),
+            sender: "44".into(),
+            text: "Tin nhắn thử".into(),
+            source_client_id: Some("900".into()),
+            mentions: Vec::new(),
+            reply_blocked: false,
+            recalled: false,
+            quote: None,
+            sticker: None,
+            media: None,
+            sent_at_ms: 1,
+        };
+        assert!(app.can_forward(&message));
+        let mut unsupported = message.clone();
+        unsupported.mentions.push(crate::domain::mention::Mention {
+            uid: "33".into(),
+            pos: 0,
+            len: 4,
+        });
+        assert!(!app.can_forward(&unsupported));
+        unsupported = message.clone();
+        unsupported.thread_id = "d:70".into();
+        assert!(!app.can_forward(&unsupported));
+        app.model.messages.push(message.clone());
+
+        app.open_forward("901");
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(LiveCommand::ForwardTargets { source_thread, source_message_id, .. })
+                if source_thread == "g:70" && source_message_id == "901"
+        ));
+        assert!(app.live.as_ref().unwrap().forwarding.is_open());
+        app.model.generation += 1;
+        app.sync_forward();
+        assert!(!app.live.as_ref().unwrap().forwarding.is_open());
+
+        app.open_forward("901");
+        let state = app.live.as_mut().unwrap();
+        assert!(state.forwarding.is_open());
+        assert!(state.privacy.snapshot(&LiveEvent::PrivacyChanged {
+            account_id: "11".into(),
+            revision: 2,
+            status: LivePrivacyStatus::Ready,
+            hidden_threads: vec!["g:70".into()],
+            unlocked_thread: None,
+        }));
+        app.sync_forward();
+        assert!(!app.live.as_ref().unwrap().forwarding.is_open());
+        assert!(!app.can_forward(&message));
+
+        app.live.as_mut().unwrap().privacy = super::super::privacy::Privacy::fixture_ready();
+        app.model.conversations[0].group_left = true;
+        assert!(!app.can_forward(&message));
+        assert_eq!(app.drafts.active.text, "Bản nháp đang nhập");
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

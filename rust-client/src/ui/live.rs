@@ -2962,11 +2962,21 @@ pub(in crate::ui) mod tests {
                 if let Some(scene) = forward_scene.as_deref() {
                     app.model.messages[0].id = "901".into();
                     app.model.messages[0].source_client_id = Some("900".into());
+                    if scene == "group-source" {
+                        let group = "g:70";
+                        app.model.selected = Some(group.into());
+                        app.model.conversations[0].id = group.into();
+                        app.model.conversations[0].title = "Nhóm kiểm thử chuyển tiếp".into();
+                        app.model.messages[0].thread_id = group.into();
+                        app.drafts.select(group).unwrap();
+                        app.drafts.active.text = "Bản nháp đang nhập trong nhóm".into();
+                    }
                     let state = app.live.as_mut().unwrap();
                     state.forwarding.fixture(
                         "11",
                         Some(state.login.generation()),
                         app.model.generation,
+                        app.model.selected.as_deref().unwrap(),
                         scene,
                     );
                 }

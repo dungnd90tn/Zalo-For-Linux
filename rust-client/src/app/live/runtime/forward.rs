@@ -1,4 +1,4 @@
-//! Ordinary direct text forwarding with per-recipient preflight and dispatch.
+//! Ordinary text forwarding with scoped source and recipient preflight.
 use super::*;
 use crate::protocol::forward::{self as wire_forward, ForwardAck, ForwardReference};
 use std::collections::{HashMap, VecDeque};
@@ -26,8 +26,7 @@ impl ForwardRequest {
         wire::numeric_id(&self.source_message_id)?;
         let source = Target::from_thread(&self.source_thread)?;
         let target = Target::from_thread(&self.target_thread)?;
-        if source.kind != ThreadKind::Direct
-            || source.remote_id == account
+        if (source.kind == ThreadKind::Direct && source.remote_id == account)
             || (target.kind == ThreadKind::Direct && target.remote_id == account)
         {
             return Err(WireError::Unsupported);
@@ -185,6 +184,12 @@ struct GroupProof {
 struct DispatchProof {
     ttl: TargetTtlProof,
     group: Option<GroupProof>,
+    source_group: Option<GroupSourceProof>,
+}
+
+struct GroupSourceProof {
+    ttl: TargetTtlProof,
+    group: Arc<GroupProof>,
 }
 
 #[derive(Clone, Copy)]
@@ -194,14 +199,56 @@ struct Transport<'a> {
 }
 
 impl GroupProof {
-    fn applies(&self, account: &str, target: &Target) -> bool {
+    fn spawn(
+        transport: Transport<'_>,
+        events: &Events,
+        target: Target,
+        revision: u64,
+    ) -> tokio::task::JoinHandle<Result<Self>> {
+        let (client, session, scope) = (
+            transport.client.clone(),
+            transport.session.clone(),
+            events.privacy.clone(),
+        );
+        let request = group_roster::Request {
+            thread: target.thread_id(),
+            privacy_revision: revision,
+            after: None,
+        };
+        tokio::spawn(async move { Self::verify(&client, &session, &scope, &target, request).await })
+    }
+
+    async fn verify(
+        client: &reqwest::Client,
+        session: &VerifiedSession,
+        scope: &std::sync::RwLock<privacy::Projection>,
+        target: &Target,
+        request: group_roster::Request,
+    ) -> Result<Self> {
+        let (visibility, roster) = tokio::try_join!(
+            verify_group(client, session, target),
+            group_roster::verify_members(client, session, scope, &request),
+        )?;
+        if visibility != 0 {
+            return Err(WireError::Unsupported.into());
+        }
+        Ok(Self { request, roster })
+    }
+
+    fn applies_destination(&self, account: &str, target: &Target) -> bool {
         self.request.thread == target.thread_id()
             && self.roster.allows_forward(&self.request, account)
+    }
+
+    fn applies_source(&self, account: &str, source: &Target) -> bool {
+        self.request.thread == source.thread_id()
+            && self.roster.allows_forward_source(&self.request, account)
     }
 }
 
 struct PreparedDispatch {
     client_id: u64,
+    source: Target,
     target: Target,
     url: Url,
     body: String,
@@ -216,7 +263,7 @@ impl PreparedDispatch {
         text: &str,
         reference: &ForwardReference,
     ) -> Result<Self> {
-        let (_, target) = request.targets(session.account_id())?;
+        let (source, target) = request.targets(session.account_id())?;
         let path = match target.kind {
             ThreadKind::Direct => wire_forward::DIRECT_PATH,
             ThreadKind::Group => wire_forward::GROUP_PATH,
@@ -229,6 +276,7 @@ impl PreparedDispatch {
             .finish();
         Ok(Self {
             client_id,
+            source,
             target,
             url,
             body,
@@ -249,9 +297,16 @@ impl PreparedDispatch {
         if !proof.ttl.applies(&self.target)
             || normal_scope_revision(privacy, request) != Some(revision)
             || self.target.kind == ThreadKind::Group
-                && !proof
-                    .group
-                    .is_some_and(|group| group.applies(session.account_id(), &self.target))
+                && !proof.group.is_some_and(|group| {
+                    group.applies_destination(session.account_id(), &self.target)
+                })
+            || self.source.kind == ThreadKind::Group
+                && !proof.source_group.is_some_and(|proof| {
+                    proof.ttl.applies(&self.source)
+                        && proof
+                            .group
+                            .applies_source(session.account_id(), &self.source)
+                })
         {
             return ForwardDispatch::NotSent;
         }
@@ -273,6 +328,7 @@ impl PreparedDispatch {
 
 enum Task {
     Ttl(tokio::task::JoinHandle<Result<TtlSnapshot>>),
+    SourceGroup(tokio::task::JoinHandle<Result<GroupProof>>),
     Group(tokio::task::JoinHandle<Result<GroupProof>>),
     Ready,
     Dispatch {
@@ -290,7 +346,7 @@ impl Drop for Running {
     fn drop(&mut self) {
         match &self.task {
             Task::Ttl(task) => task.abort(),
-            Task::Group(task) => task.abort(),
+            Task::SourceGroup(task) | Task::Group(task) => task.abort(),
             Task::Dispatch { task, .. } => task.abort(),
             Task::Ready => {}
         }
@@ -300,6 +356,7 @@ impl Drop for Running {
 
 enum Phase {
     Ttl(Option<TtlSnapshot>),
+    SourceGroup(Result<GroupProof>),
     Group(Result<GroupProof>),
     Ready,
     Dispatch { id: u64, result: ForwardDispatch },
@@ -320,6 +377,7 @@ struct Work {
     revision: u64,
     authenticated_at: Option<Instant>,
     ttl: Option<TtlSnapshot>,
+    source_group: Option<Arc<GroupProof>>,
 }
 
 impl Work {
@@ -399,6 +457,9 @@ impl Forwarding {
         };
         let phase = match &mut job.task {
             Task::Ttl(task) => Phase::Ttl(task.await.ok().and_then(Result::ok)),
+            Task::SourceGroup(task) => {
+                Phase::SourceGroup(task.await.unwrap_or_else(|error| Err(error.into())))
+            }
             Task::Group(task) => Phase::Group(task.await.unwrap_or_else(|error| Err(error.into()))),
             Task::Ready => {
                 // Give queued local work a turn before another synchronous socket proof.
@@ -489,7 +550,7 @@ impl Forwarding {
         let revision = normal_source_revision(&events.privacy, &source_thread);
         let valid = request_id != 0
             && Target::from_thread(&source_thread).is_ok_and(|target| {
-                target.kind == ThreadKind::Direct && target.remote_id != events.account
+                target.kind == ThreadKind::Group || target.remote_id != events.account
             })
             && wire::numeric_id(&source_message_id).is_ok()
             && valid_forward_targets(&target_threads, &events.account);
@@ -504,6 +565,7 @@ impl Forwarding {
             revision: revision.unwrap_or_default(),
             authenticated_at: at,
             ttl: None,
+            source_group: None,
         };
         if !valid
             || revision.is_none()
@@ -590,12 +652,33 @@ impl Forwarding {
                 self.launch(&request, connection, db, events, transport, None)
                     .await?
             }
+            Phase::SourceGroup(Ok(proof))
+                if request
+                    .targets(&events.account)
+                    .is_ok_and(|(source, _)| proof.applies_source(&events.account, &source)) =>
+            {
+                self.work
+                    .as_mut()
+                    .expect("proof belongs to a forward")
+                    .source_group = Some(Arc::new(proof));
+                self.launch(&request, connection, db, events, transport, None)
+                    .await?
+            }
             Phase::Group(Ok(proof)) => {
                 self.launch(&request, connection, db, events, transport, Some(proof))
                     .await?
             }
-            Phase::Group(Err(error)) if wire_error(&error) == Some(&WireError::Authentication) => {
+            Phase::SourceGroup(Err(error)) | Phase::Group(Err(error))
+                if wire_error(&error) == Some(&WireError::Authentication) =>
+            {
                 Attempt::Pause(error)
+            }
+            Phase::SourceGroup(_) => {
+                let mut work = self.work.take().expect("proof belongs to a forward");
+                work.record(request.target_thread, ForwardOutcome::Unavailable);
+                work.skip();
+                work.finish(events).await?;
+                return Ok(CommandOutcome::Continue);
             }
             Phase::Group(Err(_)) => Attempt::Finished(ForwardOutcome::Unavailable),
             Phase::Dispatch { id, result } => {
@@ -642,7 +725,7 @@ impl Forwarding {
         let Transport { session, client } = transport;
         let work = self.work.as_ref().expect("preflight belongs to a forward");
         let revision = work.revision;
-        let (_, target) = request.targets(&events.account)?;
+        let (source, target) = request.targets(&events.account)?;
         let ttl = work
             .ttl
             .as_ref()
@@ -658,6 +741,32 @@ impl Forwarding {
         if at != work.authenticated_at || !permits_dispatch() {
             return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
         }
+        let source_group = if source.kind == ThreadKind::Group {
+            let Some(ttl) = work
+                .ttl
+                .as_ref()
+                .and_then(|snapshot| snapshot.proof(&source).ok())
+            else {
+                return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
+            };
+            let Some(group) = work
+                .source_group
+                .as_ref()
+                .filter(|proof| proof.applies_source(&events.account, &source))
+            else {
+                self.running = Some(Running {
+                    request: request.clone(),
+                    task: Task::SourceGroup(GroupProof::spawn(transport, events, source, revision)),
+                });
+                return Ok(Attempt::Dispatched);
+            };
+            Some(GroupSourceProof {
+                ttl,
+                group: group.clone(),
+            })
+        } else {
+            None
+        };
         match target.kind {
             ThreadKind::Direct => {
                 if let Err(error) = socket.verify_direct(&target, db, events).await {
@@ -674,39 +783,13 @@ impl Forwarding {
             }
             ThreadKind::Group => match &group {
                 None => {
-                    let (client, session, scope) =
-                        (client.clone(), session.clone(), events.privacy.clone());
-                    let roster_request = group_roster::Request {
-                        thread: request.target_thread.clone(),
-                        privacy_revision: revision,
-                        after: None,
-                    };
                     self.running = Some(Running {
                         request: request.clone(),
-                        task: Task::Group(tokio::spawn(async move {
-                            let (visibility, roster) = tokio::try_join!(
-                                verify_group(&client, &session, &target),
-                                group_roster::verify_members(
-                                    &client,
-                                    &session,
-                                    &scope,
-                                    &roster_request
-                                ),
-                            )?;
-                            if visibility != 0
-                                || !roster.allows_forward(&roster_request, session.account_id())
-                            {
-                                return Err(WireError::Unsupported.into());
-                            }
-                            Ok(GroupProof {
-                                request: roster_request,
-                                roster,
-                            })
-                        })),
+                        task: Task::Group(GroupProof::spawn(transport, events, target, revision)),
                     });
                     return Ok(Attempt::Dispatched);
                 }
-                Some(proof) if !proof.applies(&events.account, &target) => {
+                Some(proof) if !proof.applies_destination(&events.account, &target) => {
                     return Ok(Attempt::Finished(ForwardOutcome::Unavailable));
                 }
                 Some(_) => {}
@@ -760,12 +843,22 @@ impl Forwarding {
             task: Task::Dispatch {
                 id,
                 task: tokio::spawn(async move {
-                    if group.is_some() {
+                    let check_source = source_group.is_some();
+                    let check_destination = group.is_some();
+                    if check_source || check_destination {
                         let account = session.account_id().to_owned();
+                        let source = submitted.source_thread.clone();
+                        let message = submitted.source_message_id.clone();
                         let destination = submitted.target_thread.clone();
                         if db
                             .call(move |store| {
-                                store.forward_destination_valid(&account, &destination)
+                                if check_source {
+                                    store.forward_source_valid(&account, &source, &message)?;
+                                }
+                                if check_destination {
+                                    store.forward_destination_valid(&account, &destination)?;
+                                }
+                                Ok(())
                             })
                             .await
                             .is_err()
@@ -780,7 +873,11 @@ impl Forwarding {
                             &submitted,
                             &scope,
                             revision,
-                            DispatchProof { ttl, group },
+                            DispatchProof {
+                                ttl,
+                                group,
+                                source_group,
+                            },
                         )
                         .await
                 }),

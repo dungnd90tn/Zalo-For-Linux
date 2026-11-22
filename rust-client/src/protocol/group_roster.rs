@@ -49,6 +49,10 @@ pub(crate) struct VerifiedGroup {
 }
 
 impl VerifiedGroup {
+    pub(crate) fn fits_forwarding_group(&self) -> bool {
+        self.versions.len() < MAX_MEMBERS
+    }
+
     pub(crate) fn contains(&self, member: &str) -> bool {
         self.versions.contains_key(member)
     }
@@ -395,19 +399,18 @@ mod tests {
         let mut row = locked_row();
         row["setting"]["lockSendMsg"] = json!(true);
         let payload = response(row);
-        assert!(!verify_group(&payload, "22", &target).unwrap().can_forward);
+        let locked_member = verify_group(&payload, "22", &target).unwrap();
+        assert!(!locked_member.can_forward);
+        assert!(locked_member.fits_forwarding_group());
         assert!(verify_group(&payload, "88", &target).unwrap().can_forward);
 
         for (total, permitted) in [(99, true), (100, false)] {
             let mut row = locked_row();
             row["totalMember"] = json!(total);
             row["memVerList"] = json!((1..=total).map(|id| format!("{id}_1")).collect::<Vec<_>>());
-            assert_eq!(
-                verify_group(&response(row), "22", &target)
-                    .unwrap()
-                    .can_forward,
-                permitted
-            );
+            let group = verify_group(&response(row), "22", &target).unwrap();
+            assert_eq!(group.can_forward, permitted);
+            assert_eq!(group.fits_forwarding_group(), permitted);
         }
     }
 

@@ -497,7 +497,7 @@ impl NativeApp {
                         }
                         forward_selected = button.clicked();
                         button.on_disabled_hover_text(
-                            "Chỉ hỗ trợ tin văn bản cá nhân đủ dữ liệu gốc khi đang kết nối.",
+                            "Cần kết nối và tin văn bản gốc đủ điều kiện trong chat cá nhân hoặc nhóm.",
                         );
                     }
                     #[cfg(feature = "messaging")]
